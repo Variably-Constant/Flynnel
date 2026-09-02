@@ -61,22 +61,9 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::sched::job::{CompactJobRef, JobRef};
-
-/// Owner-pop discipline, read once from `FLYNNEL_OWNER_POP`: `lifo`
-/// pops the newest published body (Chase-Lev order), anything else
-/// the oldest (head order). Oldest-first stays the default until the
-/// measurement under flynnel-14 is ruled on.
-fn owner_pop_lifo() -> bool {
-    static LIFO: OnceLock<bool> = OnceLock::new();
-    *LIFO.get_or_init(|| {
-        std::env::var("FLYNNEL_OWNER_POP")
-            .map(|v| v.eq_ignore_ascii_case("lifo"))
-            .unwrap_or(false)
-    })
-}
 
 /// Items per KHL slot. 3 matches Fcl's cache-line-fit ratio.
 pub const KHL_LINE_ITEMS: usize = 3;
@@ -458,13 +445,12 @@ impl SchedKhlDeque {
             let body = core::mem::replace(acc, KhlBody::empty(0, 0, 0));
             return KhlSteal::Success(body);
         }
-        // Drain from the ring: oldest body through the thief pattern
-        // (head CAS), or newest under the LIFO flag.
-        if owner_pop_lifo() {
-            self.pop_newest()
-        } else {
-            self.steal_inner()
-        }
+        // Newest published body: the owner's own right half comes
+        // back first, thieves take the oldest. Oldest-first for the
+        // owner measured 10x to 15x more dispatch overhead on the
+        // noop cells of sched_overhead_isolation (430-660 us vs
+        // 41-53 us at 10k items).
+        self.pop_newest()
     }
 
     /// Owner pop of the newest published body, Chase-Lev discipline
@@ -512,44 +498,6 @@ impl SchedKhlDeque {
         // observes that also observes bottom == b); the body is ours.
         let body = unsafe { core::ptr::read(slot.body.get()) };
         slot.seq.store(b as u64, Ordering::Release);
-        KhlSteal::Success(body)
-    }
-
-    #[inline]
-    fn steal_inner(&self) -> KhlSteal {
-        let h = &*self.inner;
-        let t = h.head.load(Ordering::Acquire);
-        let b = h.bottom.load(Ordering::Acquire);
-        if t >= b {
-            return KhlSteal::Empty;
-        }
-        if h.head
-            .compare_exchange(t, t + 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return KhlSteal::Retry;
-        }
-        // SAFETY: (t & capacity_mask) is always in [0, capacity).
-        let slot = unsafe { h.buffer.get_unchecked((t & h.capacity_mask) as usize) };
-        // Wait for producer publish at this slot (seq == t + 1).
-        // Same back-pressure mitigation as publish().
-        let mut spins: u32 = 0;
-        while slot.seq.load(Ordering::Acquire) != (t as u64) + 1 {
-            spins = spins.wrapping_add(1);
-            if spins & 63 == 0 {
-                std::thread::yield_now();
-            } else {
-                std::hint::spin_loop();
-            }
-        }
-        // SAFETY: we've claimed slot t; the seq invariant means
-        // we are the sole reader of the body until our release
-        // store below.
-        let body = unsafe { core::ptr::read(slot.body.get()) };
-        slot.seq.store(
-            (t as u64) + (h.capacity as u64),
-            Ordering::Release,
-        );
         KhlSteal::Success(body)
     }
 

@@ -289,12 +289,16 @@ pub fn syev_bisect_scratch_bytes(batch, n) / gesvd_bisect_scratch_bytes(batch, m
 // Synchronous over host buffers (pin, launch, sync, fetch, unpin):
 pub fn einsum_batched(..) / gemm_batched(..) / syev_batched(..) / gesvd_batched(..)
 pub fn syev_bisect_batched(peer, k, a, batch, n, want_v) / gesvd_bisect_batched(peer, k, a, batch, m, n, want_v)
+// The measured routing: bisection from SYEV_BISECT_MIN_N = 32 (eigen) and GESVD_BISECT_MIN_N = 64 (SVD), Jacobi below
+pub fn syev_method_for(n) / gesvd_method_for(n) -> LinalgMethod
+pub fn syev_auto_batched(peer, k, a, batch, n, want_v) / gesvd_auto_batched(peer, k, a, batch, m, n, want_v)
 // gpu_peer::ozaki - the tensor-core GEMM, with its workspace pinned in the resident pool:
 pub struct OzakiKernels;  impl OzakiKernels { pub fn load(peer) -> Result<Self, GpuPeerError> }
 pub struct OzakiWorkspace; // OzakiWorkspace::new(peer, batch, m, n, k), ::bytes(..), ::release(peer)
 pub fn launch_ozaki_gemm(peer, kern, ws, a, b, c)                        // async, device addresses
 pub fn ozaki_gemm_batched(peer, kern, a, b, batch, m, n, k) -> Vec<f64>
 pub fn error_bound(a_row, b_col) -> f64                                  // 2^-53 * k * max|row| * max|col|
+// The Ozaki path is explicit: gemm_batched and the accel route stay on the native f64 kernel.
 // CPU references with the kernels' semantics:
 pub mod cpu { einsum, gemm_batched, syev_jacobi[_batched], gesvd_jacobi[_batched] }
 // accel_op registrations (see Backend System): CPU side = cpu::*, kernel side = the blk kernels

@@ -8,7 +8,8 @@
 use std::sync::{Mutex, MutexGuard};
 
 use flynnel::gpu_peer::linalg::{
-    cpu, default_sweeps, gesvd_bisect_batched, syev_bisect_batched, LinalgKernels,
+    cpu, default_sweeps, gesvd_auto_batched, gesvd_bisect_batched, gesvd_method_for,
+    syev_auto_batched, syev_bisect_batched, syev_method_for, LinalgKernels, LinalgMethod,
 };
 use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig};
 
@@ -191,6 +192,44 @@ fn syev_bisect_handles_diagonal_and_repeated_eigenvalues() {
             let dot: f64 = (0..n).map(|i| v[i * n + j] * v[i * n + j2]).sum();
             let want = if j == j2 { 1.0 } else { 0.0 };
             assert!((dot - want).abs() <= 1e-10, "V^T V at ({j},{j2}): {dot}");
+        }
+    }
+}
+
+/// The automatic helpers route by the measured rule and agree with
+/// the references whichever kernel they pick.
+#[test]
+fn auto_helpers_route_by_the_measured_rule() {
+    assert_eq!(syev_method_for(16), LinalgMethod::Jacobi);
+    assert_eq!(syev_method_for(32), LinalgMethod::Bisection);
+    assert_eq!(gesvd_method_for(32), LinalgMethod::Jacobi);
+    assert_eq!(gesvd_method_for(64), LinalgMethod::Bisection);
+    let _serial = serial();
+    let mut p = peer();
+    let k = LinalgKernels::load(&p).expect("linalg PTX");
+    for &n in &[16usize, 64] {
+        let batch = 2usize;
+        let a = symmetric_batch(50 + n as u64, batch, n);
+        let (w, _) = syev_auto_batched(&mut p, &k, &a, batch as u32, n as u32, false).expect("syev_auto");
+        let (w_ref, _) = cpu::syev_jacobi_batched(&a, batch, n, default_sweeps(n), false);
+        for item in 0..batch {
+            let got = sorted(&w[item * n..(item + 1) * n]);
+            let want = sorted(&w_ref[item * n..(item + 1) * n]);
+            let scale = max_abs(&want).max(1e-300);
+            for j in 0..n {
+                assert!((got[j] - want[j]).abs() <= 1e-10 * scale, "n={n} item {item} eigenvalue {j}");
+            }
+        }
+        let b = uniform(60 + n as u64, batch * n * n);
+        let r = gesvd_auto_batched(&mut p, &k, &b, batch as u32, n as u32, n as u32, false).expect("gesvd_auto");
+        let (_, s_ref, _) = cpu::gesvd_jacobi_batched(&b, batch, n, n, default_sweeps(n), false);
+        for item in 0..batch {
+            let got = sorted(&r.sigma[item * n..(item + 1) * n]);
+            let want = sorted(&s_ref[item * n..(item + 1) * n]);
+            let scale = max_abs(&want).max(1e-300);
+            for j in 0..n {
+                assert!((got[j] - want[j]).abs() <= 1e-10 * scale, "n={n} item {item} singular value {j}");
+            }
         }
     }
 }

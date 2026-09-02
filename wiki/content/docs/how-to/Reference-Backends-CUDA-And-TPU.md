@@ -10,7 +10,7 @@ Flynnel ships three optional reference `DispatchBackend` implementations on this
 Defined in [`src/backend/cuda.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/cuda.rs). Compiled only when the `cuda-reference` feature is enabled.
 
 ```toml
-flynnel = { version = "0.1", features = ["cuda-reference"] }
+flynnel = { version = "0.2", features = ["cuda-reference"] }
 ```
 
 The feature pulls in [cudarc](https://crates.io/crates/cudarc) with the `dynamic-loading + driver + nvrtc + cuda-12060` features. **No nvcc or CUDA SDK is required at build time** - cudarc dlopens `libcuda` at runtime through the dynamic-loading shim. The CUDA driver must be present at runtime for kernel launches to succeed; without it `CudaBackend::new()` returns `BackendError::DeviceUnavailable`.
@@ -142,7 +142,7 @@ If your consumer crate needs precise CUDA semantics not exposed through this ref
 Defined in [`src/backend/tpu_jax.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/tpu_jax.rs). Compiled only when the `tpu-jax-reference` feature is enabled.
 
 ```toml
-flynnel = { version = "0.1", features = ["tpu-jax-reference"] }
+flynnel = { version = "0.2", features = ["tpu-jax-reference"] }
 ```
 
 The feature pulls in `serde` + `serde_json` for the wire protocol. The host needs `python3` (or `python`) and JAX installed at runtime; without them, `TpuJaxBackend::new()` returns `BackendError::DeviceUnavailable`.
@@ -272,7 +272,7 @@ This same code runs unchanged across "no Python", "Python no JAX", "Python + JAX
 Defined in [`src/backend/wasm.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/wasm.rs). Compiled only when the `wasm-reference` feature is enabled.
 
 ```toml
-flynnel = { version = "0.1", features = ["wasm-reference"] }
+flynnel = { version = "0.2", features = ["wasm-reference"] }
 ```
 
 The feature pulls in [wasmtime](https://crates.io/crates/wasmtime) with the `cranelift` + `runtime` features and `default-features = false`. wasmtime ships as a pure-Rust crate, so the build needs no system shared library and the runtime needs no installed engine. The whole WebAssembly compiler and sandbox lives inside the Flynnel binary.

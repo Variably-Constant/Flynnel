@@ -70,7 +70,7 @@ A layered pun on **Flynn + flannel**. [Michael J. Flynn](https://en.wikipedia.or
 
 ```toml
 [dependencies]
-flynnel = "0.1"
+flynnel = "0.2"
 ```
 
 ### Plan-driven surface (adaptive by default; override when you know better)
@@ -461,7 +461,7 @@ Per-call cost sits at 20-52x the in-process scheduler depending on which coheren
 **Every feature above is ON by default.** None needs a toolkit at build time: cudarc dlopens libcuda at runtime, and the JAX and WASM backends degrade gracefully when their runtimes are absent. Opt OUT for a lean CPU-only build:
 
 ```toml
-flynnel = { version = "0.1", default-features = false, features = ["verify-chain"] }
+flynnel = { version = "0.2", default-features = false, features = ["verify-chain"] }
 ```
 
 ## Portability and MSRV

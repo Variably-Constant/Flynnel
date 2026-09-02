@@ -80,6 +80,36 @@ pub fn jacobi_shape_for(n: usize, batch: usize) -> JacobiShape {
     }
 }
 
+/// Which batched kernel family the automatic host helpers use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinalgMethod {
+    /// The Jacobi kernels (`syev_batched`, `gesvd_batched`), shape by
+    /// [`jacobi_shape_for`].
+    Jacobi,
+    /// Householder reduction plus bisection (`syev_bisect_batched`,
+    /// `gesvd_bisect_batched`).
+    Bisection,
+}
+
+/// Smallest `n` at which bisection beats the Jacobi kernels for
+/// symmetric eigenvalues: measured 1.4x to 1.8x at n = 32 and 4.0x at
+/// n = 64 over the block Jacobi kernel on RTX 3070 and RTX 5070.
+pub const SYEV_BISECT_MIN_N: usize = 32;
+/// Smallest `n` at which bisection beats the Jacobi kernels for
+/// singular values: 1.05x to 1.4x at n = 64 on the same hosts, behind
+/// Jacobi at n = 32.
+pub const GESVD_BISECT_MIN_N: usize = 64;
+
+/// The measured choice for symmetric eigenvalues of dimension `n`.
+pub fn syev_method_for(n: usize) -> LinalgMethod {
+    if n >= SYEV_BISECT_MIN_N { LinalgMethod::Bisection } else { LinalgMethod::Jacobi }
+}
+
+/// The measured choice for singular values of `m x n` with `m >= n`.
+pub fn gesvd_method_for(n: usize) -> LinalgMethod {
+    if n >= GESVD_BISECT_MIN_N { LinalgMethod::Bisection } else { LinalgMethod::Jacobi }
+}
+
 /// Sweep cap the reference SVD tier uses: `4 * ceil(log2 n) + 8`.
 pub fn default_sweeps(n: usize) -> u32 {
     let mut sweeps = 8u32;
@@ -799,6 +829,61 @@ pub fn gesvd_bisect_batched(
     ps.release(peer)?;
     pa.release(peer)?;
     Ok(GesvdResult { u, sigma, v })
+}
+
+/// Batched symmetric eigendecomposition over host buffers by the
+/// measured method for `n` ([`syev_method_for`]): bisection returns
+/// eigenvalues ascending, Jacobi in diagonal order.
+pub fn syev_auto_batched(
+    peer: &mut GpuPeer,
+    k: &LinalgKernels,
+    a: &[f64],
+    batch: u32,
+    n: u32,
+    want_v: bool,
+) -> Result<(Vec<f64>, Option<Vec<f64>>), GpuPeerError> {
+    match syev_method_for(n as usize) {
+        LinalgMethod::Bisection => syev_bisect_batched(peer, k, a, batch, n, want_v),
+        LinalgMethod::Jacobi => syev_batched(
+            peer,
+            k,
+            a,
+            batch,
+            n,
+            default_sweeps(n as usize),
+            want_v,
+            jacobi_shape_for(n as usize, batch as usize),
+        ),
+    }
+}
+
+/// Batched SVD over host buffers by the measured method for `n`
+/// ([`gesvd_method_for`]): bisection returns singular values
+/// descending, Jacobi in column order.
+#[allow(clippy::too_many_arguments)]
+pub fn gesvd_auto_batched(
+    peer: &mut GpuPeer,
+    k: &LinalgKernels,
+    a: &[f64],
+    batch: u32,
+    m: u32,
+    n: u32,
+    want_v: bool,
+) -> Result<GesvdResult, GpuPeerError> {
+    match gesvd_method_for(n as usize) {
+        LinalgMethod::Bisection => gesvd_bisect_batched(peer, k, a, batch, m, n, want_v),
+        LinalgMethod::Jacobi => gesvd_batched(
+            peer,
+            k,
+            a,
+            batch,
+            m,
+            n,
+            default_sweeps(n as usize),
+            want_v,
+            jacobi_shape_for(m as usize, batch as usize),
+        ),
+    }
 }
 
 /// Batched symmetric eigendecomposition over host buffers: `a` holds

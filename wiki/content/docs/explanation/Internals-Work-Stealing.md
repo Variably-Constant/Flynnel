@@ -146,6 +146,18 @@ Each worker runs:
 | `MIN_LEAF_ITEMS` | 256 (in par_iter) | SLAW bisect floor; below this a chunk runs serially. |
 | `ADAPTIVE_SLOT_CAPACITY` | 256 slots per tier per worker | Ring size of each worker deque; a slot carries up to 3 jobs. |
 
+### Owner pops newest, thieves take oldest
+
+The owner's `pop` takes the newest published body (Chase-Lev
+discipline on the ring: lower `bottom`, fence, read `head`, race the
+last body through the head CAS); thieves claim the oldest through the
+head CAS. Measured on the Zen+ host with `sched_overhead_isolation`,
+owner-oldest-first against owner-newest-first, back to back on one
+binary: the noop cell at 10k items 430-660 us vs 41-53 us, at 100k
+items 2.1-2.4 ms vs 89-101 us, `w5/10000` 548 vs 74 us,
+`join_overhead_d10` 121 vs 44 us; with rayon at 100-160 us on the
+noop cell across both runs.
+
 ### Full-deque refusal
 
 A worker deque is a fixed-size ring. The blocking push (`publish` in the KHL backing, `flush_slot` in the FCL backing) waits for a thief to release the oldest slot when the ring is full. `join_in_worker` never uses it: it pushes the right half through `WorkerCtx::try_push_tier`, which refuses instead of waiting, and on refusal runs both halves inline on the owner. The blocking form deadlocks under a circular wait - every worker's ring full, every worker blocked in its own publish, and no thief left to drain anyone - which is what a 65,536-item `collect_indexed` with `min_leaf = 1` produced on a 16-worker pool (all sixteen rings read 256 in `NumaArena::debug_snapshot`). Refusals are counted in `WorkerStats::push_refusals`; a non-zero count on a workload is the signal that its fan-out is outrunning the pool's ability to steal, not an error.
