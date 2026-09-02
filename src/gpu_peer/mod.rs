@@ -29,6 +29,7 @@ pub mod hybrid;
 pub mod l2_persist;
 pub mod lanes;
 pub mod linalg;
+pub mod ozaki;
 pub mod layout;
 pub mod region;
 pub mod timed_lock;
@@ -203,6 +204,12 @@ pub struct WideKernel {
     // Keeps the module alive for the function's lifetime.
     _module: Arc<CudaModule>,
     func: CudaFunction,
+}
+
+impl WideKernel {
+    pub(crate) fn new(module: Arc<CudaModule>, func: CudaFunction) -> Self {
+        Self { _module: module, func }
+    }
 }
 
 /// A block of DEVICE-RESIDENT data the scheduler owns by index. Data

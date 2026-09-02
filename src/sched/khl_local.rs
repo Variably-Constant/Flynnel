@@ -814,10 +814,10 @@ mod tests {
                 }
                 assert!(Instant::now() < deadline, "push {i} stalled");
             }
-            if i % 3 == 0 {
-                if let KhlSteal::Success(b) = deque.pop_newest() {
-                    unsafe { b.execute_all_lifo() };
-                }
+            if i % 3 == 0
+                && let KhlSteal::Success(b) = deque.pop_newest()
+            {
+                unsafe { b.execute_all_lifo() };
             }
         }
         loop {

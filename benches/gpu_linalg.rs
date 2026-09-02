@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use flynnel::gpu_peer::linalg::{
     EinsumSpec, JacobiShape, LinalgKernels, cpu, default_sweeps, launch_einsum, launch_gemm,
-    launch_gesvd, launch_syev,
+    launch_gesvd, launch_gesvd_qr, launch_syev, launch_syev_qr,
 };
 use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig, ResidentHandle};
 use flynnel::sched::JobPlan;
@@ -146,8 +146,10 @@ fn fits(label: &str, bytes_needed: usize) -> bool {
     }
 }
 
+use flynnel::gpu_peer::ozaki::{launch_ozaki_gemm, OzakiKernels, OzakiWorkspace};
+
 /// Whether a section runs: `FLYNNEL_BENCH_SECTIONS` names a comma
-/// list of gemm, einsum, syev, gesvd; unset runs all four.
+/// list of gemm, einsum, syev, gesvd, qr, ozaki; unset runs all six.
 fn wants(section: &str) -> bool {
     match std::env::var("FLYNNEL_BENCH_SECTIONS") {
         Ok(list) => list.split(',').any(|s| s.trim() == section),
@@ -383,5 +385,135 @@ fn main() {
             peer.unpin(pa.handle).expect("unpin");
         }
     }
+    // ---------------------------------------------------------- qr vs jacobi
+    println!("\n--- eigenvalues and singular values, f64: Jacobi (blk) vs tridiagonal / bidiagonal QR ---");
+    println!("{:>5} {:>4} {:>6} | {:>10} {:>10} {:>10} {:>10} | {:>9} {:>9}",
+        "op", "n", "batch", "jacobi ms", "qr ms", "cpu-par ms", "serial ms", "jac/qr", "par/qr");
+    for &n in &[32usize, 64] {
+        if !wants("qr") {
+            break;
+        }
+        for &batch in &[1024usize, 8192] {
+            if !fits(&format!("qr n={n} batch={batch}"), 3 * batch * n * n * 8) {
+                continue;
+            }
+            let sweeps = default_sweeps(n);
+            // Symmetric operands for the eigenvalue rows.
+            let mut a = uniform(21, batch * n * n);
+            for item in 0..batch {
+                for i in 0..n {
+                    for j in 0..i {
+                        let v = 0.5 * (a[item * n * n + i * n + j] + a[item * n * n + j * n + i]);
+                        a[item * n * n + i * n + j] = v;
+                        a[item * n * n + j * n + i] = v;
+                    }
+                }
+            }
+            let pa = pin(&mut peer, &bytes(&a));
+            let pw = pin(&mut peer, &vec![0u8; batch * n * 8]);
+            let jac = gpu_median_ns(&mut peer, runs, |p| {
+                launch_syev(p, &k, pa.ptr, pw.ptr, None, batch as u32, n as u32, sweeps, JacobiShape::BlockPerMatrix).expect("launch");
+            });
+            let qr = gpu_median_ns(&mut peer, runs, |p| {
+                launch_syev_qr(p, &k, pa.ptr, pw.ptr, None, batch as u32, n as u32).expect("launch");
+            });
+            let serial = median_ns(1, || {
+                std::hint::black_box(cpu::syev_jacobi_batched(&a, batch, n, sweeps, false));
+            });
+            let par = median_ns(3, || {
+                let items = batch.div_ceil(CHUNK);
+                let plan = JobPlan::new(0, items as u32);
+                let w: Vec<Vec<f64>> = collect_indexed(&plan, items, 1, |ci| {
+                    let lo = ci * CHUNK;
+                    let hi = (lo + CHUNK).min(batch);
+                    cpu::syev_jacobi_batched(&a[lo * n * n..hi * n * n], hi - lo, n, sweeps, false).0
+                });
+                std::hint::black_box(w);
+            });
+            println!("{:>5} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x",
+                "syev", ms(jac), ms(qr), ms(par), ms(serial), jac / qr, par / qr);
+            peer.unpin(pw.handle).expect("unpin");
+            peer.unpin(pa.handle).expect("unpin");
+            // Square SVD rows; A is overwritten by both kernels, so it is
+            // reloaded before every launch as the Jacobi section does.
+            let a = uniform(22, batch * n * n);
+            let a_bytes = bytes(&a);
+            let pa = pin(&mut peer, &a_bytes);
+            let ps = pin(&mut peer, &vec![0u8; batch * n * 8]);
+            let jac = gpu_median_ns(&mut peer, runs, |p| {
+                p.write_resident_bulk(&pa.handle, &a_bytes).expect("reload");
+                launch_gesvd(p, &k, pa.ptr, ps.ptr, None, batch as u32, n as u32, n as u32, sweeps, JacobiShape::BlockPerMatrix).expect("launch");
+            });
+            let qr = gpu_median_ns(&mut peer, runs, |p| {
+                p.write_resident_bulk(&pa.handle, &a_bytes).expect("reload");
+                launch_gesvd_qr(p, &k, pa.ptr, ps.ptr, None, batch as u32, n as u32, n as u32).expect("launch");
+            });
+            let serial = median_ns(1, || {
+                std::hint::black_box(cpu::gesvd_jacobi_batched(&a, batch, n, n, sweeps, false));
+            });
+            let par = median_ns(3, || {
+                let items = batch.div_ceil(CHUNK);
+                let plan = JobPlan::new(0, items as u32);
+                let s: Vec<Vec<f64>> = collect_indexed(&plan, items, 1, |ci| {
+                    let lo = ci * CHUNK;
+                    let hi = (lo + CHUNK).min(batch);
+                    cpu::gesvd_jacobi_batched(&a[lo * n * n..hi * n * n], hi - lo, n, n, sweeps, false).1
+                });
+                std::hint::black_box(s);
+            });
+            println!("{:>5} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x",
+                "gesvd", ms(jac), ms(qr), ms(par), ms(serial), jac / qr, par / qr);
+            peer.unpin(ps.handle).expect("unpin");
+            peer.unpin(pa.handle).expect("unpin");
+        }
+    }
+
+    // ---------------------------------------------------------- ozaki gemm
+    println!("\n--- GEMM, f64: native kernel vs Ozaki scheme on the int8 tensor cores ---");
+    println!("{:>5} {:>6} | {:>10} {:>10} {:>10} | {:>9} {:>9}",
+        "n", "batch", "f64 ms", "ozaki ms", "serial ms", "f64/oz", "ser/oz");
+    let oz = OzakiKernels::load(&peer).expect("ozaki PTX");
+    for &(n, batch) in &[(64usize, 1024usize), (64, 8192), (256, 1), (512, 1), (1024, 1), (2048, 1)] {
+        if !wants("ozaki") {
+            break;
+        }
+        let need = 3 * batch * n * n * 8
+            + OzakiWorkspace::bytes(batch as u32, n as u32, n as u32, n as u32);
+        if !fits(&format!("ozaki n={n} batch={batch}"), need) {
+            continue;
+        }
+        let a = uniform(11, batch * n * n);
+        let b = uniform(12, batch * n * n);
+        let pa = pin(&mut peer, &bytes(&a));
+        let pb = pin(&mut peer, &bytes(&b));
+        let pc = pin(&mut peer, &vec![0u8; batch * n * n * 8]);
+        let ws = OzakiWorkspace::new(&mut peer, batch as u32, n as u32, n as u32, n as u32)
+            .expect("ozaki workspace");
+        let native = gpu_median_ns(&mut peer, runs, |p| {
+            launch_gemm(p, &k, pa.ptr, pb.ptr, pc.ptr, batch as u32, n as u32, n as u32, n as u32)
+                .expect("launch");
+        });
+        let ozaki = gpu_median_ns(&mut peer, runs, |p| {
+            launch_ozaki_gemm(p, &oz, &ws, pa.ptr, pb.ptr, pc.ptr).expect("launch");
+        });
+        let serial = if n <= 512 {
+            Some(median_ns(1, || {
+                std::hint::black_box(cpu::gemm_batched(&a, &b, batch, n, n, n));
+            }))
+        } else {
+            None
+        };
+        let (serial_ms, ser_ratio) = match serial {
+            Some(s) => (format!("{:.3}", ms(s)), format!("{:.2}x", s / ozaki)),
+            None => ("-".to_string(), "-".to_string()),
+        };
+        println!("{n:>5} {batch:>6} | {:>10.3} {:>10.3} {:>10} | {:>8.2}x {:>9}",
+            ms(native), ms(ozaki), serial_ms, native / ozaki, ser_ratio);
+        ws.release(&mut peer).expect("release");
+        peer.unpin(pc.handle).expect("unpin");
+        peer.unpin(pb.handle).expect("unpin");
+        peer.unpin(pa.handle).expect("unpin");
+    }
+
     println!("\nDone.");
 }

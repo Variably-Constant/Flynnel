@@ -34,6 +34,12 @@ pub const LINALG_PTX: &str = include_str!("../../kernels/linalg_f64.ptx");
 /// The kernel source, NVRTC-compiled at load when the driver rejects
 /// [`LINALG_PTX`] (a toolchain newer than the driver).
 pub const LINALG_CU: &str = include_str!("../../kernels/linalg_f64.cu");
+/// PTX of the tridiagonalisation / bidiagonalisation QR kernels
+/// (`kernels/linalg_qr_f64.cu`), the second module of
+/// [`LinalgKernels`].
+pub const LINALG_QR_PTX: &str = include_str!("../../kernels/linalg_qr_f64.ptx");
+/// Source of [`LINALG_QR_PTX`] for the NVRTC fallback.
+pub const LINALG_QR_CU: &str = include_str!("../../kernels/linalg_qr_f64.cu");
 
 /// Largest square dimension the block-per-matrix Jacobi kernels take.
 pub const LINALG_MAX_N: usize = 64;
@@ -99,42 +105,62 @@ pub struct LinalgKernels {
     pub gesvd_blk: WideKernel,
     /// `flynnel_gesvd_jacobi_f64_thr`.
     pub gesvd_thr: WideKernel,
+    /// `flynnel_syev_qr_f64_blk`.
+    pub syev_qr: WideKernel,
+    /// `flynnel_gesvd_qr_f64_blk`.
+    pub gesvd_qr: WideKernel,
+}
+
+/// Load one PTX module, compiling `cu` with NVRTC when the driver
+/// rejects the checked-in text.
+fn load_module(
+    peer: &GpuPeer,
+    what: &str,
+    ptx: &str,
+    cu: &str,
+) -> Result<std::sync::Arc<cudarc::driver::CudaModule>, GpuPeerError> {
+    match peer.context().load_module(Ptx::from_src(ptx)) {
+        Ok(m) => Ok(m),
+        Err(ptx_err) => {
+            eprintln!(
+                "flynnel gpu_peer {what}: checked-in PTX rejected ({ptx_err:?}); \
+                 compiling the {what} kernels with NVRTC instead"
+            );
+            let ptx = cudarc::nvrtc::compile_ptx(cu).map_err(|e| {
+                GpuPeerError::Driver(format!(
+                    "{what} PTX load: {ptx_err:?}; NVRTC fallback compile: {e:?}"
+                ))
+            })?;
+            peer.context()
+                .load_module(ptx)
+                .map_err(|e| GpuPeerError::Driver(format!("{what} NVRTC-fallback load: {e:?}")))
+        }
+    }
 }
 
 impl LinalgKernels {
-    /// Load the PTX into the peer's context once and resolve every
-    /// entry point.
+    /// Load both PTX modules into the peer's context once and resolve
+    /// every entry point.
     pub fn load(peer: &GpuPeer) -> Result<Self, GpuPeerError> {
-        let module = match peer.context().load_module(Ptx::from_src(LINALG_PTX)) {
-            Ok(m) => m,
-            Err(ptx_err) => {
-                eprintln!(
-                    "flynnel gpu_peer linalg: checked-in PTX rejected ({ptx_err:?}); \
-                     compiling the linalg kernels with NVRTC instead"
-                );
-                let ptx = cudarc::nvrtc::compile_ptx(LINALG_CU).map_err(|e| {
-                    GpuPeerError::Driver(format!(
-                        "linalg PTX load: {ptx_err:?}; NVRTC fallback compile: {e:?}"
-                    ))
-                })?;
-                peer.context()
-                    .load_module(ptx)
-                    .map_err(|e| GpuPeerError::Driver(format!("linalg NVRTC-fallback load: {e:?}")))?
-            }
-        };
-        let load = |entry: &str| -> Result<WideKernel, GpuPeerError> {
+        let module = load_module(peer, "linalg", LINALG_PTX, LINALG_CU)?;
+        let qr = load_module(peer, "linalg_qr", LINALG_QR_PTX, LINALG_QR_CU)?;
+        let load = |module: &std::sync::Arc<cudarc::driver::CudaModule>,
+                    entry: &str|
+         -> Result<WideKernel, GpuPeerError> {
             let func = module
                 .load_function(entry)
                 .map_err(|e| GpuPeerError::Driver(format!("linalg entry `{entry}`: {e:?}")))?;
-            Ok(WideKernel { _module: module.clone(), func })
+            Ok(WideKernel::new(module.clone(), func))
         };
         Ok(Self {
-            einsum: load("flynnel_einsum_f64")?,
-            gemm: load("flynnel_gemm_batched_f64")?,
-            syev_blk: load("flynnel_syev_jacobi_f64_blk")?,
-            syev_thr: load("flynnel_syev_jacobi_f64_thr")?,
-            gesvd_blk: load("flynnel_gesvd_jacobi_f64_blk")?,
-            gesvd_thr: load("flynnel_gesvd_jacobi_f64_thr")?,
+            einsum: load(&module, "flynnel_einsum_f64")?,
+            gemm: load(&module, "flynnel_gemm_batched_f64")?,
+            syev_blk: load(&module, "flynnel_syev_jacobi_f64_blk")?,
+            syev_thr: load(&module, "flynnel_syev_jacobi_f64_thr")?,
+            gesvd_blk: load(&module, "flynnel_gesvd_jacobi_f64_blk")?,
+            gesvd_thr: load(&module, "flynnel_gesvd_jacobi_f64_thr")?,
+            syev_qr: load(&qr, "flynnel_syev_qr_f64_blk")?,
+            gesvd_qr: load(&qr, "flynnel_gesvd_qr_f64_blk")?,
         })
     }
 }
@@ -374,7 +400,7 @@ impl EinsumSpec {
 // because the signature IS the kernel ABI and a parameter struct would
 // only re-spell it.
 
-fn check_dim(cond: bool, what: &'static str) -> Result<(), GpuPeerError> {
+pub(crate) fn check_dim(cond: bool, what: &'static str) -> Result<(), GpuPeerError> {
     if cond { Ok(()) } else { Err(GpuPeerError::Unavailable(what)) }
 }
 
@@ -507,11 +533,11 @@ pub fn launch_gesvd(
 
 // ------------------------------------------------------------ host-buffer wrappers
 
-fn f64_bytes(v: &[f64]) -> Vec<u8> {
+pub(crate) fn f64_bytes(v: &[f64]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn bytes_f64(b: &[u8]) -> Vec<f64> {
+pub(crate) fn bytes_f64(b: &[u8]) -> Vec<f64> {
     b.chunks_exact(8)
         .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
         .collect()
@@ -523,19 +549,19 @@ fn i32_bytes(v: &[i32]) -> Vec<u8> {
 
 /// A pinned span plus its device address; unpinned on drop-by-hand
 /// through [`Self::release`].
-struct Pinned {
-    handle: super::ResidentHandle,
-    ptr: u64,
+pub(crate) struct Pinned {
+    pub(crate) handle: super::ResidentHandle,
+    pub(crate) ptr: u64,
 }
 
-fn pin(peer: &mut GpuPeer, bytes: &[u8]) -> Result<Pinned, GpuPeerError> {
+pub(crate) fn pin(peer: &mut GpuPeer, bytes: &[u8]) -> Result<Pinned, GpuPeerError> {
     let handle = peer.pin_bulk(bytes)?;
     let (ptr, _) = peer.resident_ptr(&handle)?;
     Ok(Pinned { handle, ptr })
 }
 
 impl Pinned {
-    fn release(self, peer: &mut GpuPeer) -> Result<(), GpuPeerError> {
+    pub(crate) fn release(self, peer: &mut GpuPeer) -> Result<(), GpuPeerError> {
         peer.unpin(self.handle)
     }
 }
@@ -616,6 +642,112 @@ pub fn gemm_batched(
     pb.release(peer)?;
     pa.release(peer)?;
     Ok(out)
+}
+
+/// Enqueue batched symmetric eigendecomposition by tridiagonalisation
+/// and implicit QL on the wide stream: `a` holds `batch` row-major
+/// `n x n` matrices (read only), `w` receives `batch * n` eigenvalues
+/// in ascending order, `v` (when `Some`) receives eigenvectors as
+/// columns. One block per matrix, `n <= LINALG_MAX_N`. No sync.
+pub fn launch_syev_qr(
+    peer: &GpuPeer,
+    k: &LinalgKernels,
+    a: u64,
+    w: u64,
+    v: Option<u64>,
+    batch: u32,
+    n: u32,
+) -> Result<(), GpuPeerError> {
+    check_dim(batch > 0 && n > 0, "syev_qr: empty batch or n")?;
+    check_dim(n as usize <= LINALG_MAX_N, "syev_qr: n exceeds LINALG_MAX_N")?;
+    let scalars = [batch, n, u32::from(v.is_some())];
+    let ptrs = [a, w, v.unwrap_or(0)];
+    peer.launch_wide_async(&k.syev_qr, batch, LINALG_BLOCK, &ptrs, &scalars)
+}
+
+/// [`launch_syev_qr`] over host buffers: returns `(eigenvalues
+/// ascending, eigenvectors as columns when want_v)`.
+pub fn syev_qr_batched(
+    peer: &mut GpuPeer,
+    k: &LinalgKernels,
+    a: &[f64],
+    batch: u32,
+    n: u32,
+    want_v: bool,
+) -> Result<(Vec<f64>, Option<Vec<f64>>), GpuPeerError> {
+    let (bu, nu) = (batch as usize, n as usize);
+    check_dim(a.len() == bu * nu * nu, "syev_qr: a length")?;
+    let pa = pin(peer, &f64_bytes(a))?;
+    let pw = pin(peer, &vec![0u8; bu * nu * 8])?;
+    let pv = if want_v { Some(pin(peer, &vec![0u8; bu * nu * nu * 8])?) } else { None };
+    launch_syev_qr(peer, k, pa.ptr, pw.ptr, pv.as_ref().map(|p| p.ptr), batch, n)?;
+    peer.sync_wide()?;
+    let w = fetch_f64(peer, &pw, bu * nu)?;
+    let v = match &pv {
+        Some(p) => Some(fetch_f64(peer, p, bu * nu * nu)?),
+        None => None,
+    };
+    if let Some(p) = pv {
+        p.release(peer)?;
+    }
+    pw.release(peer)?;
+    pa.release(peer)?;
+    Ok((w, v))
+}
+
+/// Enqueue batched SVD by bidiagonalisation and implicit-shift QR on
+/// the wide stream: `a` holds `batch` row-major `m x n` matrices with
+/// `m >= n` and is overwritten with `U`, `sigma` receives `batch * n`
+/// singular values descending, `v` (when `Some`) the right singular
+/// vectors. One block per matrix, `m <= LINALG_MAX_N`. No sync.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_gesvd_qr(
+    peer: &GpuPeer,
+    k: &LinalgKernels,
+    a: u64,
+    sigma: u64,
+    v: Option<u64>,
+    batch: u32,
+    m: u32,
+    n: u32,
+) -> Result<(), GpuPeerError> {
+    check_dim(batch > 0 && n > 0 && m >= n, "gesvd_qr: empty batch, empty n, or m < n")?;
+    check_dim(m as usize <= LINALG_MAX_N, "gesvd_qr: m exceeds LINALG_MAX_N")?;
+    let scalars = [batch, m, n, u32::from(v.is_some())];
+    let ptrs = [a, sigma, v.unwrap_or(0)];
+    peer.launch_wide_async(&k.gesvd_qr, batch, LINALG_BLOCK, &ptrs, &scalars)
+}
+
+/// [`launch_gesvd_qr`] over host buffers; singular values descending.
+#[allow(clippy::too_many_arguments)]
+pub fn gesvd_qr_batched(
+    peer: &mut GpuPeer,
+    k: &LinalgKernels,
+    a: &[f64],
+    batch: u32,
+    m: u32,
+    n: u32,
+    want_v: bool,
+) -> Result<GesvdResult, GpuPeerError> {
+    let (bu, mu, nu) = (batch as usize, m as usize, n as usize);
+    check_dim(a.len() == bu * mu * nu, "gesvd_qr: a length")?;
+    let pa = pin(peer, &f64_bytes(a))?;
+    let ps = pin(peer, &vec![0u8; bu * nu * 8])?;
+    let pv = if want_v { Some(pin(peer, &vec![0u8; bu * nu * nu * 8])?) } else { None };
+    launch_gesvd_qr(peer, k, pa.ptr, ps.ptr, pv.as_ref().map(|p| p.ptr), batch, m, n)?;
+    peer.sync_wide()?;
+    let u = fetch_f64(peer, &pa, bu * mu * nu)?;
+    let sigma = fetch_f64(peer, &ps, bu * nu)?;
+    let v = match &pv {
+        Some(p) => Some(fetch_f64(peer, p, bu * nu * nu)?),
+        None => None,
+    };
+    if let Some(p) = pv {
+        p.release(peer)?;
+    }
+    ps.release(peer)?;
+    pa.release(peer)?;
+    Ok(GesvdResult { u, sigma, v })
 }
 
 /// Batched symmetric eigendecomposition over host buffers: `a` holds
