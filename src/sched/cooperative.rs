@@ -324,7 +324,7 @@ pub enum FanOutMode {
     ///
     /// Fallback: if a target mailbox is full (bounded at
     /// `MAILBOX_CAPACITY = 16`), the JobRef falls through to
-    /// `ctx.push()` so peer-steal still catches it. With
+    /// `ctx.push_burst()` so peer-steal still catches it. With
     /// MAILBOX_CAPACITY=16, N up to `n_workers * 16` per call
     /// fits without spilling.
     Mailbox,

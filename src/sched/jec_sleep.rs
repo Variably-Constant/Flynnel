@@ -435,6 +435,18 @@ impl IdleState {
     }
 }
 
+/// Snapshot returned by [`Sleep::debug_state`].
+pub(crate) struct SleepDebug {
+    /// Workers registered as sleeping in the counter word.
+    pub(crate) sleeping: usize,
+    /// Workers in the idle loop (sleeping ones included).
+    pub(crate) inactive: usize,
+    /// Raw JEC value; even = sleepy, odd = active.
+    pub(crate) jec: usize,
+    /// Per-worker condvar block flag; `None` if its mutex was held.
+    pub(crate) blocked: Vec<Option<bool>>,
+}
+
 /// Process-global sleep coordinator. One instance per arena;
 /// referenced by every worker and every producer.
 pub(crate) struct Sleep {
@@ -461,6 +473,24 @@ impl Sleep {
     #[allow(dead_code)]
     pub(crate) fn num_workers(&self) -> usize {
         self.worker_states.len()
+    }
+
+    /// Diagnostic view of the counter word and each worker's
+    /// condvar block flag. A flag is `None` when its mutex is held
+    /// at the instant of the read (worker mid-transition).
+    pub(crate) fn debug_state(&self) -> SleepDebug {
+        let c = self.counters.load(Ordering::SeqCst);
+        let blocked = self
+            .worker_states
+            .iter()
+            .map(|s| s.is_blocked.try_lock().ok().map(|g| *g))
+            .collect();
+        SleepDebug {
+            sleeping: c.sleeping_threads(),
+            inactive: c.inactive_threads(),
+            jec: c.jobs_counter().as_usize(),
+            blocked,
+        }
     }
 
     /// Worker-side: called when a worker enters its idle loop for

@@ -11,7 +11,9 @@ use flynnel::sched::JobPlan;
 use flynnel::sched::par_iter::collect_indexed;
 
 /// Runs `f` on a worker thread and fails if it has not finished
-/// within `limit`.
+/// within `limit`. On a timeout the pool state is printed twice, a
+/// second apart, so a spinning worker (counters moving) can be told
+/// from a blocked one.
 fn watchdog<F: FnOnce() + Send + 'static>(phase: &str, limit: Duration, f: F) {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -20,17 +22,33 @@ fn watchdog<F: FnOnce() + Send + 'static>(phase: &str, limit: Duration, f: F) {
     });
     match rx.recv_timeout(limit) {
         Ok(()) => {}
-        Err(mpsc::RecvTimeoutError::Timeout) => panic!("{phase}: no completion within {limit:?}"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let arena = flynnel::sched::arena::global_local_arena();
+            eprintln!("{phase}: pool state at timeout:\n{}", arena.debug_snapshot());
+            std::thread::sleep(Duration::from_secs(1));
+            eprintln!("{phase}: pool state 1 s later:\n{}", arena.debug_snapshot());
+            panic!("{phase}: no completion within {limit:?}");
+        }
         Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{phase}: worker panicked"),
     }
 }
 
 #[test]
 fn collect_indexed_65536_light_items_completes() {
-    for round in 0..3 {
-        watchdog(&format!("collect_indexed round {round}"), Duration::from_secs(20), || {
+    let site = flynnel::caller_site();
+    for round in 0..6 {
+        let plan = JobPlan::new(0, 65_536).with_site(site).apply_site_class();
+        eprintln!(
+            "round {round}: learned_class={:?} use_smt={} oversub={:?} est_ns={:?} tier={:?}",
+            site.get().learned_class(),
+            plan.use_smt,
+            plan.oversubscription_log2,
+            plan.estimated_per_item_ns,
+            flynnel::sched::pick_tier(&plan, flynnel::numa_topology()),
+        );
+        watchdog(&format!("collect_indexed round {round}"), Duration::from_secs(20), move || {
             let n = 65_536usize;
-            let plan = JobPlan::new(0, n as u32);
+            let plan = JobPlan::new(0, n as u32).with_site(site);
             let out: Vec<Vec<f64>> = collect_indexed(&plan, n, 1, |i| {
                 let mut v = vec![0f64; 256];
                 for (j, x) in v.iter_mut().enumerate() {
@@ -42,6 +60,44 @@ fn collect_indexed_65536_light_items_completes() {
             assert_eq!(out[n - 1][255], ((n - 1) * 256 + 255) as f64 * 0.5);
         });
     }
+}
+
+/// Runs `rounds` collect_indexed dispatches of 65,536 light items
+/// under `plan`, each under a 20 s watchdog, and reports the slowest
+/// round.
+fn rounds_under(plan_name: &str, rounds: usize, make_plan: fn() -> JobPlan) {
+    let mut worst = Duration::ZERO;
+    for round in 0..rounds {
+        let t0 = std::time::Instant::now();
+        watchdog(&format!("{plan_name} round {round}"), Duration::from_secs(20), move || {
+            let n = 65_536usize;
+            let plan = make_plan();
+            let out: Vec<Vec<f64>> = collect_indexed(&plan, n, 1, |i| {
+                let mut v = vec![0f64; 256];
+                for (j, x) in v.iter_mut().enumerate() {
+                    *x = (i * 256 + j) as f64 * 0.5;
+                }
+                v
+            });
+            assert_eq!(out.len(), n);
+        });
+        worst = worst.max(t0.elapsed());
+    }
+    eprintln!("{plan_name}: {rounds} rounds, slowest {worst:?}");
+}
+
+#[test]
+fn collect_indexed_65536_smt_off_200_rounds() {
+    rounds_under("PortBound (SMT off)", 200, || {
+        JobPlan::set_profile(0, 65_536, flynnel::DispatchProfile::PortBound)
+    });
+}
+
+#[test]
+fn collect_indexed_65536_smt_on_200_rounds() {
+    rounds_under("LatencyBound (SMT on)", 200, || {
+        JobPlan::set_profile(0, 65_536, flynnel::DispatchProfile::LatencyBound)
+    });
 }
 
 #[cfg(feature = "gpu-peer")]

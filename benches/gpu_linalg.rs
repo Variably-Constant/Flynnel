@@ -201,6 +201,12 @@ fn main() {
     println!("{:>8} {:>4} {:>7} | {:>10} {:>10} | {:>9}", "op", "n", "batch", "gpu ms", "serial ms", "gpu/ser");
     for &n in &[16usize, 64] {
         for &batch in &[8192usize, 65536] {
+            if !fits(
+                &format!("einsum n={n} batch={batch}"),
+                batch * (n * n + 2 * n) * 8 + batch * (n * n + n) * 8,
+            ) {
+                continue;
+            }
             let x = uniform(3, batch * n);
             let y = uniform(4, batch * n);
             let spec = EinsumSpec::parse("i,j->ij", &[n], Some(&[n])).expect("spec");

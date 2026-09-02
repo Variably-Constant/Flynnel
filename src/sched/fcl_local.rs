@@ -269,6 +269,32 @@ impl SchedFclDeque {
         }
     }
 
+    /// Non-blocking single push: refuses with `Err(job)` instead of
+    /// spinning when the inner deque is full. A pending burst is
+    /// flushed first under the same rule; on refusal the accumulator
+    /// is left as it was. Twin of the KHL
+    /// [`super::khl_local::SchedKhlDeque::try_push_one`].
+    #[inline]
+    pub fn try_push_one(&self, job: JobRef) -> Result<(), JobRef> {
+        // SAFETY: owner-private accumulator; single-threaded access.
+        let acc = unsafe { (*self.accumulator.get()).assume_init_mut() };
+        if acc.n_items != 0 {
+            let pending = core::mem::replace(acc, FatSlot::empty(0, 0, 0));
+            if let Err(returned) = self.inner.push(pending) {
+                *acc = returned;
+                return Err(job);
+            }
+        }
+        let mut slot = FatSlot::empty(job.k_outer, job.numa_hint, job.variant);
+        slot.items[0] = job.compact();
+        slot.n_items = 1;
+        self.inner.push(slot).map_err(|slot| {
+            // SAFETY: the slot was built from `job` just above and
+            // never published; once-only ownership returns intact.
+            unsafe { slot.items[0].to_jobref(slot.k_outer, slot.numa_hint, slot.variant) }
+        })
+    }
+
     /// Force-flush any buffered items to the underlying Chase-Lev.
     /// Infallible: spins on inner-full like `push` does (same
     /// back-pressure semantics).
@@ -381,6 +407,39 @@ mod tests {
     use crate::sched::job::StackJob;
     use crate::sched::latch::CoreLatch;
     use crate::foundation::Variant;
+
+    /// A full inner deque with no consumer refuses the next push
+    /// and hands the job back; one steal makes the same push
+    /// succeed.
+    #[test]
+    fn try_push_one_refuses_when_inner_full() {
+        let (deque, stealer) = new_fcl(4);
+        let jobs: Vec<_> = (0..5u32)
+            .map(|i| StackJob::new(move |_| i, CoreLatch::new()))
+            .collect();
+        for job in &jobs[..4] {
+            let r = unsafe { job.as_job_ref(8, 0, Variant::Faithful) };
+            assert!(deque.try_push_one(r).is_ok());
+        }
+        let fifth = unsafe { jobs[4].as_job_ref(8, 0, Variant::Faithful) };
+        let refused = match deque.try_push_one(fifth) {
+            Err(job) => job,
+            Ok(()) => panic!("fifth push into a 4-slot deque must be refused"),
+        };
+        match stealer.steal() {
+            chase_lev_local::Steal::Success(s) => unsafe { s.execute_all_lifo() },
+            other => panic!("expected Success, got {other:?}"),
+        }
+        assert!(deque.try_push_one(refused).is_ok());
+        for _ in 0..4 {
+            match stealer.steal() {
+                chase_lev_local::Steal::Success(s) => unsafe { s.execute_all_lifo() },
+                other => panic!("expected Success, got {other:?}"),
+            }
+        }
+        assert!(jobs.iter().all(|j| j.latch.is_set()));
+        assert!(matches!(stealer.steal(), chase_lev_local::Steal::Empty));
+    }
 
     #[test]
     fn push_single_then_flush_then_steal() {

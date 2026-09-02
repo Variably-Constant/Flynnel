@@ -229,10 +229,13 @@ where
 /// so the steal discipline pins the work to peers at the chosen
 /// distance or wider.
 #[inline]
-fn push_with_tier_hint(ctx: &WorkerCtx, job: JobRef, plan: &JobPlan) {
+/// Pushes `job` to the hinted tier (Public by default). `Err(job)`
+/// when that deque is full: the caller runs the job inline instead
+/// of waiting for a thief.
+fn push_with_tier_hint(ctx: &WorkerCtx, job: JobRef, plan: &JobPlan) -> Result<(), JobRef> {
     match plan.deque_tier_hint {
-        Some(tier) => ctx.push_tier(job, tier),
-        None => ctx.push(job),
+        Some(tier) => ctx.try_push_tier(job, tier)?,
+        None => ctx.try_push(job)?,
     }
     // External slot ctx: broadcast-wake all primaries after the
     // push. A single-sleeper wake random-picks the slot's deque
@@ -244,6 +247,7 @@ fn push_with_tier_hint(ctx: &WorkerCtx, job: JobRef, plan: &JobPlan) {
     if ctx.is_external_slot {
         ctx.sleep.new_internal_jobs(ctx.stealers.len() as u32, false);
     }
+    Ok(())
 }
 
 /// Fast-path body: run `join(a, b)` from within a worker that is
@@ -412,14 +416,32 @@ where
         && sibling < ctx.stealers.len()
         && ctx.peer_mailboxes[sibling].is_empty()
         && ctx.stealers[sibling][crate::sched::deque_tier::DequeTier::SmtLocal.idx()].is_empty();
-    if try_mailbox {
-        if let Err(returned_job) = ctx.push_to_mailbox(sibling, job_b_ref) {
+    let refused = if try_mailbox {
+        match ctx.push_to_mailbox(sibling, job_b_ref) {
+            Ok(()) => None,
             // Mailbox full - fall through to deque push, honoring
             // any caller-supplied deque_tier_hint.
-            push_with_tier_hint(ctx, returned_job, plan);
+            Err(returned_job) => push_with_tier_hint(ctx, returned_job, plan).err(),
         }
     } else {
-        push_with_tier_hint(ctx, job_b_ref, plan);
+        push_with_tier_hint(ctx, job_b_ref, plan).err()
+    };
+    if refused.is_some() {
+        // Deque full: run both halves here. Waiting for a thief to
+        // free a slot deadlocks when every thief is an owner waiting
+        // on its own full deque (measured: all 16 rings at 256 on a
+        // 65,536-item min_leaf=1 collect).
+        let a_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a(a_injected)));
+        // SAFETY: the refused JobRef was never published, so job_b
+        // is untouched and uniquely ours to consume.
+        let rb = unsafe { job_b.run_inline(false) };
+        return match a_result {
+            Ok(ra) => (ra, rb),
+            Err(payload) => {
+                drop(rb);
+                std::panic::resume_unwind(payload);
+            }
+        };
     }
     crate::sched::trace::emit(crate::sched::trace::TraceEvent::JoinPush, 0);
 

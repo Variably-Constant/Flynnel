@@ -68,6 +68,18 @@ impl std::fmt::Debug for NumaArena {
 }
 
 impl NumaArena {
+    /// Diagnostic snapshot of every node's pool state; see
+    /// [`LocalArena::debug_snapshot`].
+    pub fn debug_snapshot(&self) -> String {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, a)| format!("node {i}:\n{}", a.debug_snapshot()))
+            .collect()
+    }
+}
+
+impl NumaArena {
     /// Build a NumaArena sized for the current host. Reads
     /// `NumaTopology` + `CpuTopology`, builds one `LocalArena`
     /// per visible NUMA node with workers pinned to that node's

@@ -323,6 +323,61 @@ impl SchedKhlDeque {
         self.publish(body);
     }
 
+    /// Non-blocking single push. Refuses with `Err(job)` instead of
+    /// spinning when the next slot is still held by its previous
+    /// consumer (ring full, or a thief mid-read). A burst in the
+    /// accumulator is flushed first under the same rule; on refusal
+    /// the accumulator is left as it was. Callers run the refused
+    /// job inline: an owner that waits for a consumer while every
+    /// consumer is an owner waiting the same way deadlocks (measured
+    /// at 65,536 min_leaf=1 items: all 16 rings at capacity).
+    #[inline]
+    pub fn try_push_one(&self, job: JobRef) -> Result<(), JobRef> {
+        // SAFETY: owner-private accumulator; single-threaded.
+        let acc = unsafe { &mut *self.accumulator.get() };
+        if acc.n_items != 0 {
+            let pending = core::mem::replace(acc, KhlBody::empty(0, 0, 0));
+            if let Err(returned) = self.try_publish(pending) {
+                *acc = returned;
+                return Err(job);
+            }
+        }
+        let body = KhlBody {
+            n_items: 1,
+            k_outer: job.k_outer,
+            numa_hint: job.numa_hint,
+            variant: job.variant,
+            pad: [0u8; 4],
+            items: [job.compact(), CompactJobRef::null(), CompactJobRef::null()],
+        };
+        self.try_publish(body).map_err(|body| {
+            // SAFETY: the body was built from `job` just above and
+            // never published; once-only ownership returns intact.
+            unsafe { body.items[0].to_jobref(body.k_outer, body.numa_hint, body.variant) }
+        })
+    }
+
+    /// Internal: publish to the next slot only if it is already
+    /// released; returns the body untouched otherwise.
+    #[inline]
+    fn try_publish(&self, body: KhlBody) -> Result<(), KhlBody> {
+        let h = &*self.inner;
+        let b = h.bottom.load(Ordering::Relaxed);
+        // SAFETY: (b & capacity_mask) is always in [0, capacity).
+        let slot = unsafe { h.buffer.get_unchecked((b & h.capacity_mask) as usize) };
+        if slot.seq.load(Ordering::Acquire) != b as u64 {
+            return Err(body);
+        }
+        // SAFETY: seq == b means this round's body is ours to write;
+        // no consumer reads it before the Release-store below.
+        unsafe {
+            core::ptr::write(slot.body.get(), body);
+        }
+        slot.seq.store((b as u64) + 1, Ordering::Release);
+        h.bottom.store(b + 1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Internal: publish a body to the next slot. Spins if the
     /// slot is still held by its previous consumer.
     #[inline]
@@ -502,6 +557,17 @@ impl KhlStealer {
         KhlSteal::Success(body)
     }
 
+    /// Published bodies not yet claimed (`bottom - head`, clamped
+    /// at zero). Diagnostic hint; concurrent steals may invalidate
+    /// it immediately.
+    #[inline]
+    pub fn len(&self) -> usize {
+        let h = &*self.inner;
+        let t = h.head.load(Ordering::Acquire);
+        let b = h.bottom.load(Ordering::Acquire);
+        b.saturating_sub(t).max(0) as usize
+    }
+
     /// Architectural prefetch hint for the next steal target.
     /// Touches the next slot's body line so the next steal's body
     /// read is L1d-warm.
@@ -601,6 +667,39 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    /// A full ring with no consumer refuses the next push and hands
+    /// the job back; one steal makes the same push succeed.
+    #[test]
+    fn try_push_one_refuses_when_ring_full() {
+        let (deque, stealer) = new_khl(4);
+        let jobs: Vec<_> = (0..5u32)
+            .map(|i| StackJob::new(move |_| i, CoreLatch::new()))
+            .collect();
+        for job in &jobs[..4] {
+            let r = unsafe { job.as_job_ref(4, 0, Variant::Fast) };
+            assert!(deque.try_push_one(r).is_ok());
+        }
+        let fifth = unsafe { jobs[4].as_job_ref(4, 0, Variant::Fast) };
+        let refused = match deque.try_push_one(fifth) {
+            Err(job) => job,
+            Ok(()) => panic!("fifth push into a 4-slot ring must be refused"),
+        };
+        match stealer.steal() {
+            KhlSteal::Success(b) => unsafe { b.execute_all_lifo() },
+            other => panic!("expected Success, got {other:?}"),
+        }
+        assert!(jobs[0].latch.is_set());
+        assert!(deque.try_push_one(refused).is_ok());
+        for _ in 0..4 {
+            match stealer.steal() {
+                KhlSteal::Success(b) => unsafe { b.execute_all_lifo() },
+                other => panic!("expected Success, got {other:?}"),
+            }
+        }
+        assert!(jobs.iter().all(|j| j.latch.is_set()));
+        assert!(matches!(stealer.steal(), KhlSteal::Empty));
     }
 
     #[test]

@@ -269,12 +269,15 @@ pub struct WorkerStats {
     /// Single-push count (push that auto-flushes; join right-half
     /// pattern). Useful for distinguishing burst vs single workload
     /// shape via the [`Self::burst_ratio`] helper. Incremented by
-    /// `WorkerCtx::push_tier`.
+    /// `WorkerCtx::try_push_tier` on an accepted push.
     pub single_pushes: core::sync::atomic::AtomicU64,
     /// Burst-push count (`push_tier_burst`). Counts each call,
     /// regardless of whether the underlying accumulator auto-
     /// flushed at n_items=3.
     pub burst_pushes: core::sync::atomic::AtomicU64,
+    /// Pushes refused by a full deque (`try_push_tier`); the caller
+    /// ran the job inline instead of waiting for a thief.
+    pub push_refusals: core::sync::atomic::AtomicU64,
 }
 
 impl WorkerStats {
@@ -297,24 +300,6 @@ impl WorkerStats {
 }
 
 impl WorkerCtx {
-    /// LIFO local-deque push. Caller MUST be the owner thread.
-    /// Routes to the [`DequeTier::SmtLocal`] tier by default - the
-    /// tightest cache. Producers that know the work will fan out
-    /// across CCXs call [`Self::push_tier`] with a wider tier so
-    /// cross-CCX peers can find the work without invalidating the
-    /// SMT-sibling's L1d copy.
-    ///
-    /// When this transitions ANY tier deque from empty to non-empty,
-    /// rotate-unpark one peer. Peers spinning in `park_until`'s
-    /// spin floor will observe the predicate change on their next
-    /// yield-round and exit park_until without paying the unpark
-    /// (they ignore the spurious permit on entry). Truly-parked
-    /// peers wake on the unpark.
-    #[inline]
-    pub(crate) fn push(&self, job: JobRef) {
-        self.push_tier(job, DequeTier::default());
-    }
-
     /// Owner-directed mailbox push (URD-style SIMC/MIMC hand-off).
     /// ANY worker may call this against ANY peer's mailbox - the
     /// caller's role is "producer who knows the target worker is
@@ -414,15 +399,36 @@ impl WorkerCtx {
         }
     }
 
-    /// Tiered LIFO push. Caller MUST be the owner thread. Routes
-    /// the job to the named [`DequeTier`]'s deque. Peers stealing
-    /// at distance `d` may take this job only if `tier >= d` per
-    /// the asymmetric steal discipline enforced by
-    /// [`crate::sched::deque_tier::thief_may_steal`].
+    /// Single push to the default ([`DequeTier::Public`]) deque;
+    /// see [`Self::try_push_tier`].
     #[inline]
-    pub(crate) fn push_tier(&self, job: JobRef, tier: DequeTier) {
+    pub(crate) fn try_push(&self, job: JobRef) -> Result<(), JobRef> {
+        self.try_push_tier(job, DequeTier::default())
+    }
+
+    /// Tiered single push. Caller MUST be the owner thread. Routes
+    /// the job to the named [`DequeTier`]'s deque; peers stealing
+    /// at distance `d` may take it only if `tier >= d` per the
+    /// asymmetric steal discipline in
+    /// [`crate::sched::deque_tier::thief_may_steal`].
+    ///
+    /// Refuses with `Err(job)` instead of waiting when the deque is
+    /// full: 256 slots of this worker's own right-halves are already
+    /// waiting for thieves, and waiting for one while every thief
+    /// may be an owner in the same state is the circular wait behind
+    /// the 65,536-item hang. The caller runs a refused job inline.
+    #[inline]
+    pub(crate) fn try_push_tier(&self, job: JobRef, tier: DequeTier) -> Result<(), JobRef> {
         let any_was_empty = self.workers.iter().all(|w| w.is_empty());
-        self.workers[tier.idx()].push(job);
+        match self.workers[tier.idx()].try_push(job) {
+            Ok(()) => {}
+            Err(job) => {
+                self.stats
+                    .push_refusals
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return Err(job);
+            }
+        }
         self.stats
             .single_pushes
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -437,6 +443,7 @@ impl WorkerCtx {
         if DISPATCH_USE_JEC_WAKE.with(|c| c.get()) {
             self.sleep.new_internal_jobs(1, any_was_empty);
         }
+        Ok(())
     }
 
     /// Broadcast unpark to every peer parker. Caller MUST be the
@@ -1494,6 +1501,66 @@ impl LocalArena {
             arena: Arc::clone(self),
         }
     }
+
+    /// Diagnostic snapshot for hang reports: sleep counters, each
+    /// worker's per-tier deque occupancy (`.` = empty, else the
+    /// unclaimed KHL body count; tiers SmtLocal/IntraCcx/CrossCcx/
+    /// Public) plus block state and counters, and every external
+    /// slot that is claimed or holds work.
+    pub fn debug_snapshot(&self) -> String {
+        use core::sync::atomic::Ordering::Relaxed;
+        let n = self.workers.len();
+        let sleep = self.sleep.debug_state();
+        let occupancy = |idx: usize| -> String {
+            self.stealers[idx]
+                .iter()
+                .map(|st| {
+                    if st.is_empty() {
+                        ".".to_string()
+                    } else {
+                        format!("{}", st.khl_len().max(1))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut s = format!(
+            "workers={n} primary={} smt_requests={} injector_empty={} \
+             sleeping={} inactive={} jec={}\n",
+            self.primary_count,
+            self.smt_requests.load(Ordering::Acquire),
+            self.injector.is_empty(),
+            sleep.sleeping,
+            sleep.inactive,
+            sleep.jec,
+        );
+        for i in 0..n {
+            let st = &self.stats[i];
+            let state = match sleep.blocked.get(i) {
+                Some(Some(true)) => "blocked",
+                Some(Some(false)) => "awake",
+                _ => "mutex-held",
+            };
+            s.push_str(&format!(
+                "  w{i:02} deques[{}] {state} pops={} steals={} stolen_from={} refused={}\n",
+                occupancy(i),
+                st.local_pops.load(Relaxed),
+                st.peer_steal_hits.load(Relaxed),
+                st.times_stolen_from.load(Relaxed),
+                st.push_refusals.load(Relaxed),
+            ));
+        }
+        for (k, slot) in self.external_slots.iter().enumerate() {
+            let occ = occupancy(n + k);
+            if slot.is_claimed() || occ.chars().any(|c| c.is_ascii_digit()) {
+                s.push_str(&format!(
+                    "  slot{k:02} claimed={} deques[{occ}]\n",
+                    slot.is_claimed()
+                ));
+            }
+        }
+        s
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2397,7 +2464,7 @@ mod tests {
                 if let Err(j) = ctx.push_to_mailbox(target, job) {
                     // Mailbox full - fall back to a regular push
                     // so no child is lost.
-                    ctx.push(j);
+                    assert!(ctx.try_push(j).is_ok(), "test deque has room");
                 }
             }
             parent_done_clone.store(1, Ordering::Release);
@@ -2476,7 +2543,7 @@ mod tests {
                 let job = unsafe {
                     (*sj_ptr).as_job_ref(2, NUMA_HINT_ANY, Variant::Faithful)
                 };
-                ctx.push_tier(job, DequeTier::SmtLocal);
+                assert!(ctx.try_push_tier(job, DequeTier::SmtLocal).is_ok(), "test deque has room");
             }
             parent_done_clone.store(1, Ordering::Release);
         });

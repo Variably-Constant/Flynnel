@@ -121,6 +121,13 @@ impl FclWorker {
         self.inner.flush();
     }
 
+    /// Non-blocking single push; `Err(job)` when the inner deque is
+    /// full instead of spinning for a thief.
+    #[inline]
+    pub fn try_push(&self, job: JobRef) -> Result<(), JobRef> {
+        self.inner.try_push_one(job)
+    }
+
     /// Push without auto-flush (burst API for cooperative fan-out).
     #[inline(always)]
     pub fn push_burst(&self, job: JobRef) {

@@ -167,6 +167,13 @@ impl KhlWorker {
         self.inner.push_one(job);
     }
 
+    /// Non-blocking single push; `Err(job)` when the ring's next
+    /// slot is still held instead of spinning for its consumer.
+    #[inline]
+    pub fn try_push(&self, job: JobRef) -> Result<(), JobRef> {
+        self.inner.try_push_one(job)
+    }
+
     /// Push without auto-flushing. Use this when the caller knows
     /// it will follow up with more pushes (cooperative_join_n_flat
     /// fan-out) and an explicit [`Self::flush`] at the end. Buffers

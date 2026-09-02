@@ -144,6 +144,13 @@ Each worker runs:
 | `PROBE_FULL_CUTOFF` | 8 | At pool sizes <= 8 (Zen+ physical-core count), walk all peers per loop iteration. |
 | `PROBE_LARGE` | 4 | At pool sizes > 8, clamp probes to 4 per loop iteration to keep deque-head cache traffic bounded. |
 | `MIN_LEAF_ITEMS` | 256 (in par_iter) | SLAW bisect floor; below this a chunk runs serially. |
+| `ADAPTIVE_SLOT_CAPACITY` | 256 slots per tier per worker | Ring size of each worker deque; a slot carries up to 3 jobs. |
+
+### Full-deque refusal
+
+A worker deque is a fixed-size ring. The blocking push (`publish` in the KHL backing, `flush_slot` in the FCL backing) waits for a thief to release the oldest slot when the ring is full. `join_in_worker` never uses it: it pushes the right half through `WorkerCtx::try_push_tier`, which refuses instead of waiting, and on refusal runs both halves inline on the owner. The blocking form deadlocks under a circular wait - every worker's ring full, every worker blocked in its own publish, and no thief left to drain anyone - which is what a 65,536-item `collect_indexed` with `min_leaf = 1` produced on a 16-worker pool (all sixteen rings read 256 in `NumaArena::debug_snapshot`). Refusals are counted in `WorkerStats::push_refusals`; a non-zero count on a workload is the signal that its fan-out is outrunning the pool's ability to steal, not an error.
+
+`NumaArena::debug_snapshot()` (reachable through `sched::arena::global_local_arena()`) prints the sleep-coordinator counters and, per worker, the unclaimed body count of each deque tier, the JEC block state, and the stat counters; the collect-scale tests print it from their watchdog on a timeout.
 
 ### Stats observability
 
@@ -152,6 +159,7 @@ Each worker runs:
 - `local_pops: AtomicU64` - local-deque LIFO pops.
 - `peer_steal_hits: AtomicU64` - successful peer steals.
 - `peer_steal_misses: AtomicU64` - peer-probe rounds that returned no work.
+- `push_refusals: AtomicU64` - pushes refused by a full deque and run inline instead.
 
 `#[repr(align(128))]` pads each `WorkerStats` to a 128-byte boundary so adjacent workers' counters never share a 128-byte block (Intel L1 hardware prefetcher fetches in pairs of 64-byte lines; 128 is the effective false-sharing unit on modern CPUs).
 

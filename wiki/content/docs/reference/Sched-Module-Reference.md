@@ -105,6 +105,8 @@ pub fn global_local_arena() -> &'static Arc<NumaArena>
 
 Lazily-initialized process-global NUMA-aware arena. On single-NUMA hosts this is a single sub-arena; on multi-NUMA hosts (Genoa, dual-socket Xeon / Threadripper) it has one sub-arena per NUMA node, each pinned to its node's CPUs.
 
+`NumaArena::debug_snapshot() -> String` renders every node's pool state for hang reports: the sleep-coordinator counters, and per worker the unclaimed body count of each deque tier, the JEC block state, and the stat counters (pops, steals, stolen-from, push refusals), plus every external slot that is claimed or holds work. A watchdog that prints it twice a second apart tells a spinning worker (counters moving) from a blocked one.
+
 ## `par_iter`
 
 The bisecting parallel-iterator family. Defined in [`src/sched/par_iter.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/par_iter.rs).

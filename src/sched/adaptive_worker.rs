@@ -105,6 +105,12 @@ impl AdaptiveStealer {
     pub fn is_empty(&self) -> bool {
         self.khl.is_empty() && self.fcl.is_empty()
     }
+
+    /// Unclaimed bodies in the KHL backing (diagnostic hint).
+    #[inline]
+    pub fn khl_len(&self) -> usize {
+        self.khl.len()
+    }
 }
 
 /// Per-worker thief-side stash that absorbs K_inner=3 batches
@@ -195,6 +201,17 @@ impl AdaptiveWorker {
                 core::hint::cold_path();
                 self.fcl.push(job);
             }
+        }
+    }
+
+    /// Non-blocking single push to the active backing; `Err(job)`
+    /// when that backing is full. The caller runs a refused job
+    /// inline rather than waiting for a thief.
+    #[inline]
+    pub fn try_push(&self, job: JobRef) -> Result<(), JobRef> {
+        match self.active.load(Ordering::Acquire) {
+            ACTIVE_KHL => self.khl.try_push(job),
+            _ => self.fcl.try_push(job),
         }
     }
 
