@@ -52,12 +52,35 @@ fn bytes(v: &[f64]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// Median of `runs` timings of one `launch` followed by a stream
+/// sync, after a 300 ms ramp of back-to-back launches. The ramp is
+/// bursts of 32 enqueues per sync: a launch-and-sync loop leaves the
+/// GPU idle between calls and an RTX 3070 then never leaves idle
+/// clocks (12.8 ms for an outer product that takes 0.5 ms at boost,
+/// even after 150 ms of such calls); saturating the queue does.
+fn gpu_median_ns<F: FnMut(&mut GpuPeer)>(peer: &mut GpuPeer, runs: usize, mut launch: F) -> f64 {
+    let ramp = Instant::now();
+    while ramp.elapsed() < Duration::from_millis(300) {
+        for _ in 0..32 {
+            launch(peer);
+        }
+        peer.sync_wide().expect("ramp sync");
+    }
+    let mut t: Vec<f64> = (0..runs)
+        .map(|_| {
+            let t0 = Instant::now();
+            launch(peer);
+            peer.sync_wide().expect("sync");
+            t0.elapsed().as_nanos() as f64
+        })
+        .collect();
+    t.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    t[t.len() / 2]
+}
+
 /// Median of `runs` timings of `f` after warming up: `f` runs until
-/// at least 150 ms have elapsed (at least once, at most 4000 calls),
-/// long enough for a GPU that idled through a multi-second CPU phase
-/// to raise its clocks before the timed calls. A call cap of 20 let
-/// a 0.2 ms kernel warm for 4 ms and measure at idle clocks (RTX
-/// 3070: 17 ms for an outer product that takes 0.6 ms warm).
+/// at least 150 ms have elapsed (at least once, at most 4000 calls).
+/// CPU contenders only; GPU timings go through [`gpu_median_ns`].
 fn median_ns<F: FnMut()>(runs: usize, mut f: F) -> f64 {
     let warm = Instant::now();
     let mut calls = 0;
@@ -172,16 +195,17 @@ fn main() {
             let pa = pin(&mut peer, &bytes(&a));
             let pb = pin(&mut peer, &bytes(&b));
             let pc = pin(&mut peer, &vec![0u8; batch * n * n * 8]);
+            let pin_ns = t_pin.elapsed().as_nanos() as f64;
             trace("gpu launches");
-            let gpu = median_ns(runs, || {
-                launch_gemm(&peer, &k, pa.ptr, pb.ptr, pc.ptr, batch as u32, n as u32, n as u32, n as u32)
+            let gpu = gpu_median_ns(&mut peer, runs, |p| {
+                launch_gemm(p, &k, pa.ptr, pb.ptr, pc.ptr, batch as u32, n as u32, n as u32, n as u32)
                     .expect("launch");
-                peer.sync_wide().expect("sync");
             });
             trace("fetch");
             let mut out = vec![0u8; batch * n * n * 8];
+            let t_fetch = Instant::now();
             peer.fetch_bulk(&pc.handle, &mut out).expect("fetch");
-            let pin_fetch = t_pin.elapsed().as_nanos() as f64 - gpu * (runs as f64 + 1.0);
+            let pin_fetch = pin_ns + t_fetch.elapsed().as_nanos() as f64;
             trace("serial");
             let serial = median_ns(1, || {
                 std::hint::black_box(cpu::gemm_batched(&a, &b, batch, n, n, n));
@@ -233,9 +257,8 @@ fn main() {
             let px = pin(&mut peer, &bytes(&x));
             let py = pin(&mut peer, &bytes(&y));
             let po = pin(&mut peer, &vec![0u8; batch * n * n * 8]);
-            let gpu = median_ns(runs, || {
-                launch_einsum(&peer, &k, &spec, tables.ptr, px.ptr, py.ptr, po.ptr, batch as u32).expect("launch");
-                peer.sync_wide().expect("sync");
+            let gpu = gpu_median_ns(&mut peer, runs, |p| {
+                launch_einsum(p, &k, &spec, tables.ptr, px.ptr, py.ptr, po.ptr, batch as u32).expect("launch");
             });
             let serial = median_ns(1, || {
                 std::hint::black_box(cpu::einsum(&spec, &x, Some(&y), batch));
@@ -246,9 +269,8 @@ fn main() {
             let rtables = pin(&mut peer, &rspec.tables().iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
             let pa = pin(&mut peer, &bytes(&a));
             let pr = pin(&mut peer, &vec![0u8; batch * n * 8]);
-            let gpu = median_ns(runs, || {
-                launch_einsum(&peer, &k, &rspec, rtables.ptr, pa.ptr, pa.ptr, pr.ptr, batch as u32).expect("launch");
-                peer.sync_wide().expect("sync");
+            let gpu = gpu_median_ns(&mut peer, runs, |p| {
+                launch_einsum(p, &k, &rspec, rtables.ptr, pa.ptr, pa.ptr, pr.ptr, batch as u32).expect("launch");
             });
             let serial = median_ns(1, || {
                 std::hint::black_box(cpu::einsum(&rspec, &a, None, batch));
@@ -276,14 +298,12 @@ fn main() {
             let sweeps = default_sweeps(n);
             let pa = pin(&mut peer, &bytes(&a));
             let pw = pin(&mut peer, &vec![0u8; batch * n * 8]);
-            let blk = median_ns(runs, || {
-                launch_syev(&peer, &k, pa.ptr, pw.ptr, None, batch as u32, n as u32, sweeps, JacobiShape::BlockPerMatrix).expect("launch");
-                peer.sync_wide().expect("sync");
+            let blk = gpu_median_ns(&mut peer, runs, |p| {
+                launch_syev(p, &k, pa.ptr, pw.ptr, None, batch as u32, n as u32, sweeps, JacobiShape::BlockPerMatrix).expect("launch");
             });
             let thr = if n <= 16 {
-                Some(median_ns(runs, || {
-                    launch_syev(&peer, &k, pa.ptr, pw.ptr, None, batch as u32, n as u32, sweeps, JacobiShape::ThreadPerMatrix).expect("launch");
-                    peer.sync_wide().expect("sync");
+                Some(gpu_median_ns(&mut peer, runs, |p| {
+                    launch_syev(p, &k, pa.ptr, pw.ptr, None, batch as u32, n as u32, sweeps, JacobiShape::ThreadPerMatrix).expect("launch");
                 }))
             } else {
                 None
@@ -329,16 +349,14 @@ fn main() {
             let ps = pin(&mut peer, &vec![0u8; batch * n * 8]);
             // The kernel overwrites A with U; re-upload before each run.
             let a_bytes = bytes(&a);
-            let blk = median_ns(runs, || {
-                peer.write_resident_bulk(&pa.handle, &a_bytes).expect("reload");
-                launch_gesvd(&peer, &k, pa.ptr, ps.ptr, None, batch as u32, n as u32, n as u32, sweeps, JacobiShape::BlockPerMatrix).expect("launch");
-                peer.sync_wide().expect("sync");
+            let blk = gpu_median_ns(&mut peer, runs, |p| {
+                p.write_resident_bulk(&pa.handle, &a_bytes).expect("reload");
+                launch_gesvd(p, &k, pa.ptr, ps.ptr, None, batch as u32, n as u32, n as u32, sweeps, JacobiShape::BlockPerMatrix).expect("launch");
             });
             let thr = if n <= 16 {
-                Some(median_ns(runs, || {
-                    peer.write_resident_bulk(&pa.handle, &a_bytes).expect("reload");
-                    launch_gesvd(&peer, &k, pa.ptr, ps.ptr, None, batch as u32, n as u32, n as u32, sweeps, JacobiShape::ThreadPerMatrix).expect("launch");
-                    peer.sync_wide().expect("sync");
+                Some(gpu_median_ns(&mut peer, runs, |p| {
+                    p.write_resident_bulk(&pa.handle, &a_bytes).expect("reload");
+                    launch_gesvd(p, &k, pa.ptr, ps.ptr, None, batch as u32, n as u32, n as u32, sweeps, JacobiShape::ThreadPerMatrix).expect("launch");
                 }))
             } else {
                 None
