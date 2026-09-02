@@ -264,7 +264,7 @@ fn main() {
         if !wants("syev") {
             break;
         }
-        for &batch in &[1024usize, 8192, 65536] {
+        for &batch in &[1024usize, 2048, 4096, 8192, 65536] {
             if !fits(&format!("syev n={n} batch={batch}"), batch * n * n * 8 + batch * n * 8) {
                 continue;
             }
@@ -315,7 +315,7 @@ fn main() {
         if !wants("gesvd") {
             break;
         }
-        for &batch in &[1024usize, 8192, 65536] {
+        for &batch in &[1024usize, 2048, 4096, 8192, 65536] {
             if !fits(&format!("gesvd n={n} batch={batch}"), batch * n * n * 8 + batch * n * 8) {
                 continue;
             }
