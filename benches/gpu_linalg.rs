@@ -1,14 +1,16 @@
 //! gpu_peer linalg: device kernels vs the Flynnel-parallel CPU
 //! reference vs serial CPU, per op, matrix size and batch size, plus
 //! the block-per-matrix vs thread-per-matrix Jacobi shape comparison
-//! that sets `JACOBI_THREAD_SHAPE_MAX_N`.
+//! that sets `JACOBI_THREAD_SHAPE_BATCH_PER_N`.
 //!
 //! Every contender computes the same result from the same inputs.
 //! GPU times are kernel wall (launch + sync) with the data already
 //! resident, which is the steady state of a scoring loop that pins
 //! once per step; the one-time pin + fetch cost is printed separately.
 //! Run with:
-//!   cargo bench --profile=release-test --bench gpu_linalg
+//!   cargo bench --features gpu-peer --bench gpu_linalg
+//! `FLYNNEL_BENCH_SECTIONS=syev,gesvd` (any of gemm, einsum, syev,
+//! gesvd) limits the run to those sections.
 
 use std::time::{Duration, Instant};
 
@@ -51,13 +53,15 @@ fn bytes(v: &[f64]) -> Vec<u8> {
 }
 
 /// Median of `runs` timings of `f` after warming up: `f` runs until
-/// at least 150 ms have elapsed (at most 20 calls), long enough for
-/// a GPU that idled through a multi-second CPU phase to raise its
-/// clocks before the timed calls.
+/// at least 150 ms have elapsed (at least once, at most 4000 calls),
+/// long enough for a GPU that idled through a multi-second CPU phase
+/// to raise its clocks before the timed calls. A call cap of 20 let
+/// a 0.2 ms kernel warm for 4 ms and measure at idle clocks (RTX
+/// 3070: 17 ms for an outer product that takes 0.6 ms warm).
 fn median_ns<F: FnMut()>(runs: usize, mut f: F) -> f64 {
     let warm = Instant::now();
     let mut calls = 0;
-    while calls < 20 && (calls == 0 || warm.elapsed() < Duration::from_millis(150)) {
+    while calls == 0 || (calls < 4000 && warm.elapsed() < Duration::from_millis(150)) {
         f();
         calls += 1;
     }

@@ -43,11 +43,12 @@ pub const LINALG_THR_MAX_N: usize = 16;
 pub const EINSUM_MAX_RANK: usize = 12;
 /// Threads per block every kernel here is launched with.
 pub const LINALG_BLOCK: u32 = 256;
-/// Largest `n` routed to the thread-per-matrix Jacobi kernels by
-/// [`jacobi_shape_for`]. Both shapes are valid up to
-/// [`LINALG_THR_MAX_N`]; `benches/gpu_linalg.rs` measures the
-/// crossover on each bench host.
-pub const JACOBI_THREAD_SHAPE_MAX_N: usize = 16;
+/// Matrices per unit of `n` a batch needs before the thread-per-
+/// matrix Jacobi kernels beat block-per-matrix. Measured by
+/// `benches/gpu_linalg.rs` on RTX 3070 and RTX 5070 for syev and
+/// gesvd alike: thr wins at n=4 from batch 1024, n=8 from 2048, n=16
+/// from 4096; blk wins below (3x at n=16, batch 1024).
+pub const JACOBI_THREAD_SHAPE_BATCH_PER_N: usize = 256;
 
 /// Device-side parallelization of one matrix in the batched Jacobi
 /// kernels.
@@ -61,9 +62,12 @@ pub enum JacobiShape {
     ThreadPerMatrix,
 }
 
-/// The shape used for dimension `n` when the caller does not pin one.
-pub fn jacobi_shape_for(n: usize) -> JacobiShape {
-    if n <= JACOBI_THREAD_SHAPE_MAX_N {
+/// The faster shape for `batch` matrices of dimension `n` when the
+/// caller does not pin one: thread-per-matrix needs enough matrices
+/// to fill the device (`batch >= JACOBI_THREAD_SHAPE_BATCH_PER_N * n`)
+/// and `n <= LINALG_THR_MAX_N`; block-per-matrix otherwise.
+pub fn jacobi_shape_for(n: usize, batch: usize) -> JacobiShape {
+    if n <= LINALG_THR_MAX_N && batch >= JACOBI_THREAD_SHAPE_BATCH_PER_N * n {
         JacobiShape::ThreadPerMatrix
     } else {
         JacobiShape::BlockPerMatrix
@@ -1248,6 +1252,21 @@ pub fn gesvd_accel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The measured crossovers: thr from batch 1024 at n=4, 2048 at
+    /// n=8, 4096 at n=16; blk below those and for every n > 16.
+    #[test]
+    fn jacobi_shape_follows_measured_crossovers() {
+        use JacobiShape::{BlockPerMatrix as Blk, ThreadPerMatrix as Thr};
+        assert_eq!(jacobi_shape_for(4, 1024), Thr);
+        assert_eq!(jacobi_shape_for(4, 512), Blk);
+        assert_eq!(jacobi_shape_for(8, 1024), Blk);
+        assert_eq!(jacobi_shape_for(8, 2048), Thr);
+        assert_eq!(jacobi_shape_for(16, 2048), Blk);
+        assert_eq!(jacobi_shape_for(16, 4096), Thr);
+        assert_eq!(jacobi_shape_for(32, 65536), Blk);
+        assert_eq!(jacobi_shape_for(64, 65536), Blk);
+    }
 
     #[test]
     fn einsum_spec_matmul_tables() {

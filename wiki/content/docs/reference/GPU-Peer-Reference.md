@@ -255,13 +255,19 @@ build or run time), over resident blocks:
 | symmetric eigen | `flynnel_syev_jacobi_f64_{blk,thr}` | Batched Jacobi eigendecomposition, `n <= 64`; eigenvalues in diagonal order plus optional eigenvectors |
 | SVD | `flynnel_gesvd_jacobi_f64_{blk,thr}` | Batched one-sided Jacobi SVD, `m >= n`, `m <= 64`; `A` is overwritten with `U`, singular values in column order, optional `V` |
 
-Two Jacobi kernel shapes exist because the best one depends on `n`:
-`blk` runs one 256-thread block per matrix with the matrix in 32 KB of
-static shared memory and applies `n / 2` disjoint rotations per
-tournament round; `thr` runs one thread per matrix in local memory
-(`n <= 16`). `jacobi_shape_for(n)` picks by
-`JACOBI_THREAD_SHAPE_MAX_N`, which `benches/gpu_linalg.rs` sets from
-measurement on the bench hosts.
+Two Jacobi kernel shapes exist because the best one depends on `n`
+and on the batch: `blk` runs one 256-thread block per matrix with the
+matrix in 32 KB of static shared memory and applies `n / 2` disjoint
+rotations per tournament round; `thr` runs one thread per matrix in
+local memory (`n <= 16`) and needs enough matrices to fill the
+device. `jacobi_shape_for(n, batch)` picks `thr` when `n <= 16` and
+`batch >= JACOBI_THREAD_SHAPE_BATCH_PER_N * n` (256 per unit of `n`),
+`blk` otherwise. The constant is measured, not chosen:
+`benches/gpu_linalg.rs` on an RTX 3070 and an RTX 5070 puts the
+crossover at batch 1024 for n=4, 2048 for n=8 and 4096 for n=16, for
+syev and gesvd alike, with `blk` ahead by up to 3x below it (n=16,
+batch 1024) and `thr` ahead by up to 24x above it (n=4, batch 65536).
+The measured tables are at the end of this section.
 
 Three surfaces over the same kernels:
 
