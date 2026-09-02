@@ -7,7 +7,7 @@ Flynnel ships three optional reference `DispatchBackend` implementations on this
 
 ## `CudaBackend`
 
-Defined in [`src/backend/cuda.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/cuda.rs). Compiled only when the `cuda-reference` feature is enabled.
+Defined in [`src/backend/cuda.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/cuda.rs). Compiled only when the `cuda-reference` feature is enabled.
 
 ```toml
 flynnel = { version = "0.1", features = ["cuda-reference"] }
@@ -139,7 +139,7 @@ If your consumer crate needs precise CUDA semantics not exposed through this ref
 
 ## `TpuJaxBackend`
 
-Defined in [`src/backend/tpu_jax.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/tpu_jax.rs). Compiled only when the `tpu-jax-reference` feature is enabled.
+Defined in [`src/backend/tpu_jax.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/tpu_jax.rs). Compiled only when the `tpu-jax-reference` feature is enabled.
 
 ```toml
 flynnel = { version = "0.1", features = ["tpu-jax-reference"] }
@@ -269,7 +269,7 @@ This same code runs unchanged across "no Python", "Python no JAX", "Python + JAX
 
 ## `WasmBackend`
 
-Defined in [`src/backend/wasm.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/wasm.rs). Compiled only when the `wasm-reference` feature is enabled.
+Defined in [`src/backend/wasm.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/wasm.rs). Compiled only when the `wasm-reference` feature is enabled.
 
 ```toml
 flynnel = { version = "0.1", features = ["wasm-reference"] }
@@ -334,7 +334,7 @@ let handle = backend.register_kernel("add", ADD_WASM)?;
 backend.dispatch_kernel(handle, 1, &[KernelArg::I32(3), KernelArg::I32(4)])?;
 ```
 
-The runnable version is at [`examples/wasm_dispatch_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/wasm_dispatch_demo.rs) (`cargo run --release --example wasm_dispatch_demo --features wasm-reference`).
+The runnable version is at [`examples/wasm_dispatch_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/wasm_dispatch_demo.rs) (`cargo run --release --example wasm_dispatch_demo --features wasm-reference`).
 
 ### When to reach for WASM dispatch
 

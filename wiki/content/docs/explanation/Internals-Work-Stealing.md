@@ -11,19 +11,19 @@ A work-stealing pool is built from interlocking primitives. Flynnel's are all in
 
 | Primitive | File | Role |
 |-----------|------|------|
-| `chase_lev_local::Worker<T>` | [`src/sched/chase_lev_local.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/chase_lev_local.rs) | Per-worker, owner-side LIFO push/pop; thieves steal from the FIFO end. In-house Chase-Lev implementation per Vafeiadis et al.; exposes `slot_ptr` for prefetch wiring the upstream crossbeam version doesn't. The production worker pool layers KHL (per-slot Vyukov, K_inner=3) and Fcl (counter-only, K_inner=3) backings on top, swapped at runtime via `AdaptiveWorker`'s AtomicU32 tag. |
-| `injector::Injector<JobRef>` | [`src/sched/injector.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/injector.rs) | Per-arena MPMC queue for external (non-worker-thread) submissions. Wraps `FlynnelRing` (Vyukov per-slot sequence) with the same Success/Empty/Retry steal surface as the upstream crossbeam Injector but reduced wrapper overhead. |
-| `flynnel_ring::FlynnelRing<JobRef>` | [`src/sched/flynnel_ring.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/flynnel_ring.rs) | Per-worker mailbox: bounded MPMC ring used by `push_to_mailbox` for cross-worker hand-offs in recursive splits. |
-| `CoreLatch` | [`src/sched/latch.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/latch.rs) | Per-job one-shot signal with a 4-state machine. |
-| `Sleep` (JEC) | [`src/sched/jec_sleep.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/jec_sleep.rs) | Per-arena Jobs Event Counter wake protocol; tracks `awake_but_idle` vs `sleeping` worker counts so producers can skip unpark syscalls when enough workers are already spinning. Port of `rayon-core-1.13.0::sleep::{counters,mod}`. |
-| `Parker` | [`src/sched/sleep.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/sleep.rs) | Per-worker yield-spin-then-park primitive. Wraps `std::thread::park` + `wake_counter: AtomicU64` for a permit-based race-free wake. Used for the SMT-sibling gate (siblings park whenever `smt_requests == 0`) AND for the `NotifyHub` per-consumer wake; the main-loop sleep path uses the JEC `Sleep` above. |
-| `notify_ring::NotifyHub<T>` | [`src/sched/notify_ring.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/notify_ring.rs) | Blocking send/recv wrapper over `FlynnelRing` + per-consumer `Parker`. Used by the IO pool, GPU/WASM backend workers, and the `hybrid_pipeline` stage hand-off. No Mutex on the hot wake path (`Box<[OnceLock<Arc<Parker>>]>` is pre-allocated at hub construction). |
+| `chase_lev_local::Worker<T>` | [`src/sched/chase_lev_local.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/chase_lev_local.rs) | Per-worker, owner-side LIFO push/pop; thieves steal from the FIFO end. In-house Chase-Lev implementation per Vafeiadis et al.; exposes `slot_ptr` for prefetch wiring the upstream crossbeam version doesn't. The production worker pool layers KHL (per-slot Vyukov, K_inner=3) and Fcl (counter-only, K_inner=3) backings on top, swapped at runtime via `AdaptiveWorker`'s AtomicU32 tag. |
+| `injector::Injector<JobRef>` | [`src/sched/injector.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/injector.rs) | Per-arena MPMC queue for external (non-worker-thread) submissions. Wraps `FlynnelRing` (Vyukov per-slot sequence) with the same Success/Empty/Retry steal surface as the upstream crossbeam Injector but reduced wrapper overhead. |
+| `flynnel_ring::FlynnelRing<JobRef>` | [`src/sched/flynnel_ring.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/flynnel_ring.rs) | Per-worker mailbox: bounded MPMC ring used by `push_to_mailbox` for cross-worker hand-offs in recursive splits. |
+| `CoreLatch` | [`src/sched/latch.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/latch.rs) | Per-job one-shot signal with a 4-state machine. |
+| `Sleep` (JEC) | [`src/sched/jec_sleep.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/jec_sleep.rs) | Per-arena Jobs Event Counter wake protocol; tracks `awake_but_idle` vs `sleeping` worker counts so producers can skip unpark syscalls when enough workers are already spinning. Port of `rayon-core-1.13.0::sleep::{counters,mod}`. |
+| `Parker` | [`src/sched/sleep.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/sleep.rs) | Per-worker yield-spin-then-park primitive. Wraps `std::thread::park` + `wake_counter: AtomicU64` for a permit-based race-free wake. Used for the SMT-sibling gate (siblings park whenever `smt_requests == 0`) AND for the `NotifyHub` per-consumer wake; the main-loop sleep path uses the JEC `Sleep` above. |
+| `notify_ring::NotifyHub<T>` | [`src/sched/notify_ring.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/notify_ring.rs) | Blocking send/recv wrapper over `FlynnelRing` + per-consumer `Parker`. Used by the IO pool, GPU/WASM backend workers, and the `hybrid_pipeline` stage hand-off. No Mutex on the hot wake path (`Box<[OnceLock<Arc<Parker>>]>` is pre-allocated at hub construction). |
 
-Above them, [`LocalArena`](#localarena) in `src/sched/arena_local.rs` is the per-NUMA-node worker pool; [`NumaArena`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/arena_numa.rs) composes one `LocalArena` per node.
+Above them, [`LocalArena`](#localarena) in `src/sched/arena_local.rs` is the per-NUMA-node worker pool; [`NumaArena`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/arena_numa.rs) composes one `LocalArena` per node.
 
 ## `JobRef` two-word vtable
 
-Defined in [`src/sched/job.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/job.rs).
+Defined in [`src/sched/job.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/job.rs).
 
 ```rust
 pub(crate) struct JobRef {
@@ -70,7 +70,7 @@ Flynnel ships three wake-capable wrappers that honor this discipline: `SpinLatch
 
 ## Sleep protocol: JEC + spin floor
 
-The main worker loop uses the **JEC (Jobs Event Counter)** sleep protocol from [`src/sched/jec_sleep.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/jec_sleep.rs), a verbatim port of `rayon-core-1.13.0::sleep::{counters,mod}`. The protocol's central trick is to track two separate worker counts: `awake_but_idle` (spinning in `no_work_found`) and `sleeping` (parked on a `Mutex<Condvar>`). When a producer posts new work, it consults both counters and skips the unpark syscall if there are already enough idle-but-awake workers to absorb the dispatched jobs. The hot path is producer-side `new_internal_jobs(num_jobs, queue_was_empty)`, which:
+The main worker loop uses the **JEC (Jobs Event Counter)** sleep protocol from [`src/sched/jec_sleep.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/jec_sleep.rs), a verbatim port of `rayon-core-1.13.0::sleep::{counters,mod}`. The protocol's central trick is to track two separate worker counts: `awake_but_idle` (spinning in `no_work_found`) and `sleeping` (parked on a `Mutex<Condvar>`). When a producer posts new work, it consults both counters and skips the unpark syscall if there are already enough idle-but-awake workers to absorb the dispatched jobs. The hot path is producer-side `new_internal_jobs(num_jobs, queue_was_empty)`, which:
 
 1. Increments the global JEC if any worker is in the `Sleepy` phase (signals sleepy workers to re-search before sleeping).
 2. If the queue was non-empty, wakes `min(num_jobs, num_sleepers)` parked workers.
@@ -78,7 +78,7 @@ The main worker loop uses the **JEC (Jobs Event Counter)** sleep protocol from [
 
 The four-phase consumer state machine (`Active -> Idle -> Sleepy -> Sleeping`) escalates only after `ROUNDS_UNTIL_SLEEPY` (32) yields of finding no work, then a further spin-window's worth of yields (default 500, tunable via `FLYNNEL_SPIN_WINDOW_ROUNDS` / `set_spin_window`) with the worker counted as `Sleepy` before it finally locks its mutex and waits on the condvar. The JEC rescue lets producers pull `Sleepy` workers back into the search loop without paying the park / unpark roundtrip.
 
-The `Parker` primitive in [`src/sched/sleep.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/sleep.rs) is wired to the SMT-sibling gate (siblings park whenever `smt_requests == 0` and unpark when it goes positive). That path is structurally separate from the main-loop wake decision and uses stdlib `park`/`unpark` because its permit-based race resolution is enough for an on/off SMT toggle.
+The `Parker` primitive in [`src/sched/sleep.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/sleep.rs) is wired to the SMT-sibling gate (siblings park whenever `smt_requests == 0` and unpark when it goes positive). That path is structurally separate from the main-loop wake decision and uses stdlib `park`/`unpark` because its permit-based race resolution is enough for an on/off SMT toggle.
 
 ### Yield-spin floor
 
@@ -107,7 +107,7 @@ After the yield-spin window, the worker enters real park. The CoreLatch two-phas
 
 ## `LocalArena`
 
-Defined in [`src/sched/arena_local.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/arena_local.rs).
+Defined in [`src/sched/arena_local.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/arena_local.rs).
 
 ### Construction
 
@@ -159,7 +159,7 @@ The background observer (`split_observer::spawn_observer`) samples these every i
 
 ## `NumaArena`
 
-Defined in [`src/sched/arena_numa.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/arena_numa.rs).
+Defined in [`src/sched/arena_numa.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/arena_numa.rs).
 
 Composes one `LocalArena` per NUMA node. On single-NUMA hosts (most desktops) it collapses to a single underlying `LocalArena`; cross-node code paths are dead branches with zero overhead. On multi-NUMA hosts (Genoa, dual-socket Xeon / Threadripper) it routes work to the caller's current-thread node by default and rebalances via cross-node steal when one node is idle.
 
@@ -172,7 +172,7 @@ The structure is borrowed largely from rayon-core 1.13; the design has been batt
 1. **K-axis tier picker** at the entry point. `pick_tier` reads `JobPlan` and the cached NUMA topology to decide whether to even touch the arena. This avoids paying scheduling overhead on micro-jobs where serial execution beats every parallel strategy.
 2. **Per-NUMA arena composition**. `NumaArena` collapses on single-node hosts and routes intelligently on multi-node hosts. The composition is built on top of the same `LocalArena` primitive so single-NUMA users pay nothing for the multi-NUMA code path.
 
-Everything else (the worker loop, the latch, the deque, the JEC sleep protocol) is the rayon-core lineage with minor adjustments (env-var-driven pinning default off, SMT-sibling extension model that runs on the simpler `Parker` path on top of the JEC main loop, adaptive peer-probe with last-victim). [`src/sched/jec_sleep.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/jec_sleep.rs) is a verbatim port of `rayon-core-1.13.0::sleep::{counters,mod}`.
+Everything else (the worker loop, the latch, the deque, the JEC sleep protocol) is the rayon-core lineage with minor adjustments (env-var-driven pinning default off, SMT-sibling extension model that runs on the simpler `Parker` path on top of the JEC main loop, adaptive peer-probe with last-victim). [`src/sched/jec_sleep.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/jec_sleep.rs) is a verbatim port of `rayon-core-1.13.0::sleep::{counters,mod}`.
 
 ## Reading order for contributors
 

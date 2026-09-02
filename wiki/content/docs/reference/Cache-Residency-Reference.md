@@ -19,7 +19,7 @@ On compute capability 8.0 and up, the driver sets aside part of L2 and lets a st
 - `L2Persist::reserve(ctx, bytes)` claims the set-aside (clamped to the ceiling); `pin_window(stream, dev_ptr, num_bytes, hit_ratio)` marks the window; `clear_window` releases it.
 - `benchmark(ctx, hot, pol, iters, runs)` runs a fair A/B - the identical hammer kernel over identical data, timed with the hot set pinned versus streaming, min-of-runs.
 
-The result on an RTX 3070 is instructive and non-monotonic. Pinning wins under moderate contention (1.12x with a 16 MiB polluter) but goes *negative* when the set-aside starves the co-runner (0.89x with a 6 MiB polluter). So the lever is measured and gated, not always-on - the same rule the Fischer and sys-atomics probes follow. Its ceiling is the device's L2 size; it grows on server parts. E2E: [`examples/gpu_l2_persist_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/gpu_l2_persist_demo.rs).
+The result on an RTX 3070 is instructive and non-monotonic. Pinning wins under moderate contention (1.12x with a 16 MiB polluter) but goes *negative* when the set-aside starves the co-runner (0.89x with a 6 MiB polluter). So the lever is measured and gated, not always-on - the same rule the Fischer and sys-atomics probes follow. Its ceiling is the device's L2 size; it grows on server parts. E2E: [`examples/gpu_l2_persist_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/gpu_l2_persist_demo.rs).
 
 ## CPU: L3 way reservation (`sched::cat`)
 
@@ -28,7 +28,7 @@ Linux `resctrl` exposes L3 cache-way allocation. You carve a class of service wi
 - `CatCapability::detect()` reads `/sys/fs/resctrl/info/L3` for way count, class count, and domains; it reports unsupported on any non-Linux host or where resctrl is not mounted.
 - `L3Reservation::reserve_ways(name, first_way, num_ways)` builds a contiguous mask, creates a resctrl group, applies the mask to every L3 domain, and binds the current process. Dropping it removes the group, re-homing the process to the default. `schemata()` reads the reservation back.
 
-The reservation path needs a mounted resctrl and root; where either is missing the lever returns `Unsupported` cleanly. E2E: [`examples/cat_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/cat_demo.rs), which reserves half the L3 ways and reads the schemata back on a Zen2+/RDT Linux host, and reports the capability without acting anywhere else.
+The reservation path needs a mounted resctrl and root; where either is missing the lever returns `Unsupported` cleanly. E2E: [`examples/cat_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/cat_demo.rs), which reserves half the L3 ways and reads the schemata back on a Zen2+/RDT Linux host, and reports the capability without acting anywhere else.
 
 ## TPU: VMEM/HBM residency (`tpu/tpu_residency.ipynb`)
 

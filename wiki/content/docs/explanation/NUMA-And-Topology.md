@@ -7,7 +7,7 @@ Flynnel probes three orthogonal pieces of host hardware at startup. All three ca
 
 ## `CpuInfo`
 
-Defined in [`src/cpu_info.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/cpu_info.rs); accessed via `flynnel::cpu_info::cpu_info() -> &'static CpuInfo`.
+Defined in [`src/cpu_info.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/cpu_info.rs); accessed via `flynnel::cpu_info::cpu_info() -> &'static CpuInfo`.
 
 ```rust
 pub struct CpuInfo {
@@ -33,7 +33,7 @@ Notes:
 
 ## `NumaTopology`
 
-Defined in [`src/numa_topology.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/numa_topology.rs); accessed via `flynnel::numa_topology() -> &'static NumaTopology`.
+Defined in [`src/numa_topology.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/numa_topology.rs); accessed via `flynnel::numa_topology() -> &'static NumaTopology`.
 
 ```rust
 pub struct NumaTopology {
@@ -103,7 +103,7 @@ The Intel Module-domain code is the analogue of AMD's CCX code: same shape, diff
 
 ## `TopologyLatencyTable`
 
-Defined in [`src/sched/numa_latency.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/numa_latency.rs); accessed via `flynnel::sched::topology_latency_table() -> Option<&'static TopologyLatencyTable>`.
+Defined in [`src/sched/numa_latency.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/numa_latency.rs); accessed via `flynnel::sched::topology_latency_table() -> Option<&'static TopologyLatencyTable>`.
 
 Per-core sync-latency calibration table built by ping-pong measurements between pinned cores. The `K_unified` / `K_core` dispatch policy uses these numbers to decide whether cooperation amortizes its sync cost on the host.
 

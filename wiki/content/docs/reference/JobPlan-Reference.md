@@ -3,7 +3,7 @@ title: JobPlan Reference
 weight: 1
 ---
 
-The plan struct attached to every dispatch. Defined in [`src/sched/plan.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/plan.rs); re-exported as `flynnel::JobPlan`.
+The plan struct attached to every dispatch. Defined in [`src/sched/plan.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/plan.rs); re-exported as `flynnel::JobPlan`.
 
 ```rust
 pub struct JobPlan {
@@ -161,7 +161,7 @@ Hard cap on the worker count for this dispatch. `None` means use every available
 
 ### `bisect_variant: Option<BisectVariant>`
 
-Selects one of two production-validated bisect-policy variants (`ProducerMaxLenWorkers` or `RayonStyleReplenish`), documented in [`BisectVariant`](Foundation-Types-Reference.md#bisectvariant). `None` runs the default continuation-steal-lazy bisect path. The field is auto-resolved by [`adaptive_variant_routing::pick_variant_for_profile`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_variant_routing.rs) at [`set_profile`](#set_profile) construction time based on CPUID vendor + `DispatchProfile` + `batch_size`; per-call overrides via [`with_bisect_variant(v)`](#builder-methods) win over the auto-routing.
+Selects one of two production-validated bisect-policy variants (`ProducerMaxLenWorkers` or `RayonStyleReplenish`), documented in [`BisectVariant`](Foundation-Types-Reference.md#bisectvariant). `None` runs the default continuation-steal-lazy bisect path. The field is auto-resolved by [`adaptive_variant_routing::pick_variant_for_profile`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_variant_routing.rs) at [`set_profile`](#set_profile) construction time based on CPUID vendor + `DispatchProfile` + `batch_size`; per-call overrides via [`with_bisect_variant(v)`](#builder-methods) win over the auto-routing.
 
 ### `use_mailbox_routing: bool`
 
@@ -171,7 +171,7 @@ The realistic_bench measurement on Zen+ R7 2700 (2026-06-06) showed no productio
 
 ### `leaf_shape: crate::sched::adaptive_profile::LeafShape`
 
-Caller-supplied structural shape hint. `LeafShape::Unknown` (default) means "no explicit shape; infer from `(ns, K, N)` heuristics in the static classifier." Any other value (`PortCompute`, `LatencyCompute`, `Streaming`, `Gather`) is the strongest static signal for [`infer_class_static_with_shape`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_profile.rs); the shape maps directly to a [`WorkloadClass`](Foundation-Types-Reference.md#workloadclass) and the ns + K + N heuristics are bypassed.
+Caller-supplied structural shape hint. `LeafShape::Unknown` (default) means "no explicit shape; infer from `(ns, K, N)` heuristics in the static classifier." Any other value (`PortCompute`, `LatencyCompute`, `Streaming`, `Gather`) is the strongest static signal for [`infer_class_static_with_shape`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_profile.rs); the shape maps directly to a [`WorkloadClass`](Foundation-Types-Reference.md#workloadclass) and the ns + K + N heuristics are bypassed.
 
 Set via [`with_leaf_shape(shape)`](#builder-methods); the builder re-classifies and re-applies the profile-derived knobs (`use_smt`, `oversubscription_log2`, `use_mailbox_routing`, `deque_tier_hint`) from the new class while preserving any explicit `estimated_per_item_ns` hint.
 

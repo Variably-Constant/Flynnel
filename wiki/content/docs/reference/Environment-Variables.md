@@ -54,7 +54,7 @@ Do NOT submit compute work to this pool: the IO workers sit on SMT siblings of t
 
 ### `FLYNNEL_SPIN_WINDOW_ROUNDS=N`
 
-Override the JEC sleep protocol's spin-window (the number of extra yield rounds a sleepy worker spins before locking the condvar). Read by [`src/sched/jec_sleep.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/jec_sleep.rs).
+Override the JEC sleep protocol's spin-window (the number of extra yield rounds a sleepy worker spins before locking the condvar). Read by [`src/sched/jec_sleep.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/jec_sleep.rs).
 
 Default: 500 rounds (~500 us on a 16T Zen+ pool), confirmed as the host-best window by a `[100, 150, 200, 300, 500, 800]` sweep on a Colab Xeon Cascade Lake (12T, 2026-06-08): flynnel-default Heavy/100k medians ran 6.81ms at spin=100, 6.40ms at spin=200, 6.34ms at spin=500 (best), 6.35ms at spin=800.
 
@@ -62,37 +62,37 @@ Setting this variable pins the window and turns the adaptive controller off.
 
 ### `FLYNNEL_ADAPTIVE_SPIN=1`
 
-Opt in to the adaptive spin-window controller in [`src/sched/jec_sleep.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/jec_sleep.rs): when parks dominate (a bursty workload keeps missing the window) the controller shrinks the window toward the 8-round floor; when rescues dominate it grows back toward the tuned default. Bounded by the default, so a throughput workload never regresses. Equivalent to calling `set_spin_adaptive(true)` at startup.
+Opt in to the adaptive spin-window controller in [`src/sched/jec_sleep.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/jec_sleep.rs): when parks dominate (a bursty workload keeps missing the window) the controller shrinks the window toward the 8-round floor; when rescues dominate it grows back toward the tuned default. Bounded by the default, so a throughput workload never regresses. Equivalent to calling `set_spin_adaptive(true)` at startup.
 
 Default: off (the fixed 500-round window).
 
 ### `FLYNNEL_TRACE=on|1|true`
 
-Enable tracing of scheduler events (job submit, worker steal, latch transitions). Read by [`src/sched/trace.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/trace.rs).
+Enable tracing of scheduler events (job submit, worker steal, latch transitions). Read by [`src/sched/trace.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/trace.rs).
 
 Default: off. Tracing adds a measurable overhead (atomic increments per event); enable only when diagnosing scheduler behavior.
 
 ### `FLYNNEL_TRACE_DISPATCH=<any value>`
 
-Enable per-`join_in_worker` dispatch tracing to stderr. Accumulates three process-wide counters: `JOIN_CALL_COUNT` (number of `join_in_worker` invocations), `JOIN_A_BODY_NS` (cycles spent in the `a` closure), `JOIN_WAIT_NS` (cycles spent in the wait loop after `a` returned). Compute "wait fraction" as `JOIN_WAIT_NS / (JOIN_A_BODY_NS + JOIN_WAIT_NS)`; high fraction means dispatch overhead is the bottleneck. Read by [`src/sched/arena.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/arena.rs) via `dispatch_trace_enabled()`; the check is cached in a `OnceLock<bool>` so the hot path pays one Relaxed load per call.
+Enable per-`join_in_worker` dispatch tracing to stderr. Accumulates three process-wide counters: `JOIN_CALL_COUNT` (number of `join_in_worker` invocations), `JOIN_A_BODY_NS` (cycles spent in the `a` closure), `JOIN_WAIT_NS` (cycles spent in the wait loop after `a` returned). Compute "wait fraction" as `JOIN_WAIT_NS / (JOIN_A_BODY_NS + JOIN_WAIT_NS)`; high fraction means dispatch overhead is the bottleneck. Read by [`src/sched/arena.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/arena.rs) via `dispatch_trace_enabled()`; the check is cached in a `OnceLock<bool>` so the hot path pays one Relaxed load per call.
 
 Default: off.
 
 ### `FLYNNEL_LOCKLATCH_DIAGNOSE=1|true`
 
-Enable per-`LockLatch::wait()` entry/exit diagnostic logging to stderr. Read by [`src/sched/latch.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/latch.rs) via `locklatch_diagnose_enabled()`; the check is cached in a `OnceLock<bool>` so the hot wait path pays one Relaxed load per call.
+Enable per-`LockLatch::wait()` entry/exit diagnostic logging to stderr. Read by [`src/sched/latch.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/latch.rs) via `locklatch_diagnose_enabled()`; the check is cached in a `OnceLock<bool>` so the hot wait path pays one Relaxed load per call.
 
 Default: off. Enable only when diagnosing external-dispatch fallback wait behavior.
 
 ### `FLYNNEL_ENABLE_FLAT_FANOUT=<any value except 0/false/empty>`
 
-Enable the flat-fanout path in `reduce_chunks` ([`src/sched/par_iter.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/par_iter.rs)). The default path is bisect-only: the bench audit measured flat structurally slower for the characterized reduce_chunks workloads because the per-round `external_dispatch` + `LockLatch` overhead dominates. Set only for in-source A/B experiments.
+Enable the flat-fanout path in `reduce_chunks` ([`src/sched/par_iter.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/par_iter.rs)). The default path is bisect-only: the bench audit measured flat structurally slower for the characterized reduce_chunks workloads because the per-round `external_dispatch` + `LockLatch` overhead dominates. Set only for in-source A/B experiments.
 
 Default: off.
 
 ### `FLYNNEL_REDUCE_CHUNKS_CHUNKS=N`
 
-Bench-driven audit hook: override the reduce_chunks target chunk count. Read by [`src/sched/par_iter.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/par_iter.rs). Used by the chunk-count investigation harness; production callers do not set this.
+Bench-driven audit hook: override the reduce_chunks target chunk count. Read by [`src/sched/par_iter.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/par_iter.rs). Used by the chunk-count investigation harness; production callers do not set this.
 
 Default: unset (use the plan-derived chunk count).
 

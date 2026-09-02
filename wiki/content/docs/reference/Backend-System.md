@@ -3,7 +3,7 @@ title: Backend System
 weight: 4
 ---
 
-The pluggable dispatch fabric. The [`flynnel::backend`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend) module owns the `Backend` taxonomy enum, the `DispatchBackend` trait, the runtime registry, and the per-runtime detection probes.
+The pluggable dispatch fabric. The [`flynnel::backend`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend) module owns the `Backend` taxonomy enum, the `DispatchBackend` trait, the runtime registry, and the per-runtime detection probes.
 
 ## Mental model
 
@@ -91,7 +91,7 @@ Reported by each backend so routing helpers can reason about cost (small jobs st
 
 ## `DispatchBackend` trait
 
-Defined in [`src/backend/mod.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/mod.rs). Object-safe so `Arc<dyn DispatchBackend>` works.
+Defined in [`src/backend/mod.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/mod.rs). Object-safe so `Arc<dyn DispatchBackend>` works.
 
 ```rust
 pub trait DispatchBackend: Send + Sync + 'static {
@@ -183,7 +183,7 @@ Implements `Display` and `std::error::Error`. Routing helpers (`JobPlan::pick_ba
 
 ## Registry
 
-The process-global registry stores `Arc<dyn DispatchBackend>` keyed by [`Backend`](#backend-enum). Defined in [`src/backend/registry.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/registry.rs).
+The process-global registry stores `Arc<dyn DispatchBackend>` keyed by [`Backend`](#backend-enum). Defined in [`src/backend/registry.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/registry.rs).
 
 ### `register_backend`
 
@@ -227,7 +227,7 @@ Forces the registry to initialize. Most callers do not need this since any regis
 
 ## Runtime backend migration (active-backend tag)
 
-Lives in [`src/sched/adaptive_backend.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_backend.rs). Process-global `AtomicU32` tag selects the active backend for routing helpers that consult the global (e.g. `AdaptiveDispatcher::execute_indexed` and the dispatcher's `resolve_active_backend()` method). Distinct from `backend_hint` on a per-call `JobPlan`: the hint pins one call; the tag drives the default for every call that does not pin a backend.
+Lives in [`src/sched/adaptive_backend.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_backend.rs). Process-global `AtomicU32` tag selects the active backend for routing helpers that consult the global (e.g. `AdaptiveDispatcher::execute_indexed` and the dispatcher's `resolve_active_backend()` method). Distinct from `backend_hint` on a per-call `JobPlan`: the hint pins one call; the tag drives the default for every call that does not pin a backend.
 
 ### `active_backend_id`
 
@@ -253,11 +253,11 @@ pub fn resolve_active_backend() -> (BackendRef, bool)
 
 Looks up the registered backend for the active tag. Returns `(backend, fell_back)`. When the requested backend is registered, returns it with `fell_back = false`. When it is not registered (e.g., `Backend::Cuda { device_id: 0 }` on a host without `cuda-reference` enabled and a CUDA driver loadable), returns the always-available CPU backend with `fell_back = true`. The boolean flag lets the caller observe the fallback explicitly instead of silently dispatching to the wrong target.
 
-Wired through [`AdaptiveDispatcher`](Sched-Module-Reference.md#dispatch) as `dispatcher.active_backend_id()`, `dispatcher.migrate_backend(b)`, `dispatcher.resolve_active_backend()`. End-to-end demonstration in Section [7] of [`examples/adaptive_dispatcher_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/adaptive_dispatcher_demo.rs).
+Wired through [`AdaptiveDispatcher`](Sched-Module-Reference.md#dispatch) as `dispatcher.active_backend_id()`, `dispatcher.migrate_backend(b)`, `dispatcher.resolve_active_backend()`. End-to-end demonstration in Section [7] of [`examples/adaptive_dispatcher_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/adaptive_dispatcher_demo.rs).
 
 ## Automatic CPU/accelerator routing (`accel_op`)
 
-Lives in [`src/backend/accel_op.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/accel_op.rs). The layer that turns "a GPU is registered" into "eligible work runs on it" without a per-call-site placement decision. A Rust closure cannot execute on a GPU or TPU, so the surface is a registry of DECLARED equivalences, mirroring `pass_registry`'s closure-id pattern at the device boundary: code does not cross, an id and an argument list do.
+Lives in [`src/backend/accel_op.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/accel_op.rs). The layer that turns "a GPU is registered" into "eligible work runs on it" without a per-call-site placement decision. A Rust closure cannot execute on a GPU or TPU, so the surface is a registry of DECLARED equivalences, mirroring `pass_registry`'s closure-id pattern at the device boundary: code does not cross, an id and an argument list do.
 
 ```rust
 pub fn register_accel_op(name, bytes_per_item, cpu_impl) -> AccelOpId
@@ -277,11 +277,11 @@ Per dispatch, three decisions in order:
 
 The trait grows `DispatchBackend::dispatch_kernel_sync` (launch to COMPLETION, defaulted to `dispatch_kernel` for inherently synchronous backends; `CudaBackend` overrides with launch + stream synchronize), which is what the router times against.
 
-Every failure lands on the CPU implementation: no binding, an unregistered backend, a failed launch. E2E on live devices: [`examples/accel_route_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/accel_route_demo.rs) - the gate keeps a 64-item batch on the CPU, the cold bucket races, and 9/9 warm rounds exploit the GPU on both bench hosts (262k-element Newton sqrt: AVX2 host + RTX 3070, CPU 7.4 ms vs GPU 174 us; AVX-512 host + RTX 5070, CPU 2.7 ms vs GPU 87 us).
+Every failure lands on the CPU implementation: no binding, an unregistered backend, a failed launch. E2E on live devices: [`examples/accel_route_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/accel_route_demo.rs) - the gate keeps a 64-item batch on the CPU, the cold bucket races, and 9/9 warm rounds exploit the GPU on both bench hosts (262k-element Newton sqrt: AVX2 host + RTX 3070, CPU 7.4 ms vs GPU 174 us; AVX-512 host + RTX 5070, CPU 2.7 ms vs GPU 87 us).
 
 ## Detection probes
 
-[`src/backend/detect.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/detect.rs) probes whether each accelerator runtime is present on the host *without linking the SDK at build time*. Every probe `dlopen`s the platform-specific shared library via `libloading` or checks a known device-file / env-var path.
+[`src/backend/detect.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/detect.rs) probes whether each accelerator runtime is present on the host *without linking the SDK at build time*. Every probe `dlopen`s the platform-specific shared library via `libloading` or checks a known device-file / env-var path.
 
 | Probe | What it checks |
 |-------|---------------|

@@ -4,7 +4,7 @@
 # Only params verified against the Hextra docs + starter template are
 # included; nothing is invented from training-data memory.
 
-baseURL: https://markusmcnugen.github.io/flynnel/
+baseURL: https://variably-constant.github.io/Flynnel/
 title: Flynnel Wiki
 languageCode: en-us
 enableRobotsTXT: true
@@ -36,7 +36,7 @@ menu:
         type: search
     - name: GitHub
       weight: 3
-      url: https://github.com/markusmcnugen/flynnel
+      url: https://github.com/Variably-Constant/Flynnel
       params:
         icon: github
 
@@ -65,7 +65,7 @@ params:
 
   editURL:
     enable: true
-    base: https://github.com/markusmcnugen/flynnel/edit/main/wiki/content
+    base: https://github.com/Variably-Constant/Flynnel/edit/main/wiki/content
 
   search:
     enable: true

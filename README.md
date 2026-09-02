@@ -569,4 +569,4 @@ reproduced verbatim in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
 
 ## Contributing
 
-Issues and PRs welcome at [github.com/markusmcnugen/flynnel](https://github.com/markusmcnugen/flynnel). For larger changes, please open an issue first to discuss the design - especially anything that adds a new dispatch profile or a new Flynn axis.
+Issues and PRs welcome at [github.com/Variably-Constant/Flynnel](https://github.com/Variably-Constant/Flynnel). For larger changes, please open an issue first to discuss the design - especially anything that adds a new dispatch profile or a new Flynn axis.

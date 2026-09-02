@@ -52,7 +52,7 @@ Every primitive in the `flynnel::sched` module, organised by Flynn axis. The wor
 
 ## `arena`
 
-The MIMD entry points. Defined in [`src/sched/arena.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/arena.rs).
+The MIMD entry points. Defined in [`src/sched/arena.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/arena.rs).
 
 ### `join`
 
@@ -107,7 +107,7 @@ Lazily-initialized process-global NUMA-aware arena. On single-NUMA hosts this is
 
 ## `par_iter`
 
-The bisecting parallel-iterator family. Defined in [`src/sched/par_iter.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/par_iter.rs).
+The bisecting parallel-iterator family. Defined in [`src/sched/par_iter.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/par_iter.rs).
 
 ### `for_each_chunk`
 
@@ -178,7 +178,7 @@ Map-fold-reduce: each leaf chunk folds into an accumulator `A`; chunk-level accu
 
 ## `k_join`
 
-Const-generic K-recursion driver. Defined in [`src/sched/k_join.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/k_join.rs).
+Const-generic K-recursion driver. Defined in [`src/sched/k_join.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/k_join.rs).
 
 ### `k_join`
 
@@ -203,7 +203,7 @@ Use these when the K parameter is compile-time-known (Karatsuba / NTT / Burnikel
 
 ## `cooperative`
 
-The SIMC and MIMC entry point. Defined in [`src/sched/cooperative.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/cooperative.rs).
+The SIMC and MIMC entry point. Defined in [`src/sched/cooperative.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/cooperative.rs).
 
 ### `cooperative_join_n`
 
@@ -284,11 +284,11 @@ let results = cooperative_join_n(&plan, closures);
 
 Four closures, four distinct roles, one cooperative sync boundary. MIMC.
 
-See [`benches/flynn_axes.rs`](https://github.com/markusmcnugen/flynnel/blob/main/benches/flynn_axes.rs) for the criterion benches that exercise the 4-way heterogeneous reduce and the pivoted-LU step MIMC shapes, and [`examples/dispatcher_per_axis.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/dispatcher_per_axis.rs) for a runnable MIMC walk-through through the AdaptiveDispatcher.
+See [`benches/flynn_axes.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/benches/flynn_axes.rs) for the criterion benches that exercise the 4-way heterogeneous reduce and the pivoted-LU step MIMC shapes, and [`examples/dispatcher_per_axis.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/dispatcher_per_axis.rs) for a runnable MIMC walk-through through the AdaptiveDispatcher.
 
 ## `hybrid`
 
-The MIMT entry point. Defined in [`src/sched/hybrid.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/hybrid.rs).
+The MIMT entry point. Defined in [`src/sched/hybrid.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/hybrid.rs).
 
 ### `join_hybrid`
 
@@ -396,7 +396,7 @@ let accepted: Vec<f32> = hybrid_pipeline(&plan, 0..16u64, pre_cpu, gpu, post_cpu
 assert_eq!(accepted.len(), 16);
 ```
 
-See [`benches/mimt_coupled.rs`](https://github.com/markusmcnugen/flynnel/blob/main/benches/mimt_coupled.rs) for three full coupled-algorithm bench files (MCMC, batched CG, AlphaZero-shape MCTS) and the [Benchmarks page](Benchmarks.md#mimt-pipelined---coupled-algorithm-benchmarks) for measured speedups (Metropolis MCMC 1.96x, Batched CG 2.35x, MCTS 1.84x on Zen+/16T + RTX 3070).
+See [`benches/mimt_coupled.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/benches/mimt_coupled.rs) for three full coupled-algorithm bench files (MCMC, batched CG, AlphaZero-shape MCTS) and the [Benchmarks page](Benchmarks.md#mimt-pipelined---coupled-algorithm-benchmarks) for measured speedups (Metropolis MCMC 1.96x, Batched CG 2.35x, MCTS 1.84x on Zen+/16T + RTX 3070).
 
 ### `hybrid_auto`
 
@@ -414,7 +414,7 @@ Learned CPU-vs-backend placement for two implementations of the SAME computation
 - **Warm bucket**: routes to whichever side holds the lower EWMA and times just that side, keeping the model current.
 - **Reprobe**: every 32nd call in a bucket re-races so a shifted workload or freed-up device gets re-measured.
 
-Returns `(result, Placement)` where [`Placement`](#call_site) reports `Cpu`, `Backend`, or `Race`. End-to-end wall time on the calling side is the ONLY signal; there is no data-residency model, so transfer cost is captured implicitly in the measured backend time. E2E walkthrough: [`examples/hybrid_auto_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/hybrid_auto_demo.rs).
+Returns `(result, Placement)` where [`Placement`](#call_site) reports `Cpu`, `Backend`, or `Race`. End-to-end wall time on the calling side is the ONLY signal; there is no data-residency model, so transfer cost is captured implicitly in the measured backend time. E2E walkthrough: [`examples/hybrid_auto_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/hybrid_auto_demo.rs).
 
 ### `hybrid_auto_split`
 
@@ -443,7 +443,7 @@ Data-parallel variant: splits `items` between the CPU and the backend at a LEARN
 
 ## `race`
 
-The MISD entry point. Defined in [`src/sched/race.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/race.rs).
+The MISD entry point. Defined in [`src/sched/race.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/race.rs).
 
 ### `race_variants`
 
@@ -491,11 +491,11 @@ The COMPLEMENT of [`race_variants`]. Where `race_variants` is first-past-the-pos
 - `explore(i)` produces explorer `i`'s result for `i` in `0..n`; the index seeds per-explorer state (clone id, RNG stream).
 - `better(a, b)` returns `true` when `a` is STRICTLY better than `b`, fully defining "best" (argmin, argmax, lexicographic, tie-break) without float-`Ord` friction. Ties keep the earlier index, so the winner is deterministic given deterministic explorers.
 
-Returns the winning `(index, result)`, or `None` when `n == 0`. Each explorer is one leaf (`min_leaf = 1`) so N heavy trajectories fan out fully even at small N. E2E walkthrough: [`examples/explore_select_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/explore_select_demo.rs).
+Returns the winning `(index, result)`, or `None` when `n == 0`. Each explorer is one leaf (`min_leaf = 1`) so N heavy trajectories fan out fully even at small N. E2E walkthrough: [`examples/explore_select_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/explore_select_demo.rs).
 
 ### The racing family
 
-`race_variants` and `explore_select` are two answers to one question: launch several trials, then decide something from how they turn out. Racing has more answers than those two. Each primitive below fixes a different combination of three choices - when the ensemble stops, what it returns, and what the losers do - and each matches a distinct kind of work. The [`racing_zoo_demo`](https://github.com/markusmcnugen/flynnel/blob/main/examples/racing_zoo_demo.rs) runs all of them against known-correct answers.
+`race_variants` and `explore_select` are two answers to one question: launch several trials, then decide something from how they turn out. Racing has more answers than those two. Each primitive below fixes a different combination of three choices - when the ensemble stops, what it returns, and what the losers do - and each matches a distinct kind of work. The [`racing_zoo_demo`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/racing_zoo_demo.rs) runs all of them against known-correct answers.
 
 ### `race_any`
 
@@ -608,7 +608,7 @@ Useful when paired indices need disjoint mutable access that the standard slice 
 
 ## `pipeline`
 
-Generic N-stage pipeline. Defined in [`src/sched/pipeline.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/pipeline.rs).
+Generic N-stage pipeline. Defined in [`src/sched/pipeline.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/pipeline.rs).
 
 ### `PipelineStage` trait
 
@@ -672,7 +672,7 @@ Panics if `lhs.len() != rhs.len()`.
 
 ## `mode_region`
 
-Matrix-extension mode-region wrappers (Intel AMX, ARM SME, NVIDIA Tensor Cores). Defined in [`src/sched/mode_region.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/mode_region.rs).
+Matrix-extension mode-region wrappers (Intel AMX, ARM SME, NVIDIA Tensor Cores). Defined in [`src/sched/mode_region.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/mode_region.rs).
 
 ### `MatrixModeBackend` trait
 
@@ -702,7 +702,7 @@ The always-available no-op backend so callers can write `run_in_region` code tha
 
 ## `io_pool`
 
-SMT-sibling thread pool for non-compute roles. Defined in [`src/sched/io_pool.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/io_pool.rs).
+SMT-sibling thread pool for non-compute roles. Defined in [`src/sched/io_pool.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/io_pool.rs).
 
 ### `IoPool`
 
@@ -763,11 +763,11 @@ no controller, so existing throughput code does not regress; a bursty
 workload opts in. Measured (RTX-host 16-thread, 120-burst bursty
 workload): the forced short window cut idle yields 3.2x, the adaptive
 controller 2.1x while converging the window to its floor. E2E:
-[`examples/adaptive_spin_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/adaptive_spin_demo.rs).
+[`examples/adaptive_spin_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/adaptive_spin_demo.rs).
 
 ## `bg_calibration`
 
-Background per-host calibration on the IO pool. Defined in [`src/sched/bg_calibration.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/bg_calibration.rs).
+Background per-host calibration on the IO pool. Defined in [`src/sched/bg_calibration.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/bg_calibration.rs).
 
 ### `timed_avg_ns`
 
@@ -787,7 +787,7 @@ Submit a list of calibration microbenches to the IO pool. No-op when the IO pool
 
 ## `prefetch`
 
-Software prefetch hints. Defined in [`src/sched/prefetch.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/prefetch.rs).
+Software prefetch hints. Defined in [`src/sched/prefetch.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/prefetch.rs).
 
 ```rust
 pub fn prefetch_into_l3<T>(slice: &[T])
@@ -800,7 +800,7 @@ The non-inline variants submit to the IO pool (async prefetch on the SMT sibling
 
 ## `numa_alloc`
 
-Cross-platform NUMA-aware page allocator. Defined in [`src/sched/numa_alloc.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/numa_alloc.rs).
+Cross-platform NUMA-aware page allocator. Defined in [`src/sched/numa_alloc.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/numa_alloc.rs).
 
 ### `NumaAlloc`
 
@@ -812,7 +812,7 @@ Sentinel constant (`u32::MAX`) meaning "use the current thread's NUMA node."
 
 ## `bg_zero`
 
-Background memory zeroing for next-op allocation. Defined in [`src/sched/bg_zero.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/bg_zero.rs).
+Background memory zeroing for next-op allocation. Defined in [`src/sched/bg_zero.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/bg_zero.rs).
 
 ### `prepare`
 
@@ -824,7 +824,7 @@ Submit a request to allocate + first-touch a `Vec<u8>` of size `n_bytes` on the 
 
 ## `verify_chain` (feature `verify-chain`)
 
-BLAKE3-rooted hash chain for per-stripe verification. Defined in [`src/sched/verify_chain.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/verify_chain.rs).
+BLAKE3-rooted hash chain for per-stripe verification. Defined in [`src/sched/verify_chain.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/verify_chain.rs).
 
 ### `VerifyHasher` trait
 
@@ -854,7 +854,7 @@ Running hash chain over a sequence of stripe outputs. `submit_chunk` is non-bloc
 
 ## `split_observer`
 
-Runtime tuning of the SLAW split-budget multiplier. Defined in [`src/sched/split_observer.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/split_observer.rs).
+Runtime tuning of the SLAW split-budget multiplier. Defined in [`src/sched/split_observer.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/split_observer.rs).
 
 ### `split_multiplier` / `set_split_multiplier`
 
@@ -887,7 +887,7 @@ Aggregate leaf-time statistics produced by `snapshot_leaf_stats`.
 
 ## `idempotent`
 
-Marker trait for jobs safe to execute more than once. Defined in [`src/sched/idempotent.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/idempotent.rs).
+Marker trait for jobs safe to execute more than once. Defined in [`src/sched/idempotent.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/idempotent.rs).
 
 ```rust
 pub trait IdempotentJob: Send + Sync {
@@ -901,7 +901,7 @@ Pairs with fence-free work-stealing variants where the cross-worker race can los
 
 ## `chase_lev_local`
 
-In-house Chase-Lev work-stealing deque. Defined in [`src/sched/chase_lev_local.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/chase_lev_local.rs). Replaces the prior dependency on `crossbeam::deque::{Worker, Stealer, Steal}`; same wait-free single-owner LIFO + thief-side FIFO steal per Vafeiadis et al. (arXiv:2309.03642), generic over the slot type `T`.
+In-house Chase-Lev work-stealing deque. Defined in [`src/sched/chase_lev_local.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/chase_lev_local.rs). Replaces the prior dependency on `crossbeam::deque::{Worker, Stealer, Steal}`; same wait-free single-owner LIFO + thief-side FIFO steal per Vafeiadis et al. (arXiv:2309.03642), generic over the slot type `T`.
 
 ### `new_chase_lev`
 
@@ -933,7 +933,7 @@ Three-arm outcome of `Worker::pop` and `Stealer::steal`: `Success(T)` / `Empty` 
 
 ## `flynnel_ring`
 
-Bounded MPMC Vyukov per-slot-sequence ring. Defined in [`src/sched/flynnel_ring.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/flynnel_ring.rs).
+Bounded MPMC Vyukov per-slot-sequence ring. Defined in [`src/sched/flynnel_ring.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/flynnel_ring.rs).
 
 ```rust
 pub struct FlynnelRing<T: Send> { /* opaque */ }
@@ -953,7 +953,7 @@ Used as the per-worker mailbox in [`arena_local`](#arena_local) (replaced `cross
 
 ## `flynnel_ring_spsc`
 
-Single-producer single-consumer Lamport ring with zero CAS. Defined in [`src/sched/flynnel_ring_spsc.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/flynnel_ring_spsc.rs).
+Single-producer single-consumer Lamport ring with zero CAS. Defined in [`src/sched/flynnel_ring_spsc.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/flynnel_ring_spsc.rs).
 
 ```rust
 pub fn new_spsc<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>)
@@ -966,7 +966,7 @@ Producer Release-stores `tail`; consumer Release-stores `head`; counters live on
 
 ## `flynnel_ring_mpsc`
 
-Multi-producer single-consumer ring. CAS on the producer side, no CAS on the consumer side. Defined in [`src/sched/flynnel_ring_mpsc.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/flynnel_ring_mpsc.rs).
+Multi-producer single-consumer ring. CAS on the producer side, no CAS on the consumer side. Defined in [`src/sched/flynnel_ring_mpsc.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/flynnel_ring_mpsc.rs).
 
 ```rust
 pub fn new_mpsc<T: Send>(capacity: usize) -> (MpscProducer<T>, Consumer<T>)
@@ -979,7 +979,7 @@ pub enum MpscPopResult<T>  { Ok(T), Empty }
 
 ## `flynnel_ring_composed`
 
-N-by-M Lamport SPSC grid: MPMC built from `N * M` per-pair SPSC rings instead of one Vyukov MPMC. Per-producer FIFO preserved; global FIFO traded for per-op throughput. Defined in [`src/sched/flynnel_ring_composed.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/flynnel_ring_composed.rs).
+N-by-M Lamport SPSC grid: MPMC built from `N * M` per-pair SPSC rings instead of one Vyukov MPMC. Per-producer FIFO preserved; global FIFO traded for per-op throughput. Defined in [`src/sched/flynnel_ring_composed.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/flynnel_ring_composed.rs).
 
 ```rust
 pub fn new_composed_mpsc<T: Send>(n_producers: usize, capacity_per_producer: usize) -> ComposedMpsc<T>
@@ -1002,7 +1002,7 @@ Headline measured win on 44T Genoa Heavy/100k MPMC: composed grid 21.08 M/s vs V
 
 ## `injector`
 
-Global MPMC fork queue. External submitters push jobs here; arena workers steal from it when their local deque is empty. Defined in [`src/sched/injector.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/injector.rs).
+Global MPMC fork queue. External submitters push jobs here; arena workers steal from it when their local deque is empty. Defined in [`src/sched/injector.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/injector.rs).
 
 ```rust
 pub struct Injector<T: Send> { /* wraps FlynnelRing<T> */ }
@@ -1023,7 +1023,7 @@ In-house implementation of the global injector. Same three-arm `Success` / `Empt
 
 ## `notify_ring`
 
-Blocking notify-wrapper over `FlynnelRing` + per-consumer `Parker`. Gives the standard channel surface (`send` / `recv` / `close`) without depending on `crossbeam::channel` or `std::sync::mpsc`. Defined in [`src/sched/notify_ring.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/notify_ring.rs).
+Blocking notify-wrapper over `FlynnelRing` + per-consumer `Parker`. Gives the standard channel surface (`send` / `recv` / `close`) without depending on `crossbeam::channel` or `std::sync::mpsc`. Defined in [`src/sched/notify_ring.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/notify_ring.rs).
 
 ```rust
 pub struct NotifyHub<T: Send> { /* opaque */ }
@@ -1046,7 +1046,7 @@ Used by the IO pool ([`io_pool`](#io_pool)), the hybrid pipeline ([`hybrid::hybr
 
 ## `call_site`
 
-Per-call-site adaptive state. Defined in [`src/sched/call_site.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/call_site.rs).
+Per-call-site adaptive state. Defined in [`src/sched/call_site.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/call_site.rs).
 
 ```rust
 pub struct CallSiteState { /* all-atomic, const-init */ }
@@ -1067,11 +1067,11 @@ What each site learns, all atomically and lock-free:
 - **Policy arms**: EWMA per arm (`Slaw` vs `Heartbeat`) with a trial cadence, so irregular workloads converge on the scheduling policy that measures faster at THAT site.
 - **Hybrid placement**: per-log2-size-bucket CPU vs backend EWMAs feeding [`hybrid_auto`](#hybrid_auto), plus learned per-item split throughputs feeding [`hybrid_auto_split`](#hybrid_auto_split).
 
-`SiteRef::new(&STATIC_SITE)` wraps a caller-owned static for explicit attachment via [`JobPlan::with_site`](JobPlan-Reference.md#builder-methods); an outer attachment always wins over the entry's own location-resolved site. E2E walkthrough: [`examples/site_classifier_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/site_classifier_demo.rs).
+`SiteRef::new(&STATIC_SITE)` wraps a caller-owned static for explicit attachment via [`JobPlan::with_site`](JobPlan-Reference.md#builder-methods); an outer attachment always wins over the entry's own location-resolved site. E2E walkthrough: [`examples/site_classifier_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/site_classifier_demo.rs).
 
 ## `adaptive_profile`
 
-Process-global `WorkloadClass` / `DispatchProfile` migration via a single `AtomicU8` tag, plus the calibrated classification thresholds. Defined in [`src/sched/adaptive_profile.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_profile.rs).
+Process-global `WorkloadClass` / `DispatchProfile` migration via a single `AtomicU8` tag, plus the calibrated classification thresholds. Defined in [`src/sched/adaptive_profile.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_profile.rs).
 
 ```rust
 pub enum WorkloadClass { Light, Compute, Heavy, Memory }
@@ -1084,7 +1084,7 @@ pub fn migrate_workload_class(c: WorkloadClass);         // Release-store
 
 The global `ACTIVE_PROFILE_TAG: AtomicU8` is read by the `AdaptiveDispatcher`'s plan construction (~1 ns), zero per-op cost on the dispatch hot path. [`JobPlan::new`](JobPlan-Reference.md#new) routes from its own static classifier instead, so the global reflects dispatcher-surface policy rather than every plan. Applications observe their workload and call `migrate_workload_class(...)` when the active class no longer matches; the observer's `tick_auto_classify()` does the same automatically from measured leaf times.
 
-See [`WorkloadClass`](Foundation-Types-Reference.md#workloadclass) for the user-facing enum + the mapping to `DispatchProfile`; migration behavior is covered by the unit tests in [`src/sched/adaptive_profile.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_profile.rs).
+See [`WorkloadClass`](Foundation-Types-Reference.md#workloadclass) for the user-facing enum + the mapping to `DispatchProfile`; migration behavior is covered by the unit tests in [`src/sched/adaptive_profile.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_profile.rs).
 
 ### `ClassThresholds` and in-binary calibration
 
@@ -1109,7 +1109,7 @@ The classification boundaries used by `classify_observed` and the static hint br
 
 ## `adaptive_worker`
 
-Per-worker K_inner=3 deque-backing tag swap. Defined in [`src/sched/adaptive_worker.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_worker.rs).
+Per-worker K_inner=3 deque-backing tag swap. Defined in [`src/sched/adaptive_worker.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_worker.rs).
 
 ```rust
 pub struct AdaptiveWorker { /* holds an AtomicU32 tag + two backings */ }
@@ -1126,7 +1126,7 @@ See [`KGating`](Foundation-Types-Reference.md#kgating) for the user-facing enum.
 
 ## `adaptive_backend`
 
-Process-global active-backend tag swap. Defined in [`src/sched/adaptive_backend.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_backend.rs).
+Process-global active-backend tag swap. Defined in [`src/sched/adaptive_backend.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_backend.rs).
 
 ```rust
 pub fn active_backend_id() -> Backend;
@@ -1140,7 +1140,7 @@ Wired by [`AdaptiveDispatcher`](#dispatch) for `migrate_backend` / `active_backe
 
 ## `dispatch`
 
-Unified user-facing dispatcher: [`AdaptiveDispatcher`](#dispatch). Defined in [`src/sched/dispatch.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/dispatch.rs). Picks the Flynn-axis entry point (SISD / MIMD / SIMC / MIMC / MISD) from a single [`WorkloadShape`](Foundation-Types-Reference.md#workloadshape) hint.
+Unified user-facing dispatcher: [`AdaptiveDispatcher`](#dispatch). Defined in [`src/sched/dispatch.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/dispatch.rs). Picks the Flynn-axis entry point (SISD / MIMD / SIMC / MIMC / MISD) from a single [`WorkloadShape`](Foundation-Types-Reference.md#workloadshape) hint.
 
 ```rust
 pub struct AdaptiveDispatcher { /* opaque */ }
@@ -1174,7 +1174,7 @@ impl AdaptiveDispatcher {
 }
 ```
 
-End-to-end demo covering all four Flynn-axis dispatches + all four migration surfaces (K_gating, WorkloadClass, DispatchProfile, Backend) sits at [`examples/adaptive_dispatcher_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/adaptive_dispatcher_demo.rs):
+End-to-end demo covering all four Flynn-axis dispatches + all four migration surfaces (K_gating, WorkloadClass, DispatchProfile, Backend) sits at [`examples/adaptive_dispatcher_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/adaptive_dispatcher_demo.rs):
 
 ```sh
 cargo run --release --example adaptive_dispatcher_demo
@@ -1183,7 +1183,7 @@ cargo run --release --features cuda-reference,wasm-reference --example adaptive_
 
 ## `workload_shape`
 
-Declarative shape API. Defined in [`src/sched/workload_shape.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/workload_shape.rs). The enum lives at the call site; the dispatcher maps shape -> `(k_gating, mailbox, oversubscription)` knob triples once at plan construction, and the per-call dispatch path stays direct atomic ops.
+Declarative shape API. Defined in [`src/sched/workload_shape.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/workload_shape.rs). The enum lives at the call site; the dispatcher maps shape -> `(k_gating, mailbox, oversubscription)` knob triples once at plan construction, and the per-call dispatch path stays direct atomic ops.
 
 ```rust
 pub enum WorkloadShape {
@@ -1209,7 +1209,7 @@ Consumed by [`JobPlan::with_workload_shape(shape)`](JobPlan-Reference.md#builder
 
 ## `k_gating`
 
-Per-worker K_inner=3 deque-backing selector + per-host calibration. Defined in [`src/sched/k_gating.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/k_gating.rs).
+Per-worker K_inner=3 deque-backing selector + per-host calibration. Defined in [`src/sched/k_gating.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/k_gating.rs).
 
 ```rust
 pub enum KGating { Auto, CounterOnly, PerSlot }
@@ -1224,7 +1224,7 @@ See [`KGating`](Foundation-Types-Reference.md#kgating) for the user-facing enum 
 
 ## `arena_local`
 
-Single-NUMA-node work-stealing thread pool. Defined in [`src/sched/arena_local.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/arena_local.rs).
+Single-NUMA-node work-stealing thread pool. Defined in [`src/sched/arena_local.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/arena_local.rs).
 
 ```rust
 pub struct LocalArena { /* opaque */ }
@@ -1247,7 +1247,7 @@ Each worker holds an [`AdaptiveWorker`](#adaptive_worker) per-tier stack (4 tier
 
 ## `arena_numa`
 
-Multi-NUMA composition. Defined in [`src/sched/arena_numa.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/arena_numa.rs).
+Multi-NUMA composition. Defined in [`src/sched/arena_numa.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/arena_numa.rs).
 
 ```rust
 pub struct NumaArena { /* opaque */ }
@@ -1257,7 +1257,7 @@ Composes one `LocalArena` per NUMA node. On single-NUMA hosts (most desktops) it
 
 ## `numa_latency`
 
-Cross-core cache-line round-trip latency table. Defined in [`src/sched/numa_latency.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/numa_latency.rs).
+Cross-core cache-line round-trip latency table. Defined in [`src/sched/numa_latency.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/numa_latency.rs).
 
 ```rust
 pub struct TopologyLatencyTable { /* opaque */ }

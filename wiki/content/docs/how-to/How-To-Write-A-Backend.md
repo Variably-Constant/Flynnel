@@ -207,15 +207,15 @@ This is the same contract the reference [`CudaBackend`](Reference-Backends-CUDA-
 
 ## Testing your backend
 
-Stub a backend that records calls into atomic counters. The existing [`backend_dispatch_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/backend_dispatch_demo.rs) shows the pattern: register the stub, route work, observe the counters tick. This is the recommended test scaffold for new backends.
+Stub a backend that records calls into atomic counters. The existing [`backend_dispatch_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/backend_dispatch_demo.rs) shows the pattern: register the stub, route work, observe the counters tick. This is the recommended test scaffold for new backends.
 
 ## Where the existing impls live
 
 | Backend | Lines | File |
 |---------|-------|------|
-| `CpuBackend` | 152 | [`src/backend/cpu.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/cpu.rs) |
-| `CudaBackend` (cuda-reference) | 585 | [`src/backend/cuda.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/cuda.rs) |
-| `TpuJaxBackend` (tpu-jax-reference) | 477 | [`src/backend/tpu_jax.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/tpu_jax.rs) |
-| `WasmBackend` (wasm-reference) | 429 | [`src/backend/wasm.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/wasm.rs) |
+| `CpuBackend` | 152 | [`src/backend/cpu.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/cpu.rs) |
+| `CudaBackend` (cuda-reference) | 585 | [`src/backend/cuda.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/cuda.rs) |
+| `TpuJaxBackend` (tpu-jax-reference) | 477 | [`src/backend/tpu_jax.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/tpu_jax.rs) |
+| `WasmBackend` (wasm-reference) | 429 | [`src/backend/wasm.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/wasm.rs) |
 
 The CPU impl is the simplest reference. The CUDA impl shows the dlopen-via-cudarc shape (no SDK at build time). The TPU impl shows the subprocess-bridge shape with JSON wire protocol. The WASM impl shows the pure-Rust wasmtime sandbox shape.

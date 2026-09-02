@@ -1,4 +1,4 @@
-module github.com/markusmcnugen/flynnel/wiki
+module github.com/Variably-Constant/Flynnel/wiki
 
 go 1.22
 

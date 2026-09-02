@@ -94,7 +94,7 @@ This is the highest-rank Flynn axis Flynnel exposes. Below it the taxonomy fans 
 
 When the closures passed to `cooperative_join_n` are not identical, the call is MIMC (Multiple Instruction, Multiple Cores). The classic case: in a 4-way cooperative reduce, three closures compute partials and the fourth computes a calibration probe; all four run concurrently and the result combines deterministically. Flynnel's `K_class` axis names this pattern (`K_class = 2` for two distinct roles, etc.); the cooperative_join_n primitive carries the partition shape directly.
 
-Two workload shapes ship as MIMC benchmark contenders in [`benches/flynn_axes.rs`](https://github.com/markusmcnugen/flynnel/blob/main/benches/flynn_axes.rs):
+Two workload shapes ship as MIMC benchmark contenders in [`benches/flynn_axes.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/benches/flynn_axes.rs):
 
 - **4-way heterogeneous reduce**: 3 closures compute partial chained-sqrt sums over disjoint chunks (role A), 1 closure computes a max-abs calibration probe over the whole input (role B). Total work at this cell ~9 ms.
 - **Pivoted-LU step**: 1 closure does pivot selection + row scale (role A: scalar column scan), 7 closures apply the pivot to disjoint trailing-row ranges (role B: vector SAXPY). The canonical "one role factors, N roles apply" pattern in numerical linear algebra. Fine-grain coordination scale ~130 us per step; the cooperative primitive's single-sync-boundary matches the algorithm's dependency graph directly.
@@ -126,7 +126,7 @@ See [JobPlan Reference](JobPlan-Reference.md) for the full field list.
 
 ## Using each axis through `AdaptiveDispatcher`
 
-[`AdaptiveDispatcher`](../reference/Sched-Module-Reference.md#dispatch) is the unified user-facing surface. Every Flynn axis Flynnel exposes is reachable through it via a matching `execute_*` method + a `WorkloadShape` hint. The hint routes the dispatch to the low-level primitive AND tunes the K-axis knobs (K_gating, mailbox routing, oversubscription) via [`WorkloadShape::hints()`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/workload_shape.rs).
+[`AdaptiveDispatcher`](../reference/Sched-Module-Reference.md#dispatch) is the unified user-facing surface. Every Flynn axis Flynnel exposes is reachable through it via a matching `execute_*` method + a `WorkloadShape` hint. The hint routes the dispatch to the low-level primitive AND tunes the K-axis knobs (K_gating, mailbox routing, oversubscription) via [`WorkloadShape::hints()`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/workload_shape.rs).
 
 | Axis | Dispatcher call | `WorkloadShape` hint | Underlying primitive |
 |---|---|---|---|
@@ -302,7 +302,7 @@ let outputs: Vec<f32> = hybrid_pipeline(
 | `.migrate_backend(Backend)` | Retarget the SIMT / MIMT accelerator dispatches. |
 | `.active_dispatch_profile()` / `.active_backend_id()` / `.resolve_active_backend()` | Observation methods for the currently-active state. |
 
-Each migration is a single atomic Release-store; the per-op deque hot path is untouched. A full walk-through of all three (K_gating + WorkloadClass + Backend) lives at [`examples/adaptive_dispatcher_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/adaptive_dispatcher_demo.rs). A per-axis walk-through of every `execute_*` method above (SISD / MIMD / SIMC / SIMC-mailbox / MIMC / SIMT / migration surface) lives at [`examples/dispatcher_per_axis.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/dispatcher_per_axis.rs); run with `cargo run --example dispatcher_per_axis --release`.
+Each migration is a single atomic Release-store; the per-op deque hot path is untouched. A full walk-through of all three (K_gating + WorkloadClass + Backend) lives at [`examples/adaptive_dispatcher_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/adaptive_dispatcher_demo.rs). A per-axis walk-through of every `execute_*` method above (SISD / MIMD / SIMC / SIMC-mailbox / MIMC / SIMT / migration surface) lives at [`examples/dispatcher_per_axis.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/dispatcher_per_axis.rs); run with `cargo run --example dispatcher_per_axis --release`.
 
 ## Reading the source
 
@@ -310,11 +310,11 @@ Each axis maps to one or more modules:
 
 | Axis | Module |
 |------|--------|
-| SISD | [`sched::arena::inline_join_context`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/arena.rs) (private; reached via `pick_tier == Inline`) |
+| SISD | [`sched::arena::inline_join_context`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/arena.rs) (private; reached via `pick_tier == Inline`) |
 | SIMD | [`HwClass`](Foundation-Types-Reference.md#hwclass) classifier + consumer kernel bodies |
-| MISD | [`sched::race`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/race.rs) |
-| MIMD | [`sched::arena`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/arena.rs), [`sched::arena_local`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/arena_local.rs), [`sched::par_iter`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/par_iter.rs) |
-| SIMT | [`backend::DispatchBackend`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/mod.rs) |
-| MIMT | [`sched::hybrid::join_hybrid`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/hybrid.rs) |
-| SIMC | [`sched::cooperative`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/cooperative.rs) |
+| MISD | [`sched::race`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/race.rs) |
+| MIMD | [`sched::arena`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/arena.rs), [`sched::arena_local`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/arena_local.rs), [`sched::par_iter`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/par_iter.rs) |
+| SIMT | [`backend::DispatchBackend`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/mod.rs) |
+| MIMT | [`sched::hybrid::join_hybrid`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/hybrid.rs) |
+| SIMC | [`sched::cooperative`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/cooperative.rs) |
 | MIMC | `K_class` partitioning inside `cooperative_join_n` |

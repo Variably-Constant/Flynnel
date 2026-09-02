@@ -141,7 +141,7 @@ assert_eq!(sum, 7);
 
 ## Runnable example
 
-[`examples/chase_lev_mmf_steal.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/chase_lev_mmf_steal.rs) ships an end-to-end cross-process demo: the parent process creates the deque + arena, spawns the same binary as a child process pointing at the same files, dispatches 100 add-jobs, and verifies all 100 results round-trip bit-exact through the cross-process steal path.
+[`examples/chase_lev_mmf_steal.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/chase_lev_mmf_steal.rs) ships an end-to-end cross-process demo: the parent process creates the deque + arena, spawns the same binary as a child process pointing at the same files, dispatches 100 add-jobs, and verifies all 100 results round-trip bit-exact through the cross-process steal path.
 
 ```sh
 cargo run --release --features shared-memory-worker-reference --example chase_lev_mmf_steal

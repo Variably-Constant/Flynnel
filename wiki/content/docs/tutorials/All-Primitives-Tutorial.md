@@ -3,7 +3,7 @@ title: All Primitives Tutorial
 weight: 2
 ---
 
-A walk-through of every workhorse Flynnel primitive with runnable examples. Every code block in this tutorial matches a section of [`examples/tutorial_all_apis.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/tutorial_all_apis.rs); build and run it end-to-end with:
+A walk-through of every workhorse Flynnel primitive with runnable examples. Every code block in this tutorial matches a section of [`examples/tutorial_all_apis.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/tutorial_all_apis.rs); build and run it end-to-end with:
 
 ```bash
 cargo run --example tutorial_all_apis --release
@@ -189,8 +189,8 @@ let (a, b) = k_join_with_plan::<8, _, _, _, _>(
 
 The extended-Flynn MIMT axes are demonstrated with real GPU kernels in:
 
-- [`examples/tpu_jax_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/tpu_jax_demo.rs): TPU JAX backend integration
-- [`benches/mimt_coupled.rs`](https://github.com/markusmcnugen/flynnel/blob/main/benches/mimt_coupled.rs): Metropolis MCMC, batched CG, MCTS with CUDA
+- [`examples/tpu_jax_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/tpu_jax_demo.rs): TPU JAX backend integration
+- [`benches/mimt_coupled.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/benches/mimt_coupled.rs): Metropolis MCMC, batched CG, MCTS with CUDA
 
 Build with the appropriate backend feature:
 

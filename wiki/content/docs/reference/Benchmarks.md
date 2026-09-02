@@ -57,14 +57,9 @@ Bench transparency: every flynnel cell in this tree measures the adaptive defaul
 
 - Adaptive rows (headline cells): `JobPlan::new(K, n)` constructed inside `iter_batched_ref`. `JobPlan::new` consults the process-global `active_dispatch_profile()` via one `AtomicU8::Acquire-load` at construction; `KGating::Auto` lets the AdaptiveWorker pick KHL vs Fcl per worker.
 - `flynnel_for_profile_*` rows (variant cells): `JobPlan::set_profile(K, n, DispatchProfile::*)` constructed inside `iter_batched_ref`. These pin the override for the row's named profile (`LatencyBound` activates SMT siblings; `PortBound` parks them; `MemoryBound` activates them with cache-miss interleaving defaults).
-- `flynnel_v_*` rows (per-variant cells): `JobPlan::new(K, n).with_bisect_variant(v)` for one of the two pinned [`BisectVariant`](Foundation-Types-Reference.md#bisectvariant) entries. On AMD + `PortBound` + the right batch size the adaptive routing resolves to the same variant automatically (see [`adaptive_variant_routing`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_variant_routing.rs)).
+- `flynnel_v_*` rows (per-variant cells): `JobPlan::new(K, n).with_bisect_variant(v)` for one of the two pinned [`BisectVariant`](Foundation-Types-Reference.md#bisectvariant) entries. On AMD + `PortBound` + the right batch size the adaptive routing resolves to the same variant automatically (see [`adaptive_variant_routing`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_variant_routing.rs)).
 
-Adaptive-switching coverage. The `JobPlan::new` to `active_dispatch_profile()` read AND the runtime `migrate_workload_class()` propagation path are verified by [`tests/adaptive_jobplan_streaming.rs`](https://github.com/markusmcnugen/flynnel/blob/main/tests/adaptive_jobplan_streaming.rs):
-
-1. `jobplan_new_reads_active_dispatch_profile_at_construction`: cycle the global through PortBound to LatencyBound to MemoryBound to PortBound and assert `JobPlan::new`'s `use_smt` + `estimated_per_item_ns` fields match the active profile's defaults on each transition.
-2. `jobplan_bare_ignores_active_profile`: `JobPlan::bare(K, batch)` returns the profile-independent baseline regardless of the global state.
-3. `mid_stream_migration_propagates_within_bounded_iters`: a producer thread constructs `JobPlan::new` in a tight loop while an observer thread calls `migrate_workload_class(LatencyBound)` mid-stream. Asserts the producer observes the new `use_smt = true` plan within a bounded number of post-migration iterations.
-4. `concurrent_producers_both_observe_oscillation`: two producer threads stream `JobPlan::new` while a third oscillates the class between `PortBound` and `LatencyBound` every 5 ms for 100 ms; each producer must observe BOTH SMT-on AND SMT-off plans.
+Adaptive-switching coverage. `JobPlan::new(K, batch)` runs the static classifier on its own arguments (the process-global class does NOT drive it; the global drives `AdaptiveDispatcher::build_plan` and the observer's auto-migration). The `migrate_workload_class()` propagation path is verified by `workload_class_migration_propagates` in [`src/sched/adaptive_profile.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_profile.rs); end-to-end routing of the adaptive default across real consumer workload shapes (tier promotion, entry probes, site learning) is verified by [`tests/consumer_shapes_e2e.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/tests/consumer_shapes_e2e.rs).
 
 ## Default thread count
 
@@ -105,11 +100,11 @@ Each cell reports median + p10 + p90 durations to stderr and appends one markdow
 
 ### Cross-process backend microbench
 
-`benches/chase_lev_mmf.rs` measures per-op push / steal / pop cost of the memory-mapped Chase-Lev deque that backs the [`shared-memory-worker-reference`](https://github.com/markusmcnugen/flynnel/blob/main/src/backend/shared_mem/) cross-process backend. The numbers characterize the mmap-backed deque under the same push / steal patterns the in-process `chase_lev_local` deque handles.
+`benches/chase_lev_mmf.rs` measures per-op push / steal / pop cost of the memory-mapped Chase-Lev deque that backs the [`shared-memory-worker-reference`](https://github.com/Variably-Constant/Flynnel/blob/main/src/backend/shared_mem/) cross-process backend. The numbers characterize the mmap-backed deque under the same push / steal patterns the in-process `chase_lev_local` deque handles.
 
 ### `parker_wait_strategy` (criterion)
 
-Compares the three worker wait strategies: pure `thread::yield_now` spin, `thread::park` with wake counter, and Intel `WAITPKG` (UMWAIT) on hosts where it is available. Used to justify the sleep-tier defaults in [`sched::sleep`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/sleep.rs).
+Compares the three worker wait strategies: pure `thread::yield_now` spin, `thread::park` with wake counter, and Intel `WAITPKG` (UMWAIT) on hosts where it is available. Used to justify the sleep-tier defaults in [`sched::sleep`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/sleep.rs).
 
 ### Flynn-axes bench (`flynn_axes` + `simc_*` + `mimt_coupled`)
 
@@ -128,7 +123,7 @@ The full extended-Flynn-taxonomy coverage:
 |---|---|
 | `FLYNNEL_SCHED_PHYSICAL_ONLY=on` | Cap worker pool to physical cores (no SMT siblings). |
 | `FLYNNEL_SCHED_WORKERS=N` | Set worker count per NUMA node to `N`. |
-| `FLYNNEL_SCHED_STRATEGY=yield\|park\|waitpkg` | Force worker wait strategy. Default: auto-picked by [`WaitStrategy::pick`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/sleep.rs). |
+| `FLYNNEL_SCHED_STRATEGY=yield\|park\|waitpkg` | Force worker wait strategy. Default: auto-picked by [`WaitStrategy::pick`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/sleep.rs). |
 | `FLYNNEL_TRACE_DISPATCH=1` | Emit per-join dispatch trace to stderr (JOIN_CALL_COUNT / JOIN_A_BODY_NS / JOIN_WAIT_NS accumulators). |
 | `FLYNNEL_LOCKLATCH_DIAGNOSE=1` | Diagnostic wait/exit tracing on `LockLatch`. |
 

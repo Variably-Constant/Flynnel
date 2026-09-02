@@ -94,7 +94,7 @@ backend.dispatch_kernel(handle, 1, &[KernelArg::U64(21)])?;
 backend.drain_one()?;
 ```
 
-A runnable cross-process example is at [`examples/chase_lev_mmf_steal.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/chase_lev_mmf_steal.rs). The originator spawns the same binary as a child process pointing at the same deque + arena files, dispatches 100 add-jobs, and verifies all 100 results round-trip bit-exact through cross-process Chase-Lev steal.
+A runnable cross-process example is at [`examples/chase_lev_mmf_steal.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/chase_lev_mmf_steal.rs). The originator spawns the same binary as a child process pointing at the same deque + arena files, dispatches 100 add-jobs, and verifies all 100 results round-trip bit-exact through cross-process Chase-Lev steal.
 
 ## Crossing the process boundary
 

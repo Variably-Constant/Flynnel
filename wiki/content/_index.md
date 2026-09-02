@@ -51,7 +51,7 @@ Three adaptive surfaces compose without user coordination:
 - **WorkloadClass** - process-global atomic that drives the default `DispatchProfile` for `AdaptiveDispatcher` plans. `set_profile(...)` and `with_workload_class(...)` override it per-call.
 - **Backend** - `migrate_backend(Backend::Cuda { device_id: 0 })` re-points dispatch through a different registered backend; `resolve_active_backend()` falls back to CPU when the requested backend is not registered.
 
-A full end-to-end demo covering all three sits at [`examples/adaptive_dispatcher_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/adaptive_dispatcher_demo.rs); run with `cargo run --release --example adaptive_dispatcher_demo` (add `--features cuda-reference,wasm-reference` to engage real backends).
+A full end-to-end demo covering all three sits at [`examples/adaptive_dispatcher_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/adaptive_dispatcher_demo.rs); run with `cargo run --release --example adaptive_dispatcher_demo` (add `--features cuda-reference,wasm-reference` to engage real backends).
 
 ## What Flynnel is not
 
@@ -66,7 +66,7 @@ The pages below are organised under the four Diataxis sections (cards above). Ea
 ### Tutorials
 
 - [Getting Started](Getting-Started.md) - 5-minute walkthrough that gets you from `cargo add flynnel` to running parallel work.
-- [All Primitives Tutorial](All-Primitives-Tutorial.md) - runnable walk-through of every workhorse Flynnel primitive (`join`, `join_context`, `join_default`, `for_each_chunk`, `cooperative_join_n`, `race_variants`, `k_join`, `k_join_with_plan`, plus hybrid dispatch). Matches [`examples/tutorial_all_apis.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/tutorial_all_apis.rs) end-to-end.
+- [All Primitives Tutorial](All-Primitives-Tutorial.md) - runnable walk-through of every workhorse Flynnel primitive (`join`, `join_context`, `join_default`, `for_each_chunk`, `cooperative_join_n`, `race_variants`, `k_join`, `k_join_with_plan`, plus hybrid dispatch). Matches [`examples/tutorial_all_apis.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/tutorial_all_apis.rs) end-to-end.
 
 ### How-to
 
@@ -95,4 +95,4 @@ The pages below are organised under the four Diataxis sections (cards above). Ea
 
 ## License
 
-MIT - see [LICENSE](https://github.com/markusmcnugen/flynnel/blob/main/LICENSE) on the repository.
+MIT - see [LICENSE](https://github.com/Variably-Constant/Flynnel/blob/main/LICENSE) on the repository.

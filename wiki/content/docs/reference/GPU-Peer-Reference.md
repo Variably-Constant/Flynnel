@@ -130,7 +130,7 @@ signature) and blocks until done. Measured on the RTX 3070 with a
 (one SM) 41.0 us, grid=full (64 blocks, all SMs) 19.2 us - a 2.14x
 lift from spreading the op across the device, same result both ways.
 So keep small ops on the doorbell and send large ones through
-`launch_wide`. E2E: [`examples/gpu_wide_op_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/gpu_wide_op_demo.rs).
+`launch_wide`. E2E: [`examples/gpu_wide_op_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/gpu_wide_op_demo.rs).
 
 Wide ops run on their OWN stream, separate from the poller's. That
 matters more than it sounds. A wide op on the poller's stream would
@@ -201,7 +201,7 @@ small doorbell ops submitted while paused simply queue and are
 consumed after resume. Measured on a 16 MiB streaming op: pausing
 reclaimed ~10% on this hardware, more where the co-runner is more
 occupancy-starved. E2E:
-[`examples/gpu_wide_batch_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/gpu_wide_batch_demo.rs).
+[`examples/gpu_wide_batch_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/gpu_wide_batch_demo.rs).
 
 ## User opcodes (a programmable doorbell op)
 
@@ -251,7 +251,7 @@ on the device, or both. Any transfer a placement flip needs runs
 INSIDE the timed section, so the one model prices data movement and
 execution together and sticky residence emerges from measurement
 rather than from a residency planner. E2E:
-[`examples/gpu_peer_hybrid_demo.rs`](https://github.com/markusmcnugen/flynnel/blob/main/examples/gpu_peer_hybrid_demo.rs).
+[`examples/gpu_peer_hybrid_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/gpu_peer_hybrid_demo.rs).
 
 ## Examples
 

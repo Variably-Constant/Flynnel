@@ -76,7 +76,7 @@ What's happening:
 
 ## Picking the right plan
 
-For most call sites `JobPlan::new(K, batch)` is enough. The default plan is adaptive: a static classifier on `(K, batch)` picks the `WorkloadClass` for call-1 routing, `KGating::Auto` lets the scheduler pick between the KHL (per-slot Vyukov) and Fcl (counter-only Chase-Lev) K_inner=3 backings based on host calibration, and per-call-site learned classes refine unpinned plans on later calls. The process-global class drives the `AdaptiveDispatcher` surface; [`flynnel::sched::adaptive_profile::migrate_workload_class`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_profile.rs) flips it in one atomic store, free on the per-op path.
+For most call sites `JobPlan::new(K, batch)` is enough. The default plan is adaptive: a static classifier on `(K, batch)` picks the `WorkloadClass` for call-1 routing, `KGating::Auto` lets the scheduler pick between the KHL (per-slot Vyukov) and Fcl (counter-only Chase-Lev) K_inner=3 backings based on host calibration, and per-call-site learned classes refine unpinned plans on later calls. The process-global class drives the `AdaptiveDispatcher` surface; [`flynnel::sched::adaptive_profile::migrate_workload_class`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_profile.rs) flips it in one atomic store, free on the per-op path.
 
 ```rust
 use flynnel::JobPlan;

@@ -7,7 +7,7 @@ The vocabulary every Flynnel call site speaks. Nine small types: [`Variant`](#va
 
 ## `Variant`
 
-Defined in [`src/foundation.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/foundation.rs).
+Defined in [`src/foundation.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/foundation.rs).
 
 ```rust
 pub enum Variant {
@@ -35,7 +35,7 @@ API:
 
 ## `SchedTier`
 
-Defined in [`src/foundation.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/foundation.rs).
+Defined in [`src/foundation.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/foundation.rs).
 
 ```rust
 pub enum SchedTier {
@@ -65,7 +65,7 @@ API:
 
 ## `HwClass`
 
-Defined in [`src/foundation.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/foundation.rs).
+Defined in [`src/foundation.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/foundation.rs).
 
 ```rust
 pub enum HwClass {
@@ -112,7 +112,7 @@ API:
 
 ## `DispatchProfile`
 
-Defined in [`src/dispatch_profile.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/dispatch_profile.rs).
+Defined in [`src/dispatch_profile.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/dispatch_profile.rs).
 
 ```rust
 pub enum DispatchProfile {
@@ -140,7 +140,7 @@ Downstream crates that want richer op classification (a math crate with kernel-s
 
 ## `OpClass` trait
 
-Defined in [`src/op_class.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/op_class.rs).
+Defined in [`src/op_class.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/op_class.rs).
 
 ```rust
 pub trait OpClass: Copy + Clone + Eq + Hash + Debug + 'static {
@@ -178,7 +178,7 @@ The op value is consumed at plan construction; subsequent dispatch (`join`, `for
 
 ## `WorkloadClass`
 
-Defined in [`src/sched/adaptive_profile.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_profile.rs).
+Defined in [`src/sched/adaptive_profile.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_profile.rs).
 
 ```rust
 pub enum WorkloadClass {
@@ -210,11 +210,11 @@ API:
 
 Cost: one atomic store per migration; one Acquire-load per plan construction; zero per-op cost on the dispatch hot path.
 
-Streaming-migration behavior (consultation at plan construction, per-call escape hatch, mid-stream propagation) is covered by the unit tests in [`src/sched/adaptive_profile.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_profile.rs).
+Streaming-migration behavior (consultation at plan construction, per-call escape hatch, mid-stream propagation) is covered by the unit tests in [`src/sched/adaptive_profile.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_profile.rs).
 
 ## `WorkloadShape`
 
-Defined in [`src/sched/workload_shape.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/workload_shape.rs).
+Defined in [`src/sched/workload_shape.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/workload_shape.rs).
 
 ```rust
 pub enum WorkloadShape {
@@ -244,7 +244,7 @@ Calls to other `with_*` builders that touch the same knobs (`with_k_gating`, `wi
 
 ## `KGating`
 
-Defined in [`src/sched/k_gating.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/k_gating.rs).
+Defined in [`src/sched/k_gating.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/k_gating.rs).
 
 ```rust
 pub enum KGating {
@@ -270,7 +270,7 @@ API:
 
 ## `BisectVariant`
 
-Defined in [`src/sched/plan.rs`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/plan.rs).
+Defined in [`src/sched/plan.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/plan.rs).
 
 ```rust
 pub enum BisectVariant {
@@ -281,7 +281,7 @@ pub enum BisectVariant {
 
 Per-call selector for one of two production-validated bisect-policy variants. The default behavior (field `None`) uses the continuation-steal-lazy bisect: first level always splits to seed initial fanout (`workers` eager leaves), subsequent levels run serially inline unless real steal pressure is detected on the dispatching worker's deque.
 
-The two variants are auto-routed by [`adaptive_variant_routing`](https://github.com/markusmcnugen/flynnel/blob/main/src/sched/adaptive_variant_routing.rs) at `JobPlan::set_profile` construction time: AMD vendors with `DispatchProfile::PortBound` (the profile [`WorkloadClass::PortBound`](#workloadclass) and [`WorkloadClass::FineGrain`](#workloadclass) map to) get `ProducerMaxLenWorkers` for `batch_size >= 50_000` and `RayonStyleReplenish` for smaller batches; all other profiles + vendors get `None`. Per-call overrides via [`JobPlan::with_bisect_variant(v)`](JobPlan-Reference.md#builder-methods) win over the auto-routing.
+The two variants are auto-routed by [`adaptive_variant_routing`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_variant_routing.rs) at `JobPlan::set_profile` construction time: AMD vendors with `DispatchProfile::PortBound` (the profile [`WorkloadClass::PortBound`](#workloadclass) and [`WorkloadClass::FineGrain`](#workloadclass) map to) get `ProducerMaxLenWorkers` for `batch_size >= 50_000` and `RayonStyleReplenish` for smaller batches; all other profiles + vendors get `None`. Per-call overrides via [`JobPlan::with_bisect_variant(v)`](JobPlan-Reference.md#builder-methods) win over the auto-routing.
 
 | Variant | What it changes | Empirical win cell |
 |---|---|---|
