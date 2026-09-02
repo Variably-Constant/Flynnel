@@ -335,11 +335,6 @@ were already at boost.
 | 64 | 1024 | 1.576 | 55.813 | 355.628 | 35.4x | 225.7x | 0.997 | 16.633 | 188.629 | 16.7x | 189.2x |
 | 64 | 8192 | 12.542 | 300.222 | 2917.730 | 23.9x | 232.6x | 8.059 | 105.231 | 1538.680 | 13.1x | 190.9x |
 
-At n=64 the kernel sustains 342 GFLOPS on the 3070 and 533 GFLOPS on
-the 5070, which is the native f64 rate of these parts (1/64 of their
-fp32 rate). Going past it means emulating f64 on the tensor cores
-(Ozaki-style splitting), not a better f64 kernel.
-
 #### einsum outer product `"i,j->ij"` and row sum `"ij->i"`
 
 | op | n | batch | 3070 GPU ms | 3070 serial ms | 3070 GPU/ser | 5070 GPU ms | 5070 serial ms | 5070 GPU/ser |
@@ -469,12 +464,6 @@ above follows from these two tables.
 | 64 | 2048 | 7.5x | 44.7x | 3.7x | 34.6x |
 | 64 | 4096 | 6.8x | 46.1x | 3.0x | 35.0x |
 | 64 | 8192 | 6.4x | 47.5x | 2.6x | 35.5x |
-
-The Jacobi kernels are latency-bound loops over small matrices, not
-throughput kernels: 2x to 7x over the 16-thread CPU path is what
-that algorithm gives, and the batch-1024 cells at n <= 8 are a wash.
-Larger wins at n >= 32 need a different algorithm (tridiagonalisation
-plus QR or divide-and-conquer), not a faster Jacobi.
 
 ## User opcodes (a programmable doorbell op)
 
