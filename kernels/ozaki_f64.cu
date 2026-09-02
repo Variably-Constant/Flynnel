@@ -114,22 +114,48 @@ extern "C" __global__ void flynnel_ozaki_split_a_f64(
 
 // B (batch x k x n) into SLICES slice matrices stored transposed
 // (batch x n x k), so a warp's 16-column mma operand is a 32-byte
-// aligned column-major tile.
-extern "C" __global__ void flynnel_ozaki_split_bt_f64(
+// aligned column-major tile. A block transposes one 32 x 32 tile
+// through shared memory so the reads run along n and the byte writes
+// along k, both coalesced; batch * ceil(k / 32) * ceil(n / 32) blocks
+// of 256 threads.
+extern "C" __global__ void __launch_bounds__(THREADS * 2)
+flynnel_ozaki_split_bt_f64(
     const double* __restrict__ bmat, const int* __restrict__ colexp, int8_t* __restrict__ out_t,
     unsigned batch, unsigned k, unsigned n)
 {
+    __shared__ int8_t tile[SLICES][32][33];
+    const unsigned kt = (k + 31) / 32, nt = (n + 31) / 32;
+    const unsigned per_b = kt * nt;
+    const unsigned b = blockIdx.x / per_b;
+    if (b >= batch) return;
+    const unsigned rem = blockIdx.x - b * per_b;
+    const unsigned r0 = (rem / nt) * 32;
+    const unsigned c0 = (rem - (rem / nt) * nt) * 32;
     const size_t total = (size_t)batch * k * n;
-    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    const size_t per = (size_t)k * n;
-    const size_t b = idx / per;
-    const size_t rem = idx - b * per;
-    const size_t r = rem / n;
-    const size_t c = rem - r * n;
-    const double x = bmat[idx];
-    const unsigned long long u = aligned_int(x, colexp[b * n + c]);
-    write_slices(u, signbit(x) != 0, out_t, b * per + c * k + r, total);
+    const double* src = bmat + (size_t)b * k * n;
+    int8_t* dst = out_t + (size_t)b * k * n;
+    for (unsigned e = threadIdx.x; e < 32 * 32; e += blockDim.x) {
+        const unsigned rr = e >> 5, cc = e & 31;
+        const unsigned r = r0 + rr, c = c0 + cc;
+        unsigned long long u = 0ull;
+        bool neg = false;
+        if (r < k && c < n) {
+            const double x = src[(size_t)r * n + c];
+            u = aligned_int(x, colexp[(size_t)b * n + c]);
+            neg = signbit(x) != 0;
+        }
+#pragma unroll
+        for (int s = 0; s < SLICES; ++s) {
+            const int v = (int)((u >> (TOP_BIT - (BITS_PER_SLICE - 1) - BITS_PER_SLICE * s)) & 0x7Fu);
+            tile[s][cc][rr] = (int8_t)(neg ? -v : v);
+        }
+    }
+    __syncthreads();
+    for (unsigned e = threadIdx.x; e < SLICES * 32 * 32; e += blockDim.x) {
+        const unsigned s = e >> 10, rem2 = e & 1023, cc = rem2 >> 5, rr = rem2 & 31;
+        const unsigned r = r0 + rr, c = c0 + cc;
+        if (r < k && c < n) dst[(size_t)s * total + (size_t)c * k + r] = tile[s][cc][rr];
+    }
 }
 
 // Two-sum accumulate of v into (hi, lo).

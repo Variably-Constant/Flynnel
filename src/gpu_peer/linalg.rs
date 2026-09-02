@@ -34,12 +34,12 @@ pub const LINALG_PTX: &str = include_str!("../../kernels/linalg_f64.ptx");
 /// The kernel source, NVRTC-compiled at load when the driver rejects
 /// [`LINALG_PTX`] (a toolchain newer than the driver).
 pub const LINALG_CU: &str = include_str!("../../kernels/linalg_f64.cu");
-/// PTX of the tridiagonalisation / bidiagonalisation QR kernels
-/// (`kernels/linalg_qr_f64.cu`), the second module of
+/// PTX of the tridiagonalization / bidiagonalization plus bisection
+/// kernels (`kernels/linalg_bisect_f64.cu`), the second module of
 /// [`LinalgKernels`].
-pub const LINALG_QR_PTX: &str = include_str!("../../kernels/linalg_qr_f64.ptx");
-/// Source of [`LINALG_QR_PTX`] for the NVRTC fallback.
-pub const LINALG_QR_CU: &str = include_str!("../../kernels/linalg_qr_f64.cu");
+pub const LINALG_BISECT_PTX: &str = include_str!("../../kernels/linalg_bisect_f64.ptx");
+/// Source of [`LINALG_BISECT_PTX`] for the NVRTC fallback.
+pub const LINALG_BISECT_CU: &str = include_str!("../../kernels/linalg_bisect_f64.cu");
 
 /// Largest square dimension the block-per-matrix Jacobi kernels take.
 pub const LINALG_MAX_N: usize = 64;
@@ -105,10 +105,10 @@ pub struct LinalgKernels {
     pub gesvd_blk: WideKernel,
     /// `flynnel_gesvd_jacobi_f64_thr`.
     pub gesvd_thr: WideKernel,
-    /// `flynnel_syev_qr_f64_blk`.
-    pub syev_qr: WideKernel,
-    /// `flynnel_gesvd_qr_f64_blk`.
-    pub gesvd_qr: WideKernel,
+    /// `flynnel_syev_bisect_f64_blk`.
+    pub syev_bisect: WideKernel,
+    /// `flynnel_gesvd_bisect_f64_blk`.
+    pub gesvd_bisect: WideKernel,
 }
 
 /// Load one PTX module, compiling `cu` with NVRTC when the driver
@@ -143,7 +143,7 @@ impl LinalgKernels {
     /// every entry point.
     pub fn load(peer: &GpuPeer) -> Result<Self, GpuPeerError> {
         let module = load_module(peer, "linalg", LINALG_PTX, LINALG_CU)?;
-        let qr = load_module(peer, "linalg_qr", LINALG_QR_PTX, LINALG_QR_CU)?;
+        let bisect = load_module(peer, "linalg_bisect", LINALG_BISECT_PTX, LINALG_BISECT_CU)?;
         let load = |module: &std::sync::Arc<cudarc::driver::CudaModule>,
                     entry: &str|
          -> Result<WideKernel, GpuPeerError> {
@@ -159,8 +159,8 @@ impl LinalgKernels {
             syev_thr: load(&module, "flynnel_syev_jacobi_f64_thr")?,
             gesvd_blk: load(&module, "flynnel_gesvd_jacobi_f64_blk")?,
             gesvd_thr: load(&module, "flynnel_gesvd_jacobi_f64_thr")?,
-            syev_qr: load(&qr, "flynnel_syev_qr_f64_blk")?,
-            gesvd_qr: load(&qr, "flynnel_gesvd_qr_f64_blk")?,
+            syev_bisect: load(&bisect, "flynnel_syev_bisect_f64_blk")?,
+            gesvd_bisect: load(&bisect, "flynnel_gesvd_bisect_f64_blk")?,
         })
     }
 }
@@ -644,30 +644,47 @@ pub fn gemm_batched(
     Ok(out)
 }
 
-/// Enqueue batched symmetric eigendecomposition by tridiagonalisation
-/// and implicit QL on the wide stream: `a` holds `batch` row-major
+/// Workspace bytes [`launch_syev_bisect`] needs for `batch` matrices
+/// of dimension `n` when eigenvectors are wanted (`n x n` per matrix).
+pub fn syev_bisect_scratch_bytes(batch: u32, n: u32) -> usize {
+    batch as usize * n as usize * n as usize * 8
+}
+
+/// Workspace bytes [`launch_gesvd_bisect`] needs for `batch` `m x n`
+/// matrices (`3 n x n + m x n` per matrix, always).
+pub fn gesvd_bisect_scratch_bytes(batch: u32, m: u32, n: u32) -> usize {
+    let (bu, mu, nu) = (batch as usize, m as usize, n as usize);
+    bu * (3 * nu * nu + mu * nu) * 8
+}
+
+/// Enqueue batched symmetric eigendecomposition by tridiagonalization
+/// and bisection on the wide stream: `a` holds `batch` row-major
 /// `n x n` matrices (read only), `w` receives `batch * n` eigenvalues
 /// in ascending order, `v` (when `Some`) receives eigenvectors as
-/// columns. One block per matrix, `n <= LINALG_MAX_N`. No sync.
-pub fn launch_syev_qr(
+/// columns and needs `scratch` of [`syev_bisect_scratch_bytes`]. One
+/// block per matrix, `n <= LINALG_MAX_N`. No sync.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_syev_bisect(
     peer: &GpuPeer,
     k: &LinalgKernels,
     a: u64,
     w: u64,
     v: Option<u64>,
+    scratch: u64,
     batch: u32,
     n: u32,
 ) -> Result<(), GpuPeerError> {
-    check_dim(batch > 0 && n > 0, "syev_qr: empty batch or n")?;
-    check_dim(n as usize <= LINALG_MAX_N, "syev_qr: n exceeds LINALG_MAX_N")?;
+    check_dim(batch > 0 && n > 0, "syev_bisect: empty batch or n")?;
+    check_dim(n as usize <= LINALG_MAX_N, "syev_bisect: n exceeds LINALG_MAX_N")?;
+    check_dim(v.is_none() || scratch != 0, "syev_bisect: eigenvectors need a scratch buffer")?;
     let scalars = [batch, n, u32::from(v.is_some())];
-    let ptrs = [a, w, v.unwrap_or(0)];
-    peer.launch_wide_async(&k.syev_qr, batch, LINALG_BLOCK, &ptrs, &scalars)
+    let ptrs = [a, w, v.unwrap_or(0), scratch];
+    peer.launch_wide_async(&k.syev_bisect, batch, LINALG_BLOCK, &ptrs, &scalars)
 }
 
-/// [`launch_syev_qr`] over host buffers: returns `(eigenvalues
+/// [`launch_syev_bisect`] over host buffers: returns `(eigenvalues
 /// ascending, eigenvectors as columns when want_v)`.
-pub fn syev_qr_batched(
+pub fn syev_bisect_batched(
     peer: &mut GpuPeer,
     k: &LinalgKernels,
     a: &[f64],
@@ -676,17 +693,34 @@ pub fn syev_qr_batched(
     want_v: bool,
 ) -> Result<(Vec<f64>, Option<Vec<f64>>), GpuPeerError> {
     let (bu, nu) = (batch as usize, n as usize);
-    check_dim(a.len() == bu * nu * nu, "syev_qr: a length")?;
+    check_dim(a.len() == bu * nu * nu, "syev_bisect: a length")?;
     let pa = pin(peer, &f64_bytes(a))?;
     let pw = pin(peer, &vec![0u8; bu * nu * 8])?;
     let pv = if want_v { Some(pin(peer, &vec![0u8; bu * nu * nu * 8])?) } else { None };
-    launch_syev_qr(peer, k, pa.ptr, pw.ptr, pv.as_ref().map(|p| p.ptr), batch, n)?;
+    let scratch = if want_v {
+        Some(pin(peer, &vec![0u8; syev_bisect_scratch_bytes(batch, n)])?)
+    } else {
+        None
+    };
+    launch_syev_bisect(
+        peer,
+        k,
+        pa.ptr,
+        pw.ptr,
+        pv.as_ref().map(|p| p.ptr),
+        scratch.as_ref().map_or(0, |p| p.ptr),
+        batch,
+        n,
+    )?;
     peer.sync_wide()?;
     let w = fetch_f64(peer, &pw, bu * nu)?;
     let v = match &pv {
         Some(p) => Some(fetch_f64(peer, p, bu * nu * nu)?),
         None => None,
     };
+    if let Some(p) = scratch {
+        p.release(peer)?;
+    }
     if let Some(p) = pv {
         p.release(peer)?;
     }
@@ -695,32 +729,37 @@ pub fn syev_qr_batched(
     Ok((w, v))
 }
 
-/// Enqueue batched SVD by bidiagonalisation and implicit-shift QR on
-/// the wide stream: `a` holds `batch` row-major `m x n` matrices with
-/// `m >= n` and is overwritten with `U`, `sigma` receives `batch * n`
-/// singular values descending, `v` (when `Some`) the right singular
-/// vectors. One block per matrix, `m <= LINALG_MAX_N`. No sync.
+/// Enqueue batched SVD by bidiagonalization and bisection on the
+/// Golub-Kahan tridiagonal on the wide stream: `a` holds `batch`
+/// row-major `m x n` matrices with `m >= n` and is overwritten with
+/// `U`, `sigma` receives `batch * n` singular values descending, `v`
+/// (when `Some`) the right singular vectors; `scratch` is
+/// [`gesvd_bisect_scratch_bytes`] and always required. One block per
+/// matrix, `m <= LINALG_MAX_N`. No sync.
 #[allow(clippy::too_many_arguments)]
-pub fn launch_gesvd_qr(
+pub fn launch_gesvd_bisect(
     peer: &GpuPeer,
     k: &LinalgKernels,
     a: u64,
     sigma: u64,
     v: Option<u64>,
+    scratch: u64,
     batch: u32,
     m: u32,
     n: u32,
 ) -> Result<(), GpuPeerError> {
-    check_dim(batch > 0 && n > 0 && m >= n, "gesvd_qr: empty batch, empty n, or m < n")?;
-    check_dim(m as usize <= LINALG_MAX_N, "gesvd_qr: m exceeds LINALG_MAX_N")?;
+    check_dim(batch > 0 && n > 0 && m >= n, "gesvd_bisect: empty batch, empty n, or m < n")?;
+    check_dim(m as usize <= LINALG_MAX_N, "gesvd_bisect: m exceeds LINALG_MAX_N")?;
+    check_dim(scratch != 0, "gesvd_bisect: scratch buffer required")?;
     let scalars = [batch, m, n, u32::from(v.is_some())];
-    let ptrs = [a, sigma, v.unwrap_or(0)];
-    peer.launch_wide_async(&k.gesvd_qr, batch, LINALG_BLOCK, &ptrs, &scalars)
+    let ptrs = [a, sigma, v.unwrap_or(0), scratch];
+    peer.launch_wide_async(&k.gesvd_bisect, batch, LINALG_BLOCK, &ptrs, &scalars)
 }
 
-/// [`launch_gesvd_qr`] over host buffers; singular values descending.
+/// [`launch_gesvd_bisect`] over host buffers; singular values
+/// descending.
 #[allow(clippy::too_many_arguments)]
-pub fn gesvd_qr_batched(
+pub fn gesvd_bisect_batched(
     peer: &mut GpuPeer,
     k: &LinalgKernels,
     a: &[f64],
@@ -730,11 +769,22 @@ pub fn gesvd_qr_batched(
     want_v: bool,
 ) -> Result<GesvdResult, GpuPeerError> {
     let (bu, mu, nu) = (batch as usize, m as usize, n as usize);
-    check_dim(a.len() == bu * mu * nu, "gesvd_qr: a length")?;
+    check_dim(a.len() == bu * mu * nu, "gesvd_bisect: a length")?;
     let pa = pin(peer, &f64_bytes(a))?;
     let ps = pin(peer, &vec![0u8; bu * nu * 8])?;
     let pv = if want_v { Some(pin(peer, &vec![0u8; bu * nu * nu * 8])?) } else { None };
-    launch_gesvd_qr(peer, k, pa.ptr, ps.ptr, pv.as_ref().map(|p| p.ptr), batch, m, n)?;
+    let scratch = pin(peer, &vec![0u8; gesvd_bisect_scratch_bytes(batch, m, n)])?;
+    launch_gesvd_bisect(
+        peer,
+        k,
+        pa.ptr,
+        ps.ptr,
+        pv.as_ref().map(|p| p.ptr),
+        scratch.ptr,
+        batch,
+        m,
+        n,
+    )?;
     peer.sync_wide()?;
     let u = fetch_f64(peer, &pa, bu * mu * nu)?;
     let sigma = fetch_f64(peer, &ps, bu * nu)?;
@@ -742,6 +792,7 @@ pub fn gesvd_qr_batched(
         Some(p) => Some(fetch_f64(peer, p, bu * nu * nu)?),
         None => None,
     };
+    scratch.release(peer)?;
     if let Some(p) = pv {
         p.release(peer)?;
     }

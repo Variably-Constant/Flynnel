@@ -254,8 +254,8 @@ build or run time), over resident blocks:
 | GEMM | `flynnel_gemm_batched_f64` | Batched row-major `C = A x B`, 16x16 shared-memory tiles, fma with `k` ascending |
 | symmetric eigen | `flynnel_syev_jacobi_f64_{blk,thr}` | Batched Jacobi eigendecomposition, `n <= 64`; eigenvalues in diagonal order plus optional eigenvectors |
 | SVD | `flynnel_gesvd_jacobi_f64_{blk,thr}` | Batched one-sided Jacobi SVD, `m >= n`, `m <= 64`; `A` is overwritten with `U`, singular values in column order, optional `V` |
-| symmetric eigen (QR) | `flynnel_syev_qr_f64_blk` (`linalg_qr_f64.ptx`) | Batched Householder tridiagonalisation plus implicit QL with shifts (the EISPACK tred2 / tql2 pair), `n <= 64`, one block per matrix; eigenvalues ascending plus optional eigenvectors |
-| SVD (QR) | `flynnel_gesvd_qr_f64_blk` (`linalg_qr_f64.ptx`) | Batched Householder bidiagonalisation plus implicit-shift bidiagonal QR (LINPACK dsvdc), `m >= n`, `m <= 64`; `A` is overwritten with `U`, singular values descending, optional `V` |
+| symmetric eigen (bisection) | `flynnel_syev_bisect_f64_blk` (`linalg_bisect_f64.ptx`) | Batched Householder tridiagonalization (EISPACK tred2) then bisection with Sturm counts, one thread per eigenvalue; eigenvectors by inverse iteration with cluster orthonormalization; `n <= 64`, one block per matrix; eigenvalues ascending |
+| SVD (bisection) | `flynnel_gesvd_bisect_f64_blk` (`linalg_bisect_f64.ptx`) | Batched Householder bidiagonalization (LINPACK dsvdc) then bisection on the Golub-Kahan tridiagonal for the singular values, inverse iteration for the vectors; `m >= n`, `m <= 64`; `A` is overwritten with `U`, singular values descending, optional `V`, needs a scratch buffer |
 | GEMM (Ozaki) | `flynnel_ozaki_{rowexp,colexp,split_a,split_bt,gemm}_f64` (`ozaki_f64.ptx`) | `C = A x B` on the int8 tensor cores: operands split into eight 7-bit slices aligned to their row (A) or column (B) maximum exponent, 36 slice pairs multiplied exactly by int8 mma into int32, recombined in f64 with two-sum compensation; `m`, `n`, `k` multiples of 32, `k <= 16384`, finite operands |
 
 Two Jacobi kernel shapes exist because the best one depends on `n`
@@ -283,11 +283,12 @@ pub fn launch_einsum(peer, k, spec, tables_dev, a, b, out, batch)
 pub fn launch_gemm(peer, k, a, b, c, batch, m, n, kdim)
 pub fn launch_syev(peer, k, a, w, v: Option<u64>, batch, n, max_sweeps, shape)
 pub fn launch_gesvd(peer, k, a, sigma, v: Option<u64>, batch, m, n, max_sweeps, shape)
-pub fn launch_syev_qr(peer, k, a, w, v: Option<u64>, batch, n)          // eigenvalues ascending
-pub fn launch_gesvd_qr(peer, k, a, sigma, v: Option<u64>, batch, m, n)   // singular values descending
+pub fn launch_syev_bisect(peer, k, a, w, v: Option<u64>, scratch, batch, n)        // eigenvalues ascending
+pub fn launch_gesvd_bisect(peer, k, a, sigma, v: Option<u64>, scratch, batch, m, n) // singular values descending
+pub fn syev_bisect_scratch_bytes(batch, n) / gesvd_bisect_scratch_bytes(batch, m, n) // workspace sizes
 // Synchronous over host buffers (pin, launch, sync, fetch, unpin):
 pub fn einsum_batched(..) / gemm_batched(..) / syev_batched(..) / gesvd_batched(..)
-pub fn syev_qr_batched(peer, k, a, batch, n, want_v) / gesvd_qr_batched(peer, k, a, batch, m, n, want_v)
+pub fn syev_bisect_batched(peer, k, a, batch, n, want_v) / gesvd_bisect_batched(peer, k, a, batch, m, n, want_v)
 // gpu_peer::ozaki - the tensor-core GEMM, with its workspace pinned in the resident pool:
 pub struct OzakiKernels;  impl OzakiKernels { pub fn load(peer) -> Result<Self, GpuPeerError> }
 pub struct OzakiWorkspace; // OzakiWorkspace::new(peer, batch, m, n, k), ::bytes(..), ::release(peer)
@@ -313,13 +314,16 @@ norm. Reducers a consumer wants (trace, Frobenius norm, spectral
 radius, nuclear norm, condition number, determinant) are host-side
 folds over the einsum, eigenvalue and singular-value outputs.
 
-The QR kernels are checked by `tests/gpu_qr_parity.rs` against the
-same Jacobi CPU references: eigenvalues and singular values to
-`1e-10` relative, eigenvectors by `A v = lambda v`, the SVD by
-reconstruction and orthonormal `U` and `V`, square and rectangular,
-with repeated and vanishing spectra. Their outputs are sorted
-(eigenvalues ascending, singular values descending), unlike the
-Jacobi kernels' diagonal order.
+The bisection kernels are checked by `tests/gpu_bisect_parity.rs`
+against the same Jacobi CPU references: eigenvalues and singular
+values to `1e-10` relative, eigenvectors by `A v = lambda v`, the
+SVD by reconstruction and orthonormal `U` and `V`, square and
+rectangular, with repeated and vanishing spectra. Their outputs are
+sorted (eigenvalues ascending, singular values descending), unlike
+the Jacobi kernels' diagonal order. Eigenvalues closer than
+`1e3 * eps * ||T||` are treated as one cluster: their inverse
+iterations use distinct shifts and the cluster is orthonormalized
+by its first thread.
 
 The Ozaki GEMM is not bit-identical to `flynnel_gemm_batched_f64`:
 its summation order differs from the fma-ordered kernel, and

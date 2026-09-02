@@ -1,14 +1,14 @@
-//! The tridiagonalisation / bidiagonalisation QR kernels against the
-//! Jacobi CPU references on the real device: eigenvalues and singular
-//! values to 1e-10 relative, eigenvectors by `A v = lambda v`,
-//! `A = U diag(sigma) V^T`, and orthonormal columns. Requires a CUDA
-//! device.
+//! The tridiagonalization / bidiagonalization plus bisection kernels
+//! against the Jacobi CPU references on the real device: eigenvalues
+//! and singular values to 1e-10 relative, eigenvectors by
+//! `A v = lambda v`, `A = U diag(sigma) V^T`, and orthonormal columns,
+//! including repeated and vanishing spectra. Requires a CUDA device.
 #![cfg(feature = "gpu-peer")]
 
 use std::sync::{Mutex, MutexGuard};
 
 use flynnel::gpu_peer::linalg::{
-    cpu, default_sweeps, gesvd_qr_batched, syev_qr_batched, LinalgKernels,
+    cpu, default_sweeps, gesvd_bisect_batched, syev_bisect_batched, LinalgKernels,
 };
 use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig};
 
@@ -73,7 +73,7 @@ fn check_syev(batch: usize, n: usize, seed: u64) {
     let mut p = peer();
     let k = LinalgKernels::load(&p).expect("linalg PTX");
     let a = symmetric_batch(seed, batch, n);
-    let (w, v) = syev_qr_batched(&mut p, &k, &a, batch as u32, n as u32, true).expect("syev_qr");
+    let (w, v) = syev_bisect_batched(&mut p, &k, &a, batch as u32, n as u32, true).expect("syev_bisect");
     let v = v.expect("eigenvectors requested");
     let (w_ref, _) = cpu::syev_jacobi_batched(&a, batch, n, default_sweeps(n), false);
     for item in 0..batch {
@@ -111,7 +111,7 @@ fn check_gesvd(batch: usize, m: usize, n: usize, seed: u64) {
     let mut p = peer();
     let k = LinalgKernels::load(&p).expect("linalg PTX");
     let a = uniform(seed, batch * m * n);
-    let r = gesvd_qr_batched(&mut p, &k, &a, batch as u32, m as u32, n as u32, true).expect("gesvd_qr");
+    let r = gesvd_bisect_batched(&mut p, &k, &a, batch as u32, m as u32, n as u32, true).expect("gesvd_bisect");
     let v = r.v.expect("V requested");
     let (_, s_ref, _) = cpu::gesvd_jacobi_batched(&a, batch, m, n, default_sweeps(n), false);
     for item in 0..batch {
@@ -151,69 +151,73 @@ fn check_gesvd(batch: usize, m: usize, n: usize, seed: u64) {
 }
 
 #[test]
-fn syev_qr_matches_jacobi_n4() {
+fn syev_bisect_matches_jacobi_n4() {
     check_syev(16, 4, 31);
 }
 
 #[test]
-fn syev_qr_matches_jacobi_n32() {
+fn syev_bisect_matches_jacobi_n32() {
     check_syev(4, 32, 32);
 }
 
 #[test]
-fn syev_qr_matches_jacobi_n64() {
+fn syev_bisect_matches_jacobi_n64() {
     check_syev(3, 64, 33);
 }
 
 #[test]
-fn syev_qr_handles_diagonal_and_repeated_eigenvalues() {
+fn syev_bisect_handles_diagonal_and_repeated_eigenvalues() {
     let _serial = serial();
     let mut p = peer();
     let k = LinalgKernels::load(&p).expect("linalg PTX");
     let n = 8usize;
-    // A diagonal matrix with a repeated eigenvalue and a zero.
     let mut a = vec![0f64; n * n];
     let diag = [3.0, -1.0, 3.0, 0.0, 2.5, 3.0, -1.0, 7.0];
     for i in 0..n {
         a[i * n + i] = diag[i];
     }
-    let (w, v) = syev_qr_batched(&mut p, &k, &a, 1, n as u32, true).expect("syev_qr");
+    let (w, v) = syev_bisect_batched(&mut p, &k, &a, 1, n as u32, true).expect("syev_bisect");
     let want = sorted(&diag);
     for j in 0..n {
         assert!((w[j] - want[j]).abs() <= 1e-12, "eigenvalue {j}: {} vs {}", w[j], want[j]);
     }
     let v = v.expect("V");
     for j in 0..n {
+        for i in 0..n {
+            let av: f64 = (0..n).map(|kk| a[i * n + kk] * v[kk * n + j]).sum();
+            assert!((av - w[j] * v[i * n + j]).abs() <= 1e-10, "A v = lambda v at ({i},{j})");
+        }
         for j2 in 0..n {
             let dot: f64 = (0..n).map(|i| v[i * n + j] * v[i * n + j2]).sum();
             let want = if j == j2 { 1.0 } else { 0.0 };
-            assert!((dot - want).abs() <= 1e-12, "V^T V at ({j},{j2}): {dot}");
+            assert!((dot - want).abs() <= 1e-10, "V^T V at ({j},{j2}): {dot}");
         }
     }
 }
 
 #[test]
-fn gesvd_qr_matches_jacobi_square_n32() {
+fn gesvd_bisect_matches_jacobi_square_n32() {
     check_gesvd(4, 32, 32, 41);
 }
 
 #[test]
-fn gesvd_qr_matches_jacobi_square_n64() {
+fn gesvd_bisect_matches_jacobi_square_n64() {
     check_gesvd(2, 64, 64, 42);
 }
 
 #[test]
-fn gesvd_qr_matches_jacobi_rectangular_48x32() {
+fn gesvd_bisect_matches_jacobi_rectangular_48x32() {
     check_gesvd(3, 48, 32, 43);
 }
 
 #[test]
-fn gesvd_qr_matches_jacobi_small_and_rank_deficient() {
+fn gesvd_bisect_small_and_rank_deficient() {
     check_gesvd(8, 6, 4, 44);
     let _serial = serial();
     let mut p = peer();
     let k = LinalgKernels::load(&p).expect("linalg PTX");
-    // Rank-2 matrix: two identical column pairs.
+    // Rank-2 matrix: two identical column pairs. Singular values 2
+    // and 3 vanish; U and V must still be orthonormal and reconstruct.
     let (m, n) = (8usize, 4usize);
     let base = uniform(45, m * 2);
     let mut a = vec![0f64; m * n];
@@ -223,7 +227,24 @@ fn gesvd_qr_matches_jacobi_small_and_rank_deficient() {
         a[i * n + 2] = base[i * 2];
         a[i * n + 3] = base[i * 2 + 1];
     }
-    let r = gesvd_qr_batched(&mut p, &k, &a, 1, m as u32, n as u32, true).expect("gesvd_qr");
+    let r = gesvd_bisect_batched(&mut p, &k, &a, 1, m as u32, n as u32, true).expect("gesvd_bisect");
+    let v = r.v.expect("V");
     assert!(r.sigma[2].abs() <= 1e-12 * r.sigma[0] && r.sigma[3].abs() <= 1e-12 * r.sigma[0],
         "rank-2 matrix must have two vanishing singular values: {:?}", r.sigma);
+    let anorm = max_abs(&a);
+    for i in 0..m {
+        for j in 0..n {
+            let rec: f64 = (0..n).map(|kk| r.u[i * n + kk] * r.sigma[kk] * v[j * n + kk]).sum();
+            assert!((rec - a[i * n + j]).abs() <= 1e-9 * anorm * n as f64, "reconstruction at ({i},{j})");
+        }
+    }
+    for j in 0..n {
+        for j2 in 0..n {
+            let du: f64 = (0..m).map(|i| r.u[i * n + j] * r.u[i * n + j2]).sum();
+            let dv: f64 = (0..n).map(|i| v[i * n + j] * v[i * n + j2]).sum();
+            let want = if j == j2 { 1.0 } else { 0.0 };
+            assert!((du - want).abs() <= 1e-9, "U^T U at ({j},{j2}): {du}");
+            assert!((dv - want).abs() <= 1e-9, "V^T V at ({j},{j2}): {dv}");
+        }
+    }
 }

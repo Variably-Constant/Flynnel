@@ -150,10 +150,10 @@ pub fn launch_ozaki_gemm(
         &[a, ws.rowexp.ptr, ws.a_slices.ptr],
         &[batch, m, k],
     )?;
-    let b_elems = batch as u64 * k as u64 * n as u64;
+    let grid_split_bt = batch * k.div_ceil(32) * n.div_ceil(32);
     peer.launch_wide_async(
         &kern.split_bt,
-        b_elems.div_ceil(u64::from(BLOCK)) as u32,
+        grid_split_bt,
         BLOCK,
         &[b, ws.colexp.ptr, ws.bt_slices.ptr],
         &[batch, k, n],

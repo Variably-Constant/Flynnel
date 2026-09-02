@@ -15,8 +15,9 @@
 use std::time::{Duration, Instant};
 
 use flynnel::gpu_peer::linalg::{
-    EinsumSpec, JacobiShape, LinalgKernels, cpu, default_sweeps, launch_einsum, launch_gemm,
-    launch_gesvd, launch_gesvd_qr, launch_syev, launch_syev_qr,
+    EinsumSpec, JacobiShape, LinalgKernels, cpu, default_sweeps, gesvd_bisect_scratch_bytes,
+    launch_einsum, launch_gemm, launch_gesvd, launch_gesvd_bisect, launch_syev,
+    launch_syev_bisect,
 };
 use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig, ResidentHandle};
 use flynnel::sched::JobPlan;
@@ -149,7 +150,7 @@ fn fits(label: &str, bytes_needed: usize) -> bool {
 use flynnel::gpu_peer::ozaki::{launch_ozaki_gemm, OzakiKernels, OzakiWorkspace};
 
 /// Whether a section runs: `FLYNNEL_BENCH_SECTIONS` names a comma
-/// list of gemm, einsum, syev, gesvd, qr, ozaki; unset runs all six.
+/// list of gemm, einsum, syev, gesvd, bisect, ozaki; unset runs all six.
 fn wants(section: &str) -> bool {
     match std::env::var("FLYNNEL_BENCH_SECTIONS") {
         Ok(list) => list.split(',').any(|s| s.trim() == section),
@@ -385,16 +386,16 @@ fn main() {
             peer.unpin(pa.handle).expect("unpin");
         }
     }
-    // ---------------------------------------------------------- qr vs jacobi
-    println!("\n--- eigenvalues and singular values, f64: Jacobi (blk) vs tridiagonal / bidiagonal QR ---");
+    // ---------------------------------------------------------- bisect vs jacobi
+    println!("\n--- eigenvalues and singular values, f64: Jacobi (blk) vs tridiagonalization / bidiagonalization + bisection ---");
     println!("{:>5} {:>4} {:>6} | {:>10} {:>10} {:>10} {:>10} | {:>9} {:>9}",
-        "op", "n", "batch", "jacobi ms", "qr ms", "cpu-par ms", "serial ms", "jac/qr", "par/qr");
+        "op", "n", "batch", "jacobi ms", "bisect ms", "cpu-par ms", "serial ms", "jac/bis", "par/bis");
     for &n in &[32usize, 64] {
-        if !wants("qr") {
+        if !wants("bisect") {
             break;
         }
         for &batch in &[1024usize, 8192] {
-            if !fits(&format!("qr n={n} batch={batch}"), 3 * batch * n * n * 8) {
+            if !fits(&format!("bisect n={n} batch={batch}"), 6 * batch * n * n * 8) {
                 continue;
             }
             let sweeps = default_sweeps(n);
@@ -415,7 +416,7 @@ fn main() {
                 launch_syev(p, &k, pa.ptr, pw.ptr, None, batch as u32, n as u32, sweeps, JacobiShape::BlockPerMatrix).expect("launch");
             });
             let qr = gpu_median_ns(&mut peer, runs, |p| {
-                launch_syev_qr(p, &k, pa.ptr, pw.ptr, None, batch as u32, n as u32).expect("launch");
+                launch_syev_bisect(p, &k, pa.ptr, pw.ptr, None, 0, batch as u32, n as u32).expect("launch");
             });
             let serial = median_ns(1, || {
                 std::hint::black_box(cpu::syev_jacobi_batched(&a, batch, n, sweeps, false));
@@ -440,13 +441,14 @@ fn main() {
             let a_bytes = bytes(&a);
             let pa = pin(&mut peer, &a_bytes);
             let ps = pin(&mut peer, &vec![0u8; batch * n * 8]);
+            let scratch = pin(&mut peer, &vec![0u8; gesvd_bisect_scratch_bytes(batch as u32, n as u32, n as u32)]);
             let jac = gpu_median_ns(&mut peer, runs, |p| {
                 p.write_resident_bulk(&pa.handle, &a_bytes).expect("reload");
                 launch_gesvd(p, &k, pa.ptr, ps.ptr, None, batch as u32, n as u32, n as u32, sweeps, JacobiShape::BlockPerMatrix).expect("launch");
             });
             let qr = gpu_median_ns(&mut peer, runs, |p| {
                 p.write_resident_bulk(&pa.handle, &a_bytes).expect("reload");
-                launch_gesvd_qr(p, &k, pa.ptr, ps.ptr, None, batch as u32, n as u32, n as u32).expect("launch");
+                launch_gesvd_bisect(p, &k, pa.ptr, ps.ptr, None, scratch.ptr, batch as u32, n as u32, n as u32).expect("launch");
             });
             let serial = median_ns(1, || {
                 std::hint::black_box(cpu::gesvd_jacobi_batched(&a, batch, n, n, sweeps, false));
@@ -463,6 +465,7 @@ fn main() {
             });
             println!("{:>5} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x",
                 "gesvd", ms(jac), ms(qr), ms(par), ms(serial), jac / qr, par / qr);
+            peer.unpin(scratch.handle).expect("unpin");
             peer.unpin(ps.handle).expect("unpin");
             peer.unpin(pa.handle).expect("unpin");
         }
