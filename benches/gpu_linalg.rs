@@ -10,7 +10,7 @@
 //! Run with:
 //!   cargo bench --profile=release-test --bench gpu_linalg
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use flynnel::gpu_peer::linalg::{
     EinsumSpec, JacobiShape, LinalgKernels, cpu, default_sweeps, launch_einsum, launch_gemm,
@@ -50,9 +50,17 @@ fn bytes(v: &[f64]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-/// Median of `runs` timings of `f` after one warm-up call.
+/// Median of `runs` timings of `f` after warming up: `f` runs until
+/// at least 150 ms have elapsed (at most 20 calls), long enough for
+/// a GPU that idled through a multi-second CPU phase to raise its
+/// clocks before the timed calls.
 fn median_ns<F: FnMut()>(runs: usize, mut f: F) -> f64 {
-    f();
+    let warm = Instant::now();
+    let mut calls = 0;
+    while calls < 20 && (calls == 0 || warm.elapsed() < Duration::from_millis(150)) {
+        f();
+        calls += 1;
+    }
     let mut t: Vec<f64> = (0..runs)
         .map(|_| {
             let t0 = Instant::now();
@@ -93,6 +101,24 @@ fn pin(peer: &mut GpuPeer, data: &[u8]) -> Dev {
     Dev { handle, ptr }
 }
 
+/// Resident pool capacity in bytes for the config below.
+const POOL_BYTES: usize = 96 * 16 * 1024 * 1024;
+
+/// True when a cell's buffers fit the pool; prints a skip line
+/// otherwise so the table never silently omits a cell.
+fn fits(label: &str, bytes_needed: usize) -> bool {
+    if bytes_needed <= POOL_BYTES {
+        true
+    } else {
+        println!(
+            "{label}: skipped, needs {:.1} GiB resident vs a {:.1} GiB pool",
+            bytes_needed as f64 / (1u64 << 30) as f64,
+            POOL_BYTES as f64 / (1u64 << 30) as f64
+        );
+        false
+    }
+}
+
 fn main() {
     let mut peer = match GpuPeer::init(GpuPeerConfig {
         slot_bytes: 64 * 1024,
@@ -119,6 +145,9 @@ fn main() {
         "n", "batch", "gpu ms", "cpu-par ms", "serial ms", "gpu/par", "gpu/ser", "pin+fetch");
     for &n in &[8usize, 16, 32, 64] {
         for &batch in &[1024usize, 8192, 65536] {
+            if !fits(&format!("gemm n={n} batch={batch}"), 3 * batch * n * n * 8) {
+                continue;
+            }
             trace(&format!("gemm n={n} batch={batch}: generate"));
             let a = uniform(1, batch * n * n);
             let b = uniform(2, batch * n * n);
@@ -212,6 +241,9 @@ fn main() {
         "n", "batch", "blk ms", "thr ms", "cpu-par ms", "serial ms", "best/par", "best/ser");
     for &n in &[4usize, 8, 16, 32, 64] {
         for &batch in &[1024usize, 8192, 65536] {
+            if !fits(&format!("syev n={n} batch={batch}"), batch * n * n * 8 + batch * n * 8) {
+                continue;
+            }
             let a = symmetric_batch(10, batch, n);
             let sweeps = default_sweeps(n);
             let pa = pin(&mut peer, &bytes(&a));
@@ -257,6 +289,9 @@ fn main() {
         "n", "batch", "blk ms", "thr ms", "cpu-par ms", "serial ms", "best/par", "best/ser");
     for &n in &[4usize, 8, 16, 32, 64] {
         for &batch in &[1024usize, 8192, 65536] {
+            if !fits(&format!("gesvd n={n} batch={batch}"), batch * n * n * 8 + batch * n * 8) {
+                continue;
+            }
             let a = uniform(20, batch * n * n);
             let sweeps = default_sweeps(n);
             let pa = pin(&mut peer, &bytes(&a));

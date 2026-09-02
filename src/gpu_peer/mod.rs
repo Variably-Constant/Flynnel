@@ -562,6 +562,9 @@ impl GpuPeer {
             .ok_or(GpuPeerError::Unavailable("resident pool disabled"))?;
         let block_bytes = pool.block_bytes() as usize;
         let need = data.len().div_ceil(block_bytes.max(1)).max(1);
+        if need > pool.free_blocks() {
+            return Err(GpuPeerError::Unavailable("resident pool exhausted"));
+        }
         let first = pool
             .alloc_span(need as u32)
             .ok_or(GpuPeerError::Unavailable("no contiguous resident span"))?;
