@@ -267,6 +267,15 @@ pub fn accel_target(plan, op) -> Option<(Backend, KernelHandle)>
 pub fn dispatch_accel(plan, op, count, cpu_args, kernel_args) -> AccelReport
 ```
 
+`AccelReport::fallback_error` carries the launch error whenever
+`fell_back` is set, so a dispatch that landed on the CPU because the
+kernel failed says why. Flynnel registers its own batched linear
+algebra this way: `gpu_peer::linalg::register_linalg_accel_ops()` +
+`bind_linalg_kernels(&ops, Backend::Cuda { .. })` make batched GEMM,
+Jacobi symmetric-eig and Jacobi SVD routable ops whose CPU side is
+the `linalg::cpu` reference and whose kernel side is the shipped PTX
+(see the [GPU-Peer reference](GPU-Peer-Reference.md#batched-linear-algebra-gpu_peerlinalg)).
+
 Per dispatch, three decisions in order:
 
 1. **Target resolution**: `plan.backend_hint` when set and registered, else the active-backend tag when non-CPU and bound, else the first bound-and-registered backend. No target: the CPU implementation runs.

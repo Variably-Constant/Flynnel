@@ -68,6 +68,20 @@ fn ms(ns: f64) -> f64 {
     ns / 1e6
 }
 
+/// Matrices per CPU-parallel work item: enough work per item that
+/// the adaptive plan dispatches it rather than running the probe's
+/// light-item verdict inline (a 64-matrix chunk of n = 8 GEMMs is
+/// ~40 us).
+const CHUNK: usize = 64;
+
+/// Phase trace to stderr when `FLYNNEL_BENCH_TRACE` is set, so a
+/// stalled cell names the phase it stalled in.
+fn trace(phase: &str) {
+    if std::env::var_os("FLYNNEL_BENCH_TRACE").is_some() {
+        eprintln!("[trace] {phase}");
+    }
+}
+
 struct Dev {
     handle: ResidentHandle,
     ptr: u64,
@@ -105,32 +119,42 @@ fn main() {
         "n", "batch", "gpu ms", "cpu-par ms", "serial ms", "gpu/par", "gpu/ser", "pin+fetch");
     for &n in &[8usize, 16, 32, 64] {
         for &batch in &[1024usize, 8192, 65536] {
+            trace(&format!("gemm n={n} batch={batch}: generate"));
             let a = uniform(1, batch * n * n);
             let b = uniform(2, batch * n * n);
             let t_pin = Instant::now();
+            trace("pin");
             let pa = pin(&mut peer, &bytes(&a));
             let pb = pin(&mut peer, &bytes(&b));
             let pc = pin(&mut peer, &vec![0u8; batch * n * n * 8]);
+            trace("gpu launches");
             let gpu = median_ns(runs, || {
                 launch_gemm(&peer, &k, pa.ptr, pb.ptr, pc.ptr, batch as u32, n as u32, n as u32, n as u32)
                     .expect("launch");
                 peer.sync_wide().expect("sync");
             });
+            trace("fetch");
             let mut out = vec![0u8; batch * n * n * 8];
             peer.fetch_bulk(&pc.handle, &mut out).expect("fetch");
             let pin_fetch = t_pin.elapsed().as_nanos() as f64 - gpu * (runs as f64 + 1.0);
+            trace("serial");
             let serial = median_ns(1, || {
                 std::hint::black_box(cpu::gemm_batched(&a, &b, batch, n, n, n));
             });
-            // The consumer shape: one matrix per item through the
-            // adaptive default plan.
+            trace("cpu-parallel");
+            // The consumer shape: CHUNK matrices per item through the
+            // adaptive default plan, so the CPU side has enough work
+            // per item to be dispatched instead of probed inline.
             let par = median_ns(3, || {
-                let plan = JobPlan::new(0, batch as u32);
-                let c: Vec<Vec<f64>> = collect_indexed(&plan, batch, 1, |bi| {
+                let items = batch.div_ceil(CHUNK);
+                let plan = JobPlan::new(0, items as u32);
+                let c: Vec<Vec<f64>> = collect_indexed(&plan, items, 1, |ci| {
+                    let lo = ci * CHUNK;
+                    let hi = (lo + CHUNK).min(batch);
                     cpu::gemm_batched(
-                        &a[bi * n * n..(bi + 1) * n * n],
-                        &b[bi * n * n..(bi + 1) * n * n],
-                        1, n, n, n,
+                        &a[lo * n * n..hi * n * n],
+                        &b[lo * n * n..hi * n * n],
+                        hi - lo, n, n, n,
                     )
                 });
                 std::hint::black_box(c);
@@ -208,9 +232,12 @@ fn main() {
                 std::hint::black_box(cpu::syev_jacobi_batched(&a, batch, n, sweeps, false));
             });
             let par = median_ns(3, || {
-                let plan = JobPlan::new(0, batch as u32);
-                let w: Vec<Vec<f64>> = collect_indexed(&plan, batch, 1, |bi| {
-                    cpu::syev_jacobi(&a[bi * n * n..(bi + 1) * n * n], n, sweeps, false).0
+                let items = batch.div_ceil(CHUNK);
+                let plan = JobPlan::new(0, items as u32);
+                let w: Vec<Vec<f64>> = collect_indexed(&plan, items, 1, |ci| {
+                    let lo = ci * CHUNK;
+                    let hi = (lo + CHUNK).min(batch);
+                    cpu::syev_jacobi_batched(&a[lo * n * n..hi * n * n], hi - lo, n, sweeps, false).0
                 });
                 std::hint::black_box(w);
             });
@@ -254,9 +281,12 @@ fn main() {
                 std::hint::black_box(cpu::gesvd_jacobi_batched(&a, batch, n, n, sweeps, false));
             });
             let par = median_ns(3, || {
-                let plan = JobPlan::new(0, batch as u32);
-                let s: Vec<Vec<f64>> = collect_indexed(&plan, batch, 1, |bi| {
-                    cpu::gesvd_jacobi(&a[bi * n * n..(bi + 1) * n * n], n, n, sweeps, false).1
+                let items = batch.div_ceil(CHUNK);
+                let plan = JobPlan::new(0, items as u32);
+                let s: Vec<Vec<f64>> = collect_indexed(&plan, items, 1, |ci| {
+                    let lo = ci * CHUNK;
+                    let hi = (lo + CHUNK).min(batch);
+                    cpu::gesvd_jacobi_batched(&a[lo * n * n..hi * n * n], hi - lo, n, n, sweeps, false).1
                 });
                 std::hint::black_box(s);
             });

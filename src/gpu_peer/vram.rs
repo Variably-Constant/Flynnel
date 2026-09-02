@@ -87,12 +87,45 @@ impl VramPool {
         self.free.pop()
     }
 
+    /// Claim `need` consecutive block indices and return the first,
+    /// or `None` when no free run that long exists. Searches the
+    /// free set in index order, so release order never decides
+    /// whether a span is available; the lowest-indexed fitting run
+    /// wins.
+    pub fn alloc_span(&mut self, need: u32) -> Option<u32> {
+        let first = span_start(&self.free, need)?;
+        self.free.retain(|&b| b < first || b >= first + need);
+        Some(first)
+    }
+
     /// Return a block to the pool.
     pub fn release(&mut self, block: u32) {
         debug_assert!(block < self.blocks);
         debug_assert!(!self.free.contains(&block), "double release of block {block}");
         self.free.push(block);
     }
+}
+
+/// First index of the lowest run of `need` consecutive values in
+/// `free` (any order), or `None`.
+fn span_start(free: &[u32], need: u32) -> Option<u32> {
+    if need == 0 || need as usize > free.len() {
+        return None;
+    }
+    let mut sorted = free.to_vec();
+    sorted.sort_unstable();
+    let need_us = need as usize;
+    let mut run_start = 0usize;
+    for i in 1..=sorted.len() {
+        let contiguous = i < sorted.len() && sorted[i] == sorted[i - 1] + 1;
+        if !contiguous {
+            if i - run_start >= need_us {
+                return Some(sorted[run_start]);
+            }
+            run_start = i;
+        }
+    }
+    None
 }
 
 impl Drop for VramPool {
@@ -125,5 +158,18 @@ mod tests {
         let mut seen: Vec<u32> = std::mem::take(&mut free);
         seen.sort_unstable();
         assert_eq!(seen, (2..blocks).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn span_start_ignores_free_list_order() {
+        // Released out of order: a LIFO pop sequence could never
+        // produce 4..8 consecutively, but the run exists.
+        let free = vec![9u32, 4, 6, 5, 7, 2, 0];
+        assert_eq!(super::span_start(&free, 4), Some(4));
+        assert_eq!(super::span_start(&free, 1), Some(0));
+        assert_eq!(super::span_start(&free, 2), Some(4));
+        assert_eq!(super::span_start(&free, 5), None);
+        assert_eq!(super::span_start(&free, 0), None);
+        assert_eq!(super::span_start(&[], 1), None);
     }
 }

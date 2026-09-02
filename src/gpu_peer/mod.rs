@@ -561,33 +561,10 @@ impl GpuPeer {
             .as_mut()
             .ok_or(GpuPeerError::Unavailable("resident pool disabled"))?;
         let block_bytes = pool.block_bytes() as usize;
-        let need = data.len().div_ceil(block_bytes.max(1));
-        // Consecutive blocks: the pool hands out indices, so a span is
-        // claimed by taking one and checking the rest follow it.
+        let need = data.len().div_ceil(block_bytes.max(1)).max(1);
         let first = pool
-            .alloc()
-            .ok_or(GpuPeerError::Unavailable("resident pool exhausted"))?;
-        let mut claimed = vec![first];
-        while claimed.len() < need {
-            match pool.alloc() {
-                Some(b) if b == first + claimed.len() as u32 => claimed.push(b),
-                Some(b) => {
-                    // Not contiguous: give everything back rather than
-                    // hand out a span that is not one.
-                    pool.release(b);
-                    for c in claimed {
-                        pool.release(c);
-                    }
-                    return Err(GpuPeerError::Unavailable("no contiguous resident span"));
-                }
-                None => {
-                    for c in claimed {
-                        pool.release(c);
-                    }
-                    return Err(GpuPeerError::Unavailable("resident pool exhausted"));
-                }
-            }
-        }
+            .alloc_span(need as u32)
+            .ok_or(GpuPeerError::Unavailable("no contiguous resident span"))?;
         let dst = pool.block_ptr(first);
         // SAFETY: `dst` is the pool's own device allocation and the
         // span was just claimed, so it covers `data.len()` bytes.
@@ -768,7 +745,13 @@ impl GpuPeer {
             .pool
             .as_mut()
             .ok_or(GpuPeerError::Unavailable("resident pool disabled"))?;
-        pool.release(handle.block);
+        // A pin_bulk handle spans every block its bytes cover.
+        let span = (handle.bytes as usize)
+            .div_ceil(pool.block_bytes().max(1) as usize)
+            .max(1) as u32;
+        for b in handle.block..handle.block + span {
+            pool.release(b);
+        }
         Ok(())
     }
 

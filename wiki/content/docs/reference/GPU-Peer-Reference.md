@@ -56,6 +56,26 @@ impl GpuPeer {
     pub fn reap(&mut self, ticket: Ticket) -> Result<(), GpuPeerError>;
     pub fn timed_lock_acquire(&self, timeout: Duration) -> Result<(), GpuPeerError>;
     pub fn timed_lock_release(&self);
+    // Resident blocks and wide ops (detailed in the sections below):
+    pub fn pin(&mut self, data: &[u8]) -> Result<ResidentHandle, GpuPeerError>;
+    pub fn pin_bulk(&mut self, data: &[u8]) -> Result<ResidentHandle, GpuPeerError>;
+    pub fn pin_prefetch(&mut self, data: &[u8]) -> Result<(ResidentHandle, Ticket), GpuPeerError>;
+    pub fn write_resident_bulk(&mut self, handle: &ResidentHandle, data: &[u8]) -> Result<(), GpuPeerError>;
+    pub fn fetch(&mut self, handle: &ResidentHandle, out: &mut [u8]) -> Result<(), GpuPeerError>;
+    pub fn fetch_bulk(&mut self, handle: &ResidentHandle, out: &mut [u8]) -> Result<(), GpuPeerError>;
+    pub fn unpin(&mut self, handle: ResidentHandle) -> Result<(), GpuPeerError>;
+    pub fn resident_ptr(&self, handle: &ResidentHandle) -> Result<(u64, usize), GpuPeerError>;
+    pub fn submit_resident(&mut self, op: u32, handle: &ResidentHandle) -> Result<Ticket, GpuPeerError>;
+    pub fn submit_user(&mut self, op: u32, handle: Option<&ResidentHandle>, args: &[u8]) -> Result<Ticket, GpuPeerError>;
+    pub fn compile_wide_kernel(&self, src: &str, entry: &str) -> Result<WideKernel, GpuPeerError>;
+    pub fn load_wide_kernel_ptx(&self, ptx: &str, entry: &str) -> Result<WideKernel, GpuPeerError>;
+    pub fn launch_wide(&self, kernel: &WideKernel, grid_blocks: u32, block_threads: u32, ptrs: &[u64], scalars: &[u32]) -> Result<(), GpuPeerError>;
+    pub fn launch_wide_async(&self, ..same..) -> Result<(), GpuPeerError>;
+    pub fn sync_wide(&self) -> Result<(), GpuPeerError>;
+    pub fn pause_poller(&mut self) -> Result<(), GpuPeerError>;
+    pub fn resume_poller(&mut self) -> Result<(), GpuPeerError>;
+    pub fn context(&self) -> &Arc<CudaContext>;
+    pub fn wide_stream(&self) -> &Arc<CudaStream>;
 }
 ```
 
@@ -202,6 +222,78 @@ consumed after resume. Measured on a 16 MiB streaming op: pausing
 reclaimed ~10% on this hardware, more where the co-runner is more
 occupancy-starved. E2E:
 [`examples/gpu_wide_batch_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/gpu_wide_batch_demo.rs).
+
+### Loading wide kernels from checked-in PTX; the context and stream
+
+`load_wide_kernel_ptx(ptx, entry)` builds a `WideKernel` from PTX
+text the driver JIT-compiles, so a consumer can ship its kernels the
+same way Flynnel ships its own, with no NVRTC at run time.
+`context()` and `wide_stream()` expose the CUDA context and the wide
+stream: work a consumer enqueues on that stream (its own kernels,
+library calls) is FIFO-ordered with `launch_wide_async` launches and
+fenced by `sync_wide`. cudarc's `CudaContext::new` retains the
+device's PRIMARY context, so device pointers from the peer's resident
+pool are valid for any other cudarc user on the same device in the
+process (verified by the accel-route parity test, which launches on
+peer-pinned buffers through a separate `CudaBackend`).
+
+`pin_bulk` claims the lowest free run of consecutive pool blocks that
+covers the data, whatever order earlier blocks were released in, and
+`unpin` returns every block of the span.
+
+## Batched linear algebra (`gpu_peer::linalg`)
+
+Four op families as house-owned f64 kernels in
+`kernels/linalg_f64.ptx` (driver-JIT'd; NVRTC fallback from the
+embedded `.cu` when a driver rejects the PTX; no cuBLAS / cuSOLVER at
+build or run time), over resident blocks:
+
+| Op | Kernel | Contract |
+|---|---|---|
+| einsum | `flynnel_einsum_f64` | Any `"ij,jk->ik"`-style contraction over one or two operands (matmul, outer product, n-d outer, axis sums, trace, transposed contractions), batched; one thread per output element, fma-accumulated in ascending contracted-index order |
+| GEMM | `flynnel_gemm_batched_f64` | Batched row-major `C = A x B`, 16x16 shared-memory tiles, fma with `k` ascending |
+| symmetric eigen | `flynnel_syev_jacobi_f64_{blk,thr}` | Batched Jacobi eigendecomposition, `n <= 64`; eigenvalues in diagonal order plus optional eigenvectors |
+| SVD | `flynnel_gesvd_jacobi_f64_{blk,thr}` | Batched one-sided Jacobi SVD, `m >= n`, `m <= 64`; `A` is overwritten with `U`, singular values in column order, optional `V` |
+
+Two Jacobi kernel shapes exist because the best one depends on `n`:
+`blk` runs one 256-thread block per matrix with the matrix in 32 KB of
+static shared memory and applies `n / 2` disjoint rotations per
+tournament round; `thr` runs one thread per matrix in local memory
+(`n <= 16`). `jacobi_shape_for(n)` picks by
+`JACOBI_THREAD_SHAPE_MAX_N`, which `benches/gpu_linalg.rs` sets from
+measurement on the bench hosts.
+
+Three surfaces over the same kernels:
+
+```rust
+pub struct LinalgKernels { einsum, gemm, syev_blk, syev_thr, gesvd_blk, gesvd_thr }
+impl LinalgKernels { pub fn load(peer: &GpuPeer) -> Result<Self, GpuPeerError> }
+pub struct EinsumSpec;               // EinsumSpec::parse("ij,jk->ik", &a_shape, Some(&b_shape))
+// Async, over device addresses; queue a step, then peer.sync_wide() once:
+pub fn launch_einsum(peer, k, spec, tables_dev, a, b, out, batch)
+pub fn launch_gemm(peer, k, a, b, c, batch, m, n, kdim)
+pub fn launch_syev(peer, k, a, w, v: Option<u64>, batch, n, max_sweeps, shape)
+pub fn launch_gesvd(peer, k, a, sigma, v: Option<u64>, batch, m, n, max_sweeps, shape)
+// Synchronous over host buffers (pin, launch, sync, fetch, unpin):
+pub fn einsum_batched(..) / gemm_batched(..) / syev_batched(..) / gesvd_batched(..)
+// CPU references with the kernels' semantics:
+pub mod cpu { einsum, gemm_batched, syev_jacobi[_batched], gesvd_jacobi[_batched] }
+// accel_op registrations (see Backend System): CPU side = cpu::*, kernel side = the blk kernels
+pub fn register_linalg_accel_ops() -> LinalgAccelOps
+pub fn bind_linalg_kernels(&ops, backend) -> Result<(), BackendError>
+pub fn gemm_accel(..) / syev_accel(..) / gesvd_accel(..) -> AccelReport
+```
+
+Parity contract, verified on the device by
+`tests/gpu_linalg_parity.rs` (RTX 3070 and RTX 5070): einsum and gemm
+match the CPU references bit for bit (the same fma order); the Jacobi
+ops rotate pairs in tournament order while the CPU references sweep
+cyclically, so eigenvalues and singular values agree to `1e-10`
+relative, with eigenvectors checked by `A v = lambda v`, and the SVD
+by `A = U diag(sigma) V^T` and `U^T U = I` at `1e-9` of the operand
+norm. Reducers a consumer wants (trace, Frobenius norm, spectral
+radius, nuclear norm, condition number, determinant) are host-side
+folds over the einsum, eigenvalue and singular-value outputs.
 
 ## User opcodes (a programmable doorbell op)
 
