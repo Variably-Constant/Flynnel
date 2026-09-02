@@ -119,6 +119,15 @@ fn fits(label: &str, bytes_needed: usize) -> bool {
     }
 }
 
+/// Whether a section runs: `FLYNNEL_BENCH_SECTIONS` names a comma
+/// list of gemm, einsum, syev, gesvd; unset runs all four.
+fn wants(section: &str) -> bool {
+    match std::env::var("FLYNNEL_BENCH_SECTIONS") {
+        Ok(list) => list.split(',').any(|s| s.trim() == section),
+        Err(_) => true,
+    }
+}
+
 fn main() {
     let mut peer = match GpuPeer::init(GpuPeerConfig {
         slot_bytes: 64 * 1024,
@@ -144,6 +153,9 @@ fn main() {
     println!("{:>4} {:>7} | {:>10} {:>10} {:>10} | {:>9} {:>9} | {:>10}",
         "n", "batch", "gpu ms", "cpu-par ms", "serial ms", "gpu/par", "gpu/ser", "pin+fetch");
     for &n in &[8usize, 16, 32, 64] {
+        if !wants("gemm") {
+            break;
+        }
         for &batch in &[1024usize, 8192, 65536] {
             if !fits(&format!("gemm n={n} batch={batch}"), 3 * batch * n * n * 8) {
                 continue;
@@ -200,6 +212,9 @@ fn main() {
     println!("\n--- einsum outer product \"i,j->ij\" (n x n) and row sum \"ij->i\", f64 ---");
     println!("{:>8} {:>4} {:>7} | {:>10} {:>10} | {:>9}", "op", "n", "batch", "gpu ms", "serial ms", "gpu/ser");
     for &n in &[16usize, 64] {
+        if !wants("einsum") {
+            break;
+        }
         for &batch in &[8192usize, 65536] {
             if !fits(
                 &format!("einsum n={n} batch={batch}"),
@@ -246,6 +261,9 @@ fn main() {
     println!("{:>4} {:>7} | {:>10} {:>10} {:>10} {:>10} | {:>9} {:>9}",
         "n", "batch", "blk ms", "thr ms", "cpu-par ms", "serial ms", "best/par", "best/ser");
     for &n in &[4usize, 8, 16, 32, 64] {
+        if !wants("syev") {
+            break;
+        }
         for &batch in &[1024usize, 8192, 65536] {
             if !fits(&format!("syev n={n} batch={batch}"), batch * n * n * 8 + batch * n * 8) {
                 continue;
@@ -294,6 +312,9 @@ fn main() {
     println!("{:>4} {:>7} | {:>10} {:>10} {:>10} {:>10} | {:>9} {:>9}",
         "n", "batch", "blk ms", "thr ms", "cpu-par ms", "serial ms", "best/par", "best/ser");
     for &n in &[4usize, 8, 16, 32, 64] {
+        if !wants("gesvd") {
+            break;
+        }
         for &batch in &[1024usize, 8192, 65536] {
             if !fits(&format!("gesvd n={n} batch={batch}"), batch * n * n * 8 + batch * n * 8) {
                 continue;
