@@ -61,9 +61,22 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::sched::job::{CompactJobRef, JobRef};
+
+/// Owner-pop discipline, read once from `FLYNNEL_OWNER_POP`: `lifo`
+/// pops the newest published body (Chase-Lev order), anything else
+/// the oldest (head order). Oldest-first stays the default until the
+/// measurement under flynnel-14 is ruled on.
+fn owner_pop_lifo() -> bool {
+    static LIFO: OnceLock<bool> = OnceLock::new();
+    *LIFO.get_or_init(|| {
+        std::env::var("FLYNNEL_OWNER_POP")
+            .map(|v| v.eq_ignore_ascii_case("lifo"))
+            .unwrap_or(false)
+    })
+}
 
 /// Items per KHL slot. 3 matches Fcl's cache-line-fit ratio.
 pub const KHL_LINE_ITEMS: usize = 3;
@@ -216,7 +229,8 @@ pub enum KhlSteal {
     Success(KhlBody),
     /// Deque was empty (no race).
     Empty,
-    /// Lost head CAS (steal only) or seq race (rare).
+    /// Lost the head CAS: a steal, or an owner LIFO pop racing a
+    /// thief for the last body.
     Retry,
 }
 
@@ -444,11 +458,61 @@ impl SchedKhlDeque {
             let body = core::mem::replace(acc, KhlBody::empty(0, 0, 0));
             return KhlSteal::Success(body);
         }
-        // Drain from inner. The owner uses the thief steal pattern
-        // (head CAS) for inner consumption; works whether the owner
-        // pops LIFO (b - 1) or FIFO (head). KHL is a Vyukov ring
-        // so owner-FIFO via head is the natural fit.
-        self.steal_inner()
+        // Drain from the ring: oldest body through the thief pattern
+        // (head CAS), or newest under the LIFO flag.
+        if owner_pop_lifo() {
+            self.pop_newest()
+        } else {
+            self.steal_inner()
+        }
+    }
+
+    /// Owner pop of the newest published body, Chase-Lev discipline
+    /// on the seq ring: `bottom` is lowered first and `head` read
+    /// after a SeqCst fence, so a thief that still sees the old
+    /// bottom loaded `head` before this pop announced itself and
+    /// cannot claim index `b` unless `head == b`; that last-body case
+    /// is raced through the head CAS as a thief would race it. A body
+    /// taken without the race leaves its slot unpublished for round
+    /// `b` again (`bottom` stays at `b`); one taken through the race
+    /// releases the slot as a thief release would.
+    fn pop_newest(&self) -> KhlSteal {
+        let h = &*self.inner;
+        let b = h.bottom.load(Ordering::Relaxed) - 1;
+        if h.head.load(Ordering::Acquire) > b {
+            return KhlSteal::Empty;
+        }
+        h.bottom.store(b, Ordering::SeqCst);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let t = h.head.load(Ordering::SeqCst);
+        if t > b {
+            h.bottom.store(b + 1, Ordering::SeqCst);
+            return KhlSteal::Empty;
+        }
+        // SAFETY: (b & capacity_mask) is always in [0, capacity).
+        let slot = unsafe { h.buffer.get_unchecked((b & h.capacity_mask) as usize) };
+        if t == b {
+            let won = h
+                .head
+                .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok();
+            h.bottom.store(b + 1, Ordering::SeqCst);
+            if !won {
+                return KhlSteal::Retry;
+            }
+            // SAFETY: the head CAS made this owner the slot's sole
+            // consumer for round b; seq is b + 1 (published before
+            // bottom advanced past b).
+            let body = unsafe { core::ptr::read(slot.body.get()) };
+            slot.seq.store((b as u64) + (h.capacity as u64), Ordering::Release);
+            return KhlSteal::Success(body);
+        }
+        // SAFETY: head < b after the announcement, so no thief can
+        // claim index b (a claim needs head == b, and a thief that
+        // observes that also observes bottom == b); the body is ours.
+        let body = unsafe { core::ptr::read(slot.body.get()) };
+        slot.seq.store(b as u64, Ordering::Release);
+        KhlSteal::Success(body)
     }
 
     #[inline]
@@ -667,6 +731,109 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    /// `pop_newest` returns the most recently published body; a
+    /// thief still takes the oldest; the slot a LIFO pop vacates is
+    /// republishable at once.
+    #[test]
+    fn pop_newest_takes_newest_and_leaves_oldest_to_thieves() {
+        let (deque, stealer) = new_khl(4);
+        let jobs: Vec<_> = (0..4u32)
+            .map(|i| StackJob::new(move |_| i, CoreLatch::new()))
+            .collect();
+        for job in &jobs[..3] {
+            deque.push_one(unsafe { job.as_job_ref(4, 0, Variant::Fast) });
+        }
+        match deque.pop_newest() {
+            KhlSteal::Success(b) => unsafe { b.execute_all_lifo() },
+            other => panic!("expected Success, got {other:?}"),
+        }
+        assert!(jobs[2].latch.is_set() && !jobs[0].latch.is_set() && !jobs[1].latch.is_set());
+        // The vacated index publishes again without waiting.
+        deque.push_one(unsafe { jobs[3].as_job_ref(4, 0, Variant::Fast) });
+        match stealer.steal() {
+            KhlSteal::Success(b) => unsafe { b.execute_all_lifo() },
+            other => panic!("expected Success, got {other:?}"),
+        }
+        assert!(jobs[0].latch.is_set());
+        match deque.pop_newest() {
+            KhlSteal::Success(b) => unsafe { b.execute_all_lifo() },
+            other => panic!("expected Success, got {other:?}"),
+        }
+        assert!(jobs[3].latch.is_set());
+        match deque.pop_newest() {
+            KhlSteal::Success(b) => unsafe { b.execute_all_lifo() },
+            other => panic!("expected Success, got {other:?}"),
+        }
+        assert!(jobs[1].latch.is_set());
+        assert!(matches!(deque.pop_newest(), KhlSteal::Empty));
+        assert!(matches!(stealer.steal(), KhlSteal::Empty));
+    }
+
+    /// Owner LIFO pops racing four thieves over 20,000 bodies: every
+    /// job runs exactly once and none is lost. Bounded by a deadline
+    /// so a protocol fault fails instead of hanging.
+    #[test]
+    fn pop_newest_with_concurrent_thieves_runs_each_job_once() {
+        use core::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::time::{Duration, Instant};
+        const N: usize = 20_000;
+        let (deque, stealer) = new_khl(64);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let jobs: Vec<_> = (0..N)
+            .map(|_| {
+                let ran = Arc::clone(&ran);
+                StackJob::new(move |_| { ran.fetch_add(1, Ordering::Relaxed); }, CoreLatch::new())
+            })
+            .collect();
+        let thieves: Vec<_> = (0..4)
+            .map(|_| {
+                let s = stealer.clone();
+                let done = Arc::clone(&done);
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Acquire) {
+                        if let KhlSteal::Success(b) = s.steal() {
+                            unsafe { b.execute_all_lifo() };
+                        }
+                    }
+                    while let KhlSteal::Success(b) = s.steal() {
+                        unsafe { b.execute_all_lifo() };
+                    }
+                })
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for (i, job) in jobs.iter().enumerate() {
+            let mut r = unsafe { job.as_job_ref(4, 0, Variant::Fast) };
+            while let Err(back) = deque.try_push_one(r) {
+                r = back;
+                if let KhlSteal::Success(b) = deque.pop_newest() {
+                    unsafe { b.execute_all_lifo() };
+                }
+                assert!(Instant::now() < deadline, "push {i} stalled");
+            }
+            if i % 3 == 0 {
+                if let KhlSteal::Success(b) = deque.pop_newest() {
+                    unsafe { b.execute_all_lifo() };
+                }
+            }
+        }
+        loop {
+            match deque.pop_newest() {
+                KhlSteal::Success(b) => unsafe { b.execute_all_lifo() },
+                KhlSteal::Retry => continue,
+                KhlSteal::Empty => break,
+            }
+            assert!(Instant::now() < deadline, "owner drain stalled");
+        }
+        done.store(true, Ordering::Release);
+        for t in thieves {
+            t.join().expect("thief thread");
+        }
+        assert_eq!(ran.load(Ordering::Relaxed), N, "every job runs exactly once");
+        assert!(jobs.iter().all(|j| j.latch.is_set()));
     }
 
     /// A full ring with no consumer refuses the next push and hands
