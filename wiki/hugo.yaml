@@ -1,0 +1,78 @@
+# Hugo + Hextra config for the Flynnel wiki.
+#
+# Structure mirrors github.com/imfing/hextra-starter-template/hugo.yaml.
+# Only params verified against the Hextra docs + starter template are
+# included; nothing is invented from training-data memory.
+
+baseURL: https://markusmcnugen.github.io/flynnel/
+title: Flynnel Wiki
+languageCode: en-us
+enableRobotsTXT: true
+enableGitInfo: true
+
+module:
+  hugoVersion:
+    extended: true
+    min: 0.156.0
+  imports:
+    - path: github.com/imfing/hextra
+
+markup:
+  goldmark:
+    renderer:
+      unsafe: true
+  highlight:
+    noClasses: false
+
+menu:
+  main:
+    - identifier: docs
+      name: Docs
+      pageRef: /docs
+      weight: 1
+    - name: Search
+      weight: 2
+      params:
+        type: search
+    - name: GitHub
+      weight: 3
+      url: https://github.com/markusmcnugen/flynnel
+      params:
+        icon: github
+
+params:
+  description: K-aware NUMA-aware work-stealing scheduler with extended-Flynn-taxonomy dispatch.
+
+  navbar:
+    displayTitle: true
+    displayLogo: true
+    logo:
+      path: flynnel-logo.png
+      link: /
+      width: 32
+      height: 40
+
+  page:
+    width: wide
+
+  theme:
+    default: system
+    displayToggle: true
+
+  footer:
+    displayCopyright: true
+    displayPoweredBy: true
+
+  editURL:
+    enable: true
+    base: https://github.com/markusmcnugen/flynnel/edit/main/wiki/content
+
+  search:
+    enable: true
+    type: flexsearch
+    flexsearch:
+      index: content
+      tokenize: forward
+
+  toc:
+    displayTags: true

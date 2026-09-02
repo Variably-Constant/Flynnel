@@ -1,0 +1,344 @@
+[package]
+name = "flynnel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "K-aware NUMA-aware work-stealing scheduler with extended-Flynn-taxonomy dispatch (MIMD / SIMC / MIMC / MISD / SIMT / MIMT): a rayon-shaped pool reshaped around per-call execution-class plans with first-class CPU+GPU hybrid (join_hybrid, hybrid_pipeline) and per-call dispatch profiles."
+license = "MIT"
+repository = "https://github.com/markusmcnugen/flynnel"
+documentation = "https://docs.rs/flynnel"
+readme = "README.md"
+keywords = ["scheduler", "work-stealing", "parallel", "numa", "simd"]
+categories = ["concurrency", "asynchronous"]
+# Explicit example / bench declarations only. Autodiscovery on
+# `examples/` would list files that `exclude` below removes from
+# the published tarball, producing a `cargo package` warning; the
+# explicit list keeps the on-disk workspace and the packaged crate
+# in agreement.
+autoexamples = false
+
+# Files kept OUT of the crates.io tarball. The wiki lives on GitHub
+# Wiki; agent-instruction docs are for local tooling; hidden
+# directories carry issue-tracker / IDE state that has no place in a
+# published package. `assets/*.psd` drops the ~9 MiB Photoshop
+# source; the .png logos ship so consumers can render the README's
+# branding without a network fetch.
+exclude = [
+    "/.claude/**",
+    "/.github/**",
+    "/.gitignore",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/assets/*.psd",
+    "/wiki/**",
+    "/examples/audit_real_workloads_routing.rs",
+    "/examples/classifier_audit.rs",
+    "/examples/observe_grep.rs",
+    "/examples/observe_workloads.rs",
+    "/examples/probe_k_gating.rs",
+    "/examples/migrate_observability.rs",
+    "/examples/analyze_trace.py",
+    "/examples/trace_real_grep.rs",
+    "/kaggle/**",
+    "/tpu/**",
+]
+
+[dependencies]
+# Per-thread CPU affinity pinning. Non-optional so the pinning code
+# path is available in every build; on platforms where pinning is
+# unsupported the calls degrade to OS-managed placement. crates.io
+# 2026-06-03: 0.8.3 latest.
+core_affinity = "0.8.3"
+# BLAKE3 hashing for the VerifyChain primitive (CPU/GPU bit-exact
+# trace verification). Optional because not every consumer needs the
+# verification surface; gate with the `verify-chain` feature. crates.io
+# 2026-06-03: 1.8.5 latest.
+blake3 = { version = "1.8.5", optional = true }
+# Cross-platform dlopen wrapper used by `crate::backend::detect` to
+# probe whether GPU runtimes (libcuda, libamdhip64) are loadable on
+# the host WITHOUT linking the SDK at build time. ~50 KB no-deps
+# crate; non-optional because detection is a stable surface and the
+# binary cost is trivial. crates.io 2026-06-03: 0.9.0 latest.
+libloading = "0.9"
+# CUDA reference backend (optional). cudarc with the
+# `dynamic-loading` feature dlopens libcuda at runtime, so no nvcc
+# or CUDA SDK is required at build time. The `cuda-12060` feature
+# selects the CUDA 12.6 ABI; CUDA's runtime ABI is backward
+# compatible so a host with driver >= 12.6 satisfies any binary
+# built with this feature. crates.io 2026-06-03: 0.19.7 latest.
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["fallback-dynamic-loading", "driver", "nvrtc", "cuda-13010"] }
+# TPU JAX reference backend (optional). Spawns a Python child
+# process running the embedded `tpu_jax_bridge.py` script and talks
+# to it over line-oriented JSON on stdin/stdout. No JAX dep at
+# build time; the host needs python3 + jax installed at runtime
+# for kernel launches to succeed (detection probe + graceful
+# degradation when missing). crates.io 2026-06-03: serde 1.0.228,
+# serde_json 1.0.150.
+serde = { version = "1.0.228", optional = true, features = ["derive"] }
+serde_json = { version = "1.0.150", optional = true }
+# WebAssembly reference backend (optional). wasmtime is a pure-Rust
+# embeddable WASM runtime; no system shared library is required at
+# build or run time. Gated by `wasm-reference` so hosts that do not
+# need WASM dispatch do not pull it in. crates.io 2026-06-04: 25.0
+# is the current major release line.
+wasmtime = { version = "25.0", optional = true, default-features = false, features = ["cranelift", "runtime"] }
+# Memory-mapped file primitive used by the shared-memory worker
+# backend. Pure-Rust, no system library at build time; relies on
+# OS mmap (POSIX) / CreateFileMapping (Windows) at runtime. Gated
+# by `shared-memory-worker-reference` so hosts that do not need
+# cross-process dispatch do not pull it in. crates.io 2026-06-04:
+# 0.9.10 is the current stable line.
+memmap2 = { version = "0.9.10", optional = true }
+
+[dev-dependencies]
+# Reference scheduler for the taxonomy Flynnel inherits from. Not
+# a production dep; only referenced by benches that show flynnel's
+# join / for_each_chunk / cooperative surfaces alongside the
+# rayon-style API they extend. crates.io 2026-06-03: 1.12.0 latest.
+rayon = "1.12"
+# Statistics-driven micro-benchmarking. Used by the criterion
+# benches under `benches/` (flynn_axes, inline_collapse). The
+# `html_reports` feature is on by default; we keep it for the
+# target/criterion/report/index.html dashboard. crates.io
+# 2026-06-03: 0.8.2 latest.
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[features]
+# EVERYTHING ON BY DEFAULT (owner directive, 2026-08-04). A release
+# build ships the whole substrate - the CUDA backend and the GPU-peer
+# MMF among it - because a capability that is compiled out is a
+# capability nobody can use, and "default = []" quietly meant no
+# consumer had the GPU at all. None of these need a toolkit at BUILD
+# time: cudarc dlopens libcuda at runtime and degrades when it is
+# absent, and the same is true of the JAX and WASM backends.
+#
+# Opt OUT with --no-default-features (plus whatever subset you do
+# want) for a lean CPU-only build.
+default = [
+    "verify-chain",
+    "cuda-reference",
+    "gpu-peer",
+    "shared-memory-worker-reference",
+    "tpu-jax-reference",
+    "wasm-reference",
+]
+# Enable the BLAKE3-rooted verification-chain helper (VerifyChain).
+verify-chain = ["dep:blake3"]
+# Enable the cudarc-based reference CUDA backend
+# (`crate::backend::cuda::CudaBackend`). Pulls in cudarc with
+# dynamic-loading so no CUDA SDK is needed at build time; the CUDA
+# driver must be present at runtime for kernel launches to succeed.
+cuda-reference = ["dep:cudarc"]
+# Enable the Python-JAX reference TPU backend
+# (`crate::backend::tpu_jax::TpuJaxBackend`). Pulls in serde /
+# serde_json for the wire protocol. The host needs python3 + jax
+# installed at runtime for kernel launches to succeed; without
+# them, `TpuJaxBackend::new` returns BackendError::DeviceUnavailable
+# and the routing helper falls back to the CPU backend.
+tpu-jax-reference = ["dep:serde", "dep:serde_json"]
+# Enable the wasmtime-based reference WebAssembly backend
+# (`crate::backend::wasm::WasmBackend`). Pulls in wasmtime with the
+# cranelift compiler + runtime. Self-contained: no system runtime
+# library required, the WASM engine ships inside the binary.
+wasm-reference = ["dep:wasmtime"]
+# Enable the GPU-peer substrate (`crate::gpu_peer`): the GPU joins the
+# scheduler as a shared-memory peer over a cudarc-registered memory-
+# mapped region - Lamport SPSC lanes with doorbell dispatch, host-
+# calibrated timing constants (doorbell RTT, clock offset, Fischer
+# margin) measured at init on the running machine, and a bounded-
+# quantum persistent poller kernel shipped as pre-generated PTX
+# (driver-JIT'd; no CUDA toolkit needed at build time).
+gpu-peer = ["dep:cudarc", "dep:memmap2"]
+# Enable the reference shared-memory worker backend
+# (`crate::backend::shared_mem::SharedMemoryChaseLevBackend`). Pulls
+# in memmap2 for the memory-mapped Chase-Lev work-stealing deque +
+# memory-mapped latch arena that back cross-process dispatch. Each
+# peer process pre-registers `closure_id -> handler` via
+# `shared_mem::pass_registry::register` at startup so the wire only
+# carries `(closure_id, args_inline)`. Per-call cost is 342-881 ns on
+# Zen+ depending on the coherence tier vs ~20-50 us for pipe-based IPC.
+shared-memory-worker-reference = ["dep:memmap2"]
+
+[[example]]
+name = "adaptive_dispatcher_demo"
+
+[[example]]
+name = "backend_dispatch_demo"
+
+[[example]]
+name = "dispatcher_per_axis"
+
+[[example]]
+name = "flat_api_demo"
+
+[[example]]
+name = "tutorial_all_apis"
+
+[[example]]
+name = "adaptive_spin_demo"
+
+[[example]]
+name = "explore_select_demo"
+
+[[example]]
+name = "racing_zoo_demo"
+
+[[example]]
+name = "cat_demo"
+
+[[example]]
+name = "site_classifier_demo"
+
+[[example]]
+name = "hybrid_auto_demo"
+
+[[example]]
+name = "tpu_jax_demo"
+required-features = ["tpu-jax-reference"]
+
+[[example]]
+name = "wasm_dispatch_demo"
+required-features = ["wasm-reference"]
+
+[[example]]
+name = "chase_lev_mmf_steal"
+required-features = ["shared-memory-worker-reference"]
+
+[[example]]
+name = "loh_steal"
+required-features = ["shared-memory-worker-reference"]
+
+[[example]]
+name = "khpd_steal"
+required-features = ["shared-memory-worker-reference"]
+
+[[example]]
+name = "urd_steal"
+required-features = ["shared-memory-worker-reference"]
+
+[[example]]
+name = "dispatcher_demo"
+required-features = ["shared-memory-worker-reference"]
+
+[[example]]
+name = "cuda_probe"
+required-features = ["cuda-reference"]
+
+[[example]]
+name = "accel_route_demo"
+required-features = ["cuda-reference"]
+
+[[example]]
+name = "gpu_peer_demo"
+required-features = ["gpu-peer"]
+
+[[example]]
+name = "gpu_peer_tandem_demo"
+required-features = ["gpu-peer"]
+
+[[example]]
+name = "gpu_peer_resident_demo"
+required-features = ["gpu-peer"]
+
+[[example]]
+name = "gpu_peer_user_ops_demo"
+required-features = ["gpu-peer"]
+
+[[example]]
+name = "gpu_peer_group_demo"
+required-features = ["gpu-peer"]
+
+[[example]]
+name = "gpu_peer_hybrid_demo"
+required-features = ["gpu-peer"]
+
+[[example]]
+name = "gpu_l2_persist_demo"
+required-features = ["gpu-peer"]
+
+[[example]]
+name = "gpu_wide_op_demo"
+required-features = ["gpu-peer"]
+
+[[example]]
+name = "gpu_wide_batch_demo"
+required-features = ["gpu-peer"]
+
+[[example]]
+name = "gpu_peer_multi_silicon"
+required-features = ["gpu-peer"]
+
+[[bench]]
+name = "flynn_axes"
+harness = false
+required-features = ["cuda-reference"]
+
+[[bench]]
+name = "inline_collapse"
+harness = false
+
+[[bench]]
+name = "parameter_sweep"
+harness = false
+
+[[bench]]
+name = "cold_workloads"
+harness = false
+
+[[bench]]
+name = "sched_overhead_isolation"
+harness = false
+
+[[bench]]
+name = "mimt_coupled"
+harness = false
+required-features = ["cuda-reference"]
+
+[[bench]]
+name = "chase_lev_mmf"
+harness = false
+required-features = ["shared-memory-worker-reference"]
+
+[[bench]]
+name = "dispatcher_routing"
+harness = false
+required-features = ["shared-memory-worker-reference"]
+
+[[bench]]
+name = "parker_wait_strategy"
+harness = false
+
+[[bench]]
+name = "simc_cooperative"
+harness = false
+
+[[bench]]
+name = "simc_n12_bisect"
+harness = false
+
+[[bench]]
+name = "join_overhead"
+harness = false
+
+[[bench]]
+name = "probe_gate_sweep"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# House test profile: release-grade codegen without LTO so test
+# sweeps compile fast and land in their own target/release-test
+# tree instead of target/debug.
+[profile.release-test]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true

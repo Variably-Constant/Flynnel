@@ -1,0 +1,40 @@
+# Cargo build artifacts
+/target
+
+# Editor / IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Crash dumps
+*.stackdump
+
+# Profiling / analysis output
+perf.data*
+flamegraph.svg
+*.profraw
+
+# Kaggle packaging artifact (a tar of the source tree staged for
+# notebook upload; rebuild from the tree itself)
+kaggle/flynnel-src.tar.gz
+
+# Per-user agent configuration and instructions
+.claude/
+/AGENTS.md
+/CLAUDE.md
+
+# Notebook staging (not part of the published repo)
+/kaggle/
+/tpu/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

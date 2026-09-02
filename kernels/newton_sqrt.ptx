@@ -1,0 +1,65 @@
+//
+// Per-thread Newton sqrt iteration. Each thread runs `iters`
+// iterations of `v = 0.5 * (v + x/v)` on its assigned element.
+// Compute-intensive enough to be meaningful work after H2D transfer
+// cost is amortised.
+//
+// Signature (CUDA C equivalent):
+//   __global__ void newton_sqrt(float* data, int n, int iters)
+//
+// Block dim 256 (matches the CudaBackend default launch geometry).
+//
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry newton_sqrt(
+    .param .u64 data_ptr,
+    .param .u32 n,
+    .param .u32 iters
+)
+{
+    .reg .u32   %r<10>;
+    .reg .u64   %rd<5>;
+    .reg .f32   %f<10>;
+    .reg .pred  %p<3>;
+
+    // tid = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32     %r1, %ctaid.x;
+    mov.u32     %r2, %ntid.x;
+    mov.u32     %r3, %tid.x;
+    mad.lo.s32  %r4, %r1, %r2, %r3;
+
+    // Bounds check: if (tid >= n) return;
+    ld.param.u32 %r5, [n];
+    setp.ge.u32 %p1, %r4, %r5;
+    @%p1 bra DONE;
+
+    // addr = data_ptr + tid * 4
+    ld.param.u64 %rd1, [data_ptr];
+    mul.wide.u32 %rd2, %r4, 4;
+    add.s64      %rd3, %rd1, %rd2;
+
+    // x = data[tid]; v = x (initial guess)
+    ld.global.f32 %f1, [%rd3];
+    mov.f32       %f2, %f1;
+
+    // for (i = 0; i < iters; i++) v = 0.5f * (v + x/v);
+    ld.param.u32  %r6, [iters];
+    mov.u32       %r7, 0;
+LOOP:
+    setp.ge.u32   %p2, %r7, %r6;
+    @%p2 bra LOOP_END;
+    div.approx.f32 %f3, %f1, %f2;        // x / v
+    add.f32        %f4, %f2, %f3;         // v + x/v
+    mul.f32        %f2, %f4, 0f3F000000;  // * 0.5f
+    add.u32        %r7, %r7, 1;
+    bra            LOOP;
+LOOP_END:
+
+    // data[tid] = v
+    st.global.f32 [%rd3], %f2;
+
+DONE:
+    ret;
+}
