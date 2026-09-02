@@ -499,6 +499,45 @@ above follows from these two tables.
 | 64 | 4096 | 6.8x | 46.1x | 3.0x | 35.0x |
 | 64 | 8192 | 6.4x | 47.5x | 2.6x | 35.5x |
 
+#### GEMM: native f64 kernel vs the Ozaki scheme
+
+Commit `03ed261`, both hosts idle on the GPU; kernel wall per call
+after the same ramp, operands resident, the Ozaki workspace pinned
+once per shape.
+
+| n | batch | 3070 native ms | 3070 Ozaki ms | 3070 native/Ozaki | 5070 native ms | 5070 Ozaki ms | 5070 native/Ozaki |
+|---|---|---|---|---|---|---|---|
+| 64 | 1024 | 1.723 | 3.081 | 0.56x | 1.056 | 2.126 | 0.50x |
+| 64 | 8192 | 12.616 | 23.785 | 0.53x | 8.122 | 16.328 | 0.50x |
+| 256 | 1 | 0.133 | 0.119 | 1.12x | 0.085 | 0.170 | 0.50x |
+| 512 | 1 | 0.828 | 0.346 | 2.39x | 0.911 | 0.407 | 2.24x |
+| 1024 | 1 | 6.316 | 1.624 | 3.89x | 4.123 | 1.108 | 3.72x |
+| 2048 | 1 | 49.594 | 14.751 | 3.36x | 31.813 | 7.120 | 4.47x |
+
+#### Symmetric eigenvalues: Jacobi (blk) vs tridiagonalization + bisection
+
+Commit `03ed261`, eigenvalues only. The 5070's CPU column is omitted:
+that host's CPU was saturated by other work during the run, so only
+its GPU-to-GPU ratio is reported.
+
+| n | batch | 3070 Jacobi ms | 3070 bisection ms | 3070 CPU-par ms | 3070 Jacobi/bisection | 5070 Jacobi ms | 5070 bisection ms | 5070 Jacobi/bisection |
+|---|---|---|---|---|---|---|---|---|
+| 32 | 1024 | 17.658 | 10.143 | 77.978 | 1.74x | 12.009 | 8.472 | 1.42x |
+| 32 | 8192 | 134.069 | 75.448 | 469.958 | 1.78x | 93.507 | 65.924 | 1.42x |
+| 64 | 1024 | 115.381 | 28.828 | 550.605 | 4.00x | 76.411 | 19.114 | 4.00x |
+| 64 | 8192 | 882.849 | 216.487 | 4303.191 | 4.08x | 591.616 | 148.709 | 3.98x |
+
+#### Singular values: Jacobi (blk) vs bidiagonalization + bisection
+
+Same run, singular values only, square `m = n`.
+
+| n | batch | 3070 Jacobi ms | 3070 bisection ms | 3070 CPU-par ms | 3070 Jacobi/bisection | 5070 Jacobi ms | 5070 bisection ms | 5070 Jacobi/bisection |
+|---|---|---|---|---|---|---|---|---|
+| 32 | 1024 | 19.496 | 27.960 | 79.311 | 0.70x | 17.990 | 22.969 | 0.78x |
+| 32 | 8192 | 148.754 | 209.385 | 506.507 | 0.71x | 133.232 | 180.310 | 0.74x |
+| 64 | 1024 | 97.521 | 92.549 | 905.330 | 1.05x | 83.814 | 60.748 | 1.38x |
+| 64 | 8192 | 733.331 | 670.885 | 4577.038 | 1.09x | 634.704 | 471.169 | 1.35x |
+
 ## User opcodes (a programmable doorbell op)
 
 `GpuPeerConfig::user_ops_cuda` carries a caller-authored CUDA device
