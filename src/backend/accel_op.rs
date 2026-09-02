@@ -182,7 +182,7 @@ pub(crate) fn cost_gate_pass(
 }
 
 /// Outcome of one [`dispatch_accel`] call, for telemetry and tests.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AccelReport {
     /// The placement the learned model chose. [`Placement::Race`]
     /// means both sides ran and both samples were recorded.
@@ -203,6 +203,8 @@ pub struct AccelReport {
     /// A kernel launch was attempted and failed; the CPU
     /// implementation covered the dispatch.
     pub fell_back: bool,
+    /// The launch error behind `fell_back`, rendered with `Debug`.
+    pub fallback_error: Option<String>,
 }
 
 /// Route one dispatch of a registered op to the CPU implementation
@@ -250,6 +252,7 @@ pub fn dispatch_accel(
             backend_ns: None,
             gate_blocked: false,
             fell_back: false,
+            fallback_error: None,
         };
     };
     let backend = backend_by_id(&backend_id).expect("accel_target checked registration");
@@ -265,6 +268,7 @@ pub fn dispatch_accel(
             backend_ns: None,
             gate_blocked: true,
             fell_back: false,
+            fallback_error: None,
         };
     }
 
@@ -284,6 +288,7 @@ pub fn dispatch_accel(
                 backend_ns: None,
                 gate_blocked: false,
                 fell_back: false,
+                fallback_error: None,
             }
         }
         Placement::Backend => match run_kernel() {
@@ -296,9 +301,10 @@ pub fn dispatch_accel(
                     backend_ns: Some(ns),
                     gate_blocked: false,
                     fell_back: false,
+                    fallback_error: None,
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 let cpu_ns = run_cpu(true);
                 AccelReport {
                     placement: Placement::Cpu,
@@ -307,6 +313,7 @@ pub fn dispatch_accel(
                     backend_ns: None,
                     gate_blocked: false,
                     fell_back: true,
+                    fallback_error: Some(format!("{e:?}")),
                 }
             }
         },
@@ -328,9 +335,10 @@ pub fn dispatch_accel(
                         backend_ns: Some(dev_ns),
                         gate_blocked: false,
                         fell_back: false,
+                        fallback_error: None,
                     }
                 }
-                Err(_) => {
+                Err(e) => {
                     site.record_placement(count, Some(cpu_ns), None);
                     AccelReport {
                         placement: Placement::Cpu,
@@ -339,6 +347,7 @@ pub fn dispatch_accel(
                         backend_ns: None,
                         gate_blocked: false,
                         fell_back: true,
+                        fallback_error: Some(format!("{e:?}")),
                     }
                 }
             }

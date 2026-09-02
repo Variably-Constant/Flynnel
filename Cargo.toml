@@ -324,6 +324,11 @@ harness = false
 name = "probe_gate_sweep"
 harness = false
 
+[[bench]]
+name = "gpu_linalg"
+harness = false
+required-features = ["gpu-peer"]
+
 [profile.release]
 opt-level = 3
 lto = "thin"

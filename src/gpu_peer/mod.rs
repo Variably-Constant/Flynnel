@@ -28,6 +28,7 @@ pub mod group;
 pub mod hybrid;
 pub mod l2_persist;
 pub mod lanes;
+pub mod linalg;
 pub mod layout;
 pub mod region;
 pub mod timed_lock;
@@ -269,9 +270,27 @@ impl GpuPeer {
             .map_err(|e| GpuPeerError::NoDevice(format!("{e:?}")))?;
         let stream = ctx.default_stream();
         let module = match &config.user_ops_cuda {
-            None => ctx
-                .load_module(Ptx::from_src(PEER_PTX))
-                .map_err(|e| GpuPeerError::Driver(format!("PTX load: {e:?}")))?,
+            None => match ctx.load_module(Ptx::from_src(PEER_PTX)) {
+                Ok(m) => m,
+                Err(ptx_err) => {
+                    // A driver older than the toolchain that produced
+                    // the checked-in PTX rejects it
+                    // (CUDA_ERROR_UNSUPPORTED_PTX_VERSION); the host's
+                    // own NVRTC emits PTX its driver accepts.
+                    eprintln!(
+                        "flynnel gpu_peer: checked-in PTX rejected ({ptx_err:?}); \
+                         compiling the peer kernels with NVRTC instead"
+                    );
+                    let ptx = cudarc::nvrtc::compile_ptx(PEER_CU).map_err(|e| {
+                        GpuPeerError::Driver(format!(
+                            "PTX load: {ptx_err:?}; NVRTC fallback compile: {e:?}"
+                        ))
+                    })?;
+                    ctx.load_module(ptx).map_err(|e| {
+                        GpuPeerError::Driver(format!("NVRTC-fallback PTX load: {e:?}"))
+                    })?
+                }
+            },
             Some(user_src) => {
                 // Compose poller + user ops into ONE compilation unit
                 // so the device-function call links, then JIT.
@@ -786,6 +805,17 @@ impl GpuPeer {
     pub fn compile_wide_kernel(&self, src: &str, entry: &str) -> Result<WideKernel, GpuPeerError> {
         let ptx = cudarc::nvrtc::compile_ptx(src)
             .map_err(|e| GpuPeerError::Driver(format!("wide-kernel NVRTC compile: {e:?}")))?;
+        self.load_wide_kernel(ptx, entry)
+    }
+
+    /// Load a wide-launch kernel from PTX text (pre-generated, driver-
+    /// JIT'd; no NVRTC needed). Same signature contract as
+    /// [`Self::compile_wide_kernel`].
+    pub fn load_wide_kernel_ptx(&self, ptx: &str, entry: &str) -> Result<WideKernel, GpuPeerError> {
+        self.load_wide_kernel(Ptx::from_src(ptx), entry)
+    }
+
+    fn load_wide_kernel(&self, ptx: Ptx, entry: &str) -> Result<WideKernel, GpuPeerError> {
         let module = self
             ._ctx
             .load_module(ptx)
@@ -794,6 +824,21 @@ impl GpuPeer {
             .load_function(entry)
             .map_err(|e| GpuPeerError::Driver(format!("wide-kernel entry `{entry}`: {e:?}")))?;
         Ok(WideKernel { _module: module, func })
+    }
+
+    /// The CUDA context this peer runs on, for consumers that bind
+    /// their own library handles or allocate device memory the wide
+    /// kernels then read.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self._ctx
+    }
+
+    /// The stream wide launches run on. Work a consumer enqueues here
+    /// (its own kernels, library calls) is FIFO-ordered with
+    /// [`Self::launch_wide_async`] launches and fenced by
+    /// [`Self::sync_wide`].
+    pub fn wide_stream(&self) -> &Arc<CudaStream> {
+        &self.wide_stream
     }
 
     /// Enqueue a [`WideKernel`] on the resident stream WITHOUT
