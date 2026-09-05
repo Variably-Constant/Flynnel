@@ -197,19 +197,16 @@ pub(crate) struct WorkerCtx {
     /// slot (one of `EXTERNAL_SLOT_COUNT` per LocalArena), false
     /// if it is a real spawned-thread worker.
     ///
-    /// Critical for the join_in_worker push routing: when an
-    /// EXTERNAL caller (sitting in a slot ctx) pushes a right-half
-    /// during a join, the push goes to the INJECTOR instead of the
-    /// slot's own deque. Reason: primaries' find_work random victim
-    /// pick has very low probability of hitting any one slot (1 of
-    /// n_workers + EXTERNAL_SLOT_COUNT = 1/36 typical), so right-
-    /// halves on slot deques sit unstolen while the external caller
-    /// races to pop its own deque after running left -- causing
-    /// effective serialization. The injector is checked BY EVERY
-    /// primary find_work call BEFORE the random pick (step 5 in
-    /// find_work), guaranteeing pickup within one find_work round.
+    /// Governs the join_in_worker push routing: when an external
+    /// caller (sitting in a slot ctx) pushes a right-half during a
+    /// join, the push goes to the injector instead of the slot's
+    /// own deque. Every worker's find_work checks the injector
+    /// before any peer probe (step 5), and probes the held slots'
+    /// deques right after (step 6), so work on either is taken
+    /// within one find_work round; random victims are drawn from
+    /// the workers alone.
     ///
-    /// Real workers always push to their OWN deque (LIFO, ~5ns,
+    /// Real workers always push to their own deque (LIFO, ~5ns,
     /// no atomic contention with peers). Only external slots
     /// re-route to the injector.
     pub(crate) is_external_slot: bool,
@@ -525,10 +522,13 @@ impl WorkerCtx {
     ///    for work that producers routed via `push_tier` with a
     ///    locality hint.
     /// 5. Injector steal (external / cross-arena submissions).
-    /// 6. Adaptive victim probe: try `self.last_victim` first across
+    /// 6. Held external slots' deques, one bit per held slot in
+    ///    `Sleep::claimed_slots`, across the allowed tiers.
+    /// 7. Adaptive victim probe: try `self.last_victim` first across
     ///    every tier the steal discipline allows for that distance
     ///    (arxiv 2401.04494; ~10% gain vs uniform-random).
-    /// 7. xorshift-random peer steal, walked across the allowed tiers.
+    /// 8. xorshift-random worker steal (the slots are excluded),
+    ///    walked across the allowed tiers.
     ///
     /// Returns `None` when all paths are empty.
     ///
@@ -605,6 +605,21 @@ impl WorkerCtx {
         if n < 2 {
             return None;
         }
+        // Held external slots: each holds at most one caller's
+        // wrapped join, and a random pick over the whole stealer
+        // table would reach it only once in n rounds.
+        let n_workers = self.sleep.worker_count();
+        let mut claimed = self.sleep.claimed_slots();
+        while claimed != 0 {
+            let slot = n_workers + claimed.trailing_zeros() as usize;
+            claimed &= claimed - 1;
+            if slot < n
+                && slot != self.index
+                && let Some(job) = self.steal_from_peer_tiered(slot)
+            {
+                return Some(job);
+            }
+        }
 
         // (2) Adaptive victim probe: try the last successful victim
         // first across all allowed tiers. The deque's head index is
@@ -620,7 +635,10 @@ impl WorkerCtx {
             return Some(job);
         }
 
-        // (3) Random victim, walked across allowed tiers.
+        // (3) Random worker victim, walked across allowed tiers.
+        if n_workers < 2 {
+            return None;
+        }
         let mut x = self.rng.get();
         if x == 0 {
             x = 0x9E37_79B9_7F4A_7C15;
@@ -629,9 +647,9 @@ impl WorkerCtx {
         x ^= x >> 7;
         x ^= x << 17;
         self.rng.set(x);
-        let mut victim = (x as usize) % n;
+        let mut victim = (x as usize) % n_workers;
         if victim == self.index {
-            victim = (victim + 1) % n;
+            victim = (victim + 1) % n_workers;
         }
         self.steal_from_peer_tiered(victim)
     }
@@ -1400,6 +1418,8 @@ impl LocalArena {
                 // local_join_context's null-check fast path).
                 clear_current_worker_ctx();
                 unsafe { set_current_worker_ctx(ctx_ptr) };
+                self.sleep
+                    .note_slot_claimed(slot.index_in_arena - self.sleep.worker_count());
                 return Some(ExternalSlotGuard {
                     slot: Arc::clone(slot),
                     prev_ctx: prev,
@@ -1677,6 +1697,8 @@ impl Drop for ExternalSlotGuard {
         }
         // Release the claim so another external caller can use
         // this slot.
+        let sleep = &self.ctx_ref().sleep;
+        sleep.note_slot_released(self.slot.index_in_arena - sleep.worker_count());
         self.slot.claimed.store(false, Ordering::Release);
     }
 }
@@ -1969,6 +1991,7 @@ fn worker_loop(
     let _clear_guard = ClearOnDrop;
 
     let n = ctx.stealers.len();
+    let n_workers = ctx.sleep.worker_count();
     // Per-worker pseudo-random state for victim selection.
     let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(idx as u64 + 1);
     let trace_label = format!("flynnel-worker-{idx}");
@@ -2127,7 +2150,32 @@ fn worker_loop(
         //     rotated order, each at all tiers the steal discipline
         //     allows from our distance. Cilk's THE protocol +
         //     KHPD-style per-tier filtering.
-        if n >= 2 {
+        // Held external slots first: each holds at most one caller's
+        // wrapped join, and a random pick over the whole stealer
+        // table would reach it only once in n rounds.
+        {
+            let mut claimed = ctx.sleep.claimed_slots();
+            let mut found = false;
+            while claimed != 0 {
+                let slot = n_workers + claimed.trailing_zeros() as usize;
+                claimed &= claimed - 1;
+                if slot < n
+                    && let Some(job) = ctx.steal_from_peer_tiered(slot)
+                {
+                    jec_account_work_found!();
+                    // SAFETY: same data-validity contract as any
+                    // peer steal; the stash gave us sole ownership.
+                    unsafe { job.execute() };
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                continue;
+            }
+        }
+        if n_workers >= 2 {
+            let n = n_workers;
             let probe_count = if n <= PROBE_FULL_CUTOFF {
                 n - 1
             } else {

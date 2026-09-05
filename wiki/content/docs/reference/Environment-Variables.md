@@ -68,7 +68,7 @@ Default: off (the fixed 500-round window).
 
 ### `FLYNNEL_TRACE=on|1|true`
 
-Enable tracing of scheduler events (job submit, worker steal, latch transitions). Read by [`src/sched/trace.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/trace.rs).
+Enable per-thread tracing of scheduler events with a TSC timestamp each: dispatch enter and exit, leaf start and end, join push and wait begin and end, and on the external path the slot push, the caller's wait end, and the wrapped join's start and end on the worker. Read by [`src/sched/trace.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/trace.rs); `examples/trace_dispatch.rs` traces one dispatch of a chosen shape and dumps every thread's rows to stderr.
 
 Default: off. Tracing adds a measurable overhead (atomic increments per event); enable only when diagnosing scheduler behavior.
 

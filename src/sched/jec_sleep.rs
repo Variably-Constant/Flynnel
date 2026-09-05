@@ -452,6 +452,12 @@ pub(crate) struct SleepDebug {
 pub(crate) struct Sleep {
     counters: AtomicCounters,
     worker_states: Vec<WorkerSleepState>,
+    /// One bit per external slot, set while a caller holds the
+    /// slot. A thief probes exactly the claimed slots' deques each
+    /// round and draws its random victims from the workers alone,
+    /// so an external job is found within a round instead of at
+    /// the rate the slot count dilutes a random pick to.
+    claimed_slots: AtomicU64,
 }
 
 impl Sleep {
@@ -467,7 +473,34 @@ impl Sleep {
         Self {
             counters: AtomicCounters::new(),
             worker_states: states,
+            claimed_slots: AtomicU64::new(0),
         }
+    }
+
+    /// The number of pool workers, which is also the index of the
+    /// first external slot in the arena's stealer table.
+    #[inline]
+    pub(crate) fn worker_count(&self) -> usize {
+        self.worker_states.len()
+    }
+
+    /// Mark external slot `slot_id` (0-based within the slot pool)
+    /// as held by a caller.
+    #[inline]
+    pub(crate) fn note_slot_claimed(&self, slot_id: usize) {
+        self.claimed_slots.fetch_or(1u64 << slot_id, Ordering::Release);
+    }
+
+    /// Mark external slot `slot_id` as free again.
+    #[inline]
+    pub(crate) fn note_slot_released(&self, slot_id: usize) {
+        self.claimed_slots.fetch_and(!(1u64 << slot_id), Ordering::Release);
+    }
+
+    /// The set of held external slots, one bit per slot id.
+    #[inline]
+    pub(crate) fn claimed_slots(&self) -> u64 {
+        self.claimed_slots.load(Ordering::Acquire)
     }
 
     #[allow(dead_code)]

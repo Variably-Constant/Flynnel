@@ -18,8 +18,12 @@
 //! `for_each_chunk_triple_min_leaf` with a 64-item floor). Each row
 //! is `thread, event, payload, tsc` after a fixed first field; the
 //! events are 1 enter, 2 exit, 3 leaf start, 4 leaf end, 5 join
-//! push, 6 join wait begin, 7 join wait end, 8 worker wake, 9 steal
-//! hit. The wall time of the traced call is printed on stdout.
+//! push, 6 join wait begin, 7 join wait end (payload 1 when a thief
+//! ran the half), 10 slot push, 11 slot wait end (payload 1 when the
+//! caller was still spinning), 12 slot job start, 13 slot job end;
+//! 8 and 9 are defined for a worker wake and a steal hit but no hook
+//! emits them. The wall time of the traced call is printed on
+//! stdout.
 
 use std::str::FromStr;
 use std::time::Instant;
@@ -28,8 +32,14 @@ use flynnel::sched::par_iter::for_each_chunk_triple_min_leaf;
 use flynnel::sched::trace;
 use flynnel::{JobPlan, for_each_chunk};
 
+/// Three chained square roots per item, a few tens of nanoseconds.
+#[inline(never)]
 fn light(x: &mut f64) {
-    *x = (*x * 1.0000001 + 0.5) * 0.999;
+    let mut v = *x;
+    for _ in 0..3 {
+        v = v.sqrt() * 1.0000001_f64;
+    }
+    *x = v;
 }
 
 /// The `index`th argument parsed as `T`, `default` when absent; an
@@ -86,12 +96,43 @@ fn main() {
     println!("traced call: {kind} n={n} est={est} ns/item, wall {wall:?}");
     trace::dump_to_stderr("caller");
     trace::request_worker_flush();
-    // Workers dump at the top of their next loop pass; a dispatch
-    // gives every one of them a pass.
-    for _ in 0..8 {
-        for_each_chunk(&plan, &mut v, |s| s.iter_mut().for_each(light));
+    // Workers dump at the top of their next loop pass, and a parked
+    // worker reaches it only when woken: wide heavy dispatches wake
+    // every worker, repeated with pauses so each gets a pass.
+    // A dump writes thousands of rows through the stderr lock and
+    // takes milliseconds; the process must not exit while one is in
+    // progress, or the newest rows, which are the traced call's, are
+    // the ones lost. The pool holds one worker per hardware thread,
+    // so that is the count of dumps to wait for.
+    let mut wide = vec![1.5f64; 1 << 20];
+    let wide_plan = JobPlan::new(6, wide.len() as u32).with_estimated_per_item_ns(50).with_smt();
+    let expected = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let done = loop {
+        for_each_chunk(&wide_plan, &mut wide, |s| {
+            for x in s.iter_mut() {
+                let mut y = *x;
+                for _ in 0..16 {
+                    y = y.sqrt() * 1.0000001;
+                }
+                *x = y;
+            }
+        });
         std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+        let done = trace::worker_flushes_done();
+        if done >= expected {
+            break done;
+        }
+        if Instant::now() > deadline {
+            eprintln!("only {done} of {expected} worker dumps completed after 30 s");
+            break done;
+        }
+    };
+    // The last dumps may still be writing: give the stderr lock time
+    // to drain before exit.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    println!("worker dumps completed: {done} of {expected}");
     trace::clear_worker_flush_request();
+    std::hint::black_box(&wide);
     std::hint::black_box((&v, &out));
 }

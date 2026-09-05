@@ -65,20 +65,49 @@ const PLACEMENT_REPROBE_CADENCE: u32 = 32;
 /// `u32` batch size and then some.
 pub const PLACEMENT_BUCKETS: usize = 40;
 
-/// EWMA update with alpha = 1/8: `new = old - old/8 + sample/8`.
-/// Zero is the "empty" sentinel, so the first sample seeds directly.
-/// Load/store (not CAS) is deliberate: concurrent updates may drop a
-/// sample, which is acceptable for a smoothed statistic and keeps
-/// the hot path at two relaxed atomics.
+/// An averaged cell packs its sample count, saturating at
+/// [`EWMA_WARM_SAMPLES`], into the top byte; the low 56 bits hold
+/// the average in nanoseconds.
+const EWMA_COUNT_SHIFT: u32 = 56;
+const EWMA_VALUE_MASK: u64 = (1u64 << EWMA_COUNT_SHIFT) - 1;
+
+/// Samples averaged with equal weight before the update turns
+/// exponential. A site's first sample is a cold one (pool start,
+/// page faults, a cold device); an exponential update from the
+/// first sample keeps seven eighths of that sample in the second
+/// average and half of it in the sixth, and a tandem split that
+/// reads the ratio of two such averages spent six rounds on the
+/// gemm parity test still short of the balance the eighth-sample
+/// average reaches.
+const EWMA_WARM_SAMPLES: u64 = 8;
+
+/// Averaged-cell update: the running mean while fewer than
+/// [`EWMA_WARM_SAMPLES`] samples are in, then exponential with
+/// alpha = 1/8: `new = old - old/8 + sample/8`. Zero is the "empty"
+/// sentinel, so the first sample seeds directly. Load/store (not
+/// CAS) is deliberate: concurrent updates may drop a sample, which
+/// is acceptable for a smoothed statistic and keeps the hot path at
+/// two relaxed atomics.
 #[inline]
 fn ewma_update(cell: &AtomicU64, sample_ns: u64) {
-    let old = cell.load(Ordering::Relaxed);
-    let new = if old == 0 {
-        sample_ns.max(1)
+    let packed = cell.load(Ordering::Relaxed);
+    let count = packed >> EWMA_COUNT_SHIFT;
+    let old = packed & EWMA_VALUE_MASK;
+    let sample = sample_ns.max(1) & EWMA_VALUE_MASK;
+    let (new, count) = if count == 0 {
+        (sample, 1)
+    } else if count < EWMA_WARM_SAMPLES {
+        ((old * count + sample) / (count + 1), count + 1)
     } else {
-        (old - old / 8).saturating_add(sample_ns / 8).max(1)
+        ((old - old / 8).saturating_add(sample / 8), count)
     };
-    cell.store(new, Ordering::Relaxed);
+    cell.store((count << EWMA_COUNT_SHIFT) | (new.max(1) & EWMA_VALUE_MASK), Ordering::Relaxed);
+}
+
+/// The average held by an averaged cell, zero while empty.
+#[inline]
+fn ewma_value(cell: &AtomicU64) -> u64 {
+    cell.load(Ordering::Relaxed) & EWMA_VALUE_MASK
 }
 
 /// Which execution policy a site's A/B state currently prefers.
@@ -377,8 +406,8 @@ impl CallSiteState {
                 PolicyArm::Default
             };
         }
-        let e0 = self.arm_ewma_ns[0].load(Ordering::Relaxed);
-        let e1 = self.arm_ewma_ns[1].load(Ordering::Relaxed);
+        let e0 = ewma_value(&self.arm_ewma_ns[0]);
+        let e1 = ewma_value(&self.arm_ewma_ns[1]);
         let best = if e1 < e0 {
             PolicyArm::Alternative
         } else {
@@ -405,8 +434,8 @@ impl CallSiteState {
     /// zero means "no samples yet". Diagnostics + tests.
     pub fn arm_ewmas(&self) -> (u64, u64) {
         (
-            self.arm_ewma_ns[0].load(Ordering::Relaxed),
-            self.arm_ewma_ns[1].load(Ordering::Relaxed),
+            ewma_value(&self.arm_ewma_ns[0]),
+            ewma_value(&self.arm_ewma_ns[1]),
         )
     }
 
@@ -427,8 +456,8 @@ impl CallSiteState {
     pub fn choose_placement(&self, batch: u32) -> Placement {
         let b = Self::bucket(batch);
         let calls = self.place_calls[b].fetch_add(1, Ordering::Relaxed);
-        let cpu = self.place_cpu_ns[b].load(Ordering::Relaxed);
-        let dev = self.place_backend_ns[b].load(Ordering::Relaxed);
+        let cpu = ewma_value(&self.place_cpu_ns[b]);
+        let dev = ewma_value(&self.place_backend_ns[b]);
         if cpu == 0 || dev == 0 {
             return Placement::Race;
         }
@@ -460,8 +489,8 @@ impl CallSiteState {
     pub fn placement_ewmas(&self, batch: u32) -> (u64, u64) {
         let b = Self::bucket(batch);
         (
-            self.place_cpu_ns[b].load(Ordering::Relaxed),
-            self.place_backend_ns[b].load(Ordering::Relaxed),
+            ewma_value(&self.place_cpu_ns[b]),
+            ewma_value(&self.place_backend_ns[b]),
         )
     }
 
@@ -471,8 +500,8 @@ impl CallSiteState {
     /// (cpu_ns_per_item + backend_ns_per_item): the faster side gets
     /// the larger share.
     pub fn split_cpu_share_per_mille(&self) -> u32 {
-        let c = self.split_cpu_ns_per_item.load(Ordering::Relaxed);
-        let g = self.split_backend_ns_per_item.load(Ordering::Relaxed);
+        let c = ewma_value(&self.split_cpu_ns_per_item);
+        let g = ewma_value(&self.split_backend_ns_per_item);
         if c == 0 || g == 0 {
             return 500;
         }
@@ -507,8 +536,8 @@ impl CallSiteState {
     /// both sides, the site-wide model otherwise.
     pub fn split_cpu_share_per_mille_for(&self, n: u32) -> u32 {
         let b = Self::bucket(n);
-        let c = self.split_cpu_ns_per_item_by_size[b].load(Ordering::Relaxed);
-        let g = self.split_backend_ns_per_item_by_size[b].load(Ordering::Relaxed);
+        let c = ewma_value(&self.split_cpu_ns_per_item_by_size[b]);
+        let g = ewma_value(&self.split_backend_ns_per_item_by_size[b]);
         if c == 0 || g == 0 {
             return self.split_cpu_share_per_mille();
         }
@@ -832,6 +861,28 @@ mod tests {
         S.record_split(1000, 10_000, 1000, 30_000);
         let share = S.split_cpu_share_per_mille();
         assert!((700..=800).contains(&share), "share {share}");
+    }
+
+    #[test]
+    fn split_share_outgrows_a_cold_first_sample_within_eight() {
+        static S: CallSiteState = CallSiteState::new();
+        // A cold first round: CPU 32 us/item, backend 18 us/item.
+        S.record_split(512, 512 * 32_000, 512, 512 * 18_000);
+        assert!(S.split_cpu_share_per_mille() < 400, "cold share {}", S.split_cpu_share_per_mille());
+        // Seven warm rounds: CPU 10 us/item, backend 25 us/item.
+        for _ in 0..7 {
+            S.record_split(500, 500 * 10_000, 500, 500 * 25_000);
+        }
+        // The eighth average weights every sample equally: CPU 12.75,
+        // backend 24.1, a share of 654; an exponential average from
+        // the first sample would still read about 500 here.
+        let share = S.split_cpu_share_per_mille();
+        assert!((620..=700).contains(&share), "share {share}");
+        // Later samples move exponentially toward the warm ratio.
+        for _ in 0..8 {
+            S.record_split(500, 500 * 10_000, 500, 500 * 25_000);
+        }
+        assert!(S.split_cpu_share_per_mille() > share, "share {}", S.split_cpu_share_per_mille());
     }
 
     #[test]

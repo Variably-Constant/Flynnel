@@ -1100,6 +1100,7 @@ What each site learns, all atomically and lock-free:
 - **Leaf statistics**: cumulative and delta-window count / sum / sum-of-squares of leaf nanoseconds, exposing `cv2_per_mille()` (squared coefficient of variation) and `leaf_count()`. Leaf batches ALSO flow into the process-global stats, which stay the cold-start prior for site-less plans.
 - **Policy arms**: EWMA per arm (`Slaw` vs `Heartbeat`) with a trial cadence, so irregular workloads converge on the scheduling policy that measures faster at THAT site.
 - **Hybrid placement**: per-log2-size-bucket CPU vs backend EWMAs feeding [`hybrid_auto`](#hybrid_auto), plus learned per-item split throughputs, site-wide and per log2-size bucket, feeding [`hybrid_auto_split`](#hybrid_auto_split) and [`hybrid_auto_split_ranges`](#hybrid_auto_split_ranges).
+- **Averaging rule**: each of the arm, placement and split averages weights its first eight samples equally, then updates exponentially at 1/8. A site's first sample is a cold one, and seeded straight into an exponential average it would hold half the weight into the sixth sample.
 
 `SiteRef::new(&STATIC_SITE)` wraps a caller-owned static for explicit attachment via [`JobPlan::with_site`](JobPlan-Reference.md#builder-methods); an outer attachment always wins over the entry's own location-resolved site. E2E walkthrough: [`examples/site_classifier_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/site_classifier_demo.rs).
 

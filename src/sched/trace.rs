@@ -25,8 +25,8 @@
 //!
 //! Criterion runs hundreds of iterations per measurement; tracing
 //! every iteration produces gigabytes of CSV. The companion
-//! `examples/trace_heavy_dispatch.rs` binary runs ONE dispatch with
-//! `FLYNNEL_TRACE=1`, dumps the trace, then exits.
+//! `examples/trace_dispatch.rs` binary traces one dispatch with
+//! `FLYNNEL_TRACE=1`, dumps every thread's buffer, then exits.
 
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +58,17 @@ pub enum TraceEvent {
     /// A worker successfully stole from a peer. Payload = victim
     /// worker_id.
     StealHit = 9,
+    /// An external caller pushed its wrapped join to a slot deque
+    /// and broadcast-woke the primaries. Payload = 0.
+    SlotPush = 10,
+    /// The external caller's wait on the slot job ended. Payload =
+    /// 1 when it ended while spinning, 0 after parking.
+    SlotWaitEnd = 11,
+    /// A primary began running an external caller's wrapped join.
+    /// Payload = 0.
+    SlotJobStart = 12,
+    /// The wrapped join returned on the primary. Payload = 0.
+    SlotJobEnd = 13,
 }
 
 /// One trace event row recorded into the per-thread buffer.
@@ -125,6 +136,7 @@ pub fn worker_loop_maybe_flush(label: &str) -> bool {
     if requested && !already_done {
         dump_to_stderr(label);
         FLUSH_OBSERVED.with(|c| c.set(true));
+        FLUSHES_DONE.fetch_add(1, Ordering::Release);
         return true;
     }
     if !requested && already_done {
@@ -133,6 +145,17 @@ pub fn worker_loop_maybe_flush(label: &str) -> bool {
         FLUSH_OBSERVED.with(|c| c.set(false));
     }
     false
+}
+
+/// Count of worker dumps completed since process start. A worker's
+/// dump writes every row it holds through the stderr lock, which
+/// takes milliseconds per worker; a requester waits on this count
+/// before exiting, or the newest rows are cut off.
+static FLUSHES_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// The number of worker dumps that have completed in full.
+pub fn worker_flushes_done() -> u64 {
+    FLUSHES_DONE.load(Ordering::Acquire)
 }
 
 /// Caller-side: reset the request after a dump cycle so subsequent
@@ -228,9 +251,8 @@ pub fn dump_to_stderr(thread_name: &str) {
 /// job so the buffer is flushed at a known quiescent point. The
 /// `name` is `flynnel-worker-{idx}` typically.
 ///
-/// In practice the example binary triggers a process-wide flush by
-/// calling this on every worker via a barrier - see
-/// `examples/trace_heavy_dispatch.rs`.
+/// `examples/trace_dispatch.rs` instead requests a flush with
+/// [`request_worker_flush`] and waits on [`worker_flushes_done`].
 pub fn flush_with_label(label: &str) {
     dump_to_stderr(label);
     reset_current_thread();

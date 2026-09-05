@@ -145,7 +145,7 @@ The shared-memory backend lands in a gap nothing else fills cleanly: faster than
 Cilk's key architectural ideas Flynnel inherits:
 
 - **Continuation stealing** as the work-stealing target (Cilk's classical model). Flynnel currently ships **child stealing** (rayon's model) where the child task is the one that gets stolen; continuation stealing is the more recent research direction (see [Libfork](https://arxiv.org/abs/2402.18480)) Flynnel's architecture leaves room for.
-- **Work-first principle** - owner runs its local work first, steals only when local is empty. The `WorkerCtx::find_work` order (local pop -> injector -> peer steal -> park) is exactly this.
+- **Work-first principle** - owner runs its local work first, steals only when local is empty. The `WorkerCtx::find_work` order (local pop -> injector -> held external slots -> peer steal -> park) is exactly this.
 - **THE protocol** (Top-Half / Exchange) for the steal-vs-pop race. Crossbeam's Chase-Lev wait-free deque implements the same idea with different atomic primitives.
 
 Cilk research papers are still the canonical references for work-stealing analysis (greedy scheduling, span complexity, work-time bounds). Flynnel's design choices that depart from Cilk:

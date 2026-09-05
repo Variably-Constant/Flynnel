@@ -273,7 +273,7 @@ fn push_with_tier_hint(ctx: &WorkerCtx, job: JobRef, plan: &JobPlan) -> Result<(
 //                            itself the recursive sub-tree)
 //   JOIN_WAIT_NS           - sum of cycles spent in the wait loop AFTER
 //                            `a()` returned (find_work probing + stolen
-//                            job execution + yield_now spins)
+//                            job execution + the idle latch poll)
 //
 // Compute "wait fraction" = JOIN_WAIT_NS / (JOIN_A_BODY_NS + JOIN_WAIT_NS).
 // High fraction == dispatch overhead is the bottleneck. Low fraction ==
@@ -286,8 +286,9 @@ static JOIN_A_BODY_NS: AtomicU64 = AtomicU64::new(0);
 static JOIN_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 // Sub-split of JOIN_WAIT_NS: time inside `unsafe { job.execute() }`
 // (productive stealing of cross-worker jobs while waiting) vs time
-// in the `yield_now()` path (no work available -- pure dispatch
-// waste). Together these sum to JOIN_WAIT_NS minus the small
+// in the idle path (no work available: the latch poll, a spin until
+// the wait exceeds the host's collapse threshold and a yield per
+// round after). Together these sum to JOIN_WAIT_NS minus the small
 // `is_set()` poll cost and the small `find_work()` probe cost itself.
 static JOIN_WAIT_STEAL_NS: AtomicU64 = AtomicU64::new(0);
 static JOIN_WAIT_IDLE_NS: AtomicU64 = AtomicU64::new(0);
@@ -338,7 +339,7 @@ pub fn dispatch_trace_snapshot() -> (u64, u64, u64) {
 /// `find_work()` probe cost adds up to `JOIN_WAIT_NS` from
 /// `dispatch_trace_snapshot()`. The split tells us how much of
 /// the wait time is productive cross-worker rebalancing vs pure
-/// dispatch waste (idle yield_now spinning).
+/// dispatch waste (the idle latch poll).
 pub fn dispatch_trace_wait_snapshot() -> (u64, u64) {
     (
         JOIN_WAIT_STEAL_NS.swap(0, Relaxed),
@@ -457,6 +458,7 @@ where
     // thief stole job_b first, we keep finding work until either
     // we observe job_b.latch set (the thief ran it) or we find
     // another job to execute.
+    let mut idle_since: Option<std::time::Instant> = None;
     loop {
         if job_b.latch.is_set() {
             crate::sched::trace::emit(crate::sched::trace::TraceEvent::JoinWaitEnd, 1);
@@ -517,12 +519,23 @@ where
             }
         } else {
             // Idle path: find_work returned None, no work to
-            // steal. The yield_now is pure dispatch waste --
-            // attribute its cycles to JOIN_WAIT_IDLE_NS so the
-            // breakdown distinguishes productive stealing from
-            // worker starvation.
+            // steal. The poll is pure dispatch waste; its cycles
+            // go to JOIN_WAIT_IDLE_NS so the breakdown
+            // distinguishes productive stealing from worker
+            // starvation.
             let t_idle_start = if traced { dispatch_tsc() } else { 0 };
-            std::thread::yield_now();
+            // Poll the latch in a spin for as long as a whole
+            // dispatched call at this host's collapse threshold
+            // takes, a span a stolen half completes well within,
+            // then yield each round so a thief the OS preempted
+            // gets its core back.
+            let idle_since = idle_since.get_or_insert_with(std::time::Instant::now);
+            match crate::sched::par_iter::measured_collapse_threshold_ns() {
+                Some(budget_ns) if idle_since.elapsed().as_nanos() >= u128::from(budget_ns) => {
+                    std::thread::yield_now();
+                }
+                _ => std::hint::spin_loop(),
+            }
             if traced {
                 JOIN_WAIT_IDLE_NS.fetch_add(
                     dispatch_tsc().wrapping_sub(t_idle_start),
@@ -640,7 +653,10 @@ where
                 // SAFETY: ctx lives for the duration of the
                 // worker that runs this job.
                 let primary_ctx = unsafe { &*primary_ctx_ptr };
-                join_in_worker(primary_ctx, plan, a, b, true)
+                crate::sched::trace::emit(crate::sched::trace::TraceEvent::SlotJobStart, 0);
+                let out = join_in_worker(primary_ctx, plan, a, b, true);
+                crate::sched::trace::emit(crate::sched::trace::TraceEvent::SlotJobEnd, 0);
+                out
             },
             SpinLatch::new(parker.clone()),
         );
@@ -657,25 +673,35 @@ where
                 [crate::sched::deque_tier::DequeTier::Public.idx()]
                 .push(r);
         }
-        // Broadcast-wake all primaries so they wake + scan
-        // immediately, dropping expected steal latency from a
-        // single-sleeper wake's ~1/(n+slots) probability per
-        // find_work round to near-1 within a few rounds.
+        // Broadcast-wake all primaries so they wake and scan at
+        // once; a scanning worker probes the held slots' deques
+        // before any peer, so the job is taken within a round.
         slot_ctx.sleep.new_internal_jobs(
             slot_ctx.stealers.len() as u32,
             false,
         );
-        // Park caller on the SpinLatch via the sleep handshake
-        // (UNSET -> SLEEPY -> SLEEPING -> set-wakes). Spin
-        // briefly first to absorb fast-completion races before
-        // dropping into park.
+        // Park the caller on the SpinLatch via the sleep handshake
+        // (unset, sleepy, sleeping, then set wakes it).
+        // The caller spins for as long as a whole dispatched call at
+        // this host's collapse threshold takes before it parks: a
+        // call that short finishes within the spin, and the park's
+        // wake would cost it more than the spin does. Before the
+        // host profile is measured the spin is a fixed count.
         const SLOT_WAIT_SPIN: usize = 256;
+        crate::sched::trace::emit(crate::sched::trace::TraceEvent::SlotPush, 0);
+        let spin_budget_ns = crate::sched::par_iter::measured_collapse_threshold_ns();
+        let wait_started = std::time::Instant::now();
         let mut spun = 0usize;
+        let mut parked = false;
         loop {
             if job.latch.is_set() {
                 break;
             }
-            if spun < SLOT_WAIT_SPIN {
+            let keep_spinning = match spin_budget_ns {
+                Some(ns) => wait_started.elapsed().as_nanos() < u128::from(ns),
+                None => spun < SLOT_WAIT_SPIN,
+            };
+            if keep_spinning {
                 std::hint::spin_loop();
                 spun += 1;
                 continue;
@@ -693,9 +719,11 @@ where
                 continue;
             }
             let _unparked = parker.park_until(|| job.latch.is_set());
+            parked = true;
             job.latch.wake_up();
             spun = 0;
         }
+        crate::sched::trace::emit(crate::sched::trace::TraceEvent::SlotWaitEnd, u32::from(!parked));
         // SAFETY: latch is set => StackJob::execute finished =>
         // result slot populated.
         let result = unsafe { job.into_result() };

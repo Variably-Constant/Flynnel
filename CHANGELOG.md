@@ -32,6 +32,45 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   0.2.3 had collapsed it to 27 us where the pool finishes in 11). The
   256-item leaf floor for hint-less work and the probe sizes keep
   their bench-sweep values.
+- An idle worker probes the held external slots' deques every round
+  and draws its random victims from the workers alone. The stealer
+  table holds the workers and the thirty-two external slots, and a
+  random pick over all of them reached a caller's wrapped join once
+  in twelve rounds on a 16-worker pool: traced on the Ryzen 7 2700,
+  a 10k-item light call's job started 4.1 us after the push and its
+  helpers arrived over the following 22 us; with the probe, 0.6 us
+  and 3.4 us.
+- A worker waiting on a stolen join half polls the latch in a spin
+  until its wait exceeds the host's measured collapse threshold, then
+  yields per round; it yielded every round before, which cost one to
+  three microseconds per level of an eight-deep steal chain (10 us
+  of drain after the last leaf on the traced call, 2 us now). An
+  external caller likewise spins for the collapse span before it
+  parks on its slot job (a fixed 256 spins until the profile is
+  measured).
+- Gate-shaped cells on the Ryzen 7 2700, medians of five interleaved
+  runs of 1000 calls each, before and after the two changes: a light
+  body at 10k items 39.5 to 26.0 us (1.80x to 2.74x over serial), at
+  100k 145.7 to 133.0 us; a body of about 80 ns per item through
+  `for_each_chunk_triple_min_leaf` at 1k 32.9 to 24.5 us (2.36x to
+  3.31x), at 10k 144.8 to 134.6 us; a heavy body at 100k unchanged
+  within noise (2.09 to 2.25 ms). Probing every worker peer per round
+  instead of four was also measured and is not adopted: the light
+  cells gained within noise and the heavy cell lost the same.
+- A call site's averaged costs (policy arms, hybrid placement, and
+  the tandem split's per-item cost on each side) weight their first
+  eight samples equally before the update turns exponential at
+  1/8. The first sample of a site is a cold one, and seeded straight
+  into the exponential average it held half the weight into the
+  sixth sample: on the gemm tandem parity test the CPU share had
+  reached 474 to 572 per mille after six rounds against a device 2.2
+  times slower per item, so the run-to-run spread crossed the 500
+  the test asserts.
+- `examples/trace_dispatch` traces one dispatch of a chosen shape
+  with `FLYNNEL_TRACE=1`, and the trace records the slot push, the
+  caller's wait end, and the wrapped join's start and end on the
+  worker; `trace::worker_flushes_done` counts completed worker dumps
+  so a tracer can wait for them before exit.
 
 ## 0.2.3 - 2026-09-05
 

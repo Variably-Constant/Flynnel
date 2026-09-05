@@ -472,6 +472,16 @@ pub fn pool_dispatch_cost_ns() -> u64 {
     host_dispatch_profile().dispatch_cost_ns
 }
 
+/// The measured collapse threshold when the calibration has run,
+/// `None` before. For pool workers, which must not start the
+/// calibration: it dispatches into the pool and waits for them.
+pub(crate) fn measured_collapse_threshold_ns() -> Option<u64> {
+    match HOST_COLLAPSE_THRESHOLD_NS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        ns => Some(ns),
+    }
+}
+
 /// Total work from which a dispatch takes the sleep-counter wake
 /// path instead of polling: [`HostDispatchProfile::jec_wake_threshold_ns`].
 pub fn jec_wake_threshold_ns() -> u64 {
@@ -1208,7 +1218,17 @@ fn record_leaf_sampled<F: FnOnce() -> R, R>(
         c.set(if v >= LEAF_SAMPLE_STRIDE { 0 } else { v });
         v >= LEAF_SAMPLE_STRIDE
     });
-    if should_sample { record_leaf(site, body) } else { body() }
+    if should_sample {
+        record_leaf(site, body)
+    } else {
+        // Unsampled leaves still appear in the trace (one cached
+        // load each when tracing is off) so a traced dispatch shows
+        // every leaf and the thread it ran on.
+        crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafStart, 0);
+        let out = body();
+        crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafEnd, 0);
+        out
+    }
 }
 
 /// Direction B: continuation-steal lazy bisect.
