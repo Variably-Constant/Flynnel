@@ -42,11 +42,35 @@ pub struct CancelToken {
 }
 
 impl CancelToken {
+    /// A fresh token in the not-cancelled state, for a race the
+    /// caller composes itself on [`crate::sched::join`] or the
+    /// indexed walkers rather than through the races in this module:
+    /// clone it into every arm, and the arm that settles calls
+    /// [`Self::cancel`]. A token that is never cancelled is the
+    /// honest argument for a path that takes one but has no peers.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { flag: Arc::new(AtomicBool::new(false)) }
+    }
+
     /// Returns `true` once any racing variant has produced a
     /// tolerable result. Cheap (single atomic load).
     #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Acquire)
+    }
+
+    /// Signal every holder of a clone of this token to stop at its
+    /// next checkpoint. Idempotent; a second call changes nothing.
+    #[inline]
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+    }
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1009,6 +1033,36 @@ mod tests {
         assert_eq!(out.winner, 4, "highest mean survives");
         assert_eq!(out.survivors, 1, "the others were eliminated by confidence");
         assert!(out.samples_each < opts.max_samples, "stopped before the sample cap");
+    }
+
+    #[test]
+    fn cancel_token_built_by_the_caller_is_shared_by_its_clones() {
+        // A caller-composed race: one token, two arms holding clones,
+        // the settling arm cancels, the other arm observes it.
+        let token = CancelToken::new();
+        assert!(!token.is_cancelled(), "fresh token is not cancelled");
+        let peer = token.clone();
+        let plan = JobPlan::new(6, 2);
+        let saw_cancel = Arc::new(AtomicU32::new(0));
+        let saw = Arc::clone(&saw_cancel);
+        join(
+            &plan,
+            move || {
+                token.cancel();
+                token.cancel();
+            },
+            move || {
+                for _ in 0..2000 {
+                    if peer.is_cancelled() {
+                        saw.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+            },
+        );
+        assert_eq!(saw_cancel.load(Ordering::Relaxed), 1, "the peer observed the caller's cancel");
+        assert!(CancelToken::default().is_cancelled() == false, "default is a fresh token");
     }
 
     #[test]

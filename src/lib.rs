@@ -34,8 +34,9 @@
 //! ```
 //!
 //! The workhorse primitives ([`join`], [`for_each_chunk`],
-//! [`cooperative_join_n`], [`join_hybrid`], [`hybrid_pipeline`],
-//! [`race_variants`], [`k_join`], [`k_join_with_plan`], [`JobPlan`])
+//! [`for_each_indexed`], [`for_each_chunk_ref`], [`cooperative_join_n`],
+//! [`join_hybrid`], [`hybrid_pipeline`], [`race_variants`],
+//! [`CancelToken`], [`k_join`], [`k_join_with_plan`], [`JobPlan`])
 //! are re-exported at the crate root following the rayon / tokio
 //! convention: short top-level path for the things you call
 //! constantly. Specialized variants stay namespaced under [`sched`]
@@ -97,10 +98,11 @@ pub use sched::{
 };
 pub use sched::hybrid::{SplitReport, hybrid_auto, hybrid_auto_split, hybrid_pipeline, join_hybrid};
 pub use sched::k_join::{k_join, k_join_with_plan};
-pub use sched::par_iter::for_each_chunk;
+pub use sched::par_iter::{for_each_chunk, for_each_chunk_ref, for_each_indexed};
 pub use sched::race::{
-    Agreement, Anytime, Settled, StatOpts, StatOutcome, explore_select, race_agree, race_any,
-    race_deadline, race_quorum, race_refute, race_statistical, race_tournament, race_variants,
+    Agreement, Anytime, CancelToken, Settled, StatOpts, StatOutcome, explore_select, race_agree,
+    race_any, race_deadline, race_quorum, race_refute, race_statistical, race_tournament,
+    race_variants,
 };
 #[cfg(feature = "shared-memory-worker-reference")]
 pub use sched::marshal::{Marshal, register_marshal_handler};

@@ -1330,6 +1330,64 @@ where
     );
 }
 
+/// Call `f(i)` for every `i` in `0..n` in parallel, each index
+/// exactly once, with no slice to mutate: the read-only and
+/// side-effect shapes (declare a cell per id through a shared
+/// resolver, fault a page per index, fill a row of a buffer the
+/// closure addresses itself). `min_leaf` is the bisect floor in
+/// indices, as in [`for_each_chunk_indexed_min_leaf`], which this
+/// runs over a zero-sized slice of length `n` so the probe, the
+/// per-call-site statistics and the lazy-steal bisect all apply
+/// unchanged. Nothing is allocated for the slice.
+///
+/// For a per-chunk body over a read-only slice use
+/// [`for_each_chunk_ref`].
+#[track_caller]
+pub fn for_each_indexed<F>(plan: &JobPlan, n: usize, min_leaf: usize, f: F)
+where
+    F: Fn(usize) + Sync,
+{
+    if n == 0 {
+        return;
+    }
+    // A Vec of unit is length without storage: the bisect halves
+    // lengths and hands out absolute starts, which is all the
+    // indexed walk needs.
+    let mut units: Vec<()> = vec![(); n];
+    for_each_chunk_indexed_min_leaf(plan, &mut units, min_leaf, |start, chunk| {
+        for i in start..start + chunk.len() {
+            f(i);
+        }
+    });
+}
+
+/// Call `f(start, chunk)` over consecutive read-only chunks of
+/// `items` in parallel: `chunk` is `items[start..start + len]` with
+/// `len == min_leaf` except on the trailing chunk, and the chunks
+/// tile the slice exactly once. The read-only counterpart of
+/// [`for_each_chunk_indexed_min_leaf`] for a body that needs a fixed
+/// batch width (a tile kernel, a resolver that takes a run of ids)
+/// and never writes the input. Built on [`for_each_indexed`] over
+/// the chunk count, one chunk per index.
+#[track_caller]
+pub fn for_each_chunk_ref<T, F>(plan: &JobPlan, items: &[T], min_leaf: usize, f: F)
+where
+    T: Sync,
+    F: Fn(usize, &[T]) + Sync,
+{
+    let n = items.len();
+    if n == 0 {
+        return;
+    }
+    let width = min_leaf.max(1);
+    let n_chunks = n.div_ceil(width);
+    for_each_indexed(plan, n_chunks, 1, |i| {
+        let lo = i * width;
+        let hi = (lo + width).min(n);
+        f(lo, &items[lo..hi]);
+    });
+}
+
 /// Continuation-steal-lazy bisect with absolute-index passthrough.
 /// Mirrors [`bisect_lazy_steal_driven`] but threads the start
 /// offset through so leaves know their absolute slot in the
@@ -3008,5 +3066,60 @@ mod tests {
         let plan = JobPlan::new(8, 0);
         par_zip_apply(&plan, &mut lhs, &rhs, |_a, _b| panic!("must not run"));
         assert!(lhs.is_empty());
+    }
+
+    #[test]
+    fn for_each_indexed_visits_every_index_exactly_once() {
+        let n = 10_000usize;
+        let seen: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+        let plan = JobPlan::new(6, n as u32);
+        for_each_indexed(&plan, n, 1, |i| {
+            seen[i].fetch_add(1, Ordering::Relaxed);
+        });
+        for (i, s) in seen.iter().enumerate() {
+            assert_eq!(s.load(Ordering::Relaxed), 1, "index {i} visited {} times", s.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn for_each_indexed_empty_is_noop() {
+        let plan = JobPlan::new(6, 0);
+        for_each_indexed(&plan, 0, 1, |_| panic!("must not run"));
+    }
+
+    #[test]
+    fn for_each_chunk_ref_tiles_the_slice_once_at_the_requested_width() {
+        let n = 4_099usize;
+        let width = 64usize;
+        let v: Vec<u32> = (0..n as u32).collect();
+        let seen: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+        let widths = Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
+        let widths_clone = Arc::clone(&widths);
+        let plan = JobPlan::new(6, n as u32);
+        for_each_chunk_ref(&plan, &v, width, |start, chunk| {
+            widths_clone.lock().unwrap().push((start, chunk.len()));
+            for (k, &x) in chunk.iter().enumerate() {
+                assert_eq!(x as usize, start + k, "chunk at {start} holds the wrong items");
+                seen[start + k].fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        for (i, s) in seen.iter().enumerate() {
+            assert_eq!(s.load(Ordering::Relaxed), 1, "item {i} covered {} times", s.load(Ordering::Relaxed));
+        }
+        let mut widths = widths.lock().unwrap().clone();
+        widths.sort_unstable();
+        assert_eq!(widths.len(), n.div_ceil(width), "one chunk per width-sized tile");
+        for (k, &(start, len)) in widths.iter().enumerate() {
+            assert_eq!(start, k * width, "chunk {k} starts at the wrong index");
+            let expected = if k + 1 == widths.len() { n - k * width } else { width };
+            assert_eq!(len, expected, "chunk {k} has the wrong width");
+        }
+    }
+
+    #[test]
+    fn for_each_chunk_ref_empty_is_noop() {
+        let v: Vec<u32> = Vec::new();
+        let plan = JobPlan::new(6, 0);
+        for_each_chunk_ref(&plan, &v, 16, |_, _| panic!("must not run"));
     }
 }
