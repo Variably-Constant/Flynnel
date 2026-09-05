@@ -1115,18 +1115,34 @@ mod tests {
         assert_eq!(active_workload_class(), WorkloadClass::MemoryBound);
     }
 
-    // RAII guard restoring default profile so cross-test state
-    // doesn't leak when --test-threads=1.
-    struct TestGuard;
+    // RAII guard holding the global-profile test lock and restoring
+    // the default profile on both ends, so a test that migrates the
+    // process-wide profile neither races a test that reads it nor
+    // leaks its last value.
+    struct TestGuard {
+        lock: std::sync::MutexGuard<'static, ()>,
+    }
     impl TestGuard {
         fn new() -> Self {
+            let lock = super::global_profile_test_lock();
             restore_default_profile();
-            Self
+            Self { lock }
         }
     }
     impl Drop for TestGuard {
         fn drop(&mut self) {
+            // Restore while the lock is still held, then release it.
             restore_default_profile();
+            let _still_held = &self.lock;
         }
     }
+}
+
+/// Serializes tests that migrate or depend on the process-wide
+/// dispatch profile; poison-tolerant so one failing test does not
+/// cascade.
+#[cfg(test)]
+pub(crate) fn global_profile_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

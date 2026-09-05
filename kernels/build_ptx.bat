@@ -8,5 +8,6 @@ cd /d "%~dp0"
 nvcc -ptx -arch=compute_75 gpu_peer.cu -o gpu_peer.ptx || exit /b %errorlevel%
 nvcc -ptx -arch=compute_75 -O3 -Werror all-warnings linalg_f64.cu -o linalg_f64.ptx || exit /b %errorlevel%
 nvcc -ptx -arch=compute_75 -O3 -Werror all-warnings ozaki_f64.cu -o ozaki_f64.ptx || exit /b %errorlevel%
-nvcc -ptx -arch=compute_75 -O3 -Werror all-warnings linalg_bisect_f64.cu -o linalg_bisect_f64.ptx
+nvcc -ptx -arch=compute_75 -O3 -Werror all-warnings linalg_bisect_f64.cu -o linalg_bisect_f64.ptx || exit /b %errorlevel%
+nvcc -ptx -arch=compute_75 -O3 -Werror all-warnings linalg_lu_f64.cu -o linalg_lu_f64.ptx
 exit /b %errorlevel%

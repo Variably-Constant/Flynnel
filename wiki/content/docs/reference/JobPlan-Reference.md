@@ -107,6 +107,10 @@ Per-op typical values from the source (Zen3 / FpN<8> baseline):
 
 The probe-and-decide path in `for_each_chunk` consults this flag: classifier defaults are routing hints (good enough for most workloads) but not authoritative per-item-cost truth. When the caller did not give an explicit hint AND N is small enough that the wrong default would cost real wall-clock, the probe path measures actual per-element cost and overrides.
 
+The probe times item 0 first and trusts a single reading at or above 20x the timer bracket (about 2 us) as a heavy item. A first call at a site pays one-time costs that read the same way: a one-add item measured 30 us on a quiet 16-worker host and 79 us under a saturated one, against a dispatch floor of 80 us there (workers x 5 us). So a single trusted reading below four floors, with a tail at least a worker's width, is confirmed by up to three more items timed one at a time, taking the minimum (preemption only inflates a reading) and stopping at the first reading that puts the tail under the floor. A light batch costs one confirmation; a heavy one at most three items, each under the allowance.
+
+Without an explicit estimate two costs apply per call that an explicit one removes: the total is unknown, so the call takes the JEC wake path rather than the sub-200 us polling path, and the inline-collapse below 50 us of total work never fires. Measured on a Ryzen 7 2700 (16 threads, medians of 300 calls): a few-flop item at n = 10000 takes 28.7 us with `JobPlan::new`, 30.1 us with `set_profile`, 20.9 us with `with_estimated_per_item_ns`, 26.2 us under rayon, 17.8 us serial; a 10 ns item at n = 1000 takes 16.9 / 12.5 / 11.7 / 22.0 / 11.5 us; a 600 ns item at n = 1000 takes 125 / 98.7 / 98.3 / 133 / 599 us, and 82.4 us with both the profile and the estimate.
+
 ### `task_overhead_ns: Option<u32>`
 
 Per-task scheduler overhead in nanoseconds (Tiny-Tasks model from Acar 2013): the fixed cost incurred each time a chunk is dispatched (deque push, atomic, latch init). Used together with `estimated_per_item_ns` to compute the optimal chunk count via [`optimal_chunk_count`](#optimal_chunk_count).

@@ -96,7 +96,10 @@ pub use sched::cat::{CatCapability, CatError, L3Reservation};
 pub use sched::{
     reset_spin_stats, set_spin_adaptive, set_spin_window, spin_window, total_idle_yields,
 };
-pub use sched::hybrid::{SplitReport, hybrid_auto, hybrid_auto_split, hybrid_pipeline, join_hybrid};
+pub use sched::hybrid::{
+    SplitReport, hybrid_auto, hybrid_auto_split, hybrid_auto_split_ranges, hybrid_pipeline,
+    join_hybrid,
+};
 pub use sched::k_join::{k_join, k_join_with_plan};
 pub use sched::par_iter::{for_each_chunk, for_each_chunk_ref, for_each_indexed};
 pub use sched::race::{

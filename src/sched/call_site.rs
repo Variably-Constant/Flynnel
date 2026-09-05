@@ -148,9 +148,14 @@ pub struct CallSiteState {
     place_backend_ns: [AtomicU64; PLACEMENT_BUCKETS],
     place_calls: [AtomicU32; PLACEMENT_BUCKETS],
     // Split-throughput model: learned per-item cost on each side for
-    // proportional slice splitting.
+    // proportional slice splitting, site-wide and per log2-size
+    // bucket (a batch's per-item cost changes with its size on both
+    // sides, so the share is learned per bucket and falls back to
+    // the site-wide value while a bucket is cold).
     split_cpu_ns_per_item: AtomicU64,
     split_backend_ns_per_item: AtomicU64,
+    split_cpu_ns_per_item_by_size: [AtomicU64; PLACEMENT_BUCKETS],
+    split_backend_ns_per_item_by_size: [AtomicU64; PLACEMENT_BUCKETS],
     /// Reduce-merge cost observer for
     /// [`crate::sched::par_iter::reduce_chunks`]: TSC-cycle sum and
     /// sample count of timed `reduce(a, b)` calls at THIS call
@@ -184,6 +189,8 @@ impl CallSiteState {
             place_calls: [const { AtomicU32::new(0) }; PLACEMENT_BUCKETS],
             split_cpu_ns_per_item: AtomicU64::new(0),
             split_backend_ns_per_item: AtomicU64::new(0),
+            split_cpu_ns_per_item_by_size: [const { AtomicU64::new(0) }; PLACEMENT_BUCKETS],
+            split_backend_ns_per_item_by_size: [const { AtomicU64::new(0) }; PLACEMENT_BUCKETS],
             reduce_cost_sum_cycles: AtomicU64::new(0),
             reduce_cost_samples: AtomicU32::new(0),
         }
@@ -493,6 +500,46 @@ impl CallSiteState {
                 (backend_ns / backend_items as u64).max(1),
             );
         }
+    }
+
+    /// [`Self::split_cpu_share_per_mille`] for a dispatch of `n`
+    /// items: the bucket covering `n` when it has measurements on
+    /// both sides, the site-wide model otherwise.
+    pub fn split_cpu_share_per_mille_for(&self, n: u32) -> u32 {
+        let b = Self::bucket(n);
+        let c = self.split_cpu_ns_per_item_by_size[b].load(Ordering::Relaxed);
+        let g = self.split_backend_ns_per_item_by_size[b].load(Ordering::Relaxed);
+        if c == 0 || g == 0 {
+            return self.split_cpu_share_per_mille();
+        }
+        let total = c.saturating_add(g).max(1);
+        ((g.saturating_mul(1000)) / total).clamp(50, 950) as u32
+    }
+
+    /// [`Self::record_split`] for a dispatch of `n` items: updates the
+    /// bucket covering `n` and the site-wide model.
+    pub fn record_split_for(
+        &self,
+        n: u32,
+        cpu_items: usize,
+        cpu_ns: u64,
+        backend_items: usize,
+        backend_ns: u64,
+    ) {
+        let b = Self::bucket(n);
+        if cpu_items > 0 {
+            ewma_update(
+                &self.split_cpu_ns_per_item_by_size[b],
+                (cpu_ns / cpu_items as u64).max(1),
+            );
+        }
+        if backend_items > 0 {
+            ewma_update(
+                &self.split_backend_ns_per_item_by_size[b],
+                (backend_ns / backend_items as u64).max(1),
+            );
+        }
+        self.record_split(cpu_items, cpu_ns, backend_items, backend_ns);
     }
 
     /// Whether the reduce-cost observer still wants a calibration

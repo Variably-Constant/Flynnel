@@ -256,6 +256,7 @@ build or run time), over resident blocks:
 | SVD | `flynnel_gesvd_jacobi_f64_{blk,thr}` | Batched one-sided Jacobi SVD, `m >= n`, `m <= 64`; `A` is overwritten with `U`, singular values in column order, optional `V` |
 | symmetric eigen (bisection) | `flynnel_syev_bisect_f64_blk` (`linalg_bisect_f64.ptx`) | Batched Householder tridiagonalization (EISPACK tred2) then bisection with Sturm counts, one thread per eigenvalue; eigenvectors by inverse iteration with cluster orthonormalization; `n <= 64`, one block per matrix; eigenvalues ascending |
 | SVD (bisection) | `flynnel_gesvd_bisect_f64_blk` (`linalg_bisect_f64.ptx`) | Batched Householder bidiagonalization (LINPACK dsvdc) then bisection on the Golub-Kahan tridiagonal for the singular values, inverse iteration for the vectors; `m >= n`, `m <= 64`; `A` is overwritten with `U`, singular values descending, optional `V`, needs a scratch buffer |
+| LU | `flynnel_getrf_f64_blk`, `flynnel_getrs_f64_blk` (`linalg_lu_f64.ptx`) | Batched LU with partial pivoting, one block per matrix, `n <= 64`: the factor packs `U` and the unit-lower multipliers in place with the pivot row per step and a flag one past the first zero pivot; the solve takes `n x nrhs` right-hand sides (`nrhs <= 64`) or, with the identity flag, writes the inverse; every update is an explicit fused multiply-add in the host reference's order |
 | GEMM (Ozaki) | `flynnel_ozaki_{rowexp,colexp,split_a,split_bt,gemm}_f64` (`ozaki_f64.ptx`) | `C = A x B` on the int8 tensor cores: operands split into eight 7-bit slices aligned to their row (A) or column (B) maximum exponent, 36 slice pairs multiplied exactly by int8 mma into int32, recombined in f64 with two-sum compensation; `m`, `n`, `k` multiples of 32, `k <= 16384`, finite operands |
 
 Two Jacobi kernel shapes exist because the best one depends on `n`
@@ -292,6 +293,24 @@ pub fn syev_bisect_batched(peer, k, a, batch, n, want_v) / gesvd_bisect_batched(
 // The measured routing: bisection from SYEV_BISECT_MIN_N = 32 (eigen) and GESVD_BISECT_MIN_N = 64 (SVD), Jacobi below
 pub fn syev_method_for(n) / gesvd_method_for(n) -> LinalgMethod
 pub fn syev_auto_batched(peer, k, a, batch, n, want_v) / gesvd_auto_batched(peer, k, a, batch, m, n, want_v)
+// LU (linalg_lu_f64.ptx), async over device addresses and synchronous over host buffers:
+pub fn launch_getrf(peer, k, a, piv, info, batch, n)                      // in place; piv and info are i32
+pub fn launch_getrs(peer, k, lu, piv, b, batch, n, nrhs, identity_rhs)    // solves in place, or the inverse
+pub struct LuResult { lu, piv, info }
+pub fn getrf_batched(peer, k, a, batch, n) -> LuResult
+pub fn getrs_batched(peer, k, lu, piv, b, batch, n, nrhs) / getri_batched(peer, k, lu, piv, batch, n)
+pub fn lu_det_batched(lu, piv, batch, n) -> Vec<f64>                     // host fold over the factors
+// Tandem: the batch split between the device and the CPU pool by the call site's learned share
+// (sched::hybrid_auto_split_ranges); the CPU share runs the cpu:: reference in runs of
+// TANDEM_CPU_CHUNK = 64 matrices on the pool. Eigenvalues come back ascending and singular
+// values descending for every item whichever side computed it.
+pub fn gemm_tandem_batched(peer, k, plan, a, b, batch, m, n, kdim) -> (Vec<f64>, SplitReport)
+pub fn syev_tandem_batched(peer, k, plan, a, batch, n, want_v) -> ((w, Option<v>), SplitReport)
+pub fn gesvd_tandem_batched(peer, k, plan, a, batch, m, n, want_v) -> (GesvdResult, SplitReport)
+pub fn sort_eigenpairs_ascending(w, v: Option<&mut [f64]>, n) / sort_singular_descending(u, sigma, v, m, n)
+// Ragged inputs: one uniform batch per shape (every kernel takes one shape per call)
+pub fn group_by_shape<S: Ord + Copy>(shapes: &[S]) -> Vec<(S, Vec<usize>)>   // ascending shape, each index once
+pub fn gather_items(src, offsets, item_len, indices) -> Vec<f64> / scatter_items(batch, offsets, item_len, indices, dst)
 // gpu_peer::ozaki - the tensor-core GEMM, with its workspace pinned in the resident pool:
 pub struct OzakiKernels;  impl OzakiKernels { pub fn load(peer) -> Result<Self, GpuPeerError> }
 pub struct OzakiWorkspace; // OzakiWorkspace::new(peer, batch, m, n, k), ::bytes(..), ::release(peer)
@@ -300,7 +319,7 @@ pub fn ozaki_gemm_batched(peer, kern, a, b, batch, m, n, k) -> Vec<f64>
 pub fn error_bound(a_row, b_col) -> f64                                  // 2^-53 * k * max|row| * max|col|
 // The Ozaki path is explicit: gemm_batched and the accel route stay on the native f64 kernel.
 // CPU references with the kernels' semantics:
-pub mod cpu { einsum, gemm_batched, syev_jacobi[_batched], gesvd_jacobi[_batched] }
+pub mod cpu { einsum, gemm_batched, syev_jacobi[_batched], gesvd_jacobi[_batched], getrf_batched, getrs_batched, getri_batched }
 // accel_op registrations (see Backend System): CPU side = cpu::*, kernel side = the blk kernels
 pub fn register_linalg_accel_ops() -> LinalgAccelOps
 pub fn bind_linalg_kernels(&ops, backend) -> Result<(), BackendError>
@@ -329,6 +348,23 @@ the Jacobi kernels' diagonal order. Eigenvalues closer than
 iterations use distinct shifts and the cluster is orthonormalized
 by its first thread.
 
+The LU kernels are checked by `tests/gpu_lu_parity.rs`: factors,
+pivots and flags match `cpu::getrf_batched` bit for bit at n = 1, 2,
+3, 8, 16, 33 and 64, solves and inverses match `cpu::getrs_batched`
+and `cpu::getri_batched` bit for bit, residuals `A x - b` and `A
+inv(A) - I` hold at `1e-12` of the operand scale, determinants follow
+the pivot signs, and a zero column sets the same flag on both sides.
+The Frobenius inner product `"ij,ij->"` is covered in
+`tests/gpu_linalg_parity.rs`, bit for bit against `cpu::einsum`.
+
+The tandem helpers are checked by `tests/gpu_tandem_parity.rs`: the
+GEMM result is bit-identical to the CPU reference whatever the
+split, both sides always receive items, the share stays within
+50..=950 per mille and after six calls sits on the side of the
+measured per-item balance; eigenvalues and singular values match the
+sorted references to `1e-10` relative with `A v = lambda v` and the
+SVD reconstruction at `1e-9`, ascending and descending per item.
+
 The Ozaki GEMM is not bit-identical to `flynnel_gemm_batched_f64`:
 its summation order differs from the fma-ordered kernel, and
 elements far below their row or column maximum lose the bits that
@@ -356,6 +392,56 @@ come from one run of the whole bench at commit `f068879` plus the
 ramp; the 5070 columns from two runs on an idle machine at `a3fa53f`
 (Jacobi sections, then GEMM and einsum), whose sub-millisecond cells
 were already at boost.
+
+#### Tandem: device alone, CPU pool alone, both
+
+`benches/gpu_linalg.rs` section `tandem`. Every column is a
+host-buffer helper end to end, so each carries its pin and fetch:
+`gemm_batched` / `syev_auto_batched` / `gesvd_auto_batched` for the
+device alone, the CPU reference through `collect_indexed` with 64
+matrices per item for the pool alone, and the `*_tandem_batched`
+helper after three warm calls have taught the call site its share
+(medians of three further calls). `share` is the CPU share in per
+mille the site had learned, `cpu-side` and `dev-side` the two halves'
+own wall times on one more call. Eigen and SVD rows request vectors.
+Cells whose pins would exceed half the 1.5 GiB pool are skipped.
+
+#### Batched LU: factor, solve (nrhs = 1), inverse
+
+`benches/gpu_linalg.rs` section `lu`, 2026-09-04, RTX 3070 with the
+Ryzen 7 2700, same method as the tables below: GPU is kernel wall with
+the operands resident (the factor refactors its resident copy in
+place each launch; the work per launch does not depend on the data),
+CPU-par the CPU reference through `collect_indexed` with 64 matrices
+per item, serial the reference on one thread. Pin+fetch is the
+host-buffer helper's transfer cost per call.
+
+| op | n | batch | GPU ms | CPU-par ms | serial ms | GPU/par | GPU/ser | pin+fetch ms |
+|---|---|---|---|---|---|---|---|---|
+| getrf | 8 | 1024 | 0.229 | 0.195 | 0.694 | 0.85x | 3.0x | 1.57 |
+| getrs | 8 | 1024 | 0.102 | 0.204 | 0.360 | 2.0x | 3.5x | 0.43 |
+| getri | 8 | 1024 | 0.086 | 0.325 | 1.444 | 3.8x | 16.8x | 0.66 |
+| getrf | 8 | 8192 | 1.597 | 0.706 | 5.867 | 0.44x | 3.7x | 10.54 |
+| getrs | 8 | 8192 | 0.653 | 0.568 | 3.086 | 0.87x | 4.7x | 3.24 |
+| getri | 8 | 8192 | 0.561 | 1.254 | 10.724 | 2.2x | 19.1x | 9.72 |
+| getrf | 16 | 1024 | 0.445 | 1.021 | 5.865 | 2.3x | 13.2x | 6.60 |
+| getrs | 16 | 1024 | 0.200 | 0.665 | 3.304 | 3.3x | 16.6x | 2.90 |
+| getri | 16 | 1024 | 0.166 | 2.880 | 12.077 | 17.4x | 72.8x | 10.28 |
+| getrf | 16 | 8192 | 3.375 | 4.450 | 50.842 | 1.3x | 15.1x | 108.45 |
+| getrs | 16 | 8192 | 1.320 | 3.699 | 31.514 | 2.8x | 23.9x | 22.94 |
+| getri | 16 | 8192 | 1.201 | 7.496 | 89.055 | 6.2x | 74.1x | 65.87 |
+| getrf | 32 | 1024 | 0.977 | 5.249 | 25.090 | 5.4x | 25.7x | 29.35 |
+| getrs | 32 | 1024 | 0.372 | 2.655 | 13.135 | 7.1x | 35.3x | 10.66 |
+| getri | 32 | 1024 | 0.494 | 11.150 | 65.554 | 22.6x | 132.7x | 50.47 |
+| getrf | 32 | 8192 | 7.070 | 14.787 | 169.476 | 2.1x | 24.0x | 265.21 |
+| getrs | 32 | 8192 | 2.277 | 12.318 | 91.214 | 5.4x | 40.1x | 67.40 |
+| getri | 32 | 8192 | 3.578 | 38.783 | 463.215 | 10.8x | 129.5x | 271.97 |
+| getrf | 64 | 1024 | 2.400 | 42.430 | 119.154 | 17.7x | 49.7x | 129.74 |
+| getrs | 64 | 1024 | 0.713 | 22.075 | 83.828 | 31.0x | 117.6x | 53.58 |
+| getri | 64 | 1024 | 2.362 | 38.649 | 266.501 | 16.4x | 112.8x | 111.90 |
+| getrf | 64 | 8192 | 17.343 | 102.590 | 910.304 | 5.9x | 52.5x | 867.07 |
+| getrs | 64 | 8192 | 5.231 | 44.250 | 446.476 | 8.5x | 85.4x | 253.29 |
+| getri | 64 | 8192 | 17.319 | 189.269 | 1978.660 | 10.9x | 114.3x | 815.91 |
 
 #### Batched GEMM (m = n = k)
 

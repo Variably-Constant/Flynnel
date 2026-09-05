@@ -814,10 +814,16 @@ mod tests {
     fn inline_join_runs_a_before_b_when_serial() {
         // The serial dispatch runs a first, then b. Closures that
         // observe shared state must see the order (10, 20).
+        // A hint-less plan of 32 items or fewer is classed latency-
+        // bound, which activates SMT and routes even one item to the
+        // pool, where a peer may steal b and run it first. An explicit
+        // light estimate classes the plan fine-grain and keeps the
+        // join inline, which is the tier this test is about.
         let order = Arc::new(AtomicU32::new(0));
         let order_a = Arc::clone(&order);
         let order_b = Arc::clone(&order);
-        let plan = JobPlan::new(2, 1);
+        let plan = JobPlan::new(2, 1).with_estimated_per_item_ns(10);
+        assert_eq!(pick_tier(&plan, numa_topology()), SchedTier::Inline);
         let (ra, rb) = join(
             &plan,
             move || order_a.fetch_add(10, Ordering::SeqCst),

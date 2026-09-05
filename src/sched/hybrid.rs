@@ -319,6 +319,76 @@ where
     }
 }
 
+/// Learned-ratio split of `n` divisible items into two index ranges:
+/// `cpu_fn` gets `0..mid` and `gpu_fn` gets `mid..n`, with `mid` set
+/// by the per-item throughputs this call site has measured for
+/// batches of this size (even split until both sides have data,
+/// then the faster side takes the larger share). Neither side is
+/// handed a slice, so the backend side may operate on data resident
+/// on the device and addressed by index, and the CPU side on host
+/// data the caller owns. Both halves run concurrently in the
+/// [`join_hybrid`] shape and the measured per-item costs update the
+/// site's model for the next call, bucketed by `log2(n)`.
+///
+/// `cpu_fn` and `gpu_fn` MUST apply the same per-item
+/// transformation; the split boundary is a performance decision.
+///
+/// # Panics
+///
+/// Propagates a panic from either side.
+#[track_caller]
+pub fn hybrid_auto_split_ranges<CF, GF>(
+    plan: &JobPlan,
+    n: usize,
+    cpu_fn: CF,
+    gpu_fn: GF,
+) -> SplitReport
+where
+    CF: FnOnce(std::ops::Range<usize>),
+    GF: FnOnce(std::ops::Range<usize>) + Send + 'static,
+{
+    let plan_owned = plan.with_site_if_none(crate::sched::call_site::caller_site());
+    let plan = &plan_owned;
+    let site = plan
+        .site
+        .expect("with_site_if_none attached a site above")
+        .get();
+
+    let n_key = n.min(u32::MAX as usize) as u32;
+    let share = site.split_cpu_share_per_mille_for(n_key);
+    let mid = ((n as u64 * share as u64) / 1000) as usize;
+    let mid = mid.clamp(usize::from(n > 1), n.saturating_sub(usize::from(n > 1)));
+    let cpu_items = mid;
+    let backend_items = n - mid;
+
+    let (cpu_ns_out, backend_ns_out) = join_hybrid(
+        plan,
+        || {
+            let t0 = std::time::Instant::now();
+            if cpu_items > 0 {
+                cpu_fn(0..mid);
+            }
+            t0.elapsed().as_nanos() as u64
+        },
+        move || {
+            let t0 = std::time::Instant::now();
+            if backend_items > 0 {
+                gpu_fn(mid..n);
+            }
+            t0.elapsed().as_nanos() as u64
+        },
+    );
+
+    site.record_split_for(n_key, cpu_items, cpu_ns_out, backend_items, backend_ns_out);
+    SplitReport {
+        cpu_items,
+        backend_items,
+        cpu_ns: cpu_ns_out,
+        backend_ns: backend_ns_out,
+        cpu_share_per_mille: share,
+    }
+}
+
 /// Three-stage CPU-GPU-CPU pipeline. Each input flows through
 /// `pre_cpu` → `gpu` → `post_cpu`, and the three stages run on
 /// dedicated OS threads connected by depth-2 bounded channels so

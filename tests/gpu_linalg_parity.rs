@@ -115,6 +115,30 @@ fn einsum_outer_axissum_trace_bit_exact() {
 }
 
 #[test]
+fn einsum_frobenius_inner_product_bit_exact() {
+    let mut g = peer();
+    let (peer, k) = &mut *g;
+    let batch = 8usize;
+    for &(m, n) in &[(1usize, 1usize), (8, 8), (13, 5), (64, 64)] {
+        let a = uniform(20 + m as u64, batch * m * n);
+        let b = uniform(30 + n as u64, batch * m * n);
+        let spec = EinsumSpec::parse("ij,ij->", &[m, n], Some(&[m, n])).expect("spec");
+        assert_eq!(spec.out_size(), 1, "rank-0 output is one scalar per item");
+        let gpu = einsum_batched(peer, k, &spec, &a, Some(&b), batch as u32).expect("frobenius");
+        let want = cpu::einsum(&spec, &a, Some(&b), batch);
+        assert_eq!(gpu.len(), batch);
+        for (i, (g, w)) in gpu.iter().zip(&want).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "{m}x{n} item {i}: gpu {g} cpu {w}");
+        }
+        // The value is the plain inner product to rounding.
+        for item in 0..batch {
+            let s: f64 = (0..m * n).map(|e| a[item * m * n + e] * b[item * m * n + e]).sum();
+            assert!((gpu[item] - s).abs() <= 1e-13 * (m * n) as f64, "{m}x{n} item {item}: {} vs {s}", gpu[item]);
+        }
+    }
+}
+
+#[test]
 fn gemm_ragged_dims_bit_exact() {
     let mut g = peer();
     let (peer, k) = &mut *g;

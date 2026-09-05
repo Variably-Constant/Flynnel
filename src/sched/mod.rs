@@ -107,7 +107,10 @@ pub use prefetch::{
 };
 pub use k_join::k_join_with_plan;
 pub use cooperative::{cooperative_join_n, cooperative_join_n_flat, cooperative_join_n_tree};
-pub use hybrid::{SplitReport, hybrid_auto, hybrid_auto_split, hybrid_pipeline, join_hybrid};
+pub use hybrid::{
+    SplitReport, hybrid_auto, hybrid_auto_split, hybrid_auto_split_ranges, hybrid_pipeline,
+    join_hybrid,
+};
 pub use numa_latency::{TopologyLatencyTable, topology_latency_table};
 #[cfg(feature = "shared-memory-worker-reference")]
 pub use marshal::{Marshal, register_marshal_handler};

@@ -656,6 +656,39 @@ where
         // still routes to the pool, where the bisect's leaf
         // timing corrects the site.
         const CONFIRM_SIZE: usize = 4;
+        // A single trusted item is confirmed when it could be a cold
+        // first call rather than a heavy item: the first call at a
+        // site pays one-time costs (code and site state faulting in)
+        // that measured 30 us on a quiet 16-worker host and 79 us
+        // under a saturated one for a one-add item, against an 80 us
+        // dispatch floor there and a 40 us floor on 8 workers, so the
+        // allowance is four floors. Up to three further items are
+        // timed one at a time and the minimum taken, since preemption
+        // only ever inflates a reading (a Windows quantum runs to
+        // milliseconds); the loop stops at the first reading that
+        // puts the tail under the floor, so a light item costs one
+        // confirmation and a heavy one at most three, each at most
+        // the allowance. It runs only when the tail is at least a
+        // worker's width, where a misreading would dispatch a wide
+        // tail of light items; a small tail costs little either way
+        // and keeps the single-item critical path. An item beyond
+        // the allowance is heavy on its own evidence.
+        const CONFIRM_SINGLE_MAX: usize = 3;
+        let cold_start_allowance_ns = dispatch_floor_ns.saturating_mul(4);
+        if probed == 1 && first_ns < cold_start_allowance_ns && tail.len() >= workers {
+            for _ in 0..CONFIRM_SINGLE_MAX {
+                if per_elem_ns.saturating_mul(tail.len() as u64) < dispatch_floor_ns
+                    || tail.len() <= 1
+                {
+                    break;
+                }
+                let (one, rest) = tail.split_at_mut(1);
+                let start = std::time::Instant::now();
+                record_leaf(plan.site, || op(one));
+                per_elem_ns = per_elem_ns.min(start.elapsed().as_nanos().max(1) as u64);
+                tail = rest;
+            }
+        }
         if per_elem_ns.saturating_mul(tail.len() as u64) >= dispatch_floor_ns
             && probed >= 8
             && tail.len() > CONFIRM_SIZE
@@ -2727,17 +2760,29 @@ mod tests {
 
     #[test]
     fn for_each_chunk_small_input_runs_serial() {
-        // Inputs below the dispatch floor (n < workers * MIN_LEAF_ITEMS
-        // with no explicit cost estimate) run serially on the calling
-        // thread without entering the pool.
+        // An input whose measured work is below the dispatch floor
+        // (no explicit cost estimate, n < workers * MIN_LEAF_ITEMS)
+        // runs serially on the calling thread without entering the
+        // pool. A quarter of the leaf floor keeps the work below the
+        // floor even when the suite saturates the host and a one-add
+        // item measures 400 ns.
         //
         // The runtime may probe-and-decide (one small probe + tail) so
         // op CAN be called multiple times, but every call must come
         // from the calling thread (no pool dispatch). This is what
         // separates inline-collapse from pool dispatch.
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let mut v: Vec<u32> = (0..MIN_LEAF_ITEMS as u32).collect();
-        let plan = JobPlan::new(6, MIN_LEAF_ITEMS as u32);
+        // The premise holds under the PortBound global profile: a
+        // LatencyBound global activates SMT and a one-item leaf
+        // floor, which dispatches even this size. Hold the profile
+        // lock so the migration tests cannot move it underneath.
+        let _profile = crate::sched::adaptive_profile::global_profile_test_lock();
+        crate::sched::adaptive_profile::migrate_dispatch_profile(
+            crate::DispatchProfile::PortBound,
+        );
+        let n = MIN_LEAF_ITEMS / 4;
+        let mut v: Vec<u32> = (0..n as u32).collect();
+        let plan = JobPlan::new(6, n as u32);
         let snap = format!(
             "use_smt={} est_pi={:?} explicit={} oversub={:?} global={:?}",
             plan.use_smt,
@@ -2769,7 +2814,7 @@ mod tests {
         );
         assert_eq!(
             total_processed.load(Ordering::Relaxed),
-            MIN_LEAF_ITEMS,
+            n,
             "all items must be processed exactly once across probe + tail"
         );
         for (i, &x) in v.iter().enumerate() {

@@ -20,7 +20,11 @@
 //! the Jacobi ops agree to rounding (tournament vs cyclic pair order).
 //! Matrices are row-major and batched contiguously.
 
+use std::sync::{Arc, Mutex};
+
 use cudarc::nvrtc::Ptx;
+
+use crate::sched::hybrid::{SplitReport, hybrid_auto_split_ranges};
 
 use super::{GpuPeer, GpuPeerError, WideKernel};
 use crate::backend::accel_op::{AccelOpId, AccelReport, bind_accel_kernel, dispatch_accel, register_accel_op};
@@ -40,6 +44,11 @@ pub const LINALG_CU: &str = include_str!("../../kernels/linalg_f64.cu");
 pub const LINALG_BISECT_PTX: &str = include_str!("../../kernels/linalg_bisect_f64.ptx");
 /// Source of [`LINALG_BISECT_PTX`] for the NVRTC fallback.
 pub const LINALG_BISECT_CU: &str = include_str!("../../kernels/linalg_bisect_f64.cu");
+/// PTX of the LU factorization and solve kernels
+/// (`kernels/linalg_lu_f64.cu`), the third module of [`LinalgKernels`].
+pub const LINALG_LU_PTX: &str = include_str!("../../kernels/linalg_lu_f64.ptx");
+/// Source of [`LINALG_LU_PTX`] for the NVRTC fallback.
+pub const LINALG_LU_CU: &str = include_str!("../../kernels/linalg_lu_f64.cu");
 
 /// Largest square dimension the block-per-matrix Jacobi kernels take.
 pub const LINALG_MAX_N: usize = 64;
@@ -139,6 +148,10 @@ pub struct LinalgKernels {
     pub syev_bisect: WideKernel,
     /// `flynnel_gesvd_bisect_f64_blk`.
     pub gesvd_bisect: WideKernel,
+    /// `flynnel_getrf_f64_blk`.
+    pub getrf: WideKernel,
+    /// `flynnel_getrs_f64_blk`.
+    pub getrs: WideKernel,
 }
 
 /// Load one PTX module, compiling `cu` with NVRTC when the driver
@@ -169,11 +182,12 @@ fn load_module(
 }
 
 impl LinalgKernels {
-    /// Load both PTX modules into the peer's context once and resolve
-    /// every entry point.
+    /// Load the three PTX modules into the peer's context once and
+    /// resolve every entry point.
     pub fn load(peer: &GpuPeer) -> Result<Self, GpuPeerError> {
         let module = load_module(peer, "linalg", LINALG_PTX, LINALG_CU)?;
         let bisect = load_module(peer, "linalg_bisect", LINALG_BISECT_PTX, LINALG_BISECT_CU)?;
+        let lu = load_module(peer, "linalg_lu", LINALG_LU_PTX, LINALG_LU_CU)?;
         let load = |module: &std::sync::Arc<cudarc::driver::CudaModule>,
                     entry: &str|
          -> Result<WideKernel, GpuPeerError> {
@@ -191,6 +205,8 @@ impl LinalgKernels {
             gesvd_thr: load(&module, "flynnel_gesvd_jacobi_f64_thr")?,
             syev_bisect: load(&bisect, "flynnel_syev_bisect_f64_blk")?,
             gesvd_bisect: load(&bisect, "flynnel_gesvd_bisect_f64_blk")?,
+            getrf: load(&lu, "flynnel_getrf_f64_blk")?,
+            getrs: load(&lu, "flynnel_getrs_f64_blk")?,
         })
     }
 }
@@ -886,6 +902,479 @@ pub fn gesvd_auto_batched(
     }
 }
 
+// ------------------------------------------------------------ LU: factor, solve, inverse
+
+/// A batched LU factorization: `lu` holds `U` on and above the
+/// diagonal and the unit-lower multipliers below it, `piv[item * n +
+/// k]` the row swapped with row `k` at step `k`, and `info[item]` zero
+/// or one past the first step whose pivot was exactly zero.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LuResult {
+    /// Packed factors, `batch * n * n`.
+    pub lu: Vec<f64>,
+    /// Row interchanges, `batch * n`.
+    pub piv: Vec<i32>,
+    /// Singularity flags, `batch`.
+    pub info: Vec<i32>,
+}
+
+fn fetch_i32(peer: &mut GpuPeer, p: &Pinned, elems: usize) -> Result<Vec<i32>, GpuPeerError> {
+    let mut out = vec![0u8; elems * 4];
+    peer.fetch_bulk(&p.handle, &mut out)?;
+    Ok(out.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// Enqueue batched in-place LU with partial pivoting on the wide
+/// stream: `a` holds `batch` row-major `n x n` matrices and receives
+/// the packed factors, `piv` `batch * n` `i32` interchanges, `info`
+/// `batch` `i32` flags (see [`LuResult`]). One block per matrix,
+/// `n <= LINALG_MAX_N`. No sync.
+pub fn launch_getrf(
+    peer: &GpuPeer,
+    k: &LinalgKernels,
+    a: u64,
+    piv: u64,
+    info: u64,
+    batch: u32,
+    n: u32,
+) -> Result<(), GpuPeerError> {
+    check_dim(batch > 0 && n > 0, "getrf: empty batch or n")?;
+    check_dim(n as usize <= LINALG_MAX_N, "getrf: n exceeds LINALG_MAX_N")?;
+    peer.launch_wide_async(&k.getrf, batch, LINALG_BLOCK, &[a, piv, info], &[batch, n])
+}
+
+/// Enqueue batched solves with packed factors from [`launch_getrf`]
+/// on the wide stream: `b` holds `batch` row-major `n x nrhs`
+/// right-hand sides and receives the solutions. With `identity_rhs`,
+/// `b` is not read, `nrhs` must equal `n`, and `b` receives the
+/// inverse. `nrhs <= LINALG_MAX_N`. No sync.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_getrs(
+    peer: &GpuPeer,
+    k: &LinalgKernels,
+    lu: u64,
+    piv: u64,
+    b: u64,
+    batch: u32,
+    n: u32,
+    nrhs: u32,
+    identity_rhs: bool,
+) -> Result<(), GpuPeerError> {
+    check_dim(batch > 0 && n > 0 && nrhs > 0, "getrs: empty batch, n, or nrhs")?;
+    check_dim(n as usize <= LINALG_MAX_N, "getrs: n exceeds LINALG_MAX_N")?;
+    check_dim(nrhs as usize <= LINALG_MAX_N, "getrs: nrhs exceeds LINALG_MAX_N")?;
+    check_dim(!identity_rhs || nrhs == n, "getrs: the identity right-hand side needs nrhs == n")?;
+    let scalars = [batch, n, nrhs, u32::from(identity_rhs)];
+    peer.launch_wide_async(&k.getrs, batch, LINALG_BLOCK, &[lu, piv, b], &scalars)
+}
+
+/// [`launch_getrf`] over host buffers.
+pub fn getrf_batched(
+    peer: &mut GpuPeer,
+    k: &LinalgKernels,
+    a: &[f64],
+    batch: u32,
+    n: u32,
+) -> Result<LuResult, GpuPeerError> {
+    let (bu, nu) = (batch as usize, n as usize);
+    check_dim(a.len() == bu * nu * nu, "getrf: a length")?;
+    let pa = pin(peer, &f64_bytes(a))?;
+    let ppiv = pin(peer, &vec![0u8; bu * nu * 4])?;
+    let pinfo = pin(peer, &vec![0u8; bu * 4])?;
+    launch_getrf(peer, k, pa.ptr, ppiv.ptr, pinfo.ptr, batch, n)?;
+    peer.sync_wide()?;
+    let lu = fetch_f64(peer, &pa, bu * nu * nu)?;
+    let piv = fetch_i32(peer, &ppiv, bu * nu)?;
+    let info = fetch_i32(peer, &pinfo, bu)?;
+    pinfo.release(peer)?;
+    ppiv.release(peer)?;
+    pa.release(peer)?;
+    Ok(LuResult { lu, piv, info })
+}
+
+/// [`launch_getrs`] over host buffers: the solutions of `batch`
+/// systems with `nrhs` right-hand sides each.
+#[allow(clippy::too_many_arguments)]
+pub fn getrs_batched(
+    peer: &mut GpuPeer,
+    k: &LinalgKernels,
+    lu: &[f64],
+    piv: &[i32],
+    b: &[f64],
+    batch: u32,
+    n: u32,
+    nrhs: u32,
+) -> Result<Vec<f64>, GpuPeerError> {
+    let (bu, nu, ru) = (batch as usize, n as usize, nrhs as usize);
+    check_dim(lu.len() == bu * nu * nu, "getrs: lu length")?;
+    check_dim(piv.len() == bu * nu, "getrs: piv length")?;
+    check_dim(b.len() == bu * nu * ru, "getrs: b length")?;
+    let plu = pin(peer, &f64_bytes(lu))?;
+    let ppiv = pin(peer, &i32_bytes(piv))?;
+    let pb = pin(peer, &f64_bytes(b))?;
+    launch_getrs(peer, k, plu.ptr, ppiv.ptr, pb.ptr, batch, n, nrhs, false)?;
+    peer.sync_wide()?;
+    let x = fetch_f64(peer, &pb, bu * nu * ru)?;
+    pb.release(peer)?;
+    ppiv.release(peer)?;
+    plu.release(peer)?;
+    Ok(x)
+}
+
+/// [`launch_getrs`] with the identity right-hand side over host
+/// buffers: the inverses, `batch * n * n`.
+pub fn getri_batched(
+    peer: &mut GpuPeer,
+    k: &LinalgKernels,
+    lu: &[f64],
+    piv: &[i32],
+    batch: u32,
+    n: u32,
+) -> Result<Vec<f64>, GpuPeerError> {
+    let (bu, nu) = (batch as usize, n as usize);
+    check_dim(lu.len() == bu * nu * nu, "getri: lu length")?;
+    check_dim(piv.len() == bu * nu, "getri: piv length")?;
+    let plu = pin(peer, &f64_bytes(lu))?;
+    let ppiv = pin(peer, &i32_bytes(piv))?;
+    let pinv = pin(peer, &vec![0u8; bu * nu * nu * 8])?;
+    launch_getrs(peer, k, plu.ptr, ppiv.ptr, pinv.ptr, batch, n, n, true)?;
+    peer.sync_wide()?;
+    let inv = fetch_f64(peer, &pinv, bu * nu * nu)?;
+    pinv.release(peer)?;
+    ppiv.release(peer)?;
+    plu.release(peer)?;
+    Ok(inv)
+}
+
+/// Determinants from packed factors: the product of the diagonal of
+/// `U`, negated once per row interchange. `batch` values.
+pub fn lu_det_batched(lu: &[f64], piv: &[i32], batch: usize, n: usize) -> Vec<f64> {
+    (0..batch)
+        .map(|item| {
+            let f = &lu[item * n * n..(item + 1) * n * n];
+            let pv = &piv[item * n..(item + 1) * n];
+            let mut det = 1.0;
+            for k in 0..n {
+                det *= f[k * n + k];
+                if pv[k] as usize != k {
+                    det = -det;
+                }
+            }
+            det
+        })
+        .collect()
+}
+
+// ------------------------------------------------------------ tandem: device + CPU pool
+
+/// Most matrices per CPU work item in the tandem helpers. The CPU
+/// share is walked in runs sized to give the pool two runs per
+/// worker, capped here so an item stays a few microseconds of work
+/// or more and is dispatched rather than probed inline.
+pub const TANDEM_CPU_CHUNK: usize = 64;
+
+/// Sort each item's eigenpairs ascending by eigenvalue in place:
+/// `w` is `batch * n`, `v` (when given) holds eigenvectors as
+/// columns of `n x n` items.
+pub fn sort_eigenpairs_ascending(w: &mut [f64], v: Option<&mut [f64]>, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let batch = w.len() / n;
+    let mut perm: Vec<usize> = Vec::with_capacity(n);
+    let mut row = vec![0f64; n];
+    let mut v = v;
+    for item in 0..batch {
+        let wi = &mut w[item * n..(item + 1) * n];
+        perm.clear();
+        perm.extend(0..n);
+        perm.sort_by(|&x, &y| wi[x].partial_cmp(&wi[y]).expect("finite eigenvalue"));
+        let sorted: Vec<f64> = perm.iter().map(|&j| wi[j]).collect();
+        wi.copy_from_slice(&sorted);
+        if let Some(v) = v.as_deref_mut() {
+            let vi = &mut v[item * n * n..(item + 1) * n * n];
+            for r in 0..n {
+                row.copy_from_slice(&vi[r * n..(r + 1) * n]);
+                for (j, &p) in perm.iter().enumerate() {
+                    vi[r * n + j] = row[p];
+                }
+            }
+        }
+    }
+}
+
+/// Sort each item's singular triplets descending by singular value
+/// in place: `sigma` is `batch * n`, `u` holds `m x n` items with
+/// left vectors as columns, `v` (when given) `n x n` items with
+/// right vectors as columns.
+pub fn sort_singular_descending(u: &mut [f64], sigma: &mut [f64], v: Option<&mut [f64]>, m: usize, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let batch = sigma.len() / n;
+    let mut perm: Vec<usize> = Vec::with_capacity(n);
+    let mut row = vec![0f64; n];
+    let mut v = v;
+    for item in 0..batch {
+        let si = &mut sigma[item * n..(item + 1) * n];
+        perm.clear();
+        perm.extend(0..n);
+        perm.sort_by(|&x, &y| si[y].partial_cmp(&si[x]).expect("finite singular value"));
+        let sorted: Vec<f64> = perm.iter().map(|&j| si[j]).collect();
+        si.copy_from_slice(&sorted);
+        let ui = &mut u[item * m * n..(item + 1) * m * n];
+        for r in 0..m {
+            row.copy_from_slice(&ui[r * n..(r + 1) * n]);
+            for (j, &p) in perm.iter().enumerate() {
+                ui[r * n + j] = row[p];
+            }
+        }
+        if let Some(v) = v.as_deref_mut() {
+            let vi = &mut v[item * n * n..(item + 1) * n * n];
+            for r in 0..n {
+                row.copy_from_slice(&vi[r * n..(r + 1) * n]);
+                for (j, &p) in perm.iter().enumerate() {
+                    vi[r * n + j] = row[p];
+                }
+            }
+        }
+    }
+}
+
+/// Walk `range` on the pool in runs of at most [`TANDEM_CPU_CHUNK`]
+/// items, two runs per worker when the range allows, calling
+/// `f(lo, hi)` once per run with disjoint item ranges.
+fn tandem_cpu_runs<F>(range: std::ops::Range<usize>, f: F)
+where
+    F: Fn(usize, usize) + Sync,
+{
+    let workers = crate::sched::arena::global_local_arena().total_workers().max(1);
+    let width = range.len().div_ceil(2 * workers).clamp(1, TANDEM_CPU_CHUNK);
+    let runs = range.len().div_ceil(width);
+    let (start, end) = (range.start, range.end);
+    let plan = JobPlan::new(0, runs as u32);
+    crate::sched::par_iter::for_each_indexed(&plan, runs, 1, |ri| {
+        let lo = start + ri * width;
+        let hi = (lo + width).min(end);
+        f(lo, hi);
+    });
+}
+
+/// Copy `src` into `dst` at element offset `at`, where `dst` is the
+/// address of a buffer the caller keeps alive and only ever writes
+/// through disjoint offsets from concurrent runs.
+///
+/// # Safety
+///
+/// `dst..dst + (at + src.len()) * 8` must be inside a live `[f64]`
+/// no other run writes at these offsets while this runs.
+unsafe fn scatter(dst: usize, at: usize, src: &[f64]) {
+    // SAFETY: the caller's contract above.
+    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), (dst as *mut f64).add(at), src.len()) };
+}
+
+/// Batched GEMM over host buffers with the batch split between the
+/// device and the CPU pool by the call site's learned share
+/// ([`hybrid_auto_split_ranges`]): the device part runs
+/// [`gemm_batched`], the CPU part [`cpu::gemm_batched`] in runs of
+/// [`TANDEM_CPU_CHUNK`] matrices on the pool. Every item is the same
+/// bit for bit whichever side computed it. Returns the result and
+/// the split report.
+#[track_caller]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_tandem_batched(
+    peer: &mut GpuPeer,
+    k: &LinalgKernels,
+    plan: &JobPlan,
+    a: &[f64],
+    b: &[f64],
+    batch: u32,
+    m: u32,
+    n: u32,
+    kdim: u32,
+) -> Result<(Vec<f64>, SplitReport), GpuPeerError> {
+    let (bu, mu, nu, ku) = (batch as usize, m as usize, n as usize, kdim as usize);
+    check_dim(batch > 0 && m > 0 && n > 0 && kdim > 0, "gemm: empty dimension")?;
+    check_dim(a.len() == bu * mu * ku, "gemm: a length")?;
+    check_dim(b.len() == bu * ku * nu, "gemm: b length")?;
+    let (per_a, per_b, per_c) = (mu * ku, ku * nu, mu * nu);
+    let mut out = vec![0f64; bu * per_c];
+    let out_addr = out.as_mut_ptr() as usize;
+    let device_err: Arc<Mutex<Option<GpuPeerError>>> = Arc::new(Mutex::new(None));
+    let err_slot = Arc::clone(&device_err);
+    let (peer_addr, k_addr) = (peer as *mut GpuPeer as usize, k as *const LinalgKernels as usize);
+    let (a_addr, a_len, b_addr, b_len) = (a.as_ptr() as usize, a.len(), b.as_ptr() as usize, b.len());
+    let report = hybrid_auto_split_ranges(
+        plan,
+        bu,
+        |r| {
+            tandem_cpu_runs(r, |lo, hi| {
+                let c = cpu::gemm_batched(&a[lo * per_a..hi * per_a], &b[lo * per_b..hi * per_b], hi - lo, mu, nu, ku);
+                // SAFETY: `out` outlives the split; runs write disjoint item ranges.
+                unsafe { scatter(out_addr, lo * per_c, &c) };
+            });
+        },
+        move |r| {
+            // SAFETY: the caller frame blocks inside the split until this
+            // closure returns, so the peer, the kernels, the inputs and
+            // `out` outlive every access here; the device item range is
+            // disjoint from the CPU range.
+            let peer = unsafe { &mut *(peer_addr as *mut GpuPeer) };
+            let k = unsafe { &*(k_addr as *const LinalgKernels) };
+            let a = unsafe { std::slice::from_raw_parts(a_addr as *const f64, a_len) };
+            let b = unsafe { std::slice::from_raw_parts(b_addr as *const f64, b_len) };
+            let (lo, hi) = (r.start, r.end);
+            match gemm_batched(peer, k, &a[lo * per_a..hi * per_a], &b[lo * per_b..hi * per_b], (hi - lo) as u32, m, n, kdim) {
+                Ok(c) => unsafe { scatter(out_addr, lo * per_c, &c) },
+                Err(e) => *err_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e),
+            }
+        },
+    );
+    if let Some(e) = device_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        return Err(e);
+    }
+    Ok((out, report))
+}
+
+/// Batched symmetric eigendecomposition over host buffers with the
+/// batch split between the device ([`syev_auto_batched`]) and the
+/// CPU pool ([`cpu::syev_jacobi_batched`]) by the call site's learned
+/// share. Eigenvalues come back ascending for every item, with
+/// eigenvectors as columns when `want_v`, whichever side computed it.
+#[track_caller]
+pub fn syev_tandem_batched(
+    peer: &mut GpuPeer,
+    k: &LinalgKernels,
+    plan: &JobPlan,
+    a: &[f64],
+    batch: u32,
+    n: u32,
+    want_v: bool,
+) -> Result<((Vec<f64>, Option<Vec<f64>>), SplitReport), GpuPeerError> {
+    let (bu, nu) = (batch as usize, n as usize);
+    check_dim(batch > 0 && n > 0, "syev: empty batch or n")?;
+    check_dim(a.len() == bu * nu * nu, "syev: a length")?;
+    let mut w = vec![0f64; bu * nu];
+    let mut v = if want_v { vec![0f64; bu * nu * nu] } else { Vec::new() };
+    let (w_addr, v_addr) = (w.as_mut_ptr() as usize, v.as_mut_ptr() as usize);
+    let device_err: Arc<Mutex<Option<GpuPeerError>>> = Arc::new(Mutex::new(None));
+    let err_slot = Arc::clone(&device_err);
+    let (peer_addr, k_addr) = (peer as *mut GpuPeer as usize, k as *const LinalgKernels as usize);
+    let (a_addr, a_len) = (a.as_ptr() as usize, a.len());
+    let sweeps = default_sweeps(nu);
+    let report = hybrid_auto_split_ranges(
+        plan,
+        bu,
+        |r| {
+            tandem_cpu_runs(r, |lo, hi| {
+                let (mut wc, mut vc) = cpu::syev_jacobi_batched(&a[lo * nu * nu..hi * nu * nu], hi - lo, nu, sweeps, want_v);
+                sort_eigenpairs_ascending(&mut wc, vc.as_deref_mut(), nu);
+                // SAFETY: outputs outlive the split; runs write disjoint item ranges.
+                unsafe { scatter(w_addr, lo * nu, &wc) };
+                if let Some(vc) = vc {
+                    unsafe { scatter(v_addr, lo * nu * nu, &vc) };
+                }
+            });
+        },
+        move |r| {
+            // SAFETY: as in gemm_tandem_batched; the caller blocks until
+            // this returns and the device range is disjoint from the CPU's.
+            let peer = unsafe { &mut *(peer_addr as *mut GpuPeer) };
+            let k = unsafe { &*(k_addr as *const LinalgKernels) };
+            let a = unsafe { std::slice::from_raw_parts(a_addr as *const f64, a_len) };
+            let (lo, hi) = (r.start, r.end);
+            match syev_auto_batched(peer, k, &a[lo * nu * nu..hi * nu * nu], (hi - lo) as u32, n, want_v) {
+                Ok((mut wd, mut vd)) => {
+                    sort_eigenpairs_ascending(&mut wd, vd.as_deref_mut(), nu);
+                    unsafe { scatter(w_addr, lo * nu, &wd) };
+                    if let Some(vd) = vd {
+                        unsafe { scatter(v_addr, lo * nu * nu, &vd) };
+                    }
+                }
+                Err(e) => *err_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e),
+            }
+        },
+    );
+    if let Some(e) = device_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        return Err(e);
+    }
+    Ok(((w, if want_v { Some(v) } else { None }), report))
+}
+
+/// Batched SVD over host buffers with the batch split between the
+/// device ([`gesvd_auto_batched`]) and the CPU pool
+/// ([`cpu::gesvd_jacobi_batched`]) by the call site's learned share.
+/// Singular values come back descending for every item, with the
+/// matching columns of `U` and `V`, whichever side computed it.
+#[track_caller]
+#[allow(clippy::too_many_arguments)]
+pub fn gesvd_tandem_batched(
+    peer: &mut GpuPeer,
+    k: &LinalgKernels,
+    plan: &JobPlan,
+    a: &[f64],
+    batch: u32,
+    m: u32,
+    n: u32,
+    want_v: bool,
+) -> Result<(GesvdResult, SplitReport), GpuPeerError> {
+    let (bu, mu, nu) = (batch as usize, m as usize, n as usize);
+    check_dim(batch > 0 && n > 0 && m >= n, "gesvd: empty batch, empty n, or m < n")?;
+    check_dim(a.len() == bu * mu * nu, "gesvd: a length")?;
+    let mut u = vec![0f64; bu * mu * nu];
+    let mut sigma = vec![0f64; bu * nu];
+    let mut v = if want_v { vec![0f64; bu * nu * nu] } else { Vec::new() };
+    let (u_addr, s_addr, v_addr) = (u.as_mut_ptr() as usize, sigma.as_mut_ptr() as usize, v.as_mut_ptr() as usize);
+    let device_err: Arc<Mutex<Option<GpuPeerError>>> = Arc::new(Mutex::new(None));
+    let err_slot = Arc::clone(&device_err);
+    let (peer_addr, k_addr) = (peer as *mut GpuPeer as usize, k as *const LinalgKernels as usize);
+    let (a_addr, a_len) = (a.as_ptr() as usize, a.len());
+    let sweeps = default_sweeps(nu);
+    let report = hybrid_auto_split_ranges(
+        plan,
+        bu,
+        |r| {
+            tandem_cpu_runs(r, |lo, hi| {
+                let (mut uc, mut sc, mut vc) =
+                    cpu::gesvd_jacobi_batched(&a[lo * mu * nu..hi * mu * nu], hi - lo, mu, nu, sweeps, want_v);
+                sort_singular_descending(&mut uc, &mut sc, vc.as_deref_mut(), mu, nu);
+                // SAFETY: outputs outlive the split; runs write disjoint item ranges.
+                unsafe {
+                    scatter(u_addr, lo * mu * nu, &uc);
+                    scatter(s_addr, lo * nu, &sc);
+                }
+                if let Some(vc) = vc {
+                    unsafe { scatter(v_addr, lo * nu * nu, &vc) };
+                }
+            });
+        },
+        move |r| {
+            // SAFETY: as in gemm_tandem_batched.
+            let peer = unsafe { &mut *(peer_addr as *mut GpuPeer) };
+            let k = unsafe { &*(k_addr as *const LinalgKernels) };
+            let a = unsafe { std::slice::from_raw_parts(a_addr as *const f64, a_len) };
+            let (lo, hi) = (r.start, r.end);
+            match gesvd_auto_batched(peer, k, &a[lo * mu * nu..hi * mu * nu], (hi - lo) as u32, m, n, want_v) {
+                Ok(mut res) => {
+                    sort_singular_descending(&mut res.u, &mut res.sigma, res.v.as_deref_mut(), mu, nu);
+                    unsafe {
+                        scatter(u_addr, lo * mu * nu, &res.u);
+                        scatter(s_addr, lo * nu, &res.sigma);
+                    }
+                    if let Some(vd) = res.v {
+                        unsafe { scatter(v_addr, lo * nu * nu, &vd) };
+                    }
+                }
+                Err(e) => *err_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e),
+            }
+        },
+    );
+    if let Some(e) = device_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        return Err(e);
+    }
+    Ok((GesvdResult { u, sigma, v: if want_v { Some(v) } else { None } }, report))
+}
+
 /// Batched symmetric eigendecomposition over host buffers: `a` holds
 /// `batch` `n x n` matrices; returns `(eigenvalues, eigenvectors)`
 /// with eigenvalues in diagonal (unsorted) order, `batch * n` long,
@@ -969,6 +1458,47 @@ pub fn gesvd_batched(
     Ok(GesvdResult { u, sigma, v })
 }
 
+// ------------------------------------------------------------ ragged inputs by shape
+
+/// Group item indices by shape, so a ragged input becomes one
+/// uniform batch per shape: `(shape, indices)` pairs in ascending
+/// shape order, every index exactly once, indices ascending within a
+/// group. The batched kernels take one shape per call; a consumer
+/// with mixed shapes calls once per group.
+pub fn group_by_shape<S: Ord + Copy>(shapes: &[S]) -> Vec<(S, Vec<usize>)> {
+    let mut order: Vec<usize> = (0..shapes.len()).collect();
+    order.sort_by_key(|&i| (shapes[i], i));
+    let mut groups: Vec<(S, Vec<usize>)> = Vec::new();
+    for i in order {
+        match groups.last_mut() {
+            Some((s, idx)) if *s == shapes[i] => idx.push(i),
+            _ => groups.push((shapes[i], vec![i])),
+        }
+    }
+    groups
+}
+
+/// Gather the items named by `indices` into a contiguous batch:
+/// item `i` is `src[offsets[i]..offsets[i] + item_len]`, and the
+/// result holds them in `indices` order, `indices.len() * item_len`
+/// long.
+pub fn gather_items(src: &[f64], offsets: &[usize], item_len: usize, indices: &[usize]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(indices.len() * item_len);
+    for &i in indices {
+        out.extend_from_slice(&src[offsets[i]..offsets[i] + item_len]);
+    }
+    out
+}
+
+/// Scatter a contiguous batch back: item `j` of `batch` (`item_len`
+/// elements) is written to `dst[offsets[indices[j]]..]`. The inverse
+/// of [`gather_items`] for outputs of the same item length.
+pub fn scatter_items(batch: &[f64], offsets: &[usize], item_len: usize, indices: &[usize], dst: &mut [f64]) {
+    for (j, &i) in indices.iter().enumerate() {
+        dst[offsets[i]..offsets[i] + item_len].copy_from_slice(&batch[j * item_len..(j + 1) * item_len]);
+    }
+}
+
 // ------------------------------------------------------------ CPU references
 
 /// CPU implementations with the kernels' semantics. einsum and gemm
@@ -977,6 +1507,105 @@ pub fn gesvd_batched(
 /// the kernels to rounding.
 pub mod cpu {
     use super::EinsumSpec;
+
+    /// Batched LU with partial pivoting, the kernel's semantics:
+    /// `(packed factors, interchanges, flags)` as in
+    /// [`super::LuResult`]. Pivot by largest magnitude, ties to the
+    /// lowest row; every update a fused multiply-add in the kernel's
+    /// order, so the two match bit for bit.
+    pub fn getrf_batched(a: &[f64], batch: usize, n: usize) -> (Vec<f64>, Vec<i32>, Vec<i32>) {
+        let mut lu = a.to_vec();
+        let mut piv = vec![0i32; batch * n];
+        let mut info = vec![0i32; batch];
+        for item in 0..batch {
+            let s = &mut lu[item * n * n..(item + 1) * n * n];
+            for k in 0..n {
+                let mut p = k;
+                let mut best = s[k * n + k].abs();
+                for i in k + 1..n {
+                    let v = s[i * n + k].abs();
+                    if v > best {
+                        best = v;
+                        p = i;
+                    }
+                }
+                piv[item * n + k] = p as i32;
+                if s[p * n + k] == 0.0 && info[item] == 0 {
+                    info[item] = k as i32 + 1;
+                }
+                if p != k {
+                    for j in 0..n {
+                        s.swap(k * n + j, p * n + j);
+                    }
+                }
+                let pivot = s[k * n + k];
+                if pivot != 0.0 {
+                    for i in k + 1..n {
+                        s[i * n + k] /= pivot;
+                    }
+                    for i in k + 1..n {
+                        let l = s[i * n + k];
+                        for j in k + 1..n {
+                            s[i * n + j] = (-l).mul_add(s[k * n + j], s[i * n + j]);
+                        }
+                    }
+                }
+            }
+        }
+        (lu, piv, info)
+    }
+
+    /// Batched solve with packed factors from [`getrf_batched`]: `b`
+    /// holds `batch` row-major `n x nrhs` right-hand sides.
+    pub fn getrs_batched(lu: &[f64], piv: &[i32], b: &[f64], batch: usize, n: usize, nrhs: usize) -> Vec<f64> {
+        let mut x = b.to_vec();
+        for item in 0..batch {
+            let f = &lu[item * n * n..(item + 1) * n * n];
+            let pv = &piv[item * n..(item + 1) * n];
+            let xs = &mut x[item * n * nrhs..(item + 1) * n * nrhs];
+            for k in 0..n {
+                let p = pv[k] as usize;
+                if p != k {
+                    for j in 0..nrhs {
+                        xs.swap(k * nrhs + j, p * nrhs + j);
+                    }
+                }
+            }
+            for k in 0..n.saturating_sub(1) {
+                for i in k + 1..n {
+                    let l = f[i * n + k];
+                    for j in 0..nrhs {
+                        xs[i * nrhs + j] = (-l).mul_add(xs[k * nrhs + j], xs[i * nrhs + j]);
+                    }
+                }
+            }
+            for k in (0..n).rev() {
+                let d = f[k * n + k];
+                for j in 0..nrhs {
+                    xs[k * nrhs + j] /= d;
+                }
+                for i in 0..k {
+                    let u = f[i * n + k];
+                    for j in 0..nrhs {
+                        xs[i * nrhs + j] = (-u).mul_add(xs[k * nrhs + j], xs[i * nrhs + j]);
+                    }
+                }
+            }
+        }
+        x
+    }
+
+    /// Batched inverse from packed factors: [`getrs_batched`] with
+    /// the identity right-hand side.
+    pub fn getri_batched(lu: &[f64], piv: &[i32], batch: usize, n: usize) -> Vec<f64> {
+        let mut eye = vec![0f64; batch * n * n];
+        for item in 0..batch {
+            for i in 0..n {
+                eye[item * n * n + i * n + i] = 1.0;
+            }
+        }
+        getrs_batched(lu, piv, &eye, batch, n, n)
+    }
 
     /// Batched einsum.
     pub fn einsum(spec: &EinsumSpec, a: &[f64], b: Option<&[f64]>, batch: usize) -> Vec<f64> {
@@ -1623,5 +2252,29 @@ mod tests {
                 assert!((acc - want).abs() < 1e-13);
             }
         }
+    }
+
+    #[test]
+    fn group_by_shape_covers_every_index_once_in_shape_order() {
+        let shapes = [(4usize, 4usize), (2, 3), (4, 4), (2, 3), (8, 8), (2, 3)];
+        let groups = group_by_shape(&shapes);
+        assert_eq!(groups, vec![((2, 3), vec![1, 3, 5]), ((4, 4), vec![0, 2]), ((8, 8), vec![4])]);
+        assert!(group_by_shape::<(usize, usize)>(&[]).is_empty());
+    }
+
+    #[test]
+    fn gather_then_scatter_round_trips_ragged_items() {
+        // Three items of lengths 4, 9, 4 laid out back to back.
+        let src: Vec<f64> = (0..17).map(|x| x as f64).collect();
+        let offsets = [0usize, 4, 13];
+        let small = [0usize, 2];
+        let batch = gather_items(&src, &offsets, 4, &small);
+        assert_eq!(batch, vec![0.0, 1.0, 2.0, 3.0, 13.0, 14.0, 15.0, 16.0]);
+        let doubled: Vec<f64> = batch.iter().map(|x| 2.0 * x).collect();
+        let mut dst = vec![0f64; 17];
+        scatter_items(&doubled, &offsets, 4, &small, &mut dst);
+        assert_eq!(&dst[0..4], &[0.0, 2.0, 4.0, 6.0]);
+        assert_eq!(&dst[13..17], &[26.0, 28.0, 30.0, 32.0]);
+        assert!(dst[4..13].iter().all(|&x| x == 0.0), "the untouched item stays zero");
     }
 }

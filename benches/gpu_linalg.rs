@@ -10,14 +10,16 @@
 //! Run with:
 //!   cargo bench --features gpu-peer --bench gpu_linalg
 //! `FLYNNEL_BENCH_SECTIONS=syev,gesvd` (any of gemm, einsum, syev,
-//! gesvd) limits the run to those sections.
+//! gesvd, bisect, tandem, lu, ozaki) limits the run to those sections.
 
 use std::time::{Duration, Instant};
 
 use flynnel::gpu_peer::linalg::{
-    EinsumSpec, JacobiShape, LinalgKernels, cpu, default_sweeps, gesvd_bisect_scratch_bytes,
-    launch_einsum, launch_gemm, launch_gesvd, launch_gesvd_bisect, launch_syev,
-    launch_syev_bisect,
+    EinsumSpec, JacobiShape, LinalgKernels, cpu, default_sweeps, gemm_batched,
+    gemm_tandem_batched, gesvd_auto_batched, gesvd_bisect_scratch_bytes, gesvd_tandem_batched,
+    getrf_batched, getri_batched, getrs_batched, launch_einsum, launch_gemm, launch_gesvd,
+    launch_gesvd_bisect, launch_getrf, launch_getrs, launch_syev, launch_syev_bisect,
+    syev_auto_batched, syev_tandem_batched,
 };
 use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig, ResidentHandle};
 use flynnel::sched::JobPlan;
@@ -150,7 +152,8 @@ fn fits(label: &str, bytes_needed: usize) -> bool {
 use flynnel::gpu_peer::ozaki::{launch_ozaki_gemm, OzakiKernels, OzakiWorkspace};
 
 /// Whether a section runs: `FLYNNEL_BENCH_SECTIONS` names a comma
-/// list of gemm, einsum, syev, gesvd, bisect, ozaki; unset runs all six.
+/// list of gemm, einsum, syev, gesvd, bisect, tandem, lu, ozaki; unset
+/// runs all eight.
 fn wants(section: &str) -> bool {
     match std::env::var("FLYNNEL_BENCH_SECTIONS") {
         Ok(list) => list.split(',').any(|s| s.trim() == section),
@@ -468,6 +471,212 @@ fn main() {
             peer.unpin(scratch.handle).expect("unpin");
             peer.unpin(ps.handle).expect("unpin");
             peer.unpin(pa.handle).expect("unpin");
+        }
+    }
+
+    // ---------------------------------------------------------- tandem (device + CPU pool)
+    // Host-buffer helpers end to end, so every column carries its
+    // pin and fetch: the device alone, the CPU pool alone, and the
+    // two in tandem after three warm calls have taught the site its
+    // share.
+    println!("\n--- tandem over host buffers: device alone vs CPU pool alone vs both, f64 ---");
+    println!("{:>6} {:>4} {:>6} | {:>10} {:>10} {:>10} | {:>9} {:>9} | {:>5} {:>9} {:>9}",
+        "op", "n", "batch", "gpu ms", "cpu-par ms", "tandem ms", "gpu/tan", "par/tan", "share", "cpu-side", "dev-side");
+    for &n in &[16usize, 32, 64] {
+        if !wants("tandem") {
+            break;
+        }
+        for &batch in &[1024usize, 8192] {
+            // The host-buffer helpers pin inputs, outputs and the
+            // bisection scratch per call; a cell whose pins exceed
+            // half the pool is skipped, since repeated pin and unpin
+            // cycles exhaust the pool before its nominal capacity.
+            let need_gesvd = 3 * batch * n * n * 8 + gesvd_bisect_scratch_bytes(batch as u32, n as u32, n as u32);
+            if !fits(&format!("tandem n={n} batch={batch}"), 2 * need_gesvd) {
+                continue;
+            }
+            let a = uniform(21, batch * n * n);
+            let b = uniform(22, batch * n * n);
+            let sym = {
+                let mut s = uniform(23, batch * n * n);
+                for item in 0..batch {
+                    for i in 0..n {
+                        for j in 0..i {
+                            let v = 0.5 * (s[item * n * n + i * n + j] + s[item * n * n + j * n + i]);
+                            s[item * n * n + i * n + j] = v;
+                            s[item * n * n + j * n + i] = v;
+                        }
+                    }
+                }
+                s
+            };
+            let (bu, nu) = (batch as u32, n as u32);
+            let cpu_par = |f: &(dyn Fn(usize, usize) + Sync)| {
+                let items = batch.div_ceil(CHUNK);
+                let plan = JobPlan::new(0, items as u32);
+                let c: Vec<()> = collect_indexed(&plan, items, 1, |ci| {
+                    let lo = ci * CHUNK;
+                    f(lo, (lo + CHUNK).min(batch));
+                });
+                std::hint::black_box(c);
+            };
+            // gemm
+            trace(&format!("tandem gemm n={n} batch={batch}"));
+            let gpu = median_ns(3, || {
+                std::hint::black_box(gemm_batched(&mut peer, &k, &a, &b, bu, nu, nu, nu).expect("gemm"));
+            });
+            let par = median_ns(3, || {
+                cpu_par(&|lo, hi| {
+                    std::hint::black_box(cpu::gemm_batched(&a[lo * n * n..hi * n * n], &b[lo * n * n..hi * n * n], hi - lo, n, n, n));
+                });
+            });
+            let plan = JobPlan::new(0, bu);
+            let mut share = 0u32;
+            for _ in 0..3 {
+                share = gemm_tandem_batched(&mut peer, &k, &plan, &a, &b, bu, nu, nu, nu).expect("tandem").1.cpu_share_per_mille;
+            }
+            let tan = median_ns(3, || {
+                std::hint::black_box(gemm_tandem_batched(&mut peer, &k, &plan, &a, &b, bu, nu, nu, nu).expect("tandem"));
+            });
+            let last = gemm_tandem_batched(&mut peer, &k, &plan, &a, &b, bu, nu, nu, nu).expect("tandem").1;
+            println!("{:>6} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x | {share:>5} {:>9.3} {:>9.3}",
+                "gemm", ms(gpu), ms(par), ms(tan), gpu / tan, par / tan, ms(last.cpu_ns as f64), ms(last.backend_ns as f64));
+            // syev with vectors
+            trace(&format!("tandem syev n={n} batch={batch}"));
+            let sweeps = default_sweeps(n);
+            let gpu = median_ns(3, || {
+                std::hint::black_box(syev_auto_batched(&mut peer, &k, &sym, bu, nu, true).expect("syev"));
+            });
+            let par = median_ns(3, || {
+                cpu_par(&|lo, hi| {
+                    std::hint::black_box(cpu::syev_jacobi_batched(&sym[lo * n * n..hi * n * n], hi - lo, n, sweeps, true));
+                });
+            });
+            let plan = JobPlan::new(0, bu);
+            for _ in 0..3 {
+                share = syev_tandem_batched(&mut peer, &k, &plan, &sym, bu, nu, true).expect("tandem").1.cpu_share_per_mille;
+            }
+            let tan = median_ns(3, || {
+                std::hint::black_box(syev_tandem_batched(&mut peer, &k, &plan, &sym, bu, nu, true).expect("tandem"));
+            });
+            let last = syev_tandem_batched(&mut peer, &k, &plan, &sym, bu, nu, true).expect("tandem").1;
+            println!("{:>6} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x | {share:>5} {:>9.3} {:>9.3}",
+                "syev", ms(gpu), ms(par), ms(tan), gpu / tan, par / tan, ms(last.cpu_ns as f64), ms(last.backend_ns as f64));
+            // gesvd with V
+            trace(&format!("tandem gesvd n={n} batch={batch}"));
+            let gpu = median_ns(3, || {
+                std::hint::black_box(gesvd_auto_batched(&mut peer, &k, &a, bu, nu, nu, true).expect("gesvd"));
+            });
+            let par = median_ns(3, || {
+                cpu_par(&|lo, hi| {
+                    std::hint::black_box(cpu::gesvd_jacobi_batched(&a[lo * n * n..hi * n * n], hi - lo, n, n, sweeps, true));
+                });
+            });
+            let plan = JobPlan::new(0, bu);
+            for _ in 0..3 {
+                share = gesvd_tandem_batched(&mut peer, &k, &plan, &a, bu, nu, nu, true).expect("tandem").1.cpu_share_per_mille;
+            }
+            let tan = median_ns(3, || {
+                std::hint::black_box(gesvd_tandem_batched(&mut peer, &k, &plan, &a, bu, nu, nu, true).expect("tandem"));
+            });
+            let last = gesvd_tandem_batched(&mut peer, &k, &plan, &a, bu, nu, nu, true).expect("tandem").1;
+            println!("{:>6} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x | {share:>5} {:>9.3} {:>9.3}",
+                "gesvd", ms(gpu), ms(par), ms(tan), gpu / tan, par / tan, ms(last.cpu_ns as f64), ms(last.backend_ns as f64));
+        }
+    }
+
+    // ---------------------------------------------------------- LU
+    println!("\n--- batched LU with partial pivoting, f64: factor, solve (nrhs = 1), inverse ---");
+    println!("{:>7} {:>4} {:>6} | {:>10} {:>10} {:>10} | {:>9} {:>9} | {:>10}",
+        "op", "n", "batch", "gpu ms", "cpu-par ms", "serial ms", "gpu/par", "gpu/ser", "pin+fetch");
+    for &n in &[8usize, 16, 32, 64] {
+        if !wants("lu") {
+            break;
+        }
+        for &batch in &[1024usize, 8192] {
+            let a = uniform(31, batch * n * n);
+            let rhs = uniform(32, batch * n);
+            let (bu, nu) = (batch as u32, n as u32);
+            let cpu_par = |f: &(dyn Fn(usize, usize) + Sync)| {
+                let items = batch.div_ceil(CHUNK);
+                let plan = JobPlan::new(0, items as u32);
+                let c: Vec<()> = collect_indexed(&plan, items, 1, |ci| {
+                    let lo = ci * CHUNK;
+                    f(lo, (lo + CHUNK).min(batch));
+                });
+                std::hint::black_box(c);
+            };
+            // factor: the resident copy is refactored in place each
+            // launch; the work per launch does not depend on the data.
+            trace(&format!("lu getrf n={n} batch={batch}"));
+            let t_pin = Instant::now();
+            let pa = pin(&mut peer, &bytes(&a));
+            let ppiv = pin(&mut peer, &vec![0u8; batch * n * 4]);
+            let pinfo = pin(&mut peer, &vec![0u8; batch * 4]);
+            let pin_ns = t_pin.elapsed().as_nanos() as f64;
+            let gpu = gpu_median_ns(&mut peer, runs, |p| {
+                launch_getrf(p, &k, pa.ptr, ppiv.ptr, pinfo.ptr, bu, nu).expect("launch");
+            });
+            let t_fetch = Instant::now();
+            let f = getrf_batched(&mut peer, &k, &a, bu, nu).expect("getrf");
+            let pin_fetch = pin_ns + t_fetch.elapsed().as_nanos() as f64;
+            let serial = median_ns(1, || {
+                std::hint::black_box(cpu::getrf_batched(&a, batch, n));
+            });
+            let par = median_ns(3, || {
+                cpu_par(&|lo, hi| {
+                    std::hint::black_box(cpu::getrf_batched(&a[lo * n * n..hi * n * n], hi - lo, n));
+                });
+            });
+            println!("{:>7} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x | {:>8.2} ms",
+                "getrf", ms(gpu), ms(par), ms(serial), par / gpu, serial / gpu, ms(pin_fetch));
+            peer.unpin(pinfo.handle).expect("unpin");
+            peer.unpin(ppiv.handle).expect("unpin");
+            peer.unpin(pa.handle).expect("unpin");
+            // solve, one right-hand side
+            trace(&format!("lu getrs n={n} batch={batch}"));
+            let plu = pin(&mut peer, &bytes(&f.lu));
+            let ppiv = pin(&mut peer, &f.piv.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+            let pb = pin(&mut peer, &bytes(&rhs));
+            let gpu = gpu_median_ns(&mut peer, runs, |p| {
+                launch_getrs(p, &k, plu.ptr, ppiv.ptr, pb.ptr, bu, nu, 1, false).expect("launch");
+            });
+            let serial = median_ns(1, || {
+                std::hint::black_box(cpu::getrs_batched(&f.lu, &f.piv, &rhs, batch, n, 1));
+            });
+            let par = median_ns(3, || {
+                cpu_par(&|lo, hi| {
+                    std::hint::black_box(cpu::getrs_batched(&f.lu[lo * n * n..hi * n * n], &f.piv[lo * n..hi * n], &rhs[lo * n..hi * n], hi - lo, n, 1));
+                });
+            });
+            let t_all = Instant::now();
+            std::hint::black_box(getrs_batched(&mut peer, &k, &f.lu, &f.piv, &rhs, bu, nu, 1).expect("getrs"));
+            let pin_fetch = t_all.elapsed().as_nanos() as f64 - gpu;
+            println!("{:>7} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x | {:>8.2} ms",
+                "getrs", ms(gpu), ms(par), ms(serial), par / gpu, serial / gpu, ms(pin_fetch.max(0.0)));
+            peer.unpin(pb.handle).expect("unpin");
+            // inverse
+            trace(&format!("lu getri n={n} batch={batch}"));
+            let pinv = pin(&mut peer, &vec![0u8; batch * n * n * 8]);
+            let gpu = gpu_median_ns(&mut peer, runs, |p| {
+                launch_getrs(p, &k, plu.ptr, ppiv.ptr, pinv.ptr, bu, nu, nu, true).expect("launch");
+            });
+            let serial = median_ns(1, || {
+                std::hint::black_box(cpu::getri_batched(&f.lu, &f.piv, batch, n));
+            });
+            let par = median_ns(3, || {
+                cpu_par(&|lo, hi| {
+                    std::hint::black_box(cpu::getri_batched(&f.lu[lo * n * n..hi * n * n], &f.piv[lo * n..hi * n], hi - lo, n));
+                });
+            });
+            let t_all = Instant::now();
+            std::hint::black_box(getri_batched(&mut peer, &k, &f.lu, &f.piv, bu, nu).expect("getri"));
+            let pin_fetch = t_all.elapsed().as_nanos() as f64 - gpu;
+            println!("{:>7} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x | {:>8.2} ms",
+                "getri", ms(gpu), ms(par), ms(serial), par / gpu, serial / gpu, ms(pin_fetch.max(0.0)));
+            peer.unpin(pinv.handle).expect("unpin");
+            peer.unpin(ppiv.handle).expect("unpin");
+            peer.unpin(plu.handle).expect("unpin");
         }
     }
 

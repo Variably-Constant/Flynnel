@@ -16,7 +16,7 @@ Every primitive in the `flynnel::sched` module, organised by Flynn axis. The wor
 | MIMC | `cooperative_join_n` (heterogeneous closures, one role per closure) | [cooperative](#cooperative) |
 | MIMT single-pair | `join_hybrid` | [hybrid](#hybrid) |
 | MIMT pipelined | `hybrid_pipeline` | [hybrid](#hybrid) |
-| MIMT learned placement | `hybrid_auto`, `hybrid_auto_split`, `SplitReport`, `Placement` | [hybrid](#hybrid) |
+| MIMT learned placement | `hybrid_auto`, `hybrid_auto_split`, `hybrid_auto_split_ranges`, `SplitReport`, `Placement` | [hybrid](#hybrid) |
 | MISD | `race_variants` (first tolerable result wins, losers cancel) | [race](#race) |
 | MIMD explore + select | `explore_select` (all explorers finish, best-by-comparator wins) | [race](#race) |
 | Racing family | `race_any` (hedged), `race_quorum` (k-of-n), `race_refute` (duel), `race_agree` (consensus), `race_deadline` (anytime), `race_tournament` (successive halving), `race_statistical` (Hoeffding) | [race](#the-racing-family) |
@@ -442,6 +442,22 @@ pub struct SplitReport {
 ```
 
 Data-parallel variant: splits `items` between the CPU and the backend at a LEARNED share (per-mille of items to the CPU, clamped to 50..=950; 500 when cold), runs both halves concurrently, and updates per-item throughput EWMAs from the measured halves so the next call's split tracks the observed speed ratio. Blocks until both halves finish (the backend half borrows from the same slice). The returned `SplitReport` carries the realized split and per-side timings.
+
+### `hybrid_auto_split_ranges`
+
+```rust
+pub fn hybrid_auto_split_ranges<CF, GF>(
+    plan: &JobPlan,
+    n: usize,
+    cpu_impl: CF,
+    backend_impl: GF,
+) -> SplitReport
+where
+    CF: FnOnce(Range<usize>),
+    GF: FnOnce(Range<usize>) + Send + 'static,
+```
+
+The same learned split over `n` divisible items addressed by index instead of by slice: `cpu_impl` receives `0..mid` and `backend_impl` receives `mid..n`. Neither side is handed data, so the backend side may launch on buffers already resident on the device and the CPU side may walk host data the caller owns; the caller merges results by index. The share is learned per call site AND per log2 bucket of `n` (`CallSiteState::split_cpu_share_per_mille_for` / `record_split_for`), falling back to the site-wide model while a bucket is cold, because per-item cost on each side moves with the batch size. Both halves run concurrently in the `join_hybrid` shape and the call blocks until both return. `gpu_peer::linalg::{gemm,syev,gesvd}_tandem_batched` are built on it.
 
 ## `race`
 
@@ -1067,7 +1083,7 @@ What each site learns, all atomically and lock-free:
 - **Classifier**: a learned `WorkloadClass` tag with hysteresis (two consecutive agreeing quanta to switch) plus a fast-adapt path (bucket distance >= 2 with >= 64 samples switches immediately). Read via `learned_class()`; `JobPlan::apply_site_class` re-derives routing knobs from it when the caller pinned nothing.
 - **Leaf statistics**: cumulative and delta-window count / sum / sum-of-squares of leaf nanoseconds, exposing `cv2_per_mille()` (squared coefficient of variation) and `leaf_count()`. Leaf batches ALSO flow into the process-global stats, which stay the cold-start prior for site-less plans.
 - **Policy arms**: EWMA per arm (`Slaw` vs `Heartbeat`) with a trial cadence, so irregular workloads converge on the scheduling policy that measures faster at THAT site.
-- **Hybrid placement**: per-log2-size-bucket CPU vs backend EWMAs feeding [`hybrid_auto`](#hybrid_auto), plus learned per-item split throughputs feeding [`hybrid_auto_split`](#hybrid_auto_split).
+- **Hybrid placement**: per-log2-size-bucket CPU vs backend EWMAs feeding [`hybrid_auto`](#hybrid_auto), plus learned per-item split throughputs, site-wide and per log2-size bucket, feeding [`hybrid_auto_split`](#hybrid_auto_split) and [`hybrid_auto_split_ranges`](#hybrid_auto_split_ranges).
 
 `SiteRef::new(&STATIC_SITE)` wraps a caller-owned static for explicit attachment via [`JobPlan::with_site`](JobPlan-Reference.md#builder-methods); an outer attachment always wins over the entry's own location-resolved site. E2E walkthrough: [`examples/site_classifier_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/site_classifier_demo.rs).
 
