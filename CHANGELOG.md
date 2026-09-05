@@ -5,6 +5,34 @@ measurements from `benches/` and `tests/` on the two bench hosts, an
 RTX 3070 with a Ryzen 7 2700 (16 threads) and an RTX 5070 with a
 Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
+## Unreleased
+
+### Scheduler
+- The dispatch constants a call meets are measured on the running
+  host, not set by hand. `par_iter::host_dispatch_profile` measures,
+  once per process at first use (13 to 20 ms on the Ryzen 7 2700) or
+  earlier by `par_iter::calibrate_host_dispatch`, the pool's dispatch
+  cost, the collapse crossover (floored at that cost) and the
+  polling-versus-wake crossover, from a compute-bound body serial
+  against dispatched, sixteen warm-up dispatches then five sweeps
+  each. Readers: the inline collapse in every walker and the tier
+  pick's heavy-item override (the 50 us floor and 800 us cap of 0.2.3
+  and the tier pick's own 50 us constant are gone), leaf sizing from
+  an explicit or probed per-item cost (one dispatch cost of work per
+  leaf, in place of a 5 us target), the probe's decision to dispatch
+  its tail (in place of workers times 5 us times a small-host
+  factor), and the switch between polling and the sleep-counter wake
+  path (in place of 200 us). `INLINE_COLLAPSE_FLOOR_NS` and
+  `INLINE_COLLAPSE_CAP_NS` are removed; `inline_collapse_threshold_ns`
+  and `calibrate_inline_collapse_threshold` remain and read the
+  profile. Measured on the Ryzen 7 2700 across six processes:
+  dispatch cost 4.9 to 12.7 us, collapse 16.0 to 30.2 us, wake 14.0
+  to 19.3 us; on the Ryzen 9 7900X the collapse threshold measures
+  14.4 us, so a 29 us slice add there dispatches (the 50 us floor of
+  0.2.3 had collapsed it to 27 us where the pool finishes in 11). The
+  256-item leaf floor for hint-less work and the probe sizes keep
+  their bench-sweep values.
+
 ## 0.2.3 - 2026-09-05
 
 ### Scheduler
