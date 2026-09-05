@@ -21,6 +21,8 @@ pub struct JobPlan {
     pub k_inner_log2: Option<u8>,
     pub backend_hint: Option<Backend>,
     pub oversubscription_log2: Option<u8>,
+    pub oversubscription_log2_explicit: bool,
+    pub spin_before_yield_ns: Option<u64>,
     pub worker_cap: Option<u32>,
     pub bisect_variant: Option<BisectVariant>,
     pub use_mailbox_routing: bool,
@@ -158,7 +160,11 @@ Pairs with the SIMT and MIMT axes of the [extended Flynn taxonomy](Extended-Flyn
 
 ### `oversubscription_log2: Option<u8>`
 
-Per-call leaf-count multiplier expressed as a log2. `None` resolves to the conservative default 1 (2x) via `effective_oversubscription_log2()`; the probe path in `for_each_chunk` additionally consults the observer-tuned `split_multiplier`. `Some(log2)` caps the bisect leaves at `workers * 2^log2` for this dispatch only.
+Per-call leaf-count multiplier expressed as a log2, capping the bisect leaves at `workers * 2^log2` for this dispatch only.
+
+What resolves it at a dispatch entry is `effective_leaves_per_worker()`, and which of two sources it reads depends on who set the field. A factor the caller set through [`with_oversubscription_log2`](#builder-methods) wins outright and the process-global observer is not consulted: that is the whole point of the override. A factor that arrived from a profile or a learned class leaves `oversubscription_log2_explicit` false, and the entry reads the observer-tuned `split_multiplier` instead, so the adaptive default stays in charge whenever the caller expressed no opinion.
+
+`effective_oversubscription_log2()` reports the field alone, defaulting to 1 (2x), and is the right accessor for reading back what a plan carries rather than what a dispatch will do with it.
 
 | Value | Leaves per worker | Used by |
 |---|---|---|
@@ -171,7 +177,9 @@ The clamp ceiling is `3` (8x oversubscription) so accidental misuse cannot blow 
 
 ### `worker_cap: Option<u32>`
 
-Hard cap on the worker count for this dispatch. `None` means use every available worker; `Some(1)` forces serial execution on the calling thread; `Some(N)` runs at most N workers. Lets a per-call site request a smaller subset of the pool than the arena holds (for example, a probe path that wants 4 workers regardless of the host's 44-thread allocation).
+Hard cap on the worker count for this dispatch. `None` means use every available worker; `Some(1)` runs the body on the calling thread; `Some(N)` spreads over at most N workers. Lets a per-call site request a smaller subset of the pool than the arena holds (for example, a probe path that wants 4 workers regardless of the host's 44-thread allocation).
+
+`effective_workers(arena_workers)` applies the cap, and every data-parallel entry resolves its split budget through it. `Some(1)` is recognised from the plan alone by `par_iter::runs_on_caller`, so a capped call reaches neither the worker pool nor the host dispatch profile.
 
 ### `bisect_variant: Option<BisectVariant>`
 

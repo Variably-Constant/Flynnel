@@ -897,7 +897,9 @@ pub fn split_multiplier() -> u32
 pub fn set_split_multiplier(value: u32)
 ```
 
-The multiplier used by [`for_each_chunk`](#for_each_chunk) for the initial split budget (`workers * multiplier`). Defaults to 2. Higher means more aggressive subdivision (better steal granularity at the cost of dispatch overhead).
+The multiplier the data-parallel entries use for the initial split budget (`workers * multiplier`). Defaults to 2. Higher means more aggressive subdivision (better steal granularity at the cost of dispatch overhead).
+
+It applies only where the caller expressed no opinion. A plan carrying a factor the caller set through [`JobPlan::with_oversubscription_log2`](JobPlan-Reference.md#builder-methods) resolves its budget from that factor and never reads this value, so a per-call override is not competing with the observer behind the caller's back.
 
 ### `record_leaf_time_ns` / `snapshot_leaf_stats` / `reset_leaf_stats`
 

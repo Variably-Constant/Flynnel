@@ -86,7 +86,7 @@ Flynnel is a layered work-stealing scheduler. This page walks the layers top-dow
 ## Walkthrough: `flynnel::for_each_chunk(&plan, &mut slice, op)`
 
 1. Top-level alias resolves to `sched::par_iter::for_each_chunk`.
-2. The function queries `global_local_arena().total_workers()` and reads the observer-tuned `split_multiplier()` to compute `max_budget = workers * multiplier` (default multiplier is 2: 2x oversubscription so steals have headroom).
+2. The function computes `max_budget = workers * leaves_per_worker`. `workers` is the pool width from `global_local_arena().total_workers()`, capped by the plan's `worker_cap`; `leaves_per_worker` is the caller's own oversubscription factor when the caller set one, and the observer-tuned `split_multiplier()` otherwise (default 2, so steals have headroom). A plan capped to one worker never gets here: it runs its body on the calling thread.
 3. `bisect(plan, items, &op, max_budget, max_budget, migrated=false)` recurses: at each level it splits the slice at the midpoint and calls `join_context`.
 4. The recursion bottoms out when:
    - `items.len() <= MIN_LEAF_ITEMS` (256), or
