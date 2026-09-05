@@ -1054,9 +1054,9 @@ pub fn lu_det_batched(lu: &[f64], piv: &[i32], batch: usize, n: usize) -> Vec<f6
             let f = &lu[item * n * n..(item + 1) * n * n];
             let pv = &piv[item * n..(item + 1) * n];
             let mut det = 1.0;
-            for k in 0..n {
+            for (k, &p) in pv.iter().enumerate() {
                 det *= f[k * n + k];
-                if pv[k] as usize != k {
+                if p as usize != k {
                     det = -det;
                 }
             }
@@ -1066,6 +1066,10 @@ pub fn lu_det_batched(lu: &[f64], piv: &[i32], batch: usize, n: usize) -> Vec<f6
 }
 
 // ------------------------------------------------------------ tandem: device + CPU pool
+
+/// Eigenvalues (`batch * n`) with eigenvectors as columns when they
+/// were requested, the shape every eigen helper here returns.
+pub type EigenPairs = (Vec<f64>, Option<Vec<f64>>);
 
 /// Most matrices per CPU work item in the tandem helpers. The CPU
 /// share is walked in runs sized to give the pool two runs per
@@ -1257,7 +1261,7 @@ pub fn syev_tandem_batched(
     batch: u32,
     n: u32,
     want_v: bool,
-) -> Result<((Vec<f64>, Option<Vec<f64>>), SplitReport), GpuPeerError> {
+) -> Result<(EigenPairs, SplitReport), GpuPeerError> {
     let (bu, nu) = (batch as usize, n as usize);
     check_dim(batch > 0 && n > 0, "syev: empty batch or n")?;
     check_dim(a.len() == bu * nu * nu, "syev: a length")?;
@@ -1572,8 +1576,8 @@ pub mod cpu {
             let f = &lu[item * n * n..(item + 1) * n * n];
             let pv = &piv[item * n..(item + 1) * n];
             let xs = &mut x[item * n * nrhs..(item + 1) * n * nrhs];
-            for k in 0..n {
-                let p = pv[k] as usize;
+            for (k, &p) in pv.iter().enumerate() {
+                let p = p as usize;
                 if p != k {
                     for j in 0..nrhs {
                         xs.swap(k * nrhs + j, p * nrhs + j);

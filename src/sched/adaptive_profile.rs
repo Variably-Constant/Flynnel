@@ -862,6 +862,15 @@ pub fn reset_auto_classify_state() {
     AUTO_LAST_SUMSQ.store(0, Ordering::Relaxed);
 }
 
+/// Serializes tests that migrate or depend on the process-wide
+/// dispatch profile; poison-tolerant so one failing test does not
+/// cascade.
+#[cfg(test)]
+pub(crate) fn global_profile_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1136,13 +1145,4 @@ mod tests {
             let _still_held = &self.lock;
         }
     }
-}
-
-/// Serializes tests that migrate or depend on the process-wide
-/// dispatch profile; poison-tolerant so one failing test does not
-/// cascade.
-#[cfg(test)]
-pub(crate) fn global_profile_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

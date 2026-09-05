@@ -1062,7 +1062,7 @@ mod tests {
             },
         );
         assert_eq!(saw_cancel.load(Ordering::Relaxed), 1, "the peer observed the caller's cancel");
-        assert!(CancelToken::default().is_cancelled() == false, "default is a fresh token");
+        assert!(!CancelToken::default().is_cancelled(), "default is a fresh token");
     }
 
     #[test]

@@ -819,7 +819,11 @@ mod tests {
                 }
             }
         }
-        d.flush().ok();
+        // The final flush must land: a full ring keeps the entries
+        // in the LIFO, and the thieves stop only at the full count.
+        while d.flush().is_err() {
+            std::thread::yield_now();
+        }
         for h in thieves {
             h.join().expect("thief");
         }
