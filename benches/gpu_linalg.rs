@@ -112,6 +112,35 @@ fn ms(ns: f64) -> f64 {
 /// cell measures.
 const TANDEM_WARM_CALLS: usize = 12;
 
+/// One tandem cell: `TANDEM_WARM_CALLS` warm calls, then the median
+/// of three timed calls, then one more call whose report is
+/// returned. Every call goes through the one closure, so the helper's
+/// `#[track_caller]` site is the same for all of them and the timed
+/// calls run at the share the warm calls learned; each warm call is
+/// traced with its share and per-side cost.
+fn tandem_cell(label: &str, call: &mut dyn FnMut() -> flynnel::SplitReport) -> (f64, u32, flynnel::SplitReport) {
+    let mut share = 0u32;
+    for _ in 0..TANDEM_WARM_CALLS {
+        let r = call();
+        trace(&format!(
+            "{label} warm: share {} cpu {} items {:.3} ms/item dev {} items {:.3} ms/item",
+            r.cpu_share_per_mille, r.cpu_items, ms(r.cpu_ns as f64) / r.cpu_items.max(1) as f64,
+            r.backend_items, ms(r.backend_ns as f64) / r.backend_items.max(1) as f64
+        ));
+        share = r.cpu_share_per_mille;
+    }
+    let mut t: Vec<f64> = (0..3)
+        .map(|_| {
+            let t0 = Instant::now();
+            std::hint::black_box(call());
+            t0.elapsed().as_nanos() as f64
+        })
+        .collect();
+    t.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    let last = call();
+    (t[1], share, last)
+}
+
 /// Matrices per CPU-parallel work item: enough work per item that
 /// the adaptive plan dispatches it rather than running the probe's
 /// light-item verdict inline (a 64-matrix chunk of n = 8 GEMMs is
@@ -537,14 +566,9 @@ fn main() {
                 });
             });
             let plan = JobPlan::new(0, bu);
-            let mut share = 0u32;
-            for _ in 0..TANDEM_WARM_CALLS {
-                share = gemm_tandem_batched(&mut peer, &k, &plan, &a, &b, bu, nu, nu, nu).expect("tandem").1.cpu_share_per_mille;
-            }
-            let tan = median_ns(3, || {
-                std::hint::black_box(gemm_tandem_batched(&mut peer, &k, &plan, &a, &b, bu, nu, nu, nu).expect("tandem"));
+            let (tan, share, last) = tandem_cell(&format!("gemm n={n} batch={batch}"), &mut || {
+                gemm_tandem_batched(&mut peer, &k, &plan, &a, &b, bu, nu, nu, nu).expect("tandem").1
             });
-            let last = gemm_tandem_batched(&mut peer, &k, &plan, &a, &b, bu, nu, nu, nu).expect("tandem").1;
             println!("{:>6} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x | {share:>5} {:>9.3} {:>9.3}",
                 "gemm", ms(gpu), ms(par), ms(tan), gpu / tan, par / tan, ms(last.cpu_ns as f64), ms(last.backend_ns as f64));
             // syev with vectors
@@ -559,13 +583,9 @@ fn main() {
                 });
             });
             let plan = JobPlan::new(0, bu);
-            for _ in 0..TANDEM_WARM_CALLS {
-                share = syev_tandem_batched(&mut peer, &k, &plan, &sym, bu, nu, true).expect("tandem").1.cpu_share_per_mille;
-            }
-            let tan = median_ns(3, || {
-                std::hint::black_box(syev_tandem_batched(&mut peer, &k, &plan, &sym, bu, nu, true).expect("tandem"));
+            let (tan, share, last) = tandem_cell(&format!("syev n={n} batch={batch}"), &mut || {
+                syev_tandem_batched(&mut peer, &k, &plan, &sym, bu, nu, true).expect("tandem").1
             });
-            let last = syev_tandem_batched(&mut peer, &k, &plan, &sym, bu, nu, true).expect("tandem").1;
             println!("{:>6} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x | {share:>5} {:>9.3} {:>9.3}",
                 "syev", ms(gpu), ms(par), ms(tan), gpu / tan, par / tan, ms(last.cpu_ns as f64), ms(last.backend_ns as f64));
             // gesvd with V
@@ -579,13 +599,9 @@ fn main() {
                 });
             });
             let plan = JobPlan::new(0, bu);
-            for _ in 0..TANDEM_WARM_CALLS {
-                share = gesvd_tandem_batched(&mut peer, &k, &plan, &a, bu, nu, nu, true).expect("tandem").1.cpu_share_per_mille;
-            }
-            let tan = median_ns(3, || {
-                std::hint::black_box(gesvd_tandem_batched(&mut peer, &k, &plan, &a, bu, nu, nu, true).expect("tandem"));
+            let (tan, share, last) = tandem_cell(&format!("gesvd n={n} batch={batch}"), &mut || {
+                gesvd_tandem_batched(&mut peer, &k, &plan, &a, bu, nu, nu, true).expect("tandem").1
             });
-            let last = gesvd_tandem_batched(&mut peer, &k, &plan, &a, bu, nu, nu, true).expect("tandem").1;
             println!("{:>6} {n:>4} {batch:>6} | {:>10.3} {:>10.3} {:>10.3} | {:>8.2}x {:>8.2}x | {share:>5} {:>9.3} {:>9.3}",
                 "gesvd", ms(gpu), ms(par), ms(tan), gpu / tan, par / tan, ms(last.cpu_ns as f64), ms(last.backend_ns as f64));
         }

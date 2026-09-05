@@ -1182,7 +1182,9 @@ unsafe fn scatter(dst: usize, at: usize, src: &[f64]) {
 /// [`gemm_batched`], the CPU part [`cpu::gemm_batched`] in runs of
 /// [`TANDEM_CPU_CHUNK`] matrices on the pool. Every item is the same
 /// bit for bit whichever side computed it. Returns the result and
-/// the split report.
+/// the split report. The share is learned per calling source
+/// location and per log2 batch bucket, starting at 500 per mille:
+/// call from one place.
 #[track_caller]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_tandem_batched(
@@ -1242,8 +1244,10 @@ pub fn gemm_tandem_batched(
 /// Batched symmetric eigendecomposition over host buffers with the
 /// batch split between the device ([`syev_auto_batched`]) and the
 /// CPU pool ([`cpu::syev_jacobi_batched`]) by the call site's learned
-/// share. Eigenvalues come back ascending for every item, with
-/// eigenvectors as columns when `want_v`, whichever side computed it.
+/// share, learned per calling source location and per log2 batch
+/// bucket from 500 per mille, so call from one place. Eigenvalues
+/// come back ascending for every item, with eigenvectors as columns
+/// when `want_v`, whichever side computed it.
 #[track_caller]
 pub fn syev_tandem_batched(
     peer: &mut GpuPeer,
@@ -1307,8 +1311,10 @@ pub fn syev_tandem_batched(
 /// Batched SVD over host buffers with the batch split between the
 /// device ([`gesvd_auto_batched`]) and the CPU pool
 /// ([`cpu::gesvd_jacobi_batched`]) by the call site's learned share.
-/// Singular values come back descending for every item, with the
-/// matching columns of `U` and `V`, whichever side computed it.
+/// The share is learned per calling source location and per log2
+/// batch bucket from 500 per mille, so call from one place. Singular
+/// values come back descending for every item, with the matching
+/// columns of `U` and `V`, whichever side computed it.
 #[track_caller]
 #[allow(clippy::too_many_arguments)]
 pub fn gesvd_tandem_batched(

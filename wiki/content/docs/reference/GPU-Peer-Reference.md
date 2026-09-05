@@ -301,9 +301,11 @@ pub fn getrf_batched(peer, k, a, batch, n) -> LuResult
 pub fn getrs_batched(peer, k, lu, piv, b, batch, n, nrhs) / getri_batched(peer, k, lu, piv, batch, n)
 pub fn lu_det_batched(lu, piv, batch, n) -> Vec<f64>                     // host fold over the factors
 // Tandem: the batch split between the device and the CPU pool by the call site's learned share
-// (sched::hybrid_auto_split_ranges); the CPU share runs the cpu:: reference in runs of
-// TANDEM_CPU_CHUNK = 64 matrices on the pool. Eigenvalues come back ascending and singular
-// values descending for every item whichever side computed it.
+// (sched::hybrid_auto_split_ranges). The helpers are #[track_caller]: the share is learned per
+// calling source location and per log2 batch bucket, starting at 500 per mille, so call from one
+// place. The CPU share runs the cpu:: reference on the pool in runs of at most TANDEM_CPU_CHUNK = 64
+// matrices, two runs per worker. Eigenvalues come back ascending and singular values descending
+// for every item whichever side computed it.
 pub fn gemm_tandem_batched(peer, k, plan, a, b, batch, m, n, kdim) -> (Vec<f64>, SplitReport)
 pub fn syev_tandem_batched(peer, k, plan, a, batch, n, want_v) -> ((w, Option<v>), SplitReport)
 pub fn gesvd_tandem_batched(peer, k, plan, a, batch, m, n, want_v) -> (GesvdResult, SplitReport)
@@ -401,7 +403,10 @@ host-buffer helper end to end, so each carries its pin and fetch:
 device alone, the CPU reference through `collect_indexed` with 64
 matrices per item for the pool alone, and the `*_tandem_batched`
 helper after twelve warm calls have taught the call site its share
-(the model moves one eighth per call; medians of three further calls). `share` is the CPU share in per
+(the model moves one eighth per call; medians of three further calls).
+Every call of a cell is made from the same source line: the helpers
+are `#[track_caller]` and learn the share per calling location, so a
+call from another line starts at 500 per mille. `share` is the CPU share in per
 mille the site had learned, `cpu-side` and `dev-side` the two halves'
 own wall times on one more call. Eigen and SVD rows request vectors.
 Cells whose pins would exceed half the 1.5 GiB pool are skipped
@@ -445,10 +450,6 @@ idle.
 | syev | 64 | 1024 | 50.384 | 483.222 | 85.902 | 0.59x | 5.63x | 257 | 137.484 | 31.825 |
 | gesvd | 64 | 1024 | 112.154 | 480.747 | 141.108 | 0.79x | 3.41x | 400 | 172.969 | 85.594 |
 
-The per-side columns show the CPU share costing 2-3x more per item
-than the pool alone at n = 32 and 64 on both hosts (3070, syev n = 64:
-2.4 ms per item on the CPU side against 0.81 ms per item for the pool
-alone), while the device side per item matches the device alone.
 
 #### Batched LU: factor, solve (nrhs = 1), inverse
 
