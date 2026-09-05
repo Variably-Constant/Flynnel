@@ -1095,24 +1095,23 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
     // serialize the bisect, and `for_each_chunk`'s adaptive
     // min_leaf would never get a chance to fire.
     //
-    // Threshold matches `par_iter::INLINE_COLLAPSE_FLOOR_NS`, the
-    // floor of the per-host measured collapse threshold, so the two
-    // layers agree on the least work that counts as "worth the pool".
-    const HEAVY_OVERRIDE_THRESHOLD_NS: u64 = 50_000;
-    // Small hosts (< 4 physical cores) have no steal-parallelism
-    // headroom; demand 4x more predicted work before promoting out
-    // of Inline.
-    let heavy_override_threshold_ns = HEAVY_OVERRIDE_THRESHOLD_NS
-        .saturating_mul(crate::cpu_info::small_host_dispatch_factor());
+    // The threshold is this host's measured collapse threshold
+    // (`par_iter::inline_collapse_threshold_ns`), so the tier pick
+    // and the data-parallel entries agree on the least work that
+    // counts as "worth the pool" on the running host. Read only
+    // behind the explicit-estimate check: the calibration's own joins
+    // carry no explicit estimate and must not re-enter it.
+    //
     // Only trust the per-item-cost estimate when the caller marked it
     // authoritative (via with_estimated_per_item_ns or the probe-path
     // amended_plan). Classifier defaults are routing hints and would
     // produce false positives (12ns * 32 = 384ns -> never fires) or
     // miss false negatives in the heavy direction without measurement.
     let heavy_override = plan.estimated_per_item_ns_explicit
-        && plan.estimated_per_item_ns
-            .map(|ns| (ns as u64).saturating_mul(plan.batch_size as u64) >= heavy_override_threshold_ns)
-            .unwrap_or(false);
+        && plan.estimated_per_item_ns.is_some_and(|ns| {
+            (ns as u64).saturating_mul(plan.batch_size as u64)
+                >= crate::sched::par_iter::inline_collapse_threshold_ns()
+        });
 
     let base = kband_for(plan.k_outer);
     match base {

@@ -296,9 +296,6 @@ const MIN_LEAF_ITEMS: usize = 256;
 /// still compute meaningfully.
 const LEAF_SAMPLE_STRIDE: u32 = 8;
 
-/// Target per-leaf overhead used by [`adaptive_min_leaf`]. Matches
-/// the probe-path budget in [`for_each_chunk`] so all wrappers agree.
-const TARGET_PER_LEAF_OVERHEAD_NS_HELPER: u64 = 5_000;
 
 /// Compute the adaptive recursion floor for bisects based on the
 /// plan's per-item cost estimate. When the caller supplied an
@@ -400,89 +397,127 @@ fn adaptive_min_leaf(plan: &JobPlan, caller_floor: usize) -> usize {
         // for cells where it matters.
         return caller_floor;
     }
+    // A leaf carries about one dispatch cost of work, measured on
+    // this host, so the dispatch amortizes; never above the caller's
+    // floor.
     match plan.estimated_per_item_ns {
         Some(ns) if ns > 0 => {
-            let raw = (TARGET_PER_LEAF_OVERHEAD_NS_HELPER / ns as u64)
-                .max(1) as usize;
+            let raw = (pool_dispatch_cost_ns() / ns as u64).max(1) as usize;
             raw.min(caller_floor)
         }
         _ => caller_floor,
     }
 }
 
-/// Floor of [`inline_collapse_threshold_ns`]: no host collapses less
-/// work than this on the calling thread.
-pub const INLINE_COLLAPSE_FLOOR_NS: u64 = 50_000;
+/// What one calibration pass measures on the running host's pool.
+/// Every value is in nanoseconds and was measured, never assumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostDispatchProfile {
+    /// The pool's cost of one dispatch: one join over two leaves of
+    /// a compute-bound body, dispatched minus serial.
+    pub dispatch_cost_ns: u64,
+    /// Total work below which a body runs faster on the calling
+    /// thread than dispatched: the serial time at the crossover of
+    /// the doubling sweep, never below `dispatch_cost_ns`.
+    pub collapse_threshold_ns: u64,
+    /// Total work from which dispatching with the sleep-counter wake
+    /// path finishes no later than dispatching with polling only:
+    /// the crossover of the same sweep run under both scopes, or the
+    /// serial time at the largest count swept when the wake path
+    /// never catches up.
+    pub jec_wake_threshold_ns: u64,
+}
 
-/// Cap of [`inline_collapse_threshold_ns`], sixteen floors: a host
-/// whose pool never catches the serial body below it collapses up to
-/// this much work and dispatches above it.
-pub const INLINE_COLLAPSE_CAP_NS: u64 = INLINE_COLLAPSE_FLOOR_NS * 16;
+/// The measured profile, installed by the calibration; zero until it
+/// has run.
+static HOST_DISPATCH_COST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HOST_COLLAPSE_THRESHOLD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HOST_JEC_WAKE_THRESHOLD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// One calibration at a time; a second caller waits and takes the
+/// installed values.
+static HOST_DISPATCH_CALIBRATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// This host's measured dispatch profile, measured once per process
+/// by the first query (10-40 ms on the bench hosts) or earlier by
+/// [`calibrate_host_dispatch`] at start-up. No value is ever handed
+/// out that was not measured on this host.
+pub fn host_dispatch_profile() -> HostDispatchProfile {
+    use std::sync::atomic::Ordering;
+    let collapse = HOST_COLLAPSE_THRESHOLD_NS.load(Ordering::Relaxed);
+    if collapse != 0 {
+        return HostDispatchProfile {
+            dispatch_cost_ns: HOST_DISPATCH_COST_NS.load(Ordering::Relaxed),
+            collapse_threshold_ns: collapse,
+            jec_wake_threshold_ns: HOST_JEC_WAKE_THRESHOLD_NS.load(Ordering::Relaxed),
+        };
+    }
+    calibrate_host_dispatch()
+}
 
 /// Total work, in nanoseconds from the caller's explicit per-item
 /// estimate, below which a data-parallel entry runs its body on the
-/// calling thread instead of dispatching: this host's measured
-/// crossover once [`calibrate_inline_collapse_threshold`] has run,
-/// [`INLINE_COLLAPSE_FLOOR_NS`] until then. The first query starts
-/// that calibration on a thread of its own and returns the floor, so
-/// no call stalls on it; a process that wants the measured value
-/// from its first call runs the calibration itself at start-up.
-/// Classifier defaults never trigger the collapse; only
+/// calling thread instead of dispatching:
+/// [`HostDispatchProfile::collapse_threshold_ns`]. Classifier
+/// defaults never trigger the collapse; only
 /// [`JobPlan::with_estimated_per_item_ns`] does.
 pub fn inline_collapse_threshold_ns() -> u64 {
-    use std::sync::atomic::Ordering;
-    let measured = INLINE_COLLAPSE_MEASURED_NS.load(Ordering::Relaxed);
-    if measured != 0 {
-        return measured;
-    }
-    if !INLINE_COLLAPSE_CALIBRATING.swap(true, Ordering::AcqRel) {
-        let spawned = std::thread::Builder::new()
-            .name("flynnel-collapse-calibration".into())
-            .spawn(|| {
-                calibrate_inline_collapse_threshold();
-            });
-        if let Err(e) = spawned {
-            // The next query tries again; until one succeeds the
-            // floor stands.
-            INLINE_COLLAPSE_CALIBRATING.store(false, Ordering::Release);
-            eprintln!("flynnel: the collapse-threshold calibration thread did not start: {e}");
-        }
-    }
-    INLINE_COLLAPSE_FLOOR_NS
+    host_dispatch_profile().collapse_threshold_ns
 }
 
-/// The measured threshold, zero until the calibration has run.
-static INLINE_COLLAPSE_MEASURED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Set by whichever caller starts the calibration first.
-static INLINE_COLLAPSE_CALIBRATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The pool's measured cost of one dispatch on this host:
+/// [`HostDispatchProfile::dispatch_cost_ns`]. A leaf is sized to
+/// carry about this much work, and the probe's dispatch decision
+/// compares against [`inline_collapse_threshold_ns`].
+pub fn pool_dispatch_cost_ns() -> u64 {
+    host_dispatch_profile().dispatch_cost_ns
+}
 
-/// Measure this host's collapse threshold now, on the calling
-/// thread, and install it: a compute-bound body (eight dependent
-/// multiply-rotate steps per item) over doubling item counts, serial
-/// against dispatched through the pool (medians of five each), the
-/// crossover being the serial time at which the dispatched body
-/// finishes no later than the serial one, interpolated between the
-/// last two counts; three sweeps after one discarded warm-up
-/// dispatch, median taken, clamped to
-/// [`INLINE_COLLAPSE_FLOOR_NS`]..=[`INLINE_COLLAPSE_CAP_NS`]. A pool
-/// that never catches up below the cap yields the cap, so a
-/// calibration on a loaded host collapses more work inline, never
-/// less. A second call re-measures and replaces the value. Returns
-/// the installed threshold; the test
-/// `inline_collapse_threshold_is_in_its_band_and_cached` prints the
-/// value and the cost on the running host.
+/// Total work from which a dispatch takes the sleep-counter wake
+/// path instead of polling: [`HostDispatchProfile::jec_wake_threshold_ns`].
+pub fn jec_wake_threshold_ns() -> u64 {
+    host_dispatch_profile().jec_wake_threshold_ns
+}
+
+/// Measure this host's dispatch profile now, on the calling thread,
+/// and install it. A compute-bound body (eight dependent
+/// multiply-rotate steps per item) is timed serial against
+/// dispatched through the pool, medians of five each: once at two
+/// leaves for the dispatch cost; then over doubling counts from
+/// four leaves for the collapse crossover, the serial time at which
+/// the dispatched body finishes no later than the serial one,
+/// interpolated between the last two counts, three sweeps after one
+/// discarded warm-up dispatch, median taken, floored at the dispatch
+/// cost; then the same doubling sweep dispatched under the polling
+/// scope against the wake scope for the wake-path crossover. A sweep
+/// whose second side never catches up reports the serial time at the
+/// largest count swept, so a calibration on a loaded host collapses
+/// more work inline and wakes later, never the reverse. Callers
+/// arriving while one calibration runs wait for its values; a call
+/// after it re-measures and replaces them. The test
+/// `host_dispatch_profile_is_measured_and_cached` prints the values
+/// and the cost on the running host.
+pub fn calibrate_host_dispatch() -> HostDispatchProfile {
+    use std::sync::atomic::Ordering;
+    let _one_at_a_time = HOST_DISPATCH_CALIBRATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let p = measure_host_dispatch();
+    HOST_DISPATCH_COST_NS.store(p.dispatch_cost_ns, Ordering::Relaxed);
+    HOST_JEC_WAKE_THRESHOLD_NS.store(p.jec_wake_threshold_ns, Ordering::Relaxed);
+    HOST_COLLAPSE_THRESHOLD_NS.store(p.collapse_threshold_ns, Ordering::Relaxed);
+    p
+}
+
+/// [`calibrate_host_dispatch`], returning the collapse threshold.
 pub fn calibrate_inline_collapse_threshold() -> u64 {
-    use std::sync::atomic::Ordering;
-    INLINE_COLLAPSE_CALIBRATING.store(true, Ordering::Release);
-    let t = measure_inline_collapse_threshold_ns();
-    INLINE_COLLAPSE_MEASURED_NS.store(t, Ordering::Relaxed);
-    t
+    calibrate_host_dispatch().collapse_threshold_ns
 }
 
-/// The sweep behind [`inline_collapse_threshold_ns`]. Dispatch goes
-/// through a join bisect of its own with a fixed leaf, so the
-/// measurement never consults the threshold it produces.
-fn measure_inline_collapse_threshold_ns() -> u64 {
+/// The measurements behind [`host_dispatch_profile`]. Dispatch goes
+/// through a join bisect of its own with a fixed leaf and plans
+/// without an explicit estimate, so nothing here consults the values
+/// it produces.
+fn measure_host_dispatch() -> HostDispatchProfile {
     const LEAF: usize = 256;
     const MAX_ITEMS: usize = 1 << 17;
     fn median5<F: FnMut()>(mut f: F) -> u64 {
@@ -521,44 +556,96 @@ fn measure_inline_collapse_threshold_ns() -> u64 {
         let (lo, hi) = items.split_at_mut(mid);
         join_context(plan, |_| dispatched(plan, lo), |_| dispatched(plan, hi));
     }
-    // One sweep: doubling counts from four leaves; the crossover is
-    // the serial time where the dispatched minus serial difference
-    // reaches zero, interpolated linearly between the last two
-    // counts so the doubling steps do not quantize it to a factor of
-    // two. A sweep that never crosses below the cap reports the cap.
-    fn sweep(v: &mut [u64]) -> u64 {
+    // One sweep: doubling counts from four leaves, timing `first`
+    // against `second` at each; the crossover is the `first` time
+    // where `second` minus `first` reaches zero, interpolated
+    // linearly between the last two counts so the doubling steps do
+    // not quantize it to a factor of two. A sweep whose second side
+    // never catches up reports the `first` time at the largest count
+    // it timed.
+    fn sweep<A, B>(v: &mut [u64], mut first: A, mut second: B) -> u64
+    where
+        A: FnMut(&JobPlan, &mut [u64]),
+        B: FnMut(&JobPlan, &mut [u64]),
+    {
         let mut n = 4 * LEAF;
         let mut prev: Option<(u64, i64)> = None;
         loop {
             let plan = JobPlan::new(0, n as u32);
-            let serial = median5(|| body(&mut v[..n]));
-            let pool = median5(|| dispatched(&plan, &mut v[..n]));
-            let diff = pool as i64 - serial as i64;
+            let a = median5(|| first(&plan, &mut v[..n]));
+            let b = median5(|| second(&plan, &mut v[..n]));
+            let diff = b as i64 - a as i64;
             if diff <= 0 {
-                let crossing = match prev {
-                    Some((s_prev, d_prev)) if d_prev > diff => {
-                        let span = (serial - s_prev) as f64;
+                return match prev {
+                    Some((a_prev, d_prev)) if d_prev > diff => {
+                        let span = (a - a_prev) as f64;
                         let frac = d_prev as f64 / (d_prev - diff) as f64;
-                        s_prev + (span * frac) as u64
+                        a_prev + (span * frac) as u64
                     }
-                    _ => serial,
+                    _ => a,
                 };
-                return crossing.clamp(INLINE_COLLAPSE_FLOOR_NS, INLINE_COLLAPSE_CAP_NS);
             }
-            if serial >= INLINE_COLLAPSE_CAP_NS || n >= v.len() {
-                return INLINE_COLLAPSE_CAP_NS;
+            if n >= v.len() {
+                return a;
             }
-            prev = Some((serial, diff));
+            prev = Some((a, diff));
             n <<= 1;
         }
     }
+    fn median_of<const N: usize>(mut t: [u64; N]) -> u64 {
+        t.sort_unstable();
+        t[N / 2]
+    }
     let mut v: Vec<u64> = (0..MAX_ITEMS as u64).collect();
-    // The first dispatches wake a cold pool; one is discarded.
+    // The first dispatches wake a cold pool and fault the buffer in;
+    // sixteen are discarded.
     let warm = JobPlan::new(0, (4 * LEAF) as u32);
-    dispatched(&warm, &mut v[..4 * LEAF]);
-    let mut sweeps = [sweep(&mut v), sweep(&mut v), sweep(&mut v)];
-    sweeps.sort_unstable();
-    sweeps[1]
+    for _ in 0..16 {
+        dispatched(&warm, &mut v[..4 * LEAF]);
+    }
+    body(&mut v);
+    // The pool's own dispatch cost: one join over two leaves against
+    // the same body serial. Below this much work no dispatch can pay,
+    // whatever the sweep read.
+    let two = 2 * LEAF;
+    let plan_two = JobPlan::new(0, two as u32);
+    let serial_two = median5(|| body(&mut v[..two]));
+    let pool_two = median5(|| dispatched(&plan_two, &mut v[..two]));
+    let dispatch_cost_ns = pool_two.saturating_sub(serial_two).max(1);
+    let serial_vs_pool = |v: &mut [u64]| {
+        sweep(v, |_, items| body(items), dispatched)
+    };
+    let collapse_threshold_ns = median_of([
+        serial_vs_pool(&mut v),
+        serial_vs_pool(&mut v),
+        serial_vs_pool(&mut v),
+        serial_vs_pool(&mut v),
+        serial_vs_pool(&mut v),
+    ])
+    .max(dispatch_cost_ns);
+    // The wake path against polling: the same dispatched body under
+    // the two dispatch scopes.
+    let polling_vs_wake = |v: &mut [u64]| {
+        sweep(
+            v,
+            |plan, items| {
+                let _scope = crate::sched::arena_local::DispatchScope::new_if_change(false);
+                dispatched(plan, items);
+            },
+            |plan, items| {
+                let _scope = crate::sched::arena_local::DispatchScope::new_if_change(true);
+                dispatched(plan, items);
+            },
+        )
+    };
+    let jec_wake_threshold_ns = median_of([
+        polling_vs_wake(&mut v),
+        polling_vs_wake(&mut v),
+        polling_vs_wake(&mut v),
+        polling_vs_wake(&mut v),
+        polling_vs_wake(&mut v),
+    ]);
+    HostDispatchProfile { dispatch_cost_ns, collapse_threshold_ns, jec_wake_threshold_ns }
 }
 
 /// True when the caller's explicit estimate puts `n` items under
@@ -610,17 +697,12 @@ where
         .apply_site_class();
     let plan = &plan_owned;
     let _flush_on_exit = FlushLeafStatsOnExit;
-    // Hybrid JEC threshold: at small total work, the JEC counter
-    // CAS + wake-from-condvar cost (~134us per dispatch on Genoa
-    // 44T at small N, measured 2026-06-05) outweighs the
-    // structural wake-cascade benefit. Below 200us estimated
-    // total, skip JEC wake notifications and let workers find
-    // pushed work via their spin-loop polling (safe because
-    // `ROUNDS_UNTIL_SLEEPING` keeps workers spinning across
-    // typical inter-dispatch gaps). Above 200us, take the full
-    // JEC path - the wake-cascade win dominates.
-    //
-    const HYBRID_JEC_THRESHOLD_NS: u64 = 200_000;
+    // Wake path against polling: at small total work the sleep
+    // counter's CAS and condvar wake cost more than they save, and
+    // workers find pushed work by spinning (`ROUNDS_UNTIL_SLEEPING`
+    // keeps them spinning across typical inter-dispatch gaps); at
+    // large total work the wake cascade wins. The switch point is
+    // this host's measured crossover of the two.
     let estimated_total_ns: u64 = plan
         .effective_ns_per_elem()
         .map(|ns| (ns as u64).saturating_mul(n as u64))
@@ -628,7 +710,7 @@ where
         // (safe default - JEC is correct for any size, just
         // higher overhead on small).
         .unwrap_or(u64::MAX);
-    let use_jec_wake = estimated_total_ns >= HYBRID_JEC_THRESHOLD_NS;
+    let use_jec_wake = estimated_total_ns >= jec_wake_threshold_ns();
     let _jec_scope = crate::sched::arena_local::DispatchScope::new_if_change(use_jec_wake);
 
     // Inline-collapse fast path: when the caller has supplied an
@@ -681,12 +763,6 @@ where
     // serializing.
     let effective_min_leaf = adaptive_min_leaf(plan, MIN_LEAF_ITEMS);
 
-    // Probe-and-decide floor: workers * 5us. Empirically tuned for
-    // Zen+ R7 2700 / Zen3 5700G / Xeon Cascade Lake / EPYC Genoa
-    // (the four hosts in the bench matrix); higher floors regress
-    // Genoa Compute/10k by 12.7x via under-dispatching the wide pool.
-    const TARGET_PER_LEAF_OVERHEAD_NS: u64 = 5_000;
-    let target_per_leaf_overhead_ns: u64 = TARGET_PER_LEAF_OVERHEAD_NS;
 
     // Probe-and-decide path: when the caller hasn't given us a cost
     // estimate AND the workload is small relative to the worker
@@ -796,9 +872,10 @@ where
         };
         let mut per_elem_ns = probe_ns.max(1) / probed as u64;
         let mut tail = tail;
-        let dispatch_floor_ns = (workers as u64)
-            .saturating_mul(target_per_leaf_overhead_ns)
-            .saturating_mul(crate::cpu_info::small_host_dispatch_factor());
+        // The tail dispatches when its measured work is past this
+        // host's collapse crossover, the same question the explicit
+        // estimate answers at entry.
+        let dispatch_floor_ns = inline_collapse_threshold_ns();
         // Confirmation probe: a probe preempted by the OS
         // mid-measurement overstates per-item cost by orders of
         // magnitude and would misroute a trivial workload to the
@@ -879,7 +956,7 @@ where
         // above). per_elem_ns came from the probe measurement so
         // it's authoritative for THIS workload's actual cost on
         // THIS host.
-        let probe_min_leaf = target_per_leaf_overhead_ns
+        let probe_min_leaf = pool_dispatch_cost_ns()
             .checked_div(per_elem_ns)
             .map(|raw| (raw.max(1) as usize).min(MIN_LEAF_ITEMS))
             .unwrap_or(MIN_LEAF_ITEMS);
@@ -2992,32 +3069,32 @@ mod tests {
     }
 
     #[test]
-    fn inline_collapse_threshold_is_in_its_band_and_cached() {
-        // Before or during the background calibration the query
-        // answers the floor; once calibrated, the measured value.
-        let q = inline_collapse_threshold_ns();
-        assert!(
-            q == INLINE_COLLAPSE_FLOOR_NS || (INLINE_COLLAPSE_FLOOR_NS..=INLINE_COLLAPSE_CAP_NS).contains(&q),
-            "query before calibration: {q} ns"
-        );
+    fn host_dispatch_profile_is_measured_and_cached() {
         let t0 = std::time::Instant::now();
-        let t = calibrate_inline_collapse_threshold();
+        let p = calibrate_host_dispatch();
         let cost = t0.elapsed();
-        assert!((INLINE_COLLAPSE_FLOOR_NS..=INLINE_COLLAPSE_CAP_NS).contains(&t), "threshold {t} ns");
-        assert_eq!(inline_collapse_threshold_ns(), t, "the query hands out the installed value");
-        eprintln!("inline collapse threshold on this host: {t} ns (measured in {cost:?})");
+        assert!(p.dispatch_cost_ns > 0, "a measured dispatch cost is positive");
+        assert!(p.collapse_threshold_ns >= p.dispatch_cost_ns, "the collapse threshold is floored at the dispatch cost");
+        assert!(p.jec_wake_threshold_ns > 0, "a measured wake threshold is positive");
+        assert_eq!(host_dispatch_profile(), p, "the query hands out the installed profile");
+        assert_eq!(inline_collapse_threshold_ns(), p.collapse_threshold_ns);
+        eprintln!(
+            "host dispatch profile: dispatch cost {} ns, collapse threshold {} ns, wake threshold {} ns (measured in {cost:?})",
+            p.dispatch_cost_ns, p.collapse_threshold_ns, p.jec_wake_threshold_ns
+        );
     }
 
     #[test]
     fn triple_min_leaf_small_explicit_estimate_runs_on_the_caller() {
-        // 1000 items at 3 ns each is 3 us of work, under the
-        // dispatch floor: the body runs once, on the calling thread.
+        // 200 items at 1 ns each is 0.2 us of work, under any host's
+        // measured dispatch cost: the body runs once, on the calling
+        // thread.
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let n = 1000usize;
+        let n = 200usize;
         let a: Vec<u32> = (0..n as u32).collect();
         let b: Vec<u32> = vec![1; n];
         let mut out = vec![0u32; n];
-        let plan = JobPlan::new(6, n as u32).with_estimated_per_item_ns(3);
+        let plan = JobPlan::new(6, n as u32).with_estimated_per_item_ns(1);
         let caller = std::thread::current().id();
         let off_thread = AtomicUsize::new(0);
         let calls = AtomicUsize::new(0);
@@ -3038,9 +3115,9 @@ mod tests {
     #[test]
     fn indexed_min_leaf_small_explicit_estimate_runs_on_the_caller() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let n = 1000usize;
+        let n = 200usize;
         let mut v: Vec<u32> = vec![0; n];
-        let plan = JobPlan::new(6, n as u32).with_estimated_per_item_ns(3);
+        let plan = JobPlan::new(6, n as u32).with_estimated_per_item_ns(1);
         let caller = std::thread::current().id();
         let off_thread = AtomicUsize::new(0);
         let calls = AtomicUsize::new(0);
