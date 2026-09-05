@@ -203,6 +203,13 @@ pub struct JobPlan {
     /// Clamps to `[0, 3]` internally (1..8 leaves per worker; a
     /// host with 16 workers gets up to 128 leaves at log2=3).
     pub oversubscription_log2: Option<u8>,
+    /// `true` when [`oversubscription_log2`](Self::oversubscription_log2)
+    /// came from the caller via [`Self::with_oversubscription_log2`]
+    /// rather than from a profile or a learned class. The dispatch
+    /// entries read the process-global split observer for their leaf
+    /// budget; this flag is what makes a caller's own factor win over
+    /// it, so the override skips that observer entirely.
+    pub oversubscription_log2_explicit: bool,
     /// How long a thread waiting on a half of this dispatch polls the
     /// latch before it yields its core, in nanoseconds. `None` lets
     /// the scheduler decide: zero for a plan the classifier calls
@@ -543,6 +550,7 @@ impl JobPlan {
             k_inner_log2: None,
             backend_hint: None,
             oversubscription_log2: None,
+            oversubscription_log2_explicit: false,
             spin_before_yield_ns: None,
             worker_cap: None,
             bisect_variant: None,
@@ -596,6 +604,7 @@ impl JobPlan {
             k_inner_log2: None,
             backend_hint: None,
             oversubscription_log2: Some(profile.default_oversubscription_log2()),
+            oversubscription_log2_explicit: false,
             spin_before_yield_ns: None,
             worker_cap: None,
             // Resolve the bisect-variant routing from the process-global
@@ -653,6 +662,7 @@ impl JobPlan {
             k_inner_log2: None,
             backend_hint: None,
             oversubscription_log2: None,
+            oversubscription_log2_explicit: false,
             spin_before_yield_ns: None,
             worker_cap: None,
             bisect_variant: None,
@@ -883,6 +893,7 @@ impl JobPlan {
     /// 4x (latency-bound default), 3 for 8x (maximum steal headroom).
     pub fn with_oversubscription_log2(mut self, log2: u8) -> Self {
         self.oversubscription_log2 = Some(log2.min(3));
+        self.oversubscription_log2_explicit = true;
         self
     }
 
@@ -918,6 +929,31 @@ impl JobPlan {
     #[inline]
     pub fn effective_oversubscription_log2(&self) -> u8 {
         self.oversubscription_log2.unwrap_or(1)
+    }
+
+    /// Leaves per worker for this dispatch's split budget. A factor
+    /// the caller set with [`Self::with_oversubscription_log2`] wins
+    /// and the process-global split observer is not consulted at all;
+    /// otherwise the observer's measured multiplier applies, which is
+    /// what a profile-derived or learned factor defers to.
+    #[inline]
+    pub fn effective_leaves_per_worker(&self) -> usize {
+        if self.oversubscription_log2_explicit {
+            return 1usize << self.effective_oversubscription_log2();
+        }
+        (crate::sched::split_observer::split_multiplier() as usize).max(1)
+    }
+
+    /// The worker count this dispatch may spread over: the pool's
+    /// width, capped by [`Self::worker_cap`] when the caller set one.
+    /// A cap of 1 leaves a single worker, which is how a caller asks
+    /// for serial execution.
+    #[inline]
+    pub fn effective_workers(&self, arena_workers: usize) -> usize {
+        self.worker_cap
+            .map(|cap| (cap as usize).min(arena_workers))
+            .unwrap_or(arena_workers)
+            .max(1)
     }
 
     /// Variance-corrected SMT activation decision. Combines the

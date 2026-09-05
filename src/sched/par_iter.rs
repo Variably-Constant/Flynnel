@@ -658,6 +658,16 @@ fn measure_host_dispatch() -> HostDispatchProfile {
     HostDispatchProfile { dispatch_cost_ns, collapse_threshold_ns, jec_wake_threshold_ns }
 }
 
+/// True when this dispatch runs its body on the calling thread: the
+/// caller capped it to a single worker, or the caller's own estimate
+/// puts the total under the collapse threshold. The worker cap is
+/// read from the plan alone, so a capped call touches neither the
+/// pool nor the host profile.
+#[inline]
+fn runs_on_caller(plan: &JobPlan, n: usize) -> bool {
+    plan.worker_cap == Some(1) || collapses_inline(plan, n)
+}
+
 /// True when the caller's explicit estimate puts `n` items under
 /// [`inline_collapse_threshold_ns`].
 #[inline]
@@ -736,18 +746,12 @@ where
     // even though each item is 10ms of real compute. The probe path
     // downstream measures actual cost; let it run instead of
     // shortcutting here based on a guess.
-    if collapses_inline(plan, n) {
+    if runs_on_caller(plan, n) {
         record_leaf(plan.site, || op(items));
         return;
     }
 
-    let arena_workers = global_local_arena().total_workers();
-    // Resolve worker count: cap to plan.worker_cap if set.
-    let workers = plan
-        .worker_cap
-        .map(|cap| (cap as usize).min(arena_workers))
-        .unwrap_or(arena_workers)
-        .max(1);
+    let workers = plan.effective_workers(global_local_arena().total_workers());
 
     // Adaptive min_leaf. The default MIN_LEAF_ITEMS=256 floor caps
     // chunk count for fine-grain ops (~10ns/elem) where per-leaf
@@ -959,7 +963,7 @@ where
         // 8-clamp regressed Heavy/10k by 8% via probe-path
         // over-bisection vs the conservative observer-multiplier
         // choice.
-        let leaves_per_worker = crate::sched::split_observer::split_multiplier() as usize;
+        let leaves_per_worker = plan.effective_leaves_per_worker();
         let max_budget = workers.saturating_mul(leaves_per_worker).max(1);
         // Probe path: use the per-element cost we just measured to
         // pick min_leaf adaptively (same formula as the main path
@@ -1366,16 +1370,16 @@ where
         .with_site_if_none(crate::sched::call_site::caller_site())
         .apply_site_class();
     let plan = &plan_owned;
-    // Under the dispatch floor by the caller's own estimate: the
-    // body runs here, as in for_each_chunk.
-    if collapses_inline(plan, n) {
+    // Capped to one worker, or under the dispatch floor by the
+    // caller's own estimate: the body runs here, as in
+    // for_each_chunk.
+    if runs_on_caller(plan, n) {
         record_leaf(plan.site, || op(out, a, b));
         return;
     }
     let leaf = min_leaf.max(1);
-    let workers = global_local_arena().total_workers();
-    let multiplier = crate::sched::split_observer::split_multiplier() as usize;
-    let max_budget = workers.saturating_mul(multiplier).max(1);
+    let workers = plan.effective_workers(global_local_arena().total_workers());
+    let max_budget = workers.saturating_mul(plan.effective_leaves_per_worker()).max(1);
     bisect_triple(plan, out, a, b, &op, leaf, max_budget, max_budget, false);
 }
 
@@ -1521,14 +1525,15 @@ where
         .apply_site_class();
     let plan = &plan_owned;
     let _flush_on_exit = FlushLeafStatsOnExit;
-    // Under the dispatch floor by the caller's own estimate: the
-    // body runs here, as in for_each_chunk.
-    if collapses_inline(plan, n) {
+    // Capped to one worker, or under the dispatch floor by the
+    // caller's own estimate: the body runs here, as in
+    // for_each_chunk.
+    if runs_on_caller(plan, n) {
         record_leaf(plan.site, || op(0, items));
         return;
     }
     let leaf = min_leaf.max(1);
-    let workers = global_local_arena().total_workers();
+    let workers = plan.effective_workers(global_local_arena().total_workers());
 
     // Probe-and-decide: when the caller hasn't supplied a per-item
     // cost estimate AND the workload is big enough to amortize a
@@ -1622,8 +1627,9 @@ where
     // Pinned variant: fall back to the eager all-the-way-to-min_leaf
     // bisect_indexed for callers who explicitly opted into a fixed
     // split shape.
-    let multiplier = crate::sched::split_observer::split_multiplier() as usize;
-    let max_budget = workers.saturating_mul(multiplier).max(1);
+    let max_budget = workers
+        .saturating_mul(effective_plan.effective_leaves_per_worker())
+        .max(1);
     bisect_indexed(
         effective_plan, items_to_dispatch, start_offset, &op, leaf, max_budget, max_budget, false,
     );
@@ -1845,9 +1851,8 @@ where
     let _flush_on_exit = FlushLeafStatsOnExit;
 
     let leaf = min_leaf.max(1);
-    let workers = global_local_arena().total_workers();
-    let multiplier = crate::sched::split_observer::split_multiplier() as usize;
-    let max_budget = workers.saturating_mul(multiplier).max(1);
+    let workers = plan.effective_workers(global_local_arena().total_workers());
+    let max_budget = workers.saturating_mul(plan.effective_leaves_per_worker()).max(1);
 
     // Allocate buffer of `MaybeUninit<R>` with exact capacity, NO
     // zero-init. We promise to write every slot via the probe +
@@ -2371,7 +2376,7 @@ where
     if n == 0 {
         return Vec::new();
     }
-    let workers = global_local_arena().total_workers().max(1);
+    let workers = plan.effective_workers(global_local_arena().total_workers());
     let chunks = plan.optimal_chunk_count(workers);
     let min_leaf = match chunks {
         Some(c) if c > 0 => (n / c as usize).max(1),
@@ -2421,9 +2426,8 @@ where
     let span_t0 = last_tick;
     let mut tokens_since_check: u64 = 0;
 
-    let workers = global_local_arena().total_workers();
-    let multiplier = crate::sched::split_observer::split_multiplier() as usize;
-    let max_budget = workers.saturating_mul(multiplier).max(1);
+    let workers = plan.effective_workers(global_local_arena().total_workers());
+    let max_budget = workers.saturating_mul(plan.effective_leaves_per_worker()).max(1);
 
     let mut i = 0;
     while i < n {
@@ -2579,8 +2583,8 @@ where
             .trivial_reduce_cycles
             .load(Relaxed);
 
-    let workers = global_local_arena().total_workers();
-    let multiplier = crate::sched::split_observer::split_multiplier() as usize;
+    let workers = plan.effective_workers(global_local_arena().total_workers());
+    let multiplier = plan.effective_leaves_per_worker();
     // Default chunk-count budget: workers * multiplier (multiplier=2
     // by default -> 32 chunks on a 16-worker host).
     //
@@ -3499,5 +3503,81 @@ mod tests {
         let v: Vec<u32> = Vec::new();
         let plan = JobPlan::new(6, 0);
         for_each_chunk_ref(&plan, &v, 16, |_, _| panic!("must not run"));
+    }
+
+    /// A worker cap of one runs the body on the calling thread, at
+    /// every data-parallel entry rather than only the first. The
+    /// entries used to read the pool width raw, so the cap reached
+    /// only `for_each_chunk`.
+    #[test]
+    fn a_worker_cap_of_one_keeps_every_entry_on_the_calling_thread() {
+        use std::sync::Mutex;
+        // The dispatches below record heavy leaves into the global
+        // classifier, which can migrate the process profile under a
+        // test that pins it. Hold the same lock those tests hold.
+        let _profile = crate::sched::adaptive_profile::global_profile_test_lock();
+        let caller = std::thread::current().id();
+        let seen: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+        let n = 4096usize;
+
+        let mut v: Vec<u32> = (0..n as u32).collect();
+        let plan = JobPlan::new(6, n as u32).with_workers(1).with_estimated_per_item_ns(5_000);
+        for_each_chunk(&plan, &mut v, |c| {
+            seen.lock().unwrap().push(std::thread::current().id());
+            for x in c.iter_mut() {
+                *x += 1;
+            }
+        });
+
+        let a: Vec<u32> = vec![1; n];
+        let b: Vec<u32> = vec![2; n];
+        let mut out: Vec<u32> = vec![0; n];
+        for_each_chunk_triple_min_leaf(&plan, &mut out, &a, &b, 1, |o, x, y| {
+            seen.lock().unwrap().push(std::thread::current().id());
+            for ((o, x), y) in o.iter_mut().zip(x).zip(y) {
+                *o = x + y;
+            }
+        });
+
+        let mut idx: Vec<u32> = vec![0; n];
+        for_each_chunk_indexed_min_leaf(&plan, &mut idx, 1, |start, chunk| {
+            seen.lock().unwrap().push(std::thread::current().id());
+            for (k, slot) in chunk.iter_mut().enumerate() {
+                *slot = (start + k) as u32;
+            }
+        });
+
+        let threads = seen.lock().unwrap().clone();
+        assert!(!threads.is_empty(), "the bodies must have run");
+        for t in threads {
+            assert_eq!(t, caller, "a worker cap of one must not leave the caller");
+        }
+        assert_eq!(out[0], 3, "the triple entry still computed its output");
+        assert_eq!(idx[n - 1], (n - 1) as u32, "the indexed entry still filled its output");
+    }
+
+    /// The caller's own oversubscription factor decides the split
+    /// budget, in place of the process-global observer multiplier.
+    #[test]
+    fn an_explicit_oversubscription_factor_sets_the_split_budget() {
+        let plan = JobPlan::new(6, 1024);
+        assert!(!plan.oversubscription_log2_explicit, "a bare plan defers to the observer");
+        let observer = crate::sched::split_observer::split_multiplier() as usize;
+        assert_eq!(plan.effective_leaves_per_worker(), observer.max(1));
+
+        for log2 in 0..=3u8 {
+            let pinned = JobPlan::new(6, 1024).with_oversubscription_log2(log2);
+            assert!(pinned.oversubscription_log2_explicit);
+            assert_eq!(pinned.effective_leaves_per_worker(), 1usize << log2,
+                "an explicit factor of {log2} means {} leaves per worker", 1usize << log2);
+        }
+
+        // A profile sets the factor as a routing default, which still
+        // defers to the observer: only the caller's own value wins.
+        let profiled = JobPlan::set_profile(
+            6, 1024, crate::dispatch_profile::DispatchProfile::LatencyBound);
+        assert!(profiled.oversubscription_log2.is_some(), "the profile carries a default");
+        assert!(!profiled.oversubscription_log2_explicit, "but the caller set nothing");
+        assert_eq!(profiled.effective_leaves_per_worker(), observer.max(1));
     }
 }

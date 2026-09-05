@@ -41,13 +41,20 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   helpers arrived over the following 22 us; with the probe, 0.6 us
   and 3.4 us.
 - A worker waiting on a stolen join half polls the latch in a spin
-  until its wait exceeds the host's measured collapse threshold, then
-  yields per round; it yielded every round before, which cost one to
-  three microseconds per level of an eight-deep steal chain (10 us
-  of drain after the last leaf on the traced call, 2 us now). An
-  external caller likewise spins for the collapse span before it
-  parks on its slot job (a fixed 256 spins until the profile is
-  measured).
+  before it yields, where it yielded every round before, which cost
+  one to three microseconds per level of an eight-deep steal chain
+  (10 us of drain after the last leaf on the traced call, 2 us now).
+  An external caller waiting on its slot job spins on the same
+  budget before parking, over a fixed 256-spin floor that absorbs a
+  fast-completion race.
+- `JobPlan::spin_before_yield_ns` and its builder
+  `with_spin_before_yield_ns` set that budget, and
+  `effective_spin_before_yield_ns` resolves it: the caller's value
+  when set, else zero for a plan the classifier calls latency bound,
+  whose items run long enough that a spinning waiter denies a core
+  to the thief it waits for, else this host's measured collapse
+  threshold. `par_iter::measured_collapse_threshold_ns` is public and
+  reports `None` until the host profile has been measured.
 - Gate-shaped cells on the Ryzen 7 2700, medians of five interleaved
   runs of 1000 calls each, before and after the two changes: a light
   body at 10k items 39.5 to 26.0 us (1.80x to 2.74x over serial), at
