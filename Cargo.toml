@@ -160,6 +160,9 @@ gpu-peer = ["dep:cudarc", "dep:memmap2"]
 shared-memory-worker-reference = ["dep:memmap2"]
 
 [[example]]
+name = "trace_dispatch"
+
+[[example]]
 name = "adaptive_dispatcher_demo"
 
 [[example]]
