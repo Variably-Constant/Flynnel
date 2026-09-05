@@ -301,9 +301,12 @@ use flynnel::{JobPlan, DispatchProfile};
 
 let plan = JobPlan::set_profile(8, 1024, DispatchProfile::MemoryBound)
     .with_cost_ns_per_elem(80)
-    .with_oversubscription_log2(3)
-    .with_workers(16);
+    .with_oversubscription_log2(3)   // leaves per worker; skips the split observer
+    .with_spin_before_yield_ns(0)    // a waiter yields at once instead of polling
+    .with_workers(16);               // 1 runs the body on the calling thread
 ```
+
+Each of those takes a decision away from the scheduler rather than nudging it. An explicit per-element cost skips the probe that would otherwise measure the workload. An explicit oversubscription factor is used in place of the process-global split observer's multiplier. An explicit spin budget replaces the one the classifier and the host profile would have resolved. A worker cap of one is read from the plan alone, so the call reaches neither the pool nor the host profile.
 
 ## Benchmark results
 

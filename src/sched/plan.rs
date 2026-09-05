@@ -212,11 +212,9 @@ pub struct JobPlan {
     pub oversubscription_log2_explicit: bool,
     /// How long a thread waiting on a half of this dispatch polls the
     /// latch before it yields its core, in nanoseconds. `None` lets
-    /// the scheduler decide: zero for a plan the classifier calls
-    /// latency bound, whose items run long enough that a spinning
-    /// waiter denies a core to the thief it is waiting for, and this
-    /// host's measured collapse threshold otherwise, which is the
-    /// span a short dispatched call completes within.
+    /// the scheduler decide from this host's measured collapse
+    /// threshold and the plan's per-item cost; see
+    /// [`Self::effective_spin_before_yield_ns`].
     ///
     /// Set it to take that decision away from the scheduler: `0`
     /// yields immediately, a larger value spins longer. Read by the
@@ -876,19 +874,28 @@ impl JobPlan {
     }
 
     /// The spin budget a waiter on this dispatch uses: the caller's
-    /// own value when set, else zero for a latency-bound plan, whose
-    /// items run long enough that a spinning waiter denies a core to
-    /// the thief it waits for, else this host's measured collapse
-    /// threshold, the span a short dispatched call completes within.
+    /// own value when set, else this host's measured collapse
+    /// threshold, which is the span a short dispatched call completes
+    /// within, else zero while that has not been measured.
+    ///
+    /// The budget drops to zero when one item is expected to outlast
+    /// it. A waiter spins because the half it waits on is about to
+    /// finish; when a single item runs longer than the whole spin,
+    /// that premise is false and the spin only denies a core to the
+    /// thief being waited on. The per-item estimate decides this, not
+    /// [`Self::use_smt`]: that flag says siblings help hide stalls on
+    /// this workload, which is a claim about execution ports and is
+    /// unrelated to how long a waiter should poll.
     #[inline]
     pub fn effective_spin_before_yield_ns(&self) -> u64 {
         if let Some(ns) = self.spin_before_yield_ns {
             return ns;
         }
-        if self.use_smt {
-            return 0;
+        let budget = crate::sched::par_iter::measured_collapse_threshold_ns().unwrap_or(0);
+        match self.effective_ns_per_elem() {
+            Some(per) if u64::from(per) >= budget => 0,
+            _ => budget,
         }
-        crate::sched::par_iter::measured_collapse_threshold_ns().unwrap_or(0)
     }
 
     /// Builder: override the leaf-count oversubscription factor as
@@ -1557,27 +1564,36 @@ mod tests {
     }
 
     #[test]
-    fn spin_budget_prefers_the_caller_then_the_class_then_the_host() {
+    fn spin_budget_prefers_the_caller_then_the_item_cost_then_the_host() {
         // A caller's own budget wins outright, on any plan.
         let pinned = JobPlan::new(6, 10_000).with_spin_before_yield_ns(1234);
         assert_eq!(pinned.effective_spin_before_yield_ns(), 1234);
-        let pinned_heavy = JobPlan::set_profile(6, 8, DispatchProfile::LatencyBound)
+        let pinned_heavy = JobPlan::new(6, 8)
+            .with_estimated_per_item_ns(100_000_000)
             .with_spin_before_yield_ns(4321);
         assert_eq!(pinned_heavy.effective_spin_before_yield_ns(), 4321,
-            "an explicit budget overrides the class default too");
+            "an explicit budget wins even where the item cost would zero it");
 
-        // Unpinned, the class decides: a latency-bound plan yields at
-        // once rather than deny a core to the thief it waits for.
-        let heavy = JobPlan::set_profile(6, 8, DispatchProfile::LatencyBound);
-        assert!(heavy.use_smt, "the profile is the latency-bound signal");
+        // Force the host profile so the comparison has a known budget.
+        let _profile = crate::sched::adaptive_profile::global_profile_test_lock();
+        let host = crate::sched::par_iter::host_dispatch_profile().collapse_threshold_ns;
+        assert!(host > 0, "the profile is measured by the query above");
+
+        // An item that outlasts the whole spin: the half being waited
+        // on is not about to finish, so the waiter yields at once.
+        let heavy = JobPlan::new(6, 8).with_estimated_per_item_ns(u32::MAX);
         assert_eq!(heavy.effective_spin_before_yield_ns(), 0);
 
-        // Unpinned and not latency bound: this host's measured
-        // collapse threshold, and zero while it is unmeasured.
-        let light = JobPlan::new(6, 10_000);
-        assert!(!light.use_smt, "a light plan is not latency bound");
-        let host = crate::sched::par_iter::measured_collapse_threshold_ns().unwrap_or(0);
+        // An item far shorter than the budget: spin for the budget.
+        let light = JobPlan::new(6, 10_000).with_estimated_per_item_ns(1);
         assert_eq!(light.effective_spin_before_yield_ns(), host);
+
+        // The SMT flag is a claim about execution ports and says
+        // nothing about how long to poll, so it must not move this.
+        let smt_light = JobPlan::new(6, 10_000).with_estimated_per_item_ns(1).with_smt();
+        assert!(smt_light.use_smt);
+        assert_eq!(smt_light.effective_spin_before_yield_ns(), host,
+            "with_smt must not zero the spin budget of a short-item plan");
     }
 
     #[test]

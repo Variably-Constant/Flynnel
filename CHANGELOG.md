@@ -50,11 +50,16 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 - `JobPlan::spin_before_yield_ns` and its builder
   `with_spin_before_yield_ns` set that budget, and
   `effective_spin_before_yield_ns` resolves it: the caller's value
-  when set, else zero for a plan the classifier calls latency bound,
-  whose items run long enough that a spinning waiter denies a core
-  to the thief it waits for, else this host's measured collapse
-  threshold. `par_iter::measured_collapse_threshold_ns` is public and
-  reports `None` until the host profile has been measured.
+  when set, else this host's measured collapse threshold, dropping
+  to zero when the plan's per-item cost is at least that threshold.
+  A waiter spins because the half it waits on is about to finish;
+  when one item outlasts the whole spin that premise is false and
+  the spin only denies a core to the thief being waited on. The
+  decision reads the per-item cost rather than `use_smt`, which is a
+  claim about execution ports and says nothing about how long to
+  poll: a caller who sets `with_smt` for a memory-stall reason keeps
+  the spin its item cost earns. `par_iter::measured_collapse_threshold_ns`
+  is public and reports `None` until the host profile is measured.
 - Gate-shaped cells on a Ryzen 9 7900X, built there with
   `-C target-cpu=native`, medians of five interleaved runs of 1000
   calls each with the host's busy-core count sampled before every

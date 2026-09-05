@@ -118,8 +118,10 @@ Without an explicit estimate two costs apply per call that an explicit one remov
 How long a thread waiting on a half of this dispatch polls the latch before it yields its core, in nanoseconds. Both the in-pool join waiter and an external caller waiting on its slot job read it through `effective_spin_before_yield_ns()`, which resolves in three steps:
 
 1. The caller's own value, when [`with_spin_before_yield_ns`](#builder-methods) set one. Nothing else is consulted.
-2. Zero for a plan the classifier calls latency bound (`use_smt`), whose items run long enough that a spinning waiter denies a core to the thief it is waiting for.
+2. Zero when the plan's per-item cost is at least this host's measured collapse threshold. A waiter spins because the half it waits on is about to finish; when a single item outlasts the whole spin that premise is false, and the spin only denies a core to the thief being waited on.
 3. This host's measured collapse threshold otherwise, the span within which a short dispatched call completes. `par_iter::measured_collapse_threshold_ns()` reports `None`, and the budget is zero, until the host profile has been measured.
+
+The per-item cost decides step 2, not [`use_smt`](#use_smt-bool). That flag says SMT siblings help hide stalls on this workload, which is a claim about execution ports; a caller who sets it for a memory-stall reason keeps whatever spin its item cost earns.
 
 The external caller's spin is floored at a fixed count regardless of the budget, so a plan that budgets zero still absorbs a fast-completion race rather than parking on a job that is already done.
 
