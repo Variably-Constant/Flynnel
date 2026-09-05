@@ -400,8 +400,8 @@ host-buffer helper end to end, so each carries its pin and fetch:
 `gemm_batched` / `syev_auto_batched` / `gesvd_auto_batched` for the
 device alone, the CPU reference through `collect_indexed` with 64
 matrices per item for the pool alone, and the `*_tandem_batched`
-helper after three warm calls have taught the call site its share
-(medians of three further calls). `share` is the CPU share in per
+helper after twelve warm calls have taught the call site its share
+(the model moves one eighth per call; medians of three further calls). `share` is the CPU share in per
 mille the site had learned, `cpu-side` and `dev-side` the two halves'
 own wall times on one more call. Eigen and SVD rows request vectors.
 Cells whose pins would exceed half the 1.5 GiB pool are skipped.

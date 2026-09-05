@@ -106,6 +106,13 @@ fn ms(ns: f64) -> f64 {
     ns / 1e6
 }
 
+/// Warm calls before a tandem cell is timed: the split model moves
+/// one eighth of the way to each measured ratio per call, so a dozen
+/// calls bring the share within a few percent of the balance the
+/// cell measures; three left it mid-way (n = 64 eigen learned 346
+/// per mille against a 15 percent balance).
+const TANDEM_WARM_CALLS: usize = 12;
+
 /// Matrices per CPU-parallel work item: enough work per item that
 /// the adaptive plan dispatches it rather than running the probe's
 /// light-item verdict inline (a 64-matrix chunk of n = 8 GEMMs is
@@ -532,7 +539,7 @@ fn main() {
             });
             let plan = JobPlan::new(0, bu);
             let mut share = 0u32;
-            for _ in 0..3 {
+            for _ in 0..TANDEM_WARM_CALLS {
                 share = gemm_tandem_batched(&mut peer, &k, &plan, &a, &b, bu, nu, nu, nu).expect("tandem").1.cpu_share_per_mille;
             }
             let tan = median_ns(3, || {
@@ -553,7 +560,7 @@ fn main() {
                 });
             });
             let plan = JobPlan::new(0, bu);
-            for _ in 0..3 {
+            for _ in 0..TANDEM_WARM_CALLS {
                 share = syev_tandem_batched(&mut peer, &k, &plan, &sym, bu, nu, true).expect("tandem").1.cpu_share_per_mille;
             }
             let tan = median_ns(3, || {
@@ -573,7 +580,7 @@ fn main() {
                 });
             });
             let plan = JobPlan::new(0, bu);
-            for _ in 0..3 {
+            for _ in 0..TANDEM_WARM_CALLS {
                 share = gesvd_tandem_batched(&mut peer, &k, &plan, &a, bu, nu, nu, true).expect("tandem").1.cpu_share_per_mille;
             }
             let tan = median_ns(3, || {
