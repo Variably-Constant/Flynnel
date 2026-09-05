@@ -430,8 +430,13 @@ impl JobPlan {
         let h = shape.hints();
         self.k_gating = h.k_gating;
         self.use_mailbox_routing = h.use_mailbox_routing;
+        // A declared shape is the caller describing the workload, so
+        // its factor counts as theirs: the dispatch entries take it
+        // over the split observer's measured multiplier, exactly as
+        // they take a factor from `with_oversubscription_log2`.
         if let Some(over) = h.oversubscription_log2 {
             self.oversubscription_log2 = Some(over);
+            self.oversubscription_log2_explicit = true;
         }
         self
     }

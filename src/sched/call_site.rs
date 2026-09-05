@@ -71,23 +71,32 @@ pub const PLACEMENT_BUCKETS: usize = 40;
 const EWMA_COUNT_SHIFT: u32 = 56;
 const EWMA_VALUE_MASK: u64 = (1u64 << EWMA_COUNT_SHIFT) - 1;
 
+/// Smoothing rate of the exponential phase, as the denominator of
+/// alpha: each update keeps `1 - 1/EWMA_ALPHA_RECIP` of the old
+/// average. The value is the reciprocal because the update is a
+/// shift, not a multiply.
+const EWMA_ALPHA_RECIP: u64 = 8;
+
 /// Samples averaged with equal weight before the update turns
-/// exponential. A site's first sample is a cold one (pool start,
-/// page faults, a cold device); an exponential update from the
-/// first sample keeps seven eighths of that sample in the second
-/// average and half of it in the sixth, and a tandem split that
-/// reads the ratio of two such averages spent six rounds on the
-/// gemm parity test still short of the balance the eighth-sample
-/// average reaches.
-const EWMA_WARM_SAMPLES: u64 = 8;
+/// exponential. It is the smoothing rate's denominator, not a
+/// separate choice: the equal-weight phase then lasts exactly as
+/// long as the exponential's own memory, so the handoff neither
+/// leaves a sample over-weighted nor discards one.
+///
+/// The phase exists because a site's first sample is a cold one
+/// (pool start, page faults, a cold device). Seeded straight into
+/// the exponential it keeps seven eighths of its weight in the
+/// second average and half in the sixth, and a tandem split reading
+/// the ratio of two such averages spent six rounds of the gemm
+/// parity test short of the balance the eighth sample reaches.
+const EWMA_WARM_SAMPLES: u64 = EWMA_ALPHA_RECIP;
 
 /// Averaged-cell update: the running mean while fewer than
-/// [`EWMA_WARM_SAMPLES`] samples are in, then exponential with
-/// alpha = 1/8: `new = old - old/8 + sample/8`. Zero is the "empty"
-/// sentinel, so the first sample seeds directly. Load/store (not
-/// CAS) is deliberate: concurrent updates may drop a sample, which
-/// is acceptable for a smoothed statistic and keeps the hot path at
-/// two relaxed atomics.
+/// [`EWMA_WARM_SAMPLES`] samples are in, then exponential at
+/// [`EWMA_ALPHA_RECIP`]. Zero is the "empty" sentinel, so the first
+/// sample seeds directly. Load/store (not CAS) is deliberate:
+/// concurrent updates may drop a sample, which is acceptable for a
+/// smoothed statistic and keeps the hot path at two relaxed atomics.
 #[inline]
 fn ewma_update(cell: &AtomicU64, sample_ns: u64) {
     let packed = cell.load(Ordering::Relaxed);
@@ -99,7 +108,10 @@ fn ewma_update(cell: &AtomicU64, sample_ns: u64) {
     } else if count < EWMA_WARM_SAMPLES {
         ((old * count + sample) / (count + 1), count + 1)
     } else {
-        ((old - old / 8).saturating_add(sample / 8), count)
+        (
+            (old - old / EWMA_ALPHA_RECIP).saturating_add(sample / EWMA_ALPHA_RECIP),
+            count,
+        )
     };
     cell.store((count << EWMA_COUNT_SHIFT) | (new.max(1) & EWMA_VALUE_MASK), Ordering::Relaxed);
 }

@@ -3579,5 +3579,31 @@ mod tests {
         assert!(profiled.oversubscription_log2.is_some(), "the profile carries a default");
         assert!(!profiled.oversubscription_log2_explicit, "but the caller set nothing");
         assert_eq!(profiled.effective_leaves_per_worker(), observer.max(1));
+
+        // A declared shape is the caller describing the workload, so
+        // a factor the shape carries counts as theirs. The plan's own
+        // field cannot answer this: `JobPlan::new` already fills it
+        // from the classifier, so the shape's hints are what say
+        // whether the shape contributed one.
+        use crate::sched::workload_shape::WorkloadShape;
+        for shape in [
+            WorkloadShape::Streaming,
+            WorkloadShape::ProducerFast { burst: 64 },
+            WorkloadShape::WorkSteal { n_consumers: 8, batch_size: 1024 },
+            WorkloadShape::Cooperative { n_cores: 8 },
+            WorkloadShape::VariantRace { n_variants: 3 },
+        ] {
+            let shaped = JobPlan::new(6, 1024).with_workload_shape(shape);
+            match shape.hints().oversubscription_log2 {
+                Some(log2) => {
+                    assert!(shaped.oversubscription_log2_explicit,
+                        "{shape:?} carries a factor, so it is the caller's");
+                    assert_eq!(shaped.effective_leaves_per_worker(), 1usize << log2,
+                        "{shape:?} sets the split budget");
+                }
+                None => assert!(!shaped.oversubscription_log2_explicit,
+                    "{shape:?} carries no factor, so the observer still decides"),
+            }
+        }
     }
 }
