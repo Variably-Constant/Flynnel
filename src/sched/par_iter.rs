@@ -457,18 +457,20 @@ static INLINE_COLLAPSE_MEASURED_NS: std::sync::atomic::AtomicU64 = std::sync::at
 static INLINE_COLLAPSE_CALIBRATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Measure this host's collapse threshold now, on the calling
-/// thread, and install it: a one-add body over doubling item counts,
-/// serial against dispatched through the pool (medians of five
-/// each), the crossover being the serial time at which the
-/// dispatched body finishes no later than the serial one,
-/// interpolated between the last two counts; three sweeps after one
-/// discarded warm-up dispatch, median taken, clamped to
+/// thread, and install it: a compute-bound body (eight dependent
+/// multiply-rotate steps per item) over doubling item counts, serial
+/// against dispatched through the pool (medians of five each), the
+/// crossover being the serial time at which the dispatched body
+/// finishes no later than the serial one, interpolated between the
+/// last two counts; three sweeps after one discarded warm-up
+/// dispatch, median taken, clamped to
 /// [`INLINE_COLLAPSE_FLOOR_NS`]..=[`INLINE_COLLAPSE_CAP_NS`]. A pool
 /// that never catches up below the cap yields the cap, so a
 /// calibration on a loaded host collapses more work inline, never
-/// less. Measured on a Ryzen 7 2700: 105-153 us across six
-/// processes, 23-36 ms each. A second call re-measures and replaces
-/// the value. Returns the installed threshold.
+/// less. A second call re-measures and replaces the value. Returns
+/// the installed threshold; the test
+/// `inline_collapse_threshold_is_in_its_band_and_cached` prints the
+/// value and the cost on the running host.
 pub fn calibrate_inline_collapse_threshold() -> u64 {
     use std::sync::atomic::Ordering;
     INLINE_COLLAPSE_CALIBRATING.store(true, Ordering::Release);
@@ -482,7 +484,7 @@ pub fn calibrate_inline_collapse_threshold() -> u64 {
 /// measurement never consults the threshold it produces.
 fn measure_inline_collapse_threshold_ns() -> u64 {
     const LEAF: usize = 256;
-    const MAX_ITEMS: usize = 1 << 20;
+    const MAX_ITEMS: usize = 1 << 17;
     fn median5<F: FnMut()>(mut f: F) -> u64 {
         let mut t: [u64; 5] = [0; 5];
         for slot in t.iter_mut() {
@@ -493,9 +495,20 @@ fn measure_inline_collapse_threshold_ns() -> u64 {
         t.sort_unstable();
         t[2]
     }
+    // Eight dependent multiply-rotate steps per item: compute-bound
+    // at about eight nanoseconds an item, so the dispatched version
+    // scales with cores the way the work callers estimate does. A
+    // streaming body would measure the memory system instead, and on
+    // a 24-thread host the pool never beat a serial stream below the
+    // cap, which would have collapsed compute the pool runs eight
+    // times faster.
     fn body(items: &mut [u64]) {
         for x in items.iter_mut() {
-            *x = x.wrapping_add(1);
+            let mut v = *x;
+            for _ in 0..8 {
+                v = v.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(13);
+            }
+            *x = v;
         }
         std::hint::black_box(&*items);
     }
@@ -508,13 +521,13 @@ fn measure_inline_collapse_threshold_ns() -> u64 {
         let (lo, hi) = items.split_at_mut(mid);
         join_context(plan, |_| dispatched(plan, lo), |_| dispatched(plan, hi));
     }
-    // One sweep: doubling counts from 32 leaves; the crossover is
+    // One sweep: doubling counts from four leaves; the crossover is
     // the serial time where the dispatched minus serial difference
     // reaches zero, interpolated linearly between the last two
     // counts so the doubling steps do not quantize it to a factor of
     // two. A sweep that never crosses below the cap reports the cap.
     fn sweep(v: &mut [u64]) -> u64 {
-        let mut n = 32 * LEAF;
+        let mut n = 4 * LEAF;
         let mut prev: Option<(u64, i64)> = None;
         loop {
             let plan = JobPlan::new(0, n as u32);
