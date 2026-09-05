@@ -1095,8 +1095,9 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
     // serialize the bisect, and `for_each_chunk`'s adaptive
     // min_leaf would never get a chance to fire.
     //
-    // Threshold matches `for_each_chunk::INLINE_COLLAPSE_THRESHOLD_NS`
-    // so the two layers agree on what counts as "worth the pool".
+    // Threshold matches `par_iter::INLINE_COLLAPSE_FLOOR_NS`, the
+    // floor of the per-host measured collapse threshold, so the two
+    // layers agree on the least work that counts as "worth the pool".
     const HEAVY_OVERRIDE_THRESHOLD_NS: u64 = 50_000;
     // Small hosts (< 4 physical cores) have no steal-parallelism
     // headroom; demand 4x more predicted work before promoting out

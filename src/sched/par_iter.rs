@@ -410,21 +410,152 @@ fn adaptive_min_leaf(plan: &JobPlan, caller_floor: usize) -> usize {
     }
 }
 
+/// Floor of [`inline_collapse_threshold_ns`]: no host collapses less
+/// work than this on the calling thread.
+pub const INLINE_COLLAPSE_FLOOR_NS: u64 = 50_000;
+
+/// Cap of [`inline_collapse_threshold_ns`], sixteen floors: a host
+/// whose pool never catches the serial body below it collapses up to
+/// this much work and dispatches above it.
+pub const INLINE_COLLAPSE_CAP_NS: u64 = INLINE_COLLAPSE_FLOOR_NS * 16;
+
 /// Total work, in nanoseconds from the caller's explicit per-item
 /// estimate, below which a data-parallel entry runs its body on the
-/// calling thread instead of dispatching: the pool's dispatch floor
-/// (about 50 us) exceeds the work. Classifier defaults never trigger
-/// it; only [`JobPlan::with_estimated_per_item_ns`] does.
-pub const INLINE_COLLAPSE_THRESHOLD_NS: u64 = 50_000;
+/// calling thread instead of dispatching: this host's measured
+/// crossover once [`calibrate_inline_collapse_threshold`] has run,
+/// [`INLINE_COLLAPSE_FLOOR_NS`] until then. The first query starts
+/// that calibration on a thread of its own and returns the floor, so
+/// no call stalls on it; a process that wants the measured value
+/// from its first call runs the calibration itself at start-up.
+/// Classifier defaults never trigger the collapse; only
+/// [`JobPlan::with_estimated_per_item_ns`] does.
+pub fn inline_collapse_threshold_ns() -> u64 {
+    use std::sync::atomic::Ordering;
+    let measured = INLINE_COLLAPSE_MEASURED_NS.load(Ordering::Relaxed);
+    if measured != 0 {
+        return measured;
+    }
+    if !INLINE_COLLAPSE_CALIBRATING.swap(true, Ordering::AcqRel) {
+        let spawned = std::thread::Builder::new()
+            .name("flynnel-collapse-calibration".into())
+            .spawn(|| {
+                calibrate_inline_collapse_threshold();
+            });
+        if let Err(e) = spawned {
+            // The next query tries again; until one succeeds the
+            // floor stands.
+            INLINE_COLLAPSE_CALIBRATING.store(false, Ordering::Release);
+            eprintln!("flynnel: the collapse-threshold calibration thread did not start: {e}");
+        }
+    }
+    INLINE_COLLAPSE_FLOOR_NS
+}
+
+/// The measured threshold, zero until the calibration has run.
+static INLINE_COLLAPSE_MEASURED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Set by whichever caller starts the calibration first.
+static INLINE_COLLAPSE_CALIBRATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Measure this host's collapse threshold now, on the calling
+/// thread, and install it: a one-add body over doubling item counts,
+/// serial against dispatched through the pool (medians of five
+/// each), the crossover being the serial time at which the
+/// dispatched body finishes no later than the serial one,
+/// interpolated between the last two counts; three sweeps after one
+/// discarded warm-up dispatch, median taken, clamped to
+/// [`INLINE_COLLAPSE_FLOOR_NS`]..=[`INLINE_COLLAPSE_CAP_NS`]. A pool
+/// that never catches up below the cap yields the cap, so a
+/// calibration on a loaded host collapses more work inline, never
+/// less. Measured on a Ryzen 7 2700: 105-153 us across six
+/// processes, 23-36 ms each. A second call re-measures and replaces
+/// the value. Returns the installed threshold.
+pub fn calibrate_inline_collapse_threshold() -> u64 {
+    use std::sync::atomic::Ordering;
+    INLINE_COLLAPSE_CALIBRATING.store(true, Ordering::Release);
+    let t = measure_inline_collapse_threshold_ns();
+    INLINE_COLLAPSE_MEASURED_NS.store(t, Ordering::Relaxed);
+    t
+}
+
+/// The sweep behind [`inline_collapse_threshold_ns`]. Dispatch goes
+/// through a join bisect of its own with a fixed leaf, so the
+/// measurement never consults the threshold it produces.
+fn measure_inline_collapse_threshold_ns() -> u64 {
+    const LEAF: usize = 256;
+    const MAX_ITEMS: usize = 1 << 20;
+    fn median5<F: FnMut()>(mut f: F) -> u64 {
+        let mut t: [u64; 5] = [0; 5];
+        for slot in t.iter_mut() {
+            let t0 = std::time::Instant::now();
+            f();
+            *slot = t0.elapsed().as_nanos() as u64;
+        }
+        t.sort_unstable();
+        t[2]
+    }
+    fn body(items: &mut [u64]) {
+        for x in items.iter_mut() {
+            *x = x.wrapping_add(1);
+        }
+        std::hint::black_box(&*items);
+    }
+    fn dispatched(plan: &JobPlan, items: &mut [u64]) {
+        if items.len() <= LEAF {
+            body(items);
+            return;
+        }
+        let mid = items.len() >> 1;
+        let (lo, hi) = items.split_at_mut(mid);
+        join_context(plan, |_| dispatched(plan, lo), |_| dispatched(plan, hi));
+    }
+    // One sweep: doubling counts from 32 leaves; the crossover is
+    // the serial time where the dispatched minus serial difference
+    // reaches zero, interpolated linearly between the last two
+    // counts so the doubling steps do not quantize it to a factor of
+    // two. A sweep that never crosses below the cap reports the cap.
+    fn sweep(v: &mut [u64]) -> u64 {
+        let mut n = 32 * LEAF;
+        let mut prev: Option<(u64, i64)> = None;
+        loop {
+            let plan = JobPlan::new(0, n as u32);
+            let serial = median5(|| body(&mut v[..n]));
+            let pool = median5(|| dispatched(&plan, &mut v[..n]));
+            let diff = pool as i64 - serial as i64;
+            if diff <= 0 {
+                let crossing = match prev {
+                    Some((s_prev, d_prev)) if d_prev > diff => {
+                        let span = (serial - s_prev) as f64;
+                        let frac = d_prev as f64 / (d_prev - diff) as f64;
+                        s_prev + (span * frac) as u64
+                    }
+                    _ => serial,
+                };
+                return crossing.clamp(INLINE_COLLAPSE_FLOOR_NS, INLINE_COLLAPSE_CAP_NS);
+            }
+            if serial >= INLINE_COLLAPSE_CAP_NS || n >= v.len() {
+                return INLINE_COLLAPSE_CAP_NS;
+            }
+            prev = Some((serial, diff));
+            n <<= 1;
+        }
+    }
+    let mut v: Vec<u64> = (0..MAX_ITEMS as u64).collect();
+    // The first dispatches wake a cold pool; one is discarded.
+    let warm = JobPlan::new(0, (4 * LEAF) as u32);
+    dispatched(&warm, &mut v[..4 * LEAF]);
+    let mut sweeps = [sweep(&mut v), sweep(&mut v), sweep(&mut v)];
+    sweeps.sort_unstable();
+    sweeps[1]
+}
 
 /// True when the caller's explicit estimate puts `n` items under
-/// [`INLINE_COLLAPSE_THRESHOLD_NS`].
+/// [`inline_collapse_threshold_ns`].
 #[inline]
 fn collapses_inline(plan: &JobPlan, n: usize) -> bool {
     plan.estimated_per_item_ns_explicit
-        && plan
-            .effective_ns_per_elem()
-            .is_some_and(|per| (per as u64).saturating_mul(n as u64) < INLINE_COLLAPSE_THRESHOLD_NS)
+        && plan.effective_ns_per_elem().is_some_and(|per| {
+            (per as u64).saturating_mul(n as u64) < inline_collapse_threshold_ns()
+        })
 }
 
 /// Apply `op` to every element of `items` in parallel by
@@ -489,8 +620,8 @@ where
 
     // Inline-collapse fast path: when the caller has supplied an
     // AUTHORITATIVE per-item cost (via with_estimated_per_item_ns or
-    // with_cost_ns_per_elem) AND total work is smaller than the
-    // dispatch floor (~50us), skip the pool entirely.
+    // with_cost_ns_per_elem) AND total work is under this host's
+    // measured collapse threshold, skip the pool entirely.
     //
     // Gating on plan.estimated_per_item_ns_explicit (not just
     // effective_ns_per_elem) is critical: JobPlan::new auto-populates
@@ -500,10 +631,7 @@ where
     // even though each item is 10ms of real compute. The probe path
     // downstream measures actual cost; let it run instead of
     // shortcutting here based on a guess.
-    if plan.estimated_per_item_ns_explicit
-        && let Some(per_elem_ns) = plan.effective_ns_per_elem()
-        && (per_elem_ns as u64).saturating_mul(n as u64) < INLINE_COLLAPSE_THRESHOLD_NS
-    {
+    if collapses_inline(plan, n) {
         record_leaf(plan.site, || op(items));
         return;
     }
@@ -2848,6 +2976,23 @@ mod tests {
         for (i, &x) in v.iter().enumerate() {
             assert_eq!(x, i as u32 + 1000);
         }
+    }
+
+    #[test]
+    fn inline_collapse_threshold_is_in_its_band_and_cached() {
+        // Before or during the background calibration the query
+        // answers the floor; once calibrated, the measured value.
+        let q = inline_collapse_threshold_ns();
+        assert!(
+            q == INLINE_COLLAPSE_FLOOR_NS || (INLINE_COLLAPSE_FLOOR_NS..=INLINE_COLLAPSE_CAP_NS).contains(&q),
+            "query before calibration: {q} ns"
+        );
+        let t0 = std::time::Instant::now();
+        let t = calibrate_inline_collapse_threshold();
+        let cost = t0.elapsed();
+        assert!((INLINE_COLLAPSE_FLOOR_NS..=INLINE_COLLAPSE_CAP_NS).contains(&t), "threshold {t} ns");
+        assert_eq!(inline_collapse_threshold_ns(), t, "the query hands out the installed value");
+        eprintln!("inline collapse threshold on this host: {t} ns (measured in {cost:?})");
     }
 
     #[test]
