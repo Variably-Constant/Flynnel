@@ -410,6 +410,23 @@ fn adaptive_min_leaf(plan: &JobPlan, caller_floor: usize) -> usize {
     }
 }
 
+/// Total work, in nanoseconds from the caller's explicit per-item
+/// estimate, below which a data-parallel entry runs its body on the
+/// calling thread instead of dispatching: the pool's dispatch floor
+/// (about 50 us) exceeds the work. Classifier defaults never trigger
+/// it; only [`JobPlan::with_estimated_per_item_ns`] does.
+pub const INLINE_COLLAPSE_THRESHOLD_NS: u64 = 50_000;
+
+/// True when the caller's explicit estimate puts `n` items under
+/// [`INLINE_COLLAPSE_THRESHOLD_NS`].
+#[inline]
+fn collapses_inline(plan: &JobPlan, n: usize) -> bool {
+    plan.estimated_per_item_ns_explicit
+        && plan
+            .effective_ns_per_elem()
+            .is_some_and(|per| (per as u64).saturating_mul(n as u64) < INLINE_COLLAPSE_THRESHOLD_NS)
+}
+
 /// Apply `op` to every element of `items` in parallel by
 /// recursively bisecting the slice. Each leaf chunk is processed
 /// serially by `op`, which is the right granule for SIMD loops.
@@ -483,7 +500,6 @@ where
     // even though each item is 10ms of real compute. The probe path
     // downstream measures actual cost; let it run instead of
     // shortcutting here based on a guess.
-    const INLINE_COLLAPSE_THRESHOLD_NS: u64 = 50_000;
     if plan.estimated_per_item_ns_explicit
         && let Some(per_elem_ns) = plan.effective_ns_per_elem()
         && (per_elem_ns as u64).saturating_mul(n as u64) < INLINE_COLLAPSE_THRESHOLD_NS
@@ -1112,6 +1128,12 @@ where
         .with_site_if_none(crate::sched::call_site::caller_site())
         .apply_site_class();
     let plan = &plan_owned;
+    // Under the dispatch floor by the caller's own estimate: the
+    // body runs here, as in for_each_chunk.
+    if collapses_inline(plan, n) {
+        record_leaf(plan.site, || op(out, a, b));
+        return;
+    }
     let leaf = min_leaf.max(1);
     let workers = global_local_arena().total_workers();
     let multiplier = crate::sched::split_observer::split_multiplier() as usize;
@@ -1261,6 +1283,12 @@ where
         .apply_site_class();
     let plan = &plan_owned;
     let _flush_on_exit = FlushLeafStatsOnExit;
+    // Under the dispatch floor by the caller's own estimate: the
+    // body runs here, as in for_each_chunk.
+    if collapses_inline(plan, n) {
+        record_leaf(plan.site, || op(0, items));
+        return;
+    }
     let leaf = min_leaf.max(1);
     let workers = global_local_arena().total_workers();
 
@@ -2820,6 +2848,56 @@ mod tests {
         for (i, &x) in v.iter().enumerate() {
             assert_eq!(x, i as u32 + 1000);
         }
+    }
+
+    #[test]
+    fn triple_min_leaf_small_explicit_estimate_runs_on_the_caller() {
+        // 1000 items at 3 ns each is 3 us of work, under the
+        // dispatch floor: the body runs once, on the calling thread.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = 1000usize;
+        let a: Vec<u32> = (0..n as u32).collect();
+        let b: Vec<u32> = vec![1; n];
+        let mut out = vec![0u32; n];
+        let plan = JobPlan::new(6, n as u32).with_estimated_per_item_ns(3);
+        let caller = std::thread::current().id();
+        let off_thread = AtomicUsize::new(0);
+        let calls = AtomicUsize::new(0);
+        for_each_chunk_triple_min_leaf(&plan, &mut out, &a, &b, 64, |o, x, y| {
+            if std::thread::current().id() != caller {
+                off_thread.fetch_add(1, Ordering::Relaxed);
+            }
+            calls.fetch_add(1, Ordering::Relaxed);
+            for ((o, x), y) in o.iter_mut().zip(x).zip(y) {
+                *o = x + y;
+            }
+        });
+        assert_eq!(off_thread.load(Ordering::Relaxed), 0, "must not dispatch to the pool");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "one body call over the whole slice");
+        assert!(out.iter().enumerate().all(|(i, &v)| v == i as u32 + 1));
+    }
+
+    #[test]
+    fn indexed_min_leaf_small_explicit_estimate_runs_on_the_caller() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = 1000usize;
+        let mut v: Vec<u32> = vec![0; n];
+        let plan = JobPlan::new(6, n as u32).with_estimated_per_item_ns(3);
+        let caller = std::thread::current().id();
+        let off_thread = AtomicUsize::new(0);
+        let calls = AtomicUsize::new(0);
+        for_each_chunk_indexed_min_leaf(&plan, &mut v, 1, |start, chunk| {
+            if std::thread::current().id() != caller {
+                off_thread.fetch_add(1, Ordering::Relaxed);
+            }
+            calls.fetch_add(1, Ordering::Relaxed);
+            for (i, x) in chunk.iter_mut().enumerate() {
+                *x = (start + i) as u32;
+            }
+        });
+        assert_eq!(off_thread.load(Ordering::Relaxed), 0, "must not dispatch to the pool");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "one body call over the whole slice");
+        assert!(v.iter().enumerate().all(|(i, &x)| x == i as u32));
     }
 
     #[test]

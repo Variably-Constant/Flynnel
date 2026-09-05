@@ -142,7 +142,7 @@ pub fn for_each_chunk_triple<T1, T2, T3, F>(
 )
 ```
 
-Apply `op` to every chunk-triple of `(out, a, b)` in parallel. All three slices must have the same length. Used for `out = f(a, b)` slice kernels (mul_slice / add_slice / sub_slice). The `_min_leaf` variant takes a caller-supplied leaf floor (use `min_leaf = 1` for heavy per-element work like row-update or per-row spmv).
+Apply `op` to every chunk-triple of `(out, a, b)` in parallel. All three slices must have the same length. Used for `out = f(a, b)` slice kernels (mul_slice / add_slice / sub_slice). The `_min_leaf` variant takes a caller-supplied leaf floor (use `min_leaf = 1` for heavy per-element work like row-update or per-row spmv). With an explicit per-item estimate on the plan whose total is under `INLINE_COLLAPSE_THRESHOLD_NS` (50 us), both run `op` once over the whole slices on the calling thread, as `for_each_chunk` does (Ryzen 7 2700, 1 ns per item: 1000 items 0.5 us against 13.7 us dispatched).
 
 ### `for_each_chunk_indexed` and `for_each_chunk_indexed_min_leaf`
 
@@ -150,7 +150,7 @@ Apply `op` to every chunk-triple of `(out, a, b)` in parallel. All three slices 
 pub fn for_each_chunk_indexed<T, F>(plan: &JobPlan, items: &mut [T], op: F)
 ```
 
-Indexed-collect pattern: closure receives `(start_idx, &mut [T])` so the body can know the absolute slot index. The `_min_leaf` variant takes a caller-supplied floor (use `min_leaf = 1` for heavy per-element work like matmul O(k), spmv O(nnz_per_row), LU row update, Jacobi rotation, etc.).
+Indexed-collect pattern: closure receives `(start_idx, &mut [T])` so the body can know the absolute slot index. The `_min_leaf` variant takes a caller-supplied floor (use `min_leaf = 1` for heavy per-element work like matmul O(k), spmv O(nnz_per_row), LU row update, Jacobi rotation, etc.). With an explicit per-item estimate on the plan whose total is under `INLINE_COLLAPSE_THRESHOLD_NS` (50 us), both run the body once on the calling thread, as `for_each_chunk` does.
 
 ### `for_each_indexed` and `for_each_chunk_ref`
 
