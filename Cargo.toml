@@ -1,6 +1,6 @@
 [package]
 name = "flynnel"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.96"
 description = "K-aware NUMA-aware work-stealing scheduler with extended-Flynn-taxonomy dispatch (MIMD / SIMC / MIMC / MISD / SIMT / MIMT): a rayon-shaped pool reshaped around per-call execution-class plans with first-class CPU+GPU hybrid (join_hybrid, hybrid_pipeline) and per-call dispatch profiles."
