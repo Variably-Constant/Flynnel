@@ -276,7 +276,7 @@ The measured tables are at the end of this section.
 Three surfaces over the same kernels:
 
 ```rust
-pub struct LinalgKernels { einsum, gemm, syev_blk, syev_thr, gesvd_blk, gesvd_thr }
+pub struct LinalgKernels { einsum, gemm, syev_blk, syev_thr, gesvd_blk, gesvd_thr, syev_bisect, gesvd_bisect, getrf, getrs }
 impl LinalgKernels { pub fn load(peer: &GpuPeer) -> Result<Self, GpuPeerError> }
 pub struct EinsumSpec;               // EinsumSpec::parse("ij,jk->ik", &a_shape, Some(&b_shape))
 // Async, over device addresses; queue a step, then peer.sync_wide() once:
@@ -448,9 +448,7 @@ idle.
 The per-side columns show the CPU share costing 2-3x more per item
 than the pool alone at n = 32 and 64 on both hosts (3070, syev n = 64:
 2.4 ms per item on the CPU side against 0.81 ms per item for the pool
-alone), while the device side per item matches the device alone. The
-run width (two runs per worker) and the inner walk's probe (skipped
-by a latency-bound plan) each moved these cells only within noise.
+alone), while the device side per item matches the device alone.
 
 #### Batched LU: factor, solve (nrhs = 1), inverse
 

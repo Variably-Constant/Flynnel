@@ -109,8 +109,7 @@ fn ms(ns: f64) -> f64 {
 /// Warm calls before a tandem cell is timed: the split model moves
 /// one eighth of the way to each measured ratio per call, so a dozen
 /// calls bring the share within a few percent of the balance the
-/// cell measures; three left it mid-way (n = 64 eigen learned 346
-/// per mille against a 15 percent balance).
+/// cell measures.
 const TANDEM_WARM_CALLS: usize = 12;
 
 /// Matrices per CPU-parallel work item: enough work per item that

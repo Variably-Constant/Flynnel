@@ -1,6 +1,6 @@
 @echo off
-rem Regenerate the checked-in PTX (gpu_peer.ptx, linalg_f64.ptx) from
-rem their .cu sources. Requires the CUDA toolkit (nvcc) and MSVC build
+rem Regenerate the checked-in PTX (gpu_peer, linalg_f64, ozaki_f64,
+rem linalg_bisect_f64, linalg_lu_f64) from their .cu sources. Requires the CUDA toolkit (nvcc) and MSVC build
 rem tools; crate CONSUMERS never run this - the checked-in PTX is
 rem driver-JIT'd at runtime.
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul

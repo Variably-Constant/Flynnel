@@ -3,14 +3,14 @@ title: Sched Module Reference
 weight: 3
 ---
 
-Every primitive in the `flynnel::sched` module, organised by Flynn axis. The workhorses (`join`, `for_each_chunk`, `cooperative_join_n`, `join_hybrid`, `hybrid_pipeline`, `race_variants`, `k_join`) are also exposed at the crate root (`flynnel::*`).
+Every primitive in the `flynnel::sched` module, organised by Flynn axis. The workhorses (`join`, `for_each_chunk`, `for_each_indexed`, `for_each_chunk_ref`, `cooperative_join_n`, `join_hybrid`, `hybrid_pipeline`, `race_variants`, `CancelToken`, `k_join`) are also exposed at the crate root (`flynnel::*`).
 
 ## Index by Flynn axis
 
 | Axis | Primitive | Module |
 |------|-----------|--------|
 | MIMD | `join`, `join_context`, `join_default` | [arena](#arena) |
-| MIMD | `for_each_chunk` family | [par_iter](#par_iter) |
+| MIMD | `for_each_chunk` family, `for_each_indexed`, `for_each_chunk_ref` | [par_iter](#par_iter) |
 | MIMD const-K | `k_join`, `k_join_with_plan` | [k_join](#k_join) |
 | SIMC | `cooperative_join_n` (identical closures) | [cooperative](#cooperative) |
 | MIMC | `cooperative_join_n` (heterogeneous closures, one role per closure) | [cooperative](#cooperative) |
@@ -151,6 +151,18 @@ pub fn for_each_chunk_indexed<T, F>(plan: &JobPlan, items: &mut [T], op: F)
 ```
 
 Indexed-collect pattern: closure receives `(start_idx, &mut [T])` so the body can know the absolute slot index. The `_min_leaf` variant takes a caller-supplied floor (use `min_leaf = 1` for heavy per-element work like matmul O(k), spmv O(nnz_per_row), LU row update, Jacobi rotation, etc.).
+
+### `for_each_indexed` and `for_each_chunk_ref`
+
+```rust
+pub fn for_each_indexed<F>(plan: &JobPlan, n: usize, min_leaf: usize, f: F)
+where F: Fn(usize) + Sync,
+
+pub fn for_each_chunk_ref<T, F>(plan: &JobPlan, items: &[T], min_leaf: usize, f: F)
+where T: Sync, F: Fn(usize, &[T]) + Sync,
+```
+
+`for_each_indexed` calls `f(i)` for every `i` in `0..n` in parallel, each index exactly once, with no slice to mutate: the read-only and side-effect shapes (fill a row of a buffer the closure addresses itself, fault a page per index, declare a cell per id through a shared resolver). It runs the indexed bisect over a zero-sized slice of length `n`, so the probe, the per-call-site statistics and the lazy-steal bisect apply unchanged and nothing is allocated for the slice. `for_each_chunk_ref` is the read-only counterpart of `for_each_chunk_indexed_min_leaf` for a body that needs a fixed batch width and never writes its input: `chunk` is `items[start..start + min_leaf]` except on the trailing chunk, and the chunks tile the slice exactly once. Both are re-exported at the crate root.
 
 ### `collect_indexed` and variants
 
@@ -598,9 +610,13 @@ The trials are noisy, so wall-clock and single-result selection both lie - one l
 pub struct CancelToken { /* opaque */ }
 
 impl CancelToken {
+    pub fn new() -> Self;                // not cancelled; Default is the same
     pub fn is_cancelled(&self) -> bool;  // cheap atomic load
+    pub fn cancel(&self);                // idempotent; every clone observes it
 }
 ```
+
+The races in this module hand each arm a token; `new` is for a race the caller composes itself on [`join`](#join) or the indexed walkers: clone the token into every arm, and the arm that settles calls `cancel`. A token that is never cancelled is the honest argument for a path that takes one but has no peers. Re-exported at the crate root.
 
 ### `par_map_in_place`
 

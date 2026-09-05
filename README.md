@@ -400,6 +400,9 @@ Per-call cost sits at 20-52x the in-process scheduler depending on which coheren
 |-----------------------|------------|--------------------------------------------------------------------------|
 | `join(a, b)`          | MIMD       | Two-way fork-join; the bread-and-butter primitive                        |
 | `for_each_chunk`      | MIMD       | Data-parallel slice sweep with adaptive bisection                        |
+| `for_each_indexed`    | MIMD       | `f(i)` for every index once, no slice to mutate; same probe, site statistics and bisect |
+| `for_each_chunk_ref`  | MIMD       | Read-only chunk walk at a fixed width over a shared slice                |
+| `CancelToken`         | MISD       | Caller-built cancellation shared by the arms of a race composed on `join` or the walkers |
 | `JobPlan`             | -          | Per-call execution-class plan; carries K, batch, profile, overrides      |
 | `cooperative_join_n`  | SIMC/MIMC  | N closures running as ONE logical mega-vector with sync at boundary      |
 | `join_hybrid`         | MIMT       | ONE independent CPU + accelerator pair (GPU, TPU, or custom backend)     |
