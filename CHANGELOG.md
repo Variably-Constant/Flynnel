@@ -73,6 +73,22 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   reached 474 to 572 per mille after six rounds against a device 2.2
   times slower per item, so the run-to-run spread crossed the 500
   the test asserts.
+- Three documented per-call overrides now reach the dispatch
+  entries, where they were previously ignored. The leaf-count
+  oversubscription factor was read nowhere: every entry used the
+  process-global split observer's multiplier, so
+  `with_oversubscription_log2` changed nothing.
+  `effective_leaves_per_worker` resolves it, and a factor the caller
+  set skips the observer entirely, while a profile-derived or
+  class-derived one still defers to it; the new
+  `oversubscription_log2_explicit` field tells the two apart. The
+  worker cap reached only `for_each_chunk`, and
+  `effective_workers` now applies it at the triple, indexed,
+  collect, token-bucket and reduce entries as well. A cap of one,
+  documented as forcing serial execution on the calling thread,
+  dispatched into the pool at every entry; `runs_on_caller` resolves
+  it from the plan alone, so a capped call touches neither the pool
+  nor the host profile.
 - `examples/trace_dispatch` traces one dispatch of a chosen shape
   with `FLYNNEL_TRACE=1`, and the trace records the slot push, the
   caller's wait end, and the wrapped join's start and end on the
