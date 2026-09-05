@@ -456,7 +456,10 @@ mod tests {
             eprintln!("skipping: need >= 2 cores for ping-pong test");
             return;
         }
-        let rt_ns = measure_pair(ids[0], ids[1], 64);
+        // Best of five: a peer preempted mid-spin by another test
+        // thread inflates one reading by a scheduler quantum, and
+        // preemption only ever inflates.
+        let rt_ns = (0..5).map(|_| measure_pair(ids[0], ids[1], 64)).min().unwrap_or(0);
         // Round-trip must be positive (some measurable cost)
         // and reasonable (under 10us per round trip even on
         // the worst hosts).
