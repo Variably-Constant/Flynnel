@@ -528,9 +528,10 @@ where
             // Poll the latch in a spin for the plan's budget, the
             // span a stolen half of a dispatch this size completes
             // within, then yield each round so a thief the OS
-            // preempted gets its core back. A latency-bound plan
-            // budgets zero: its items run long enough that spinning
-            // would deny a core to the thief being waited on.
+            // preempted gets its core back. A plan whose single item
+            // outlasts that span budgets zero, because the half being
+            // waited on is then not about to finish and the spin
+            // would only deny a core to the thief running it.
             let idle_since = idle_since.get_or_insert_with(std::time::Instant::now);
             if idle_since.elapsed().as_nanos() >= u128::from(spin_budget_ns) {
                 std::thread::yield_now();
@@ -685,8 +686,9 @@ where
         // (unset, sleepy, sleeping, then set wakes it).
         // The caller spins for the plan's budget before it parks: a
         // call that finishes within the spin never pays the park's
-        // wake, and a latency-bound plan budgets zero because its
-        // items run far longer than a wake costs. Below the budget
+        // wake, and a plan whose single item outlasts the budget
+        // spins none, its wait being far longer than a wake costs.
+        // Below the budget
         // the spin is still floored at a fixed count, so a plan that
         // budgets zero absorbs a fast-completion race here rather
         // than parking for a job already done.

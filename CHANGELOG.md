@@ -84,9 +84,9 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   heavy shapes flat (5 items of 100ms 1.00 to 0.99, 16 items of 10ms
   1.01 to 1.00). Three rounds were not enough to settle the 1024-item
   cell, which read 1.14 to 1.00 in one session and 1.03 to 1.17 in
-  the next; seven rounds resolve it. Before the spin budget was
-  routed through the classifier the same bench regressed the heavy
-  shapes, which is what the routing fixed.
+  the next; seven rounds resolve it. While the spin budget was a
+  single host-wide value the same bench regressed the heavy shapes,
+  which is what deciding it per plan fixed.
 - Probing every worker peer per round instead of four was measured
   and is not adopted: the light cells gained within noise and the
   heavy cell lost the same.
