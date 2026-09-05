@@ -1600,6 +1600,11 @@ impl LocalArena {
 /// to the wrapper-job path.
 pub(crate) const EXTERNAL_SLOT_COUNT: usize = 32;
 
+/// A thief reads the held slots from a `u64` bitmask
+/// ([`crate::sched::jec_sleep::Sleep::claimed_slots`]), one bit per
+/// slot id, so the pool cannot outgrow the mask.
+const _: () = assert!(EXTERNAL_SLOT_COUNT <= 64);
+
 /// Capacity per AdaptiveWorker ring inside an external slot. External
 /// callers push at most O(log N) right-halves into their own deque
 /// before peers steal them or the caller pops them back. 64 slots
@@ -2335,6 +2340,31 @@ mod tests {
         drop(guard);
         assert!(!arena.external_slots[0].is_claimed(),
             "slot 0 released on guard drop");
+    }
+
+    #[test]
+    fn claimed_slot_mask_indexes_from_the_worker_count() {
+        // A thief derives a slot's stealer index as
+        // `sleep.worker_count() + bit`, so the sleep coordinator must
+        // be built with the same count the slots are indexed from, and
+        // every slot id must fit the mask.
+        let arena = LocalArena::with_smt_extension(2, 1, None);
+        let n = arena.workers.len();
+        assert_eq!(arena.sleep.worker_count(), n,
+            "sleep coordinator counts the workers the slots index from");
+        assert_eq!(arena.sleep.claimed_slots(), 0, "no slot held at rest");
+        let first = arena.try_claim_external_slot().expect("a free slot");
+        let second = arena.try_claim_external_slot().expect("a second free slot");
+        assert_eq!(arena.sleep.claimed_slots(), 0b11, "both held slots in the mask");
+        for bit in 0..2u32 {
+            let idx = n + bit as usize;
+            assert!(idx < arena.stealers.len(),
+                "held slot {bit} addresses a registered stealer");
+        }
+        drop(second);
+        assert_eq!(arena.sleep.claimed_slots(), 0b01, "released slot leaves the mask");
+        drop(first);
+        assert_eq!(arena.sleep.claimed_slots(), 0, "mask empty once both are released");
     }
 
     #[test]

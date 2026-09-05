@@ -203,6 +203,19 @@ pub struct JobPlan {
     /// Clamps to `[0, 3]` internally (1..8 leaves per worker; a
     /// host with 16 workers gets up to 128 leaves at log2=3).
     pub oversubscription_log2: Option<u8>,
+    /// How long a thread waiting on a half of this dispatch polls the
+    /// latch before it yields its core, in nanoseconds. `None` lets
+    /// the scheduler decide: zero for a plan the classifier calls
+    /// latency bound, whose items run long enough that a spinning
+    /// waiter denies a core to the thief it is waiting for, and this
+    /// host's measured collapse threshold otherwise, which is the
+    /// span a short dispatched call completes within.
+    ///
+    /// Set it to take that decision away from the scheduler: `0`
+    /// yields immediately, a larger value spins longer. Read by the
+    /// in-pool join waiter and by an external caller waiting on its
+    /// slot job.
+    pub spin_before_yield_ns: Option<u64>,
     /// Direct override of the worker count used for this dispatch.
     /// `None` uses the full per-arena worker count (16 logical
     /// threads on a typical Zen3 host).
@@ -530,6 +543,7 @@ impl JobPlan {
             k_inner_log2: None,
             backend_hint: None,
             oversubscription_log2: None,
+            spin_before_yield_ns: None,
             worker_cap: None,
             bisect_variant: None,
             use_mailbox_routing: false,
@@ -582,6 +596,7 @@ impl JobPlan {
             k_inner_log2: None,
             backend_hint: None,
             oversubscription_log2: Some(profile.default_oversubscription_log2()),
+            spin_before_yield_ns: None,
             worker_cap: None,
             // Resolve the bisect-variant routing from the process-global
             // adaptive tag (initial value: CPUID-resolved per vendor).
@@ -638,6 +653,7 @@ impl JobPlan {
             k_inner_log2: None,
             backend_hint: None,
             oversubscription_log2: None,
+            spin_before_yield_ns: None,
             worker_cap: None,
             bisect_variant: None,
             use_mailbox_routing: false,
@@ -832,6 +848,32 @@ impl JobPlan {
         self.estimated_per_item_ns = Some(ns_per_elem);
         self.estimated_per_item_ns_explicit = true;
         self
+    }
+
+    /// Builder: how long a thread waiting on a half of this dispatch
+    /// polls the latch before yielding its core, in nanoseconds. See
+    /// [`Self::spin_before_yield_ns`]; `0` yields immediately. Setting
+    /// it takes the decision away from the classifier and from this
+    /// host's measured profile.
+    pub fn with_spin_before_yield_ns(mut self, ns: u64) -> Self {
+        self.spin_before_yield_ns = Some(ns);
+        self
+    }
+
+    /// The spin budget a waiter on this dispatch uses: the caller's
+    /// own value when set, else zero for a latency-bound plan, whose
+    /// items run long enough that a spinning waiter denies a core to
+    /// the thief it waits for, else this host's measured collapse
+    /// threshold, the span a short dispatched call completes within.
+    #[inline]
+    pub fn effective_spin_before_yield_ns(&self) -> u64 {
+        if let Some(ns) = self.spin_before_yield_ns {
+            return ns;
+        }
+        if self.use_smt {
+            return 0;
+        }
+        crate::sched::par_iter::measured_collapse_threshold_ns().unwrap_or(0)
     }
 
     /// Builder: override the leaf-count oversubscription factor as
@@ -1471,6 +1513,30 @@ mod tests {
         // clamp to effective_task_count=16.
         let c = p.optimal_chunk_count(8).unwrap();
         assert!(c <= 16, "chunk count must clamp at effective_task_count");
+    }
+
+    #[test]
+    fn spin_budget_prefers_the_caller_then_the_class_then_the_host() {
+        // A caller's own budget wins outright, on any plan.
+        let pinned = JobPlan::new(6, 10_000).with_spin_before_yield_ns(1234);
+        assert_eq!(pinned.effective_spin_before_yield_ns(), 1234);
+        let pinned_heavy = JobPlan::set_profile(6, 8, DispatchProfile::LatencyBound)
+            .with_spin_before_yield_ns(4321);
+        assert_eq!(pinned_heavy.effective_spin_before_yield_ns(), 4321,
+            "an explicit budget overrides the class default too");
+
+        // Unpinned, the class decides: a latency-bound plan yields at
+        // once rather than deny a core to the thief it waits for.
+        let heavy = JobPlan::set_profile(6, 8, DispatchProfile::LatencyBound);
+        assert!(heavy.use_smt, "the profile is the latency-bound signal");
+        assert_eq!(heavy.effective_spin_before_yield_ns(), 0);
+
+        // Unpinned and not latency bound: this host's measured
+        // collapse threshold, and zero while it is unmeasured.
+        let light = JobPlan::new(6, 10_000);
+        assert!(!light.use_smt, "a light plan is not latency bound");
+        let host = crate::sched::par_iter::measured_collapse_threshold_ns().unwrap_or(0);
+        assert_eq!(light.effective_spin_before_yield_ns(), host);
     }
 
     #[test]

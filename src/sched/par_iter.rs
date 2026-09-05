@@ -475,7 +475,7 @@ pub fn pool_dispatch_cost_ns() -> u64 {
 /// The measured collapse threshold when the calibration has run,
 /// `None` before. For pool workers, which must not start the
 /// calibration: it dispatches into the pool and waits for them.
-pub(crate) fn measured_collapse_threshold_ns() -> Option<u64> {
+pub fn measured_collapse_threshold_ns() -> Option<u64> {
     match HOST_COLLAPSE_THRESHOLD_NS.load(std::sync::atomic::Ordering::Relaxed) {
         0 => None,
         ns => Some(ns),

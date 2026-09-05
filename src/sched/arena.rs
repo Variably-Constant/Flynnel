@@ -459,6 +459,7 @@ where
     // we observe job_b.latch set (the thief ran it) or we find
     // another job to execute.
     let mut idle_since: Option<std::time::Instant> = None;
+    let spin_budget_ns = plan.effective_spin_before_yield_ns();
     loop {
         if job_b.latch.is_set() {
             crate::sched::trace::emit(crate::sched::trace::TraceEvent::JoinWaitEnd, 1);
@@ -524,17 +525,17 @@ where
             // distinguishes productive stealing from worker
             // starvation.
             let t_idle_start = if traced { dispatch_tsc() } else { 0 };
-            // Poll the latch in a spin for as long as a whole
-            // dispatched call at this host's collapse threshold
-            // takes, a span a stolen half completes well within,
-            // then yield each round so a thief the OS preempted
-            // gets its core back.
+            // Poll the latch in a spin for the plan's budget, the
+            // span a stolen half of a dispatch this size completes
+            // within, then yield each round so a thief the OS
+            // preempted gets its core back. A latency-bound plan
+            // budgets zero: its items run long enough that spinning
+            // would deny a core to the thief being waited on.
             let idle_since = idle_since.get_or_insert_with(std::time::Instant::now);
-            match crate::sched::par_iter::measured_collapse_threshold_ns() {
-                Some(budget_ns) if idle_since.elapsed().as_nanos() >= u128::from(budget_ns) => {
-                    std::thread::yield_now();
-                }
-                _ => std::hint::spin_loop(),
+            if idle_since.elapsed().as_nanos() >= u128::from(spin_budget_ns) {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
             }
             if traced {
                 JOIN_WAIT_IDLE_NS.fetch_add(
@@ -682,14 +683,16 @@ where
         );
         // Park the caller on the SpinLatch via the sleep handshake
         // (unset, sleepy, sleeping, then set wakes it).
-        // The caller spins for as long as a whole dispatched call at
-        // this host's collapse threshold takes before it parks: a
-        // call that short finishes within the spin, and the park's
-        // wake would cost it more than the spin does. Before the
-        // host profile is measured the spin is a fixed count.
+        // The caller spins for the plan's budget before it parks: a
+        // call that finishes within the spin never pays the park's
+        // wake, and a latency-bound plan budgets zero because its
+        // items run far longer than a wake costs. Below the budget
+        // the spin is still floored at a fixed count, so a plan that
+        // budgets zero absorbs a fast-completion race here rather
+        // than parking for a job already done.
         const SLOT_WAIT_SPIN: usize = 256;
         crate::sched::trace::emit(crate::sched::trace::TraceEvent::SlotPush, 0);
-        let spin_budget_ns = crate::sched::par_iter::measured_collapse_threshold_ns();
+        let spin_budget_ns = plan.effective_spin_before_yield_ns();
         let wait_started = std::time::Instant::now();
         let mut spun = 0usize;
         let mut parked = false;
@@ -697,10 +700,8 @@ where
             if job.latch.is_set() {
                 break;
             }
-            let keep_spinning = match spin_budget_ns {
-                Some(ns) => wait_started.elapsed().as_nanos() < u128::from(ns),
-                None => spun < SLOT_WAIT_SPIN,
-            };
+            let keep_spinning = spun < SLOT_WAIT_SPIN
+                || wait_started.elapsed().as_nanos() < u128::from(spin_budget_ns);
             if keep_spinning {
                 std::hint::spin_loop();
                 spun += 1;
