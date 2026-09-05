@@ -55,15 +55,36 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   to the thief it waits for, else this host's measured collapse
   threshold. `par_iter::measured_collapse_threshold_ns` is public and
   reports `None` until the host profile has been measured.
-- Gate-shaped cells on the Ryzen 7 2700, medians of five interleaved
-  runs of 1000 calls each, before and after the two changes: a light
-  body at 10k items 39.5 to 26.0 us (1.80x to 2.74x over serial), at
-  100k 145.7 to 133.0 us; a body of about 80 ns per item through
-  `for_each_chunk_triple_min_leaf` at 1k 32.9 to 24.5 us (2.36x to
-  3.31x), at 10k 144.8 to 134.6 us; a heavy body at 100k unchanged
-  within noise (2.09 to 2.25 ms). Probing every worker peer per round
-  instead of four was also measured and is not adopted: the light
-  cells gained within noise and the heavy cell lost the same.
+- Gate-shaped cells on a Ryzen 9 7900X, built there with
+  `-C target-cpu=native`, medians of five interleaved runs of 1000
+  calls each with the host's busy-core count sampled before every
+  round (median 1.10 of 24). A light body at 10k items 15.2 to
+  11.3 us, which is 4.02x to 5.43x over serial; at 100k 60.3 to
+  57.1 us. A body of about 80 ns per item through
+  `for_each_chunk_triple_min_leaf` at 1k 11.4 to 9.1 us (3.80x to
+  4.76x) and at 10k 47.7 to 41.7 us. A heavy body at 100k reads 658
+  to 674 us, the one cell that did not improve.
+- The same cells on a Ryzen 7 2700, from binaries cross-built on the
+  other host so the measuring machine stayed idle: light at 10k 39.0
+  to 27.1 us (1.83x to 2.63x), the 80 ns body at 1k 24.6 to 22.1 us
+  and at 10k 137.7 to 115.2 us, heavy at 100k 2294 to 2237 us. Light
+  at 100k reads 131.2 to 136.6 us, the cell that did not improve
+  here. The two hosts disagree about which of those two cells loses,
+  which is what a difference at the edge of the run-to-run spread
+  looks like.
+- The cold-dispatch bench on the 2700, medians of seven interleaved
+  rounds, as a ratio against rayon where lower is better: 128 items
+  of 500us 1.15 to 1.02, 1024 items of 100us 1.07 to 0.99, 16384
+  items of 10us 1.12 to 1.02, 32 items of 1ms 1.01 to 0.98, and the
+  heavy shapes flat (5 items of 100ms 1.00 to 0.99, 16 items of 10ms
+  1.01 to 1.00). Three rounds were not enough to settle the 1024-item
+  cell, which read 1.14 to 1.00 in one session and 1.03 to 1.17 in
+  the next; seven rounds resolve it. Before the spin budget was
+  routed through the classifier the same bench regressed the heavy
+  shapes, which is what the routing fixed.
+- Probing every worker peer per round instead of four was measured
+  and is not adopted: the light cells gained within noise and the
+  heavy cell lost the same.
 - A call site's averaged costs (policy arms, hybrid placement, and
   the tandem split's per-item cost on each side) weight their first
   eight samples equally before the update turns exponential at
