@@ -1152,7 +1152,10 @@ where
     let width = range.len().div_ceil(2 * workers).clamp(1, TANDEM_CPU_CHUNK);
     let runs = range.len().div_ceil(width);
     let (start, end) = (range.start, range.end);
-    let plan = JobPlan::new(0, runs as u32);
+    // Every run is a batch of dense kernels, tens of microseconds to
+    // hundreds of milliseconds: a latency-bound plan dispatches all
+    // runs at once instead of timing one inline first.
+    let plan = JobPlan::set_profile(0, runs as u32, crate::DispatchProfile::LatencyBound);
     crate::sched::par_iter::for_each_indexed(&plan, runs, 1, |ri| {
         let lo = start + ri * width;
         let hi = (lo + width).min(end);
