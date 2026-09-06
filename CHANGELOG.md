@@ -87,6 +87,20 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 - Probing every worker peer per round instead of four was measured
   and is not adopted: the light cells gained within noise and the
   heavy cell lost the same.
+- A body that the inline collapse ran on the calling thread, and that
+  then took longer than the collapse threshold which admitted it,
+  latches its call site. Later calls there dispatch whatever the
+  caller's per-item estimate says. The collapse trusts that estimate,
+  and one low enough to admit work that overruns costs the difference
+  between running inline and running on the pool. Measured on an idle
+  Ryzen 9 7900X by sweeping a deliberately scaled estimate against a
+  fixed workload: an 80 ns-per-item body at 1000 items took 43.8 us
+  with its estimate set to an eighth of the truth, against 9.0 us at
+  every factor from a quarter to eight times; after the change the
+  same point reads 9.8 us against 9.3 to 9.6 across the rest. An
+  estimate eight times too high still costs a light body at 10k items
+  about 47 percent through leaf over-splitting, which is monotone in
+  the error rather than a cliff.
 - The host dispatch profile takes the fastest of nine timings at every
   point and every crossover sweep, where it took a median of five.
   Interference only adds time to a timing measurement, so the fastest
