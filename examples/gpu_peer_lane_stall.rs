@@ -140,11 +140,24 @@ fn main() {
     };
     let spin_ns = spin_ms.saturating_mul(1_000_000);
 
+    // Optional second argument: blocks per lane, so the same arm runs
+    // against a lane served by a block team.
+    let blocks_per_lane: u32 = match std::env::args().nth(2) {
+        None => 1,
+        Some(a) => match a.parse() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("blocks-per-lane argument {a:?} is not a count: {e}");
+                std::process::exit(2);
+            }
+        },
+    };
+
     println!("=== Submit latency on a parked lane, with and without a resident peer ===\n");
     let cfg = GpuPeerConfig {
         user_ops_cuda: Some(USER_OPS.to_string()),
         lanes: 4,
-        blocks_per_lane: 1,
+        blocks_per_lane,
         ..GpuPeerConfig::default()
     };
     println!(
@@ -199,10 +212,10 @@ fn main() {
     );
     let near_predicted = (h50 - predicted).abs() <= predicted * 0.25;
     if separation >= 5.0 && near_predicted {
-        println!("the parked lane waits out the resident peer: gate reproduced");
+        println!("the parked lane waits out the resident peer for the whole of its work");
     } else if separation >= 5.0 {
-        println!("the arms separate but not by the predicted amount: the wait has another bound");
+        println!("the parked lane waits on the resident peer, but not for the whole of its work");
     } else {
-        println!("no separation between the arms: the relaunch-gate account does not hold here");
+        println!("the parked lane is served while the peer is resident");
     }
 }

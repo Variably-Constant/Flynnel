@@ -321,6 +321,14 @@ impl GpuPeer {
             cas_probe: load("flynnel_peer_cas_probe")?,
         };
 
+        // The poller tracks each lane's launches and exits in a
+        // fixed-size header array, so a region with more lanes than it
+        // addresses could not be scheduled.
+        if config.lanes as usize > layout::MAX_POLLER_LANES {
+            return Err(GpuPeerError::Unavailable(
+                "lane count exceeds the per-lane poller words in the region header",
+            ));
+        }
         let geometry = Geometry {
             lanes: config.lanes.max(1),
             slot_bytes: config.slot_bytes.max(64),
@@ -366,8 +374,18 @@ impl GpuPeer {
             None => (0, 0, 0),
         };
         let lane_set = LaneSet::new(geometry);
+        // One stream per lane. Kernels on a single stream run in
+        // sequence, so a lane relaunched onto the stream of a lane that
+        // is still working would not start until that work finished.
+        let mut lane_streams = Vec::with_capacity(geometry.lanes as usize);
+        for lane in 0..geometry.lanes {
+            lane_streams.push(
+                ctx.new_stream()
+                    .map_err(|e| GpuPeerError::Driver(format!("lane {lane} stream: {e:?}")))?,
+            );
+        }
         let poller = poller::Poller::new(
-            Arc::clone(&stream),
+            lane_streams,
             f_poller,
             config.quantum_ns,
             config.idle_exit_ns,
@@ -416,10 +434,12 @@ impl GpuPeer {
         let t0 = Instant::now();
         loop {
             if let Some(t) = self.lane_set.try_submit(&self.region, op, payload)? {
-                self.poller.ensure_running(&self.region)?;
+                self.poller.ensure_running(&self.region, t.lane)?;
                 return Ok(t);
             }
-            self.poller.ensure_running(&self.region)?;
+            // Every lane is full, so the drain could come from any of
+            // them and there is no one lane to wake.
+            self.poller.ensure_running_all(&self.region)?;
             if t0.elapsed() > Duration::from_secs(10) {
                 return Err(GpuPeerError::Timeout);
             }
@@ -457,9 +477,10 @@ impl GpuPeer {
         while !self.lane_set.is_done(&self.region, ticket) {
             spins = spins.wrapping_add(1);
             if spins.is_multiple_of(4096) {
-                // Self-heal the exit-vs-new-work race: if the quantum
-                // idled out between our submit and its poll, relaunch.
-                self.poller.ensure_running(&self.region)?;
+                // Self-heal the exit-vs-new-work race: if the lane's
+                // quantum idled out between our submit and its poll,
+                // relaunch that lane.
+                self.poller.ensure_running(&self.region, ticket.lane)?;
                 if t0.elapsed() > timeout {
                     return Err(GpuPeerError::Timeout);
                 }
@@ -490,10 +511,10 @@ impl GpuPeer {
         let t0 = Instant::now();
         loop {
             if let Some(t) = self.lane_set.try_submit_on(&self.region, lane, op, payload)? {
-                self.poller.ensure_running(&self.region)?;
+                self.poller.ensure_running(&self.region, t.lane)?;
                 return Ok(t);
             }
-            self.poller.ensure_running(&self.region)?;
+            self.poller.ensure_running(&self.region, lane)?;
             if t0.elapsed() > Duration::from_secs(10) {
                 return Err(GpuPeerError::Timeout);
             }

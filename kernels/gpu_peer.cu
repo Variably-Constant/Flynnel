@@ -51,6 +51,8 @@ typedef unsigned long long u64;
 #define HDR_FISCHER_STARTED_OFF 0x148ULL
 #define HDR_FISCHER_GPU_CONT_OFF 0x14CULL
 #define HDR_GTS_OFF          0x180ULL   // u64[400]
+#define HDR_LANE_EXITS_OFF   0xE00ULL   // u32[64], one per lane
+#define HDR_LANE_GEN_OFF     0xF00ULL   // u32[64], one per lane
 #define HDR_BYTES            0x1000ULL
 
 #define LANE_STRIDE          0x100ULL
@@ -140,16 +142,19 @@ extern "C" __global__ void flynnel_peer_poller(
     unsigned char* vram_base,      // 0 when no resident pool
     u32 vram_block_bytes,
     u32 vram_blocks,
-    u32 blocks_per_lane)           // >1 gives each lane a block team
+    u32 blocks_per_lane,           // >1 gives each lane a block team
+    u32 lane_base)                 // first lane this grid serves
 {
     if (blocks_per_lane == 0u) blocks_per_lane = 1u;
     // Consecutive blocks form one lane's team: rank 0 owns the
-    // descriptor and the ring, every rank runs the user op.
-    const u32 my_lane = blockIdx.x / blocks_per_lane;
+    // descriptor and the ring, every rank runs the user op. A grid
+    // sized to one team serves the single lane at lane_base; a grid
+    // sized to every team serves lanes from lane_base upward.
+    const u32 my_lane = lane_base + blockIdx.x / blocks_per_lane;
     const u32 team_rank = blockIdx.x % blocks_per_lane;
     if (my_lane >= lanes) return;
     volatile u32* stop = (volatile u32*)(base + HDR_STOP_OFF);
-    volatile u32* active_gen = (volatile u32*)(base + HDR_ACTIVE_GEN_OFF);
+    volatile u32* active_gen = (volatile u32*)(base + HDR_LANE_GEN_OFF + my_lane * 4ULL);
     volatile u32* head = (volatile u32*)(base + HDR_BYTES + my_lane * LANE_STRIDE + LANE_HEAD_OFF);
     volatile u32* tail = (volatile u32*)(base + HDR_BYTES + my_lane * LANE_STRIDE + LANE_TAIL_OFF);
     unsigned char* slab = base + HDR_BYTES + (u64)lanes * LANE_STRIDE
@@ -170,14 +175,14 @@ extern "C" __global__ void flynnel_peer_poller(
             s_run = 0;
             s_slot = ~0u;
             u64 now = gtimer();
-            // Every rank ends its own quantum. The host counts a
-            // launch complete only when the exit counter reaches the
-            // full block count (Poller::completed_launches divides
-            // HDR_EXITS_OFF by lanes * blocks_per_lane), and it will
-            // not relaunch until then, so a rank that outlives its
-            // quantum stops the pool restarting at all. The barrier
-            // below is what tolerates ranks leaving at different
-            // moments: both sides of it are bounded.
+            // Every rank ends its own quantum. The host counts a lane's
+            // quantum complete only when that lane's exit counter
+            // reaches its team size (Poller::completed_launches divides
+            // HDR_LANE_EXITS_OFF[lane] by blocks_per_lane), and it will
+            // not relaunch the lane until then, so a rank that outlives
+            // its quantum holds up its own lane and no other. The
+            // barrier below is what tolerates ranks leaving at
+            // different moments: both sides of it are bounded.
             if (ld_vol(stop) != 0u || ld_vol(active_gen) != my_gen
                 || now - t_start > quantum_ns
                 || now - t_last_work > idle_exit_ns) {
@@ -362,8 +367,9 @@ extern "C" __global__ void flynnel_peer_poller(
 
     if (threadIdx.x == 0) {
         // Device-scope atomic on mapped memory: exact among GPU threads
-        // (one increment per exiting block; the host sums per launch).
-        atomicAdd((u32*)(base + HDR_EXITS_OFF), 1u);
+        // (one increment per exiting block; the host divides a lane's
+        // count by its team size to know that lane has drained).
+        atomicAdd((u32*)(base + HDR_LANE_EXITS_OFF + my_lane * 4ULL), 1u);
         __threadfence_system();
     }
 }

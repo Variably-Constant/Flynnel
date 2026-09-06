@@ -49,9 +49,11 @@ pub const HDR_DELTA_OFF: usize = 0x048;
 pub const HDR_LAUNCH_OFF: usize = 0x050;
 /// Global stop flag consumed by the poller (u32).
 pub const HDR_STOP_OFF: usize = 0x058;
-/// Poller block-exit counter, device-scope atomic (u32).
+/// Reserved header word (u32). The poller counts block exits per lane
+/// at [`HDR_LANE_EXITS_OFF`].
 pub const HDR_EXITS_OFF: usize = 0x05C;
-/// Active poller generation; stragglers from older launches exit (u32).
+/// Reserved header word (u32). The poller's generation tag is per lane
+/// at [`HDR_LANE_GEN_OFF`].
 pub const HDR_ACTIVE_GEN_OFF: usize = 0x060;
 /// Calibration doorbell: CPU-written ping (u32).
 pub const HDR_CALIB_PING_OFF: usize = 0x064;
@@ -75,8 +77,32 @@ pub const HDR_FISCHER_GPU_CONT_OFF: usize = 0x14C;
 pub const HDR_GTS_OFF: usize = 0x180;
 /// Calibration timestamp slots (`u64[GTS_SLOTS]` at [`HDR_GTS_OFF`]).
 pub const GTS_SLOTS: usize = 400;
+/// Per-lane poller block-exit counters, device-scope atomic
+/// (`u32[MAX_POLLER_LANES]`). A lane's quantum is drained when its
+/// counter has advanced by the lane's block team size, which is what
+/// lets one lane relaunch while another is still working.
+pub const HDR_LANE_EXITS_OFF: usize = 0xE00;
+/// Per-lane active poller generation (`u32[MAX_POLLER_LANES]`). A
+/// straggler from an older launch of THAT lane exits at its next poll;
+/// lanes do not supersede one another.
+pub const HDR_LANE_GEN_OFF: usize = 0xF00;
+/// Lanes addressable by the two per-lane arrays above, which occupy
+/// the header from [`HDR_LANE_EXITS_OFF`] to [`HDR_BYTES`].
+pub const MAX_POLLER_LANES: usize = 64;
 /// Total header reservation.
 pub const HDR_BYTES: usize = 0x1000;
+
+/// Byte offset of `lane`'s exit counter.
+#[inline]
+pub const fn lane_exits_off(lane: u32) -> usize {
+    HDR_LANE_EXITS_OFF + (lane as usize) * 4
+}
+
+/// Byte offset of `lane`'s active generation word.
+#[inline]
+pub const fn lane_gen_off(lane: u32) -> usize {
+    HDR_LANE_GEN_OFF + (lane as usize) * 4
+}
 
 /// Per-lane header stride (head and tail on separate cache lines).
 pub const LANE_STRIDE: usize = 0x100;
@@ -205,6 +231,8 @@ mod tests {
         assert_eq!(HDR_FISCHER_STARTED_OFF, 0x148);
         assert_eq!(HDR_FISCHER_GPU_CONT_OFF, 0x14C);
         assert_eq!(HDR_GTS_OFF, 0x180);
+        assert_eq!(HDR_LANE_EXITS_OFF, 0xE00);
+        assert_eq!(HDR_LANE_GEN_OFF, 0xF00);
         assert_eq!(HDR_BYTES, 0x1000);
         assert_eq!(LANE_STRIDE, 0x100);
         assert_eq!(LANE_TAIL_OFF, 0x40);
@@ -214,8 +242,21 @@ mod tests {
         // fail the test when someone edits one of them out of range.
         #[expect(clippy::assertions_on_constants, reason = "layout guard over const offsets")]
         {
-            assert!(HDR_GTS_OFF + GTS_SLOTS * 8 <= HDR_BYTES);
+            assert!(HDR_GTS_OFF + GTS_SLOTS * 8 <= HDR_LANE_EXITS_OFF);
+            assert!(HDR_LANE_EXITS_OFF + MAX_POLLER_LANES * 4 <= HDR_LANE_GEN_OFF);
+            assert!(HDR_LANE_GEN_OFF + MAX_POLLER_LANES * 4 <= HDR_BYTES);
         }
+    }
+
+    #[test]
+    fn per_lane_poller_words_are_distinct_and_in_range() {
+        assert_eq!(lane_exits_off(0), HDR_LANE_EXITS_OFF);
+        assert_eq!(lane_gen_off(0), HDR_LANE_GEN_OFF);
+        assert_eq!(lane_exits_off(3), HDR_LANE_EXITS_OFF + 12);
+        assert_eq!(lane_gen_off(3), HDR_LANE_GEN_OFF + 12);
+        let last = (MAX_POLLER_LANES - 1) as u32;
+        assert!(lane_exits_off(last) + 4 <= HDR_LANE_GEN_OFF);
+        assert!(lane_gen_off(last) + 4 <= HDR_BYTES);
     }
 
     #[test]
