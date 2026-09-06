@@ -87,6 +87,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 - Probing every worker peer per round instead of four was measured
   and is not adopted: the light cells gained within noise and the
   heavy cell lost the same.
+- The host dispatch profile takes the fastest of nine timings at every
+  point and every crossover sweep, where it took a median of five.
+  Interference only adds time to a timing measurement, so the fastest
+  run reads the cost itself and a median reads whatever else the host
+  was doing. Measured across 60 processes on an idle Ryzen 9 7900X:
+  the dispatch cost, which divides into leaf sizing, narrows from a
+  900 to 3500 ns band to 700 to 1700, standard deviation 551 to 198;
+  the wake threshold from 2700 to 6203 down to 1300 to 2100, deviation
+  992 to 217. The collapse threshold's band narrows from 14564 to
+  24030 down to 6957 to 14165, deviation 1888 to 1193, with its
+  coefficient of variation unchanged at 0.10: that value is
+  interpolated from a doubling sweep, so its precision is bounded by
+  the sweep's granularity rather than by sample noise.
 - A call site's averaged costs (policy arms, hybrid placement, and
   the tandem split's per-item cost on each side) weight their first
   eight samples equally before the update turns exponential at
