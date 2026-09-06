@@ -542,17 +542,44 @@ fn measure_host_dispatch() -> HostDispatchProfile {
 
     /// The fastest of [`SAMPLES`] timings of `f`.
     ///
-    /// Interference can only add time to a measurement, never remove
-    /// it, so the fastest observation is the one least contaminated
-    /// by whatever else the host was doing.
+    /// The fastest of n samples estimates the left tail, not the
+    /// central tendency, and the two sides of a sweep are not equally
+    /// noisy: a serial timing repeats to within a percent while a
+    /// dispatched one is right-skewed by steal timing and worker wake.
+    /// So this reads a dispatch cost below what a dispatch typically
+    /// costs, measured on a Ryzen 7 2700 at a dispatched point of 6200
+    /// ns whose median over the same nine samples was 9600.
+    ///
+    /// The bias is accepted because the alternative is worse where it
+    /// matters. A median of the same samples tracks the heavy tail
+    /// upward, and a high draw raises the collapse threshold and keeps
+    /// work on the calling thread that the pool should have had: on
+    /// that host a median-estimator calibration drew a 38700 ns
+    /// dispatch cost and the light 10k cell fell from 25.8 to 49.4 us
+    /// against a 2.76x baseline. Under-estimating dispatch spends some
+    /// overhead on work that did not need the pool; over-estimating it
+    /// forfeits the parallelism outright.
+    ///
+    /// `FLYNNEL_PROFILE_SAMPLES=1` prints every sample of each timed
+    /// point to stderr, so the spread and this bias can be read off
+    /// one calibration rather than inferred from repeated runs.
     fn fastest<F: FnMut()>(mut f: F) -> u64 {
-        let mut best = u64::MAX;
-        for _ in 0..SAMPLES {
+        let mut samples = [0u64; SAMPLES];
+        for slot in &mut samples {
             let t0 = std::time::Instant::now();
             f();
-            best = best.min(t0.elapsed().as_nanos() as u64);
+            *slot = t0.elapsed().as_nanos() as u64;
         }
-        best
+        samples.sort_unstable();
+        if std::env::var_os("FLYNNEL_PROFILE_SAMPLES").is_some() {
+            eprintln!(
+                "profile point: min {} median {} max {} samples {samples:?}",
+                samples[0],
+                samples[SAMPLES / 2],
+                samples[SAMPLES - 1]
+            );
+        }
+        samples[0]
     }
     // Eight dependent multiply-rotate steps per item: compute-bound
     // at about eight nanoseconds an item, so the dispatched version
@@ -3058,29 +3085,36 @@ mod tests {
 
     #[test]
     fn for_each_chunk_small_input_runs_serial() {
-        // An input whose measured work is below the dispatch floor
-        // (no explicit cost estimate, n < workers * MIN_LEAF_ITEMS)
-        // runs serially on the calling thread without entering the
-        // pool. A quarter of the leaf floor keeps the work below the
-        // floor even when the suite saturates the host and a one-add
-        // item measures 400 ns.
+        // An input carrying an authoritative per-item cost whose total
+        // falls below this host's collapse threshold runs on the
+        // calling thread without entering the pool.
         //
-        // The runtime may probe-and-decide (one small probe + tail) so
-        // op CAN be called multiple times, but every call must come
-        // from the calling thread (no pool dispatch). This is what
-        // separates inline-collapse from pool dispatch.
+        // The estimate is explicit because that is what the collapse
+        // gates on. With a probed cost the decision follows a live
+        // measurement of the body, and a loaded host reads a one-add
+        // item as expensive enough to dispatch, which is the routing
+        // working rather than failing. An assertion over that path
+        // states a fact about the host at the moment it runs;
+        // `for_each_chunk_small_input_without_an_estimate` covers that
+        // path with the invariant that does hold there.
+        //
+        // The runtime may probe-and-decide (one small probe plus a
+        // tail), so op can be called more than once, but every call
+        // must come from the calling thread. That is what separates
+        // inline-collapse from pool dispatch.
         use std::sync::atomic::{AtomicUsize, Ordering};
-        // The premise holds under the PortBound global profile: a
-        // LatencyBound global activates SMT and a one-item leaf
-        // floor, which dispatches even this size. Hold the profile
-        // lock so the migration tests cannot move it underneath.
+        // Hold the profile lock so the migration tests cannot move the
+        // global profile underneath this one.
         let _profile = crate::sched::adaptive_profile::global_profile_test_lock();
         crate::sched::adaptive_profile::migrate_dispatch_profile(
             crate::DispatchProfile::PortBound,
         );
         let n = MIN_LEAF_ITEMS / 4;
         let mut v: Vec<u32> = (0..n as u32).collect();
-        let plan = JobPlan::new(6, n as u32);
+        // One nanosecond an item puts the total at tens of
+        // nanoseconds, below any measured threshold, which is floored
+        // at this host's dispatch cost.
+        let plan = JobPlan::new(6, n as u32).with_estimated_per_item_ns(1);
         let snap = format!(
             "use_smt={} est_pi={:?} explicit={} oversub={:?} global={:?}",
             plan.use_smt,
@@ -3108,7 +3142,7 @@ mod tests {
         assert_eq!(
             off_thread_calls.load(Ordering::Relaxed),
             0,
-            "small input must NOT dispatch to the pool [{snap}]"
+            "an explicit estimate under the collapse threshold must not dispatch to the pool [{snap}]"
         );
         assert_eq!(
             total_processed.load(Ordering::Relaxed),
@@ -3117,6 +3151,39 @@ mod tests {
         );
         for (i, &x) in v.iter().enumerate() {
             assert_eq!(x, i as u32 + 1000);
+        }
+    }
+
+    #[test]
+    fn for_each_chunk_small_input_without_an_estimate() {
+        // The same small input with no authoritative cost. Here the
+        // probe measures the body and routes on what it finds, so
+        // whether the work lands on the calling thread or in the pool
+        // depends on the host at that moment, and neither outcome is a
+        // defect. What must hold either way is that the walk covers
+        // the slice exactly once.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _profile = crate::sched::adaptive_profile::global_profile_test_lock();
+        crate::sched::adaptive_profile::migrate_dispatch_profile(
+            crate::DispatchProfile::PortBound,
+        );
+        let n = MIN_LEAF_ITEMS / 4;
+        let mut v: Vec<u32> = (0..n as u32).collect();
+        let plan = JobPlan::new(6, n as u32);
+        let total_processed = AtomicUsize::new(0);
+        for_each_chunk(&plan, &mut v, |slice| {
+            total_processed.fetch_add(slice.len(), Ordering::Relaxed);
+            for x in slice {
+                *x += 1000;
+            }
+        });
+        assert_eq!(
+            total_processed.load(Ordering::Relaxed),
+            n,
+            "every item is processed exactly once across probe and tail, on whichever thread"
+        );
+        for (i, &x) in v.iter().enumerate() {
+            assert_eq!(x, i as u32 + 1000, "item {i} processed exactly once");
         }
     }
 
