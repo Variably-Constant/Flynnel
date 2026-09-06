@@ -170,9 +170,20 @@ extern "C" __global__ void flynnel_peer_poller(
             s_run = 0;
             s_slot = ~0u;
             u64 now = gtimer();
-            if (ld_vol(stop) != 0u || ld_vol(active_gen) != my_gen
-                || now - t_start > quantum_ns
-                || now - t_last_work > idle_exit_ns) {
+            // Only the rank that retires slots may end a quantum or
+            // park on idle. A follower leaving on its own timer while
+            // rank 0 holds a claimed slot strands the barrier below,
+            // and the lane then answers nothing until the host's wait
+            // expires. Followers leave when the host says so, through
+            // the stop flag or a superseded generation, which reaches
+            // every rank of the team alike.
+            const u32 leads = (blocks_per_lane == 1u || team_rank == 0u) ? 1u : 0u;
+            u32 quit = (ld_vol(stop) != 0u || ld_vol(active_gen) != my_gen) ? 1u : 0u;
+            if (leads && (now - t_start > quantum_ns
+                          || now - t_last_work > idle_exit_ns)) {
+                quit = 1u;
+            }
+            if (quit) {
                 s_run = 1;
             } else {
                 u32 h = ld_vol(head);
@@ -306,10 +317,19 @@ extern "C" __global__ void flynnel_peer_poller(
             __threadfence_system();
             if (team_rank == 0u) {
                 if (threadIdx.x == 0) {
-                    while (atomicAdd((u32*)team_arrive, 0u) < blocks_per_lane) { }
+                    // Bounded by the quantum: a rank the driver never
+                    // scheduled, or one the host superseded mid-slot,
+                    // must degrade this call to an error rather than
+                    // hold the lane forever. A team that cannot finish
+                    // a slot within a whole quantum is not going to.
+                    const u64 deadline = gtimer() + quantum_ns;
+                    u32 whole_team = 1u;
+                    while (atomicAdd((u32*)team_arrive, 0u) < blocks_per_lane) {
+                        if (gtimer() > deadline) { whole_team = 0u; break; }
+                    }
                     st_vol(team_arrive, 0u);
                     __threadfence_system();
-                    st_vol(d_status, op == ~0u ? STATUS_ERR : STATUS_DONE);
+                    st_vol(d_status, (op == ~0u || !whole_team) ? STATUS_ERR : STATUS_DONE);
                     __threadfence_system();
                     st_vol(tail, ld_vol(tail) + 1u);
                     __threadfence_system();
@@ -319,9 +339,16 @@ extern "C" __global__ void flynnel_peer_poller(
                 }
             } else if (threadIdx.x == 0) {
                 // Wait for rank 0 to publish the retirement, so this
-                // block does not read the same slot twice.
-                u32 want = my_gen_local + 1u;
-                while (ld_vol(team_gen) != want) { }
+                // block does not read the same slot twice. Bounded on
+                // the same reasoning: rank 0 may have left on its
+                // quantum, and a follower that waits forever for a
+                // retirement nobody will publish holds a block that
+                // the next launch needs.
+                const u32 want = my_gen_local + 1u;
+                const u64 deadline = gtimer() + quantum_ns;
+                while (ld_vol(team_gen) != want) {
+                    if (gtimer() > deadline) break;
+                }
             }
             if (threadIdx.x == 0) my_gen_local += 1u;
             __syncthreads();
