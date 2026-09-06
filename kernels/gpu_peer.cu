@@ -170,20 +170,17 @@ extern "C" __global__ void flynnel_peer_poller(
             s_run = 0;
             s_slot = ~0u;
             u64 now = gtimer();
-            // Only the rank that retires slots may end a quantum or
-            // park on idle. A follower leaving on its own timer while
-            // rank 0 holds a claimed slot strands the barrier below,
-            // and the lane then answers nothing until the host's wait
-            // expires. Followers leave when the host says so, through
-            // the stop flag or a superseded generation, which reaches
-            // every rank of the team alike.
-            const u32 leads = (blocks_per_lane == 1u || team_rank == 0u) ? 1u : 0u;
-            u32 quit = (ld_vol(stop) != 0u || ld_vol(active_gen) != my_gen) ? 1u : 0u;
-            if (leads && (now - t_start > quantum_ns
-                          || now - t_last_work > idle_exit_ns)) {
-                quit = 1u;
-            }
-            if (quit) {
+            // Every rank ends its own quantum. The host counts a
+            // launch complete only when the exit counter reaches the
+            // full block count (Poller::completed_launches divides
+            // HDR_EXITS_OFF by lanes * blocks_per_lane), and it will
+            // not relaunch until then, so a rank that outlives its
+            // quantum stops the pool restarting at all. The barrier
+            // below is what tolerates ranks leaving at different
+            // moments: both sides of it are bounded.
+            if (ld_vol(stop) != 0u || ld_vol(active_gen) != my_gen
+                || now - t_start > quantum_ns
+                || now - t_last_work > idle_exit_ns) {
                 s_run = 1;
             } else {
                 u32 h = ld_vol(head);
