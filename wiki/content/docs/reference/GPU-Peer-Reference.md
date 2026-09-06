@@ -52,6 +52,7 @@ impl GpuPeer {
     pub fn submit(&mut self, op: u32, payload: &[u8]) -> Result<Ticket, GpuPeerError>;
     pub fn is_done(&self, ticket: Ticket) -> bool;
     pub fn wait(&mut self, ticket: Ticket, timeout: Duration) -> Result<u32, GpuPeerError>;
+    pub fn wait_status(&mut self, ticket: Ticket, timeout: Duration) -> Result<u32, GpuPeerError>;
     pub fn read_result(&self, ticket: Ticket, dst: &mut [u8]);
     pub fn reap(&mut self, ticket: Ticket) -> Result<(), GpuPeerError>;
     pub fn timed_lock_acquire(&self, timeout: Duration) -> Result<(), GpuPeerError>;
@@ -67,6 +68,7 @@ impl GpuPeer {
     pub fn resident_ptr(&self, handle: &ResidentHandle) -> Result<(u64, usize), GpuPeerError>;
     pub fn submit_resident(&mut self, op: u32, handle: &ResidentHandle) -> Result<Ticket, GpuPeerError>;
     pub fn submit_user(&mut self, op: u32, handle: Option<&ResidentHandle>, args: &[u8]) -> Result<Ticket, GpuPeerError>;
+    pub fn submit_user_on_lane(&mut self, op: u32, handle: Option<&ResidentHandle>, args: &[u8], lane: u32) -> Result<Ticket, GpuPeerError>;
     pub fn compile_wide_kernel(&self, src: &str, entry: &str) -> Result<WideKernel, GpuPeerError>;
     pub fn load_wide_kernel_ptx(&self, ptx: &str, entry: &str) -> Result<WideKernel, GpuPeerError>;
     pub fn launch_wide(&self, kernel: &WideKernel, grid_blocks: u32, block_threads: u32, ptrs: &[u64], scalars: &[u32]) -> Result<(), GpuPeerError>;
@@ -84,16 +86,40 @@ Built-in opcodes: `OP_NOP`, `OP_ADD1_F32` (in-place +1.0 per f32),
 only after `reap` (results are written in place); reaping is in-order
 per lane.
 
+`wait` returns `Err(Unavailable)` for a slot that completed carrying
+a failed status, so a caller that tests only for an error cannot read
+an unfilled payload as an answer; `Err(Timeout)` still means the slot
+never completed at all. `wait_status` returns the raw status word for
+callers that want to inspect it themselves.
+
+`submit_user_on_lane` places a user op on a caller-chosen lane, for
+diagnostics that need a particular lane warm. Production code wants
+`submit_user`, which picks the lane and, for a resident handle, keeps
+same-handle ordering by riding that handle's lane. A handle's own
+lane owns its resident block, so a task sent to a different lane
+reads that block through another lane's team.
+
 ## Execution model
 
-The consumer is a bounded-quantum persistent kernel (one block per
-lane): it runs at most `quantum_ns` per launch (watchdog-safe on
-display GPUs), parks after `idle_exit_ns` without work, and is
-relaunched on demand - wake-from-idle costs one launch
-(`launch_ns`), which a continuously fed queue never pays. Running
-vs parked is tracked by a device-scope-atomic exit counter plus a
-generation word (no stream queries; stragglers from superseded
-launches exit at their next poll).
+The consumer is a bounded-quantum persistent kernel. Each lane is
+served by its own grid on its own stream: it runs at most
+`quantum_ns` per launch (watchdog-safe on display GPUs), parks after
+`idle_exit_ns` without work, and is relaunched on demand -
+wake-from-idle costs one launch (`launch_ns`), which a continuously
+fed queue never pays. Running vs parked is tracked per lane by a
+device-scope-atomic exit counter and a generation word, with no
+stream queries: a lane may relaunch once its own counter has
+advanced by its team size, and stragglers from a superseded launch
+of that lane exit at their next poll.
+
+Both halves of that independence carry weight. A lane inside a long
+op holds up no other lane's relaunch, and a lane's launch never
+queues behind another lane's work. Within a lane the opposite holds
+deliberately: one team serves a lane at a time, which is what keeps
+a second team from reading a slot the first has not retired, since
+the ring tail advances only at retirement. `GpuPeerConfig::lanes` is
+capped at `MAX_POLLER_LANES` (64), the lanes the per-lane header
+words address.
 
 The Fischer timed lock provides cross-device mutual exclusion from
 plain stores + the calibrated `delta_ns` - the mechanism that
@@ -152,13 +178,22 @@ lift from spreading the op across the device, same result both ways.
 So keep small ops on the doorbell and send large ones through
 `launch_wide`. E2E: [`examples/gpu_wide_op_demo.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/examples/gpu_wide_op_demo.rs).
 
-Wide ops run on their OWN stream, separate from the poller's. That
-matters more than it sounds. A wide op on the poller's stream would
-queue BEHIND a resident poller quantum and wait up to `idle_exit_ns`
+Wide ops run on their own stream, separate from every poller lane's.
+That matters more than it sounds. A wide op sharing a poller stream
+would queue behind a resident quantum and wait up to `idle_exit_ns`
 before it even starts - a wide op launched with a 40 ms-idle poller
 resident measured 0.10 ms on the dedicated stream, where the shared
 stream would have made it wait the full 40 ms. So a workload can
 interleave doorbell ops and wide ops without one stalling the other.
+
+The same reasoning is why lanes hold separate streams from each
+other. Measured on an RTX 3070 with one lane held resident by a
+device-side spin and another timed after a 10 ms gap, a shared
+stream made the timed lane wait out the busy lane's whole op: 139.9
+ms against a 150 ms spin and 389.9 ms against a 400 ms one, the
+second well past the 250 ms quantum. On per-lane streams the same
+arm reads 0.140 ms and 0.122 ms against a control of 0.24 ms.
+`examples/gpu_peer_lane_stall.rs` is the arm.
 
 ### Block teams per lane
 

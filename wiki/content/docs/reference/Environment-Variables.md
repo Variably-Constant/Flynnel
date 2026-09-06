@@ -78,6 +78,14 @@ Enable per-`join_in_worker` dispatch tracing to stderr. Accumulates three proces
 
 Default: off.
 
+### `FLYNNEL_PROFILE_SAMPLES=<any value>`
+
+Print every sample behind each point of the host dispatch calibration to stderr: the minimum, the median, the maximum, and the sorted samples. Read by [`src/sched/par_iter.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/par_iter.rs) inside `measure_host_dispatch`, so it costs nothing outside the one calibration per process.
+
+The profile reports the fastest of nine samples per point, which estimates the left tail rather than the central tendency. This is what makes that visible on a given host: on a Ryzen 7 2700 a serial point repeats to within a percent (4000 ns against a 4100 ns median) while a dispatched point reads 6200 ns against a 9600 ns median of the same nine samples. The bias is deliberate. A median of the same samples follows the heavy tail upward, and a high draw raises the collapse threshold and keeps work off the pool: a median-estimator calibration drew a 38700 ns dispatch cost and took the light 10k cell from 25.8 to 49.4 us. Under-estimating dispatch spends bounded overhead on work that did not need the pool; over-estimating it forfeits the parallelism outright.
+
+Default: off.
+
 ### `FLYNNEL_LOCKLATCH_DIAGNOSE=1|true`
 
 Enable per-`LockLatch::wait()` entry/exit diagnostic logging to stderr. Read by [`src/sched/latch.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/latch.rs) via `locklatch_diagnose_enabled()`; the check is cached in a `OnceLock<bool>` so the hot wait path pays one Relaxed load per call.
@@ -119,6 +127,7 @@ The detection helpers in `flynnel::backend::detect` do not read env vars directl
 | `FLYNNEL_ADAPTIVE_SPIN=1` | off | Opt in to the adaptive spin-window controller |
 | `FLYNNEL_TRACE=on` | off | Enable scheduler-event tracing |
 | `FLYNNEL_TRACE_DISPATCH=<any>` | off | Per-`join_in_worker` dispatch trace to stderr |
+| `FLYNNEL_PROFILE_SAMPLES=<any>` | off | Every sample behind each host-dispatch calibration point to stderr |
 | `FLYNNEL_LOCKLATCH_DIAGNOSE=1` | off | Per-`LockLatch::wait()` diagnostic to stderr |
 | `FLYNNEL_ENABLE_FLAT_FANOUT=1` | off | Flat-fanout path in reduce_chunks (bench-only) |
 | `FLYNNEL_REDUCE_CHUNKS_CHUNKS=N` | unset | Bench-driven audit hook: override reduce_chunks target |
