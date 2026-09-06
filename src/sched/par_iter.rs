@@ -299,7 +299,7 @@ const LEAF_SAMPLE_STRIDE: u32 = 8;
 
 /// Compute the adaptive recursion floor for bisects based on the
 /// plan's per-item cost estimate. When the caller supplied an
-/// authoritative hint AND each item is heavy enough that 1-item
+/// authoritative hint and each item is heavy enough that 1-item
 /// leaves still amortize dispatch overhead (~5us), return 1 so the
 /// bisect can split all the way down to one item per worker. For
 /// non-authoritative or fine-grain hints, fall back to MIN_LEAF_ITEMS
@@ -328,11 +328,11 @@ const TARGET_LEAF_WORK_NS: u64 = 1_000_000;
 /// (steal-pressure-driven) kicks in.
 ///
 /// Two-rule trade-off:
-/// - LIGHT items (per_item < TARGET_LEAF_WORK_NS / 16):
+/// - Light items (per_item < TARGET_LEAF_WORK_NS / 16):
 ///   log2(workers) levels. Targets workers initial leaves
 ///   (one per core) and minimizes dispatch overhead. Matches
 ///   rayon's LengthSplitter::default_count() behavior.
-/// - HEAVY items (per_item >> TARGET_LEAF_WORK_NS / items.len()):
+/// - Heavy items (per_item >> TARGET_LEAF_WORK_NS / items.len()):
 ///   log2(items) levels. Targets one leaf per item for fine-grained
 ///   load balancing -- a slow worker only blocks one item's worth
 ///   of work before its remaining items can be stolen.
@@ -789,8 +789,8 @@ where
     let _jec_scope = crate::sched::arena_local::DispatchScope::new_if_change(use_jec_wake);
 
     // Inline-collapse fast path: when the caller has supplied an
-    // AUTHORITATIVE per-item cost (via with_estimated_per_item_ns or
-    // with_cost_ns_per_elem) AND total work is under this host's
+    // authoritative per-item cost (via with_estimated_per_item_ns or
+    // with_cost_ns_per_elem) and total work is under this host's
     // measured collapse threshold, skip the pool entirely.
     //
     // Gating on plan.estimated_per_item_ns_explicit (not just
@@ -810,7 +810,7 @@ where
 
     // Adaptive min_leaf. The default MIN_LEAF_ITEMS=256 floor caps
     // chunk count for fine-grain ops (~10ns/elem) where per-leaf
-    // dispatch overhead dominates below 256-item chunks. For HEAVY
+    // dispatch overhead dominates below 256-item chunks. For heavy
     // per-element work (BigFloat mul, sqrt-chains, FMA-heavy
     // kernels), a 256-item floor SERIALIZES the small-N case:
     // N=4 items each taking 10ms can fully saturate 4 cores at
@@ -834,7 +834,7 @@ where
 
 
     // Probe-and-decide path: when the caller hasn't given us a cost
-    // estimate AND the workload is small relative to the worker
+    // estimate and the workload is small relative to the worker
     // count (n < workers * MIN_LEAF_ITEMS, meaning we can't even
     // make one MIN_LEAF-sized chunk per worker), we don't know
     // whether this work is dispatch-dominated (Light bench) or
@@ -855,7 +855,7 @@ where
     // for 600ns/elem), but big enough that per-call function
     // overhead doesn't dominate the timing.
     const PROBE_SIZE: usize = 32;
-    // Probe-and-decide fires when we lack AUTHORITATIVE per-item cost
+    // Probe-and-decide fires when we lack an authoritative per-item cost
     // information. JobPlan::new + set_profile auto-populate
     // `estimated_per_item_ns` with a classifier default (12 / 50 /
     // 600 ns); those values are routing hints, not measurements. When
@@ -948,7 +948,7 @@ where
         // Confirmation probe: a probe preempted by the OS
         // mid-measurement overstates per-item cost by orders of
         // magnitude and would misroute a trivial workload to the
-        // pool. When the probe says "dispatch" AND the light-path
+        // pool. When the probe says "dispatch" and the light-path
         // batch ran (probed >= 8, so re-measurement is cheap
         // relative to it), time a tiny second probe and take the
         // MIN per-item estimate: preemption inflates a
@@ -1014,7 +1014,7 @@ where
         // multiplier (default 2 leaves per worker) - the probe path
         // fires when no profile was provided, so we shouldn't
         // over-bisect to clamp(.., 8) like the cost-derived branch
-        // would. Empirically (Genoa EPYC 9B14, run 2026-06-04) the
+        // would. Measured on Genoa EPYC 9B14, the
         // 8-clamp regressed Heavy/10k by 8% via probe-path
         // over-bisection vs the conservative observer-multiplier
         // choice.
@@ -1023,8 +1023,8 @@ where
         // Probe path: use the per-element cost we just measured to
         // pick min_leaf adaptively (same formula as the main path
         // above). per_elem_ns came from the probe measurement so
-        // it's authoritative for THIS workload's actual cost on
-        // THIS host.
+        // it's authoritative for this workload's actual cost on
+        // this host.
         let probe_min_leaf = pool_dispatch_cost_ns()
             .checked_div(per_elem_ns)
             .map(|raw| (raw.max(1) as usize).min(MIN_LEAF_ITEMS))
@@ -1293,13 +1293,13 @@ fn record_leaf_sampled<F: FnOnce() -> R, R>(
 /// Direction B: continuation-steal lazy bisect.
 ///
 /// Splits only when this worker observes that someone has stolen from
-/// its OWN deque since the last check. Reads
+/// its own deque since the last check. Reads
 /// `WorkerCtx::stats::times_stolen_from` as a Relaxed atomic - a
 /// counter incremented by thieves at the steal site (see
 /// `arena_local.rs::WorkerCtx::find_work` and the worker_loop steal
 /// path).
 ///
-/// The FIRST `seed_splits_remaining` calls always split to seed
+/// The opening `seed_splits_remaining` calls always split to seed
 /// initial fanout to ~`workers` leaves (so workers have something to
 /// steal from before the lazy logic kicks in). Subsequent calls
 /// consult the steal counter and only split if it advanced.
@@ -1366,7 +1366,7 @@ where
 /// the right granule for SIMD slice kernels (mul_slice, add_slice,
 /// sub_slice in the consumer crate's SIMD primitives).
 ///
-/// All three slices MUST have the same length (asserted). The
+/// All three slices must have the same length (asserted). The
 /// bisect always cuts at the midpoint so the three sub-slices
 /// stay aligned by index.
 ///
@@ -1591,8 +1591,8 @@ where
     let workers = plan.effective_workers(global_local_arena().total_workers());
 
     // Probe-and-decide: when the caller hasn't supplied a per-item
-    // cost estimate AND the workload is big enough to amortize a
-    // probe, run a tiny prefix through the closure to MEASURE the
+    // cost estimate and the workload is big enough to amortize a
+    // probe, run a tiny prefix through the closure to measure the
     // actual per-item cost. The measurement feeds the static
     // classifier (via JobPlan::with_estimated_per_item_ns) so the
     // bulk dispatch already routes to the right WorkloadClass on
@@ -1605,7 +1605,7 @@ where
     // start_idx=probe_n to preserve absolute-index semantics for
     // the caller's closure.
     //
-    // probe_n MUST be at least min_leaf. The caller's closure body
+    // probe_n must be at least min_leaf. The caller's closure body
     // is sized around the leaf granularity: a stride-w row kernel,
     // a chunked accumulator over min_leaf-sized blocks, etc. A
     // probe shorter than min_leaf would feed the closure a
@@ -1769,7 +1769,7 @@ where
     F: Fn(usize, &mut [T]) + Sync,
 {
     if items.len() <= min_leaf {
-        // record_leaf (NOT _sampled): the closing-loop auto-classifier
+        // record_leaf rather than _sampled: the closing-loop auto-classifier
         // observer needs every leaf timed so it can converge on the
         // workload's shape (mean_ns + cv^2) within the first few
         // iterations of a real workload, not after thousands. The
@@ -1865,7 +1865,7 @@ where
 /// Parallel indexed collect: compute `f(idx)` for `idx in 0..n` in
 /// parallel and return the result `Vec<R>`. Matches the cost profile
 /// of `rayon`'s `(0..n).into_par_iter().map(f).collect()` by
-/// allocating the result buffer WITHOUT zero-init - uses
+/// allocating the result buffer without zero-init - uses
 /// `MaybeUninit<R>` + ptr writes inside the SLAW bisect. This is the
 /// right helper for indexed-collect ops (matmul, spmv, LU row update,
 /// Jacobi rotation, eigenvalue rotation, FFT butterfly, block-sparse
@@ -2108,7 +2108,7 @@ const HEARTBEAT_GATE_ITEMS: usize = 100_000;
 ///   entry-only static decision - fully serial when the estimated
 ///   total is below the ~20us heartbeat quantum, plain SLAW
 ///   [`collect_indexed`] otherwise. Site-learned profile defaults
-///   do NOT trip this gate; only the explicit flag does.
+///   do not trip this gate; only the explicit flag does.
 /// - Site cv^2 known and below the calibrated
 ///   `cv2_high_per_mille` threshold (uniform leaves): SLAW at any
 ///   `n` - heartbeat loses 3-4x on uniform-per-iter work.
@@ -2151,7 +2151,7 @@ where
     let plan = &plan_owned;
 
     // Plan-estimate gate (entry-only, no rdtsc-polling in hot loop).
-    // When the caller supplied an AUTHORITATIVE per-item cost, the
+    // When the caller supplied an authoritative per-item cost, the
     // dispatcher can compute total estimated cost and make a static
     // decision at entry: serial when below the heartbeat quantum,
     // SLAW-parallel otherwise. Gated on the explicit flag because
@@ -2172,12 +2172,12 @@ where
         return collect_indexed(plan, n, 1, f);
     }
 
-    // Heartbeat wins on IRREGULAR per-item cost (the Acar model's
+    // Heartbeat wins on irregular per-item cost (the Acar model's
     // target shape) and loses 3-4x on uniform cost (matmul-shaped
     // work), so the site's observed cv^2 is the routing signal:
     //
     // - cv^2 known and LOW (uniform leaves): force SLAW at any n.
-    // - cv^2 known and HIGH (irregular leaves): let the site's
+    // - cv^2 known and high (irregular leaves): let the site's
     //   policy arms A/B heartbeat (arm 1) against SLAW (arm 0) from
     //   n >= HEARTBEAT_MIN_ITEMS, adopting whichever EWMA wins and
     //   re-trialling on a fixed cadence.
@@ -2385,7 +2385,7 @@ where
     let plan = &plan_owned;
 
     // Entry gate identical to `collect_indexed_heartbeat`: skip the
-    // token-bucket machinery if the caller's AUTHORITATIVE estimate
+    // token-bucket machinery if the caller's authoritative estimate
     // says the whole batch fits in one heartbeat tick (explicit-only
     // for the same reason as the heartbeat entry: site-learned
     // profile defaults also populate the estimate field).
@@ -2421,7 +2421,7 @@ where
 /// n / optimal_chunks` instead of using the caller-supplied floor.
 /// Falls back to plain [`collect_indexed`] with `min_leaf=1` when
 /// the plan lacks the required estimates (`estimated_per_item_ns`
-/// AND `task_overhead_ns`).
+/// and `task_overhead_ns`).
 #[track_caller]
 pub fn collect_indexed_tiny_tasks<R, F>(plan: &JobPlan, n: usize, f: F) -> Vec<R>
 where
@@ -2597,7 +2597,7 @@ where
 /// publishes the average to the caller's
 /// [`crate::sched::call_site::CallSiteState`]. Subsequent calls
 /// read it: if observed average is below the calibrated
-/// trivial-reduce ceiling AND input is large enough for clean
+/// trivial-reduce ceiling and input is large enough for clean
 /// chunks above MIN_LEAF_ITEMS, flat-fanout fires. Otherwise
 /// bisect.
 ///
@@ -2647,7 +2647,7 @@ where
     // default so chunk-count-parity-with-rayon experiments can run
     // without touching the bench code. Production callers never set
     // this; it's strictly for in-source investigation. Reference
-    // rayon chunk counts on 16M-byte inputs (bench audit 2026-06-17):
+    // rayon chunk counts on 16M-byte inputs:
     //   histogram   par_chunks(1MB)   -> 16 chunks
     //   word_count  par_chunks(256KB) -> 64 chunks
     //   kmeans      par_chunks(8KB)   -> 98 chunks
@@ -2659,24 +2659,24 @@ where
         _ => workers.saturating_mul(multiplier).max(1),
     };
 
-    // OOB CALIBRATION: time ONE reduce call on the bench thread
+    // Out-of-band calibration: time one reduce call on the bench thread
     // (never on workers, to avoid the wait-loop recursion +
     // measure_reduce stack-overflow problem documented in
     // reduce_inner). Bounded at MAX_SAMPLES; after convergence,
     // overhead drops to zero (the if-branch is skipped).
     //
-    // CRITICAL: time reduce of representative folded accumulators,
+    // Time the reduce over representative folded accumulators,
     // not reduce of init() pairs. Naive reduce(init(), init())
-    // measures EMPTY-input cost which is O(0) for HashMap-merge
+    // measures empty-input cost which is O(0) for HashMap-merge
     // reducers (word_count) and similar collection-shaped
-    // accumulators -- it classifies them as TRIVIAL and routes
+    // accumulators -- it classifies them as trivial and routes
     // them to flat-fanout, which kills their perf because the
     // tree-reduce final stage merges fully-populated maps
     // serially-on-leaves rather than via bisect's natural
     // parallel-merge along the recursion unwind.
     //
     // Folding a small CAL_SLICE_LEN sample produces accumulators
-    // with REAL populated state, then reduce times the actual
+    // with genuinely populated state, then reduce times the actual
     // merge cost. Total bench-thread overhead: 16 samples * (fold
     // cost over CAL_SLICE_LEN items + reduce of two populated
     // values). For histogram: ~16 * 2us = 32us total. For
@@ -2701,7 +2701,7 @@ where
         .reduce_cost_avg_cycles()
         .is_some_and(|avg_cycles| avg_cycles < trivial_reduce_cycles_threshold);
 
-    // ADAPTIVE FAST PATH (gated): trivial reduce + large input
+    // Adaptive fast path (gated): trivial reduce + large input
     // -> flat fan-out. Audit found this path consistently slower
     // than bisect for the three characterized reduce_chunks
     // workloads because cooperative_join_n_flat's external_dispatch
@@ -2736,7 +2736,7 @@ where
 pub enum ReduceChunksPath {
     /// `reduce_chunks_flat` (`cooperative_join_n_flat` + parallel
     /// tree-reduce). Picked when observer classifies reduce as
-    /// trivial AND input is large enough for clean chunks.
+    /// trivial and input is large enough for clean chunks.
     Flat,
     /// `reduce_inner` (recursive bisect). Default; picked when
     /// observer hasn't converged yet OR observed reduce is
@@ -3044,7 +3044,7 @@ mod tests {
         // Correctness baseline for the two BisectVariant entries:
         // same input through default (None, the lazy-steal path) and
         // through each variant must produce the same output. Forces n large enough that the probe-and-decide
-        // path does NOT fire (`n >= workers * MIN_LEAF_ITEMS` with
+        // path does not fire (`n >= workers * MIN_LEAF_ITEMS` with
         // workers ~16 and MIN_LEAF_ITEMS=256 -> n >= 4096). At n=20000
         // every variant exercises the bisect path it routes through.
         let n = 20_000usize;
@@ -3125,7 +3125,7 @@ mod tests {
         );
         let calling_thread = std::thread::current().id();
         let total_processed = AtomicUsize::new(0);
-        // Violations are collected and asserted AFTER the dispatch
+        // Violations are collected and asserted after the dispatch
         // returns: a panic inside a pool-worker leaf is re-raised on
         // the test thread with its message swallowed by the pool's
         // propagation, which hides the diagnostic snapshot.
@@ -3377,7 +3377,7 @@ mod tests {
 
     #[test]
     fn bench_audit_explicit_heavy_reduce_routes_to_bisect() {
-        // EXPLICIT-COST audit: the reduce closure busy-spins for
+        // Explicit-cost audit: the reduce closure busy-spins for
         // ~50us, comfortably above the trivial-reduce ceiling
         // regardless of input shape, build profile (debug vs
         // release), or cold-vs-warm worker state. This is the only
@@ -3438,7 +3438,7 @@ mod tests {
                 |acc, chunk| acc + chunk.iter().map(|&x| x as u64).sum::<u64>(),
                 |a, b| {
                     // ~50 us simulated heavy reduce. Observer
-                    // should classify > TRIVIAL threshold and
+                    // should classify above the trivial threshold and
                     // keep call site on bisect path.
                     let t0 = read_tsc();
                     while read_tsc().wrapping_sub(t0) < 150_000 {
@@ -3459,7 +3459,7 @@ mod tests {
         // for_each_chunk run with N > MIN_LEAF_ITEMS, the LEAF_COUNT
         // must be >= 1 (at least one leaf fires) and SUM_NS must be
         // strictly positive (every leaf body takes some non-zero
-        // time). Run this AFTER a reset so the counts are this
+        // time). Run this following a reset so the counts are this
         // call's contribution alone.
         use crate::sched::split_observer::{
             acquire_test_lock, reset_leaf_stats, snapshot_leaf_stats,

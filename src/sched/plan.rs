@@ -53,7 +53,7 @@ pub enum BisectVariant {
     /// `ComputeBatchAdaptive` and `batch_size >= 50_000`.
     ProducerMaxLenWorkers,
     /// **Rayon-style replenish**: start with `leaves_per_worker = 1`
-    /// AND, on each observed steal in `bisect`, replenish to
+    /// and, on each observed steal in `bisect`, replenish to
     /// `MAX(workers, splits / 2)` instead of the default
     /// `max_budget`. Mirrors `rayon-1.12.0`'s `Splitter::try_split`
     /// formula (`splits = max(thread_count, splits / 2)`).
@@ -134,7 +134,7 @@ pub struct JobPlan {
     /// The probe-and-decide path in `for_each_chunk` consults this
     /// flag: classifier defaults are routing hints (good enough for
     /// most workloads) but not authoritative per-item-cost truth.
-    /// When the caller did not give an explicit hint AND N is small
+    /// When the caller did not give an explicit hint and N is small
     /// enough that the wrong default would cost real wall-clock,
     /// the probe path measures actual per-element cost and overrides.
     pub estimated_per_item_ns_explicit: bool,
@@ -174,7 +174,7 @@ pub struct JobPlan {
     ///   the matmul shape is too small for SIMD batching to amortize.
     ///
     /// Gating: callers should set this only when `b.cols >= 2^log2`
-    /// AND the `FpN<N>` width supports SIMD slice ops (N in
+    /// and the `FpN<N>` width supports SIMD slice ops (N in
     /// {4, 8, 16, 32}). Otherwise the kernel falls back to scalar.
     pub k_inner_log2: Option<u8>,
     /// Backend hint: which dispatch target to route this job to.
@@ -246,7 +246,7 @@ pub struct JobPlan {
     /// (default), the right-half always goes to the regular deque
     /// so the broad pool can steal.
     ///
-    /// Workload guide (Zen+ R7 2700 realistic_bench, 2026-06-06):
+    /// Workload guide (Zen+ R7 2700 realistic_bench):
     /// - Latency-bound chains (sqrt, div, transcendentals): `false`.
     ///   These benefit from broad work-stealing across all primaries;
     ///   pinning the right-half to one SMT pair concentrates load
@@ -284,7 +284,7 @@ pub struct JobPlan {
     ///
     /// - `Some(DequeTier::SmtLocal)`: pin to SMT-sibling local
     ///   deque. Only the SMT sibling can steal. Use when the
-    ///   right-half captured state is L1d-warm AND the sibling is
+    ///   right-half captured state is L1d-warm and the sibling is
     ///   expected to be the consumer (recursive splits handing off
     ///   to the same physical core).
     /// - `Some(DequeTier::IntraCcx)`: pin to intra-CCX. Cluster
@@ -341,7 +341,7 @@ pub struct JobPlan {
     /// Per-call-site adaptive state
     /// ([`crate::sched::call_site::CallSiteState`]) this dispatch
     /// records into and reads learned decisions from. Generic
-    /// dispatch entries attach the state resolved from the CALLER's
+    /// dispatch entries attach the state resolved from the caller's
     /// source location (`track_caller` chain +
     /// [`crate::sched::call_site::caller_site`]) via
     /// [`Self::with_site_if_none`]; callers can pin an explicit
@@ -418,7 +418,7 @@ impl JobPlan {
     /// primitive to call, not which internal flag the plan carries.
     ///
     /// Power users that have already set specific knobs via other
-    /// `with_*` builders should call this BEFORE those builders -
+    /// `with_*` builders should call this ahead of those builders -
     /// this method overwrites k_gating / use_mailbox_routing /
     /// oversubscription_log2 with shape-derived values.
     pub fn with_workload_shape(
@@ -720,7 +720,7 @@ impl JobPlan {
     }
 
     /// Re-derive the profile-driven knobs from this plan's site's
-    /// LEARNED class, when (a) the caller pinned nothing and (b) the
+    /// learned class, when (a) the caller pinned nothing and (b) the
     /// site has classified itself. Returns the plan unchanged
     /// otherwise. Called at the top of the generic dispatch entries
     /// after [`Self::with_site_if_none`], so repeat dispatches from
@@ -974,7 +974,7 @@ impl JobPlan {
     ///
     /// - If the plan explicitly sets `use_smt = false`, returns
     ///   `false` (no observer signal re-enables SMT).
-    /// - If the plan sets `use_smt = true` AND the observer has
+    /// - If the plan sets `use_smt = true` and the observer has
     ///   recorded measured per-leaf time variance with low cv^2
     ///   (per-mille < 50, i.e. nearly uniform leaves), returns
     ///   `false`. SMT siblings contest the same execution unit
@@ -984,7 +984,7 @@ impl JobPlan {
     /// The variance signal prefers this plan's per-call-site
     /// history when a site is attached and has recorded at least 4
     /// leaves, so a uniform-cost closure gets SMT suppressed from
-    /// ITS OWN evidence even when other closures in the process are
+    /// its own evidence even when other closures in the process are
     /// high-variance. Site-less plans consult the process-wide
     /// counters. The first call at any site sees no variance
     /// history and pays the SMT cost; subsequent calls converge
@@ -1129,7 +1129,7 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
     // Caller-explicit parallelism opt-in: if the caller has set a
     // leaf-shape hint (LeafShape::PortCompute, LatencyCompute,
     // etc.) via the `with_leaf_shape` builder, the workload is
-    // NOT a BigFloat-tier op for which K_outer characterizes per-
+    // not a BigFloat-tier op for which K_outer characterizes per-
     // op cost. Treat the leaf-shape signal as authoritative:
     // route to the worker pool whenever the batch can plausibly
     // amortize dispatch (>= 8 items as a floor; per-item shape
@@ -1140,7 +1140,7 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
     // defeating the entire point of constructing the plan via the
     // closing-loop classifier.
     //
-    // We deliberately check ONLY `leaf_shape`. The other plan
+    // We deliberately check only `leaf_shape`. The other plan
     // fields that look like they signal intent (`bisect_variant`,
     // `estimated_per_item_ns`) are auto-populated by
     // `JobPlan::new` via the static classifier and the per-arch
@@ -1175,7 +1175,7 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
         };
     }
     // Heavy-per-item small-N override: when the caller has supplied a
-    // per-item cost hint AND predicted total work exceeds the
+    // per-item cost hint and predicted total work exceeds the
     // dispatch breakeven (~50us), promote out of Inline regardless of
     // batch_size. The N >= 256 / N >= 32 floors below were tuned for
     // workloads where per_item ~ 10ns to ~1us. For per_item ~ 10us+
@@ -1207,7 +1207,7 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
     match base {
         SchedTier::Inline => {
             // K <= 4 (n_limbs <= 16) per-op cost is ~50ns-2us.
-            // Promote to Local when the BATCH is large enough that
+            // Promote to Local when the batch is large enough that
             // aggregate parallel-iteration work amortizes dispatch,
             // OR when the caller's heavy-per-item override fires.
             //
@@ -1238,7 +1238,7 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
             }
         }
         SchedTier::Local => {
-            // Small batch falls back to Inline UNLESS one of:
+            // Small batch falls back to Inline unless one of:
             //   - heavy_override fired (explicit ns hint says total
             //     work >= 50us)
             //   - classifier set use_smt=true (LatencyBound profile,
@@ -1446,7 +1446,7 @@ mod tests {
     #[test]
     fn pick_tier_inline_for_small_batch_local_k() {
         let topo = NumaTopology::fallback();
-        // PortBound profile (NOT LatencyBound) so the small-batch
+        // PortBound profile rather than LatencyBound, so the small-batch
         // inline-fallback fires. JobPlan::new(6, 16) without an ns
         // hint now routes through the no-hint classifier fallback
         // which maps batch_size<=32 to LatencyBound on the
@@ -1600,7 +1600,7 @@ mod tests {
     fn pick_tier_federated_for_large_k() {
         let topo = NumaTopology::fallback();
         let plan = JobPlan::new(13, 1);
-        // Federated does NOT collapse on batch_size; large K is its
+        // Federated does not collapse on batch_size; large K is its
         // own concern (single op may take milliseconds).
         assert_eq!(pick_tier(&plan, &topo), SchedTier::Federated);
     }

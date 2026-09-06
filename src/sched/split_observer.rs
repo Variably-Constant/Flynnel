@@ -212,7 +212,7 @@ pub fn snapshot_leaf_stats() -> LeafStats {
 /// batches, NMFD repeated calls) use the OBSERVED mean to pick
 /// a sharper granularity.
 ///
-/// Returns the leaf-level mean, NOT the per-item mean: observer
+/// Returns the leaf-level mean rather than the per-item mean: observer
 /// does not track items-per-leaf, so callers compare against
 /// per-leaf overhead thresholds rather than dividing by leaf size.
 #[inline]
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn split_multiplier_starts_at_baseline_two() {
-        // Test isolation: this test reads the GLOBAL atomic so
+        // Test isolation: this test reads the process-global atomic so
         // run-order can affect it. Allow either 2 (baseline) or
         // whatever set_split_multiplier left it at from earlier
         // tests in the same process.

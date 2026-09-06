@@ -28,7 +28,7 @@
 //!   slot = buffer[b mod cap]
 //!   spin until slot.seq.load(Acquire) == b      // last round released
 //!   write slot.body                              // items + metadata
-//!   slot.seq.store(b + 1, Release)               // PUBLISH
+//!   slot.seq.store(b + 1, Release)               // publish
 //!   bottom.store(b + 1, Relaxed)                 // emptiness hint
 //!
 //! Thief steal:
@@ -38,7 +38,7 @@
 //!   if head.cas(t, t+1, Acquire, Relaxed) fails: return Retry
 //!   spin until slot[t].seq.load(Acquire) == t + 1   // wait for publish
 //!   items = read slot[t].body
-//!   slot[t].seq.store(t + capacity, Release)     // RELEASE for next round
+//!   slot[t].seq.store(t + capacity, Release)     // release for next round
 //!   return Success(items)
 //! ```
 //!

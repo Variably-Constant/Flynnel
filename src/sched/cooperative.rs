@@ -232,11 +232,11 @@ where
 /// Mailbox-distribute variant of [`cooperative_join_n_flat`]. Each
 /// child closure routes directly to a SPECIFIC peer's mailbox via
 /// owner-directed distribution (URD-style); the target worker
-/// drains its mailbox FIRST in `find_work`, so each closure starts
+/// drains its mailbox at the head of `find_work`, so each closure starts
 /// on its assigned core with zero shared-deque CAS contention.
 ///
 /// **Use when:** the workload is N uniform-cost independent
-/// closures (canonical SIMC pattern) AND N >= 3. The mailbox path
+/// closures (canonical SIMC pattern) and N >= 3. The mailbox path
 /// is the SIMC primitive's structural fit per the Flynn-axis
 /// taxonomy (`SIMC = cooperative_join_n + owner-directed
 /// distribution`).
@@ -317,7 +317,7 @@ pub enum FanOutMode {
     /// mailbox via `WorkerCtx::push_to_mailbox`. Target rotates
     /// starting at `caller.index + 1` (the SMT sibling on the
     /// standard enumeration), skipping self, wrapping around.
-    /// The target worker drains its mailbox FIRST in `find_work`,
+    /// The target worker drains its mailbox at the head of `find_work`,
     /// so each closure starts on its assigned core with zero
     /// shared-deque CAS contention. URD-style owner-directed
     /// distribution back-ported in-process.

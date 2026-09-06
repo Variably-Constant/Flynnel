@@ -1,4 +1,4 @@
-//! Multi-peer group: N GPU peers under ONE handle namespace, or used
+//! Multi-peer group: N GPU peers under one handle namespace, or used
 //! individually - both from the same type.
 //!
 //! Each peer owns its own region, lanes, calibration, and resident

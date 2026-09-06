@@ -3,7 +3,7 @@
 //! The GPU side of this contract lives in `kernels/gpu_peer.cu` as
 //! `#define` offsets; the values here MUST stay in lockstep with that
 //! file (the unit tests at the bottom pin every one of them). All
-//! cross-device state is addressed by BYTE OFFSET from the region
+//! cross-device state is addressed by byte offset from the region
 //! base - never by raw pointer - because the CPU and GPU observe the
 //! region at different virtual addresses (`cudaHostGetDevicePointer`
 //! translation) and other processes at yet another.
@@ -133,7 +133,7 @@ pub const OP_SUM_U32: u32 = 2;
 pub const OP_H2V: u32 = 3;
 /// Opcode: download the named VRAM block into the payload at +8.
 pub const OP_V2H: u32 = 4;
-/// Opcode: add 1.0 to every f32 of the named RESIDENT block. The
+/// Opcode: add 1.0 to every f32 of the named resident block. The
 /// task moves only the 8-byte params - the data stays in VRAM.
 pub const OP_ADD1_F32_V: u32 = 5;
 /// Opcode: sum the named resident block's u32s; u64 result lands in

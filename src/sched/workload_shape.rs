@@ -26,7 +26,7 @@
 //!
 //! ## Mapping vs the existing K-axis hints
 //!
-//! [`WorkloadShape`] is the HIGH-LEVEL API. Internally it maps to
+//! [`WorkloadShape`] is the high-level API. Internally it maps to
 //! the existing low-level hints already on `JobPlan`:
 //! - `k_gating`: which publication signal protocol
 //! - `use_mailbox_routing`: SIMC owner-directed hand-off

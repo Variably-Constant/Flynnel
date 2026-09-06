@@ -209,7 +209,7 @@ impl JobRef {
     /// Project this `JobRef` to a `CompactJobRef` (16 bytes: just
     /// the pointer + execute fn). Used by K_inner=3 slot variants
     /// (Fcl/KHL) where the per-slot metadata (k_outer / numa_hint /
-    /// variant) is carried in the SLOT HEADER rather than repeated
+    /// variant) is carried in the slot header rather than repeated
     /// per-job. The handoff trade-off: a slot's three jobs share
     /// metadata (which is true for the common recursive-split case
     /// where children inherit the parent's k_outer / variant); the
@@ -517,7 +517,7 @@ where
         // both the Ok and Panic paths; no separate abort guard is
         // needed because the panic cannot escape this frame.
         let result = JobResult::capture(func, true /* stolen */);
-        // Write the result BEFORE setting the latch: the joining
+        // Write the result before setting the latch: the joining
         // thread relies on AcqRel ordering established by the
         // latch's set() to observe this store.
         //
@@ -539,7 +539,7 @@ where
 }
 
 /// Variant of [`StackJob`] that holds its latch as an `Arc<L>`
-/// instead of owning it inline. Use when N publishers share ONE
+/// instead of owning it inline. Use when N publishers share a single
 /// latch (the canonical CountLatch pattern in `fan_out_in_worker`).
 ///
 /// # Why a sibling type rather than a generic field
@@ -584,7 +584,7 @@ where
 {
     /// Construct a `StackJobShared` for the given closure that will
     /// publish to `latch` on completion. The `Arc<L>` clone count
-    /// rises by ONE for each StackJobShared constructed.
+    /// rises by one for each StackJobShared constructed.
     pub(crate) fn new(func: F, latch: std::sync::Arc<L>) -> Self {
         Self {
             latch,
@@ -646,7 +646,7 @@ where
         // SAFETY: single-execute contract on `Job::execute`.
         let func = unsafe { (*this.func.get()).take() }.expect("closure already taken");
         let result = JobResult::capture(func, true);
-        // Write the result BEFORE setting the latch (same ordering
+        // Write the result before setting the latch (same ordering
         // requirement as StackJob: parent observes via Acquire half
         // of the latch publish).
         //
@@ -658,7 +658,7 @@ where
         // the setter must not touch *this anymore (parent may have
         // dropped this StackJobShared). Both CountLatch::set and
         // SpinLatch::set honor that contract by reading every
-        // *this field BEFORE their publishing CoreLatch::set call.
+        // *this field before their publishing CoreLatch::set call.
         let latch_ptr: *const L = std::sync::Arc::as_ptr(&this.latch);
         // SAFETY: latch_ptr is valid because the Arc clone in
         // *this is alive at the call site. The latch impl honors
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn stack_job_shared_executes_and_sets_shared_latch() {
-        // N=3 participants share ONE CountLatch via Arc. Each call
+        // N=3 participants share a single CountLatch via Arc. Each call
         // to execute() decrements; the third decrement publishes.
         use crate::sched::latch::CountLatch;
         use crate::sched::sleep::Parker;

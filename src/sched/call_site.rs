@@ -56,7 +56,7 @@ const ARM_TRIAL_CADENCE: u32 = 16;
 const ARM_MIN_SAMPLES: u32 = 3;
 
 /// Placement re-probe cadence: every Nth call in a warm size bucket
-/// runs BOTH sides again so the model tracks drift (thermal
+/// runs both sides again so the model tracks drift (thermal
 /// throttling, contention) instead of freezing on stale data.
 const PLACEMENT_REPROBE_CADENCE: u32 = 32;
 
@@ -425,7 +425,7 @@ impl CallSiteState {
     /// 1. Either arm below [`ARM_MIN_SAMPLES`]: pick the
     ///    lesser-sampled arm (bounded exploration).
     /// 2. Every [`ARM_TRIAL_CADENCE`]th call: pick the arm the EWMA
-    ///    comparison does NOT prefer (drift detection).
+    ///    comparison does not prefer (drift detection).
     /// 3. Otherwise: the arm with the lower EWMA wall time.
     pub fn choose_arm(&self, alternative_allowed: bool) -> PolicyArm {
         if !alternative_allowed {

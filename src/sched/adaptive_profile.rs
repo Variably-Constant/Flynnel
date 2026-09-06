@@ -2,7 +2,7 @@
 //!
 //! The K_gating adaptive pattern proven in
 //! [`crate::sched::adaptive_worker`] generalizes to ANY routing
-//! decision that's consulted ONCE per dispatch (not per push/pop).
+//! decision that's consulted once per dispatch (not per push/pop).
 //! DispatchProfile is the canonical example: it drives `use_smt`,
 //! `oversubscription_log2`, `estimated_per_item_ns`,
 //! `use_mailbox_routing`, and `deque_tier_hint` - all of which are
@@ -624,7 +624,7 @@ pub fn infer_class_static_with_shape(
         if (ns as u64) >= t.port_heavy_ns.load(Ordering::Relaxed) {
             return WorkloadClass::MemoryBound;
         }
-        // Light per-item but BIG total batch: bulk bandwidth-bound
+        // Light per-item but a large total batch: bulk bandwidth-bound
         // streaming work over a >= 64 KiB-equivalent batch is the
         // signature pattern of byte scans, image kernels, and
         // histogram-style accumulators.
@@ -643,7 +643,7 @@ pub fn infer_class_static_with_shape(
         return WorkloadClass::Streaming;
     }
     // Small batch (<=32) without a ns hint is most often a small
-    // collection of HEAVY items: NMFD batches, ML inference passes,
+    // collection of heavy items: NMFD batches, ML inference passes,
     // image-tile transforms, recursive algorithm fan-outs. The
     // failure mode of routing these to PortBound (SMT-off, primaries
     // only) is that the worker pool is half-width and the user sees
@@ -745,7 +745,7 @@ pub(crate) fn class_bucket_distance(a: WorkloadClass, b: WorkloadClass) -> u8 {
 
 /// Tag of the WorkloadClass that the LAST auto-classifier tick
 /// produced. When this matches for [`AUTO_MIGRATION_HYSTERESIS`]
-/// consecutive ticks AND differs from the active class, the
+/// consecutive ticks and differs from the active class, the
 /// observer fires [`migrate_workload_class`].
 static AUTO_PENDING_TAG: AtomicU8 = AtomicU8::new(TAG_PORT_BOUND);
 
@@ -769,12 +769,12 @@ static AUTO_LAST_SUMSQ: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// One tick of the closing-loop observer. Reads the global leaf
-/// stats, computes the DELTA since the last tick, runs
+/// stats, computes the delta since the last tick, runs
 /// [`classify_observed`] on the delta window, and migrates the
 /// active workload class once the same observation has been
 /// confirmed [`AUTO_MIGRATION_HYSTERESIS`] times in a row.
 ///
-/// Does NOT reset the global stats -- tests and cv^2 readers see
+/// Does not reset the global stats -- tests and cv^2 readers see
 /// the full cumulative counters. The "fresh window per tick"
 /// behavior comes from comparing the current snapshot against the
 /// AUTO_LAST_* snapshot stored on the prior tick.
@@ -815,7 +815,7 @@ pub fn tick_auto_classify() {
 
     let active = active_workload_class();
     // Fast-adapt path: if the observed class is FAR from active
-    // (bucket distance >= 2) AND the delta window has enough
+    // (bucket distance >= 2) and the delta window has enough
     // samples (>= 64) to be statistically meaningful, migrate
     // immediately. The sample-count gate prevents single noisy
     // windows from triggering the migration.

@@ -102,7 +102,7 @@ pub fn calibrate_k_gating() -> KGating {
     run_calibration().winner
 }
 
-/// Run the calibration AND return the timing data. Useful for
+/// Run the calibration and return the timing data. Useful for
 /// users that want to log or inspect the per-primitive timings.
 pub fn calibrate_k_gating_verbose() -> CalibrationResult {
     run_calibration()

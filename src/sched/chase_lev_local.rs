@@ -115,7 +115,7 @@ impl<T> Drop for Header<T> {
     }
 }
 
-/// Owner half of the deque. Single-owner-writer: only ONE thread
+/// Owner half of the deque. Single-owner-writer: only one thread
 /// may hold a `Worker<T>` at a time. The companion `Stealer<T>`
 /// handles (one or more clones) provide thief-side steal access.
 pub struct Worker<T> {
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn drop_does_not_double_drop_after_pop() {
-        // After a successful pop, the consumed slot must NOT be
+        // After a successful pop, the consumed slot must not be
         // re-dropped by Header::drop.
         use std::sync::atomic::{AtomicUsize, Ordering as O};
         #[derive(Debug)]

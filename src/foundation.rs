@@ -158,7 +158,7 @@ pub enum HwClass {
     /// AVX10.2, the versioned converged vector ISA: 512-bit
     /// guaranteed on every core including E-cores, bf16 arithmetic,
     /// FP8 converts, VMINMAX. Detect via CPUID leaf 0x24's version
-    /// field, NOT the discrete flag zoo the AVX-512 era needed.
+    /// field, not the discrete flag zoo the AVX-512 era needed.
     Avx10_2,
     /// ARMv8 NEON.
     Neon,

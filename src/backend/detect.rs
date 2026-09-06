@@ -78,7 +78,7 @@ pub fn metal_available() -> bool {
 }
 
 /// True when a Google TPU or Coral Edge TPU device is visible.
-/// Checks `TPU_NAME` env (set by Google Cloud TPU VM images) AND
+/// Checks `TPU_NAME` env (set by Google Cloud TPU VM images) and
 /// device-file presence (`/dev/accel0` for vfio-bound TPUs;
 /// `/dev/apex_0` for Coral Edge TPUs). Cached per process.
 pub fn tpu_available() -> bool {

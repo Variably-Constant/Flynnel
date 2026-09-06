@@ -120,7 +120,7 @@ impl NumaArena {
             let phys_in_node = (cpus_in_node.len() / smt).max(1);
             let primary_count = workers_per_node.unwrap_or(phys_in_node);
             // SMT extension: spawn one sibling per primary when SMT
-            // is detected on this host AND primaries don't already
+            // is detected on this host and primaries don't already
             // cover the node's logical-thread count. Siblings start
             // parked and wake when a plan with `use_smt = true` is
             // dispatched. When primaries already equal logical

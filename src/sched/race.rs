@@ -174,7 +174,7 @@ where
         .expect("at least Correct must have completed")
 }
 
-/// Parallel explore-and-select: MIMD dispatch where EVERY explorer
+/// Parallel explore-and-select: MIMD dispatch where every explorer
 /// runs to completion and a caller comparator picks the winner by
 /// result quality. The complement of [`race_variants`] (see the
 /// module docs' "Two racing contracts").
@@ -344,7 +344,7 @@ pub enum Settled<P, R> {
 /// `None` when it gives up. First `Some` wins and fires the shared
 /// cancel; if both give up, the result is [`Settled::Unsettled`].
 /// So this is not [`race_variants`] with two arms: there the tiers
-/// compute the SAME answer at different accuracies, whereas here the
+/// compute the same answer at different accuracies, whereas here the
 /// two sides seek OPPOSITE conclusions and either one is decisive.
 #[track_caller]
 pub fn race_refute<P, R, FP, FR>(plan: &JobPlan, prove: FP, refute: FR) -> Settled<P, R>
@@ -836,9 +836,9 @@ mod tests {
 
     #[test]
     fn explore_select_runs_every_explorer_to_completion() {
-        // THE distinguishing property vs race_variants: nothing is
+        // The distinguishing property against race_variants: nothing is
         // canceled. Every explorer must execute exactly once even
-        // though only one is selected - the fast explorers do NOT
+        // though only one is selected - the fast explorers do not
         // short-circuit the slow one that ultimately wins.
         let plan = JobPlan::new(6, 16);
         let ran = Arc::new(AtomicU32::new(0));

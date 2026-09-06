@@ -92,7 +92,7 @@ impl AdaptiveDispatcher {
 
     /// Builder: install a declarative workload-shape hint. The
     /// shape selects which Flynn-axis primitive the framework
-    /// routes to AND the low-level K-axis knobs (K_gating,
+    /// routes to and the low-level K-axis knobs (K_gating,
     /// mailbox routing, oversubscription) via
     /// [`WorkloadShape::hints`].
     #[inline]
@@ -180,7 +180,7 @@ impl AdaptiveDispatcher {
     /// SIMC/MIMC dispatch with mailbox routing: variant of
     /// `execute_cooperative` that hands each closure directly to
     /// a specific worker's mailbox (URD-style owner-directed
-    /// distribution). Use when N >= n_workers AND closures are
+    /// distribution). Use when N >= n_workers and closures are
     /// uniform-cost. Internally gated to demote to deque mode
     /// when N < n_workers.
     pub fn execute_cooperative_mailbox<R>(
@@ -332,7 +332,7 @@ impl AdaptiveDispatcher {
     /// Builder: install a declarative WorkloadClass hint. Sets the
     /// underlying DispatchProfile on the JobPlan that this
     /// dispatcher constructs. The plan-level profile takes
-    /// precedence over the global active profile for THIS
+    /// precedence over the global active profile for this
     /// dispatch only; subsequent dispatchers without the explicit
     /// class still read the global active tag.
     #[inline]

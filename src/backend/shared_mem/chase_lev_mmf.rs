@@ -720,7 +720,7 @@ mod tests {
         d.push(dummy_slot(1, 0)).expect("push 1");
         d.push(dummy_slot(2, 0)).expect("push 2");
         let (t0, b0, sz0) = d.snapshot_size();
-        // Prefetch is purely a CPU hint; it MUST NOT change the
+        // Prefetch is purely a CPU hint; it must not change the
         // observable deque state.
         for _ in 0..16 {
             d.prefetch_for_steal();

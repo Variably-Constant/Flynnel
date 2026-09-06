@@ -1,4 +1,4 @@
-//! One model for data residence AND execution side.
+//! One model for data residence and execution side.
 //!
 //! [`hybrid_auto_resident`] routes each call through the SAME
 //! per-call-site, per-size-bucket placement EWMAs the crate-level

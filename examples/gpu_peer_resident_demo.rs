@@ -46,7 +46,7 @@ fn main() {
     let lanes_used: Vec<u32> = handles.iter().map(|h| h.lane()).collect();
     println!("[1] pinned 4 x {bytes} B blocks on lanes {lanes_used:?}");
 
-    // RESIDENT path: 8,000 tasks round-robined over the 4 handles,
+    // Resident path: 8,000 tasks round-robined over the 4 handles,
     // pipelined. Per-task bus traffic: 8 B of params.
     let tasks = 8_000usize;
     let per_handle = tasks / handles.len();
@@ -84,7 +84,7 @@ fn main() {
     println!("[2] RESIDENT: {tasks} tasks | {:.0} tasks/s | {res_per:.2} us/task | {} B/task on the bus | VERIFIED",
              tasks as f64 / dt_res.as_secs_f64(), RESIDENT_PARAMS_BYTES);
 
-    // SHIPPED-EVERY-TASK baseline: identical lanes, window, and
+    // Shipped-every-task baseline: identical lanes, window, and
     // computation, but the 64 KB payload crosses the bus both ways
     // on every task (submit copies it out; completion is read back).
     let base_tasks = 2_000usize;

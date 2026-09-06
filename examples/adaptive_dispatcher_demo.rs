@@ -203,7 +203,7 @@ fn main() {
         m3, dispatcher.active_dispatch_profile());
 
     // Verify per-call class override takes precedence over global
-    // AND actually dispatches: hold global at Compute (PortBound)
+    // and actually dispatches: hold global at Compute (PortBound)
     // and exercise `with_workload_class(Heavy)` across all four
     // WorkloadShape variants. Each dispatch should see the Heavy
     // override applied to its built JobPlan (use_smt=true,
@@ -285,7 +285,7 @@ fn main() {
     println!("      [6d] Cooperative{{n_cores:16}} + Heavy override: 16 closures via mailbox; first result={}; global still {:?}",
         r6d[0], dispatcher.active_dispatch_profile());
 
-    // Final check: global was NEVER mutated by any of the four
+    // Final check: global was never mutated by any of the four
     // per-call overrides. This is the contract: with_workload_class
     // is per-dispatcher (per-call), not a global migration.
     assert!(
@@ -302,7 +302,7 @@ fn main() {
     //    CPU is auto-registered; the demo registers Cuda
     //    explicitly under `#[cfg(feature = "cuda-reference")]` so
     //    `migrate -> Cuda{device_id:0}` lands on a real CudaBackend
-    //    when the feature is enabled AND a CUDA driver is present.
+    //    when the feature is enabled and a CUDA driver is present.
     //    On `cargo run --example adaptive_dispatcher_demo --release`
     //    (no feature) the migration still works as the documented
     //    graceful-fallback path - the active-backend tag flips,
@@ -314,7 +314,7 @@ fn main() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // Try to register Cuda when the cuda-reference feature is
-    // compiled in AND the host has a usable CUDA driver. If either
+    // compiled in and the host has a usable CUDA driver. If either
     // is absent, the demo still runs and exercises the fallback
     // path - the print line below makes the registration outcome
     // explicit so users on a CUDA host know whether they engaged
@@ -337,9 +337,9 @@ fn main() {
         false
     };
 
-    // Same pattern for WASM: wasmtime is pure-Rust so WasmBackend::new()
+    // Same pattern for `WASM`: wasmtime is pure-Rust so WasmBackend::new()
     // succeeds anywhere the feature compiles in. Re-run with
-    // --features wasm-reference to engage the real WASM sandbox.
+    // --features wasm-reference to engage the real `WASM` sandbox.
     #[cfg(feature = "wasm-reference")]
     let wasm_registered = match flynnel::backend::wasm::WasmBackend::new() {
         Ok(b) => {
@@ -358,12 +358,12 @@ fn main() {
         false
     };
 
-    // Same pattern for TPU JAX. TpuJaxBackend::new() spawns the
-    // embedded Python+JAX bridge subprocess; on hosts without
+    // Same pattern for `TPU` `JAX`. TpuJaxBackend::new() spawns the
+    // embedded Python and `JAX` bridge subprocess; on hosts without
     // python3 + jax installed, the constructor returns
     // BackendError::DeviceUnavailable and the demo falls back to
     // CPU. Re-run with --features tpu-jax-reference (and python3 +
-    // jax on PATH) to engage the real TPU.
+    // jax on `PATH`) to engage the real `TPU`.
     #[cfg(feature = "tpu-jax-reference")]
     let tpu_registered = match flynnel::backend::tpu_jax::TpuJaxBackend::new() {
         Ok(b) => {
@@ -424,7 +424,7 @@ fn main() {
         println!("    (fell back to CPU because Cuda is not registered on this host)");
     }
 
-    // Same migration story for WASM. The Backend::Wasm variant
+    // Same migration story for `WASM`. The Backend::Wasm variant
     // resolves to the WasmBackend impl if registered above; if
     // wasm-reference is off, resolves to CPU + fell_back=true.
     let t0 = std::time::Instant::now();
@@ -450,7 +450,7 @@ fn main() {
         println!("    (fell back to CPU because Wasm is not registered on this host)");
     }
 
-    // Same migration story for TPU.
+    // Same migration story for `TPU`.
     let t0 = std::time::Instant::now();
     dispatcher.migrate_backend(Backend::Tpu { device_id: 0 });
     let m_tpu = t0.elapsed().as_nanos();

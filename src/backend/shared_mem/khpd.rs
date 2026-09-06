@@ -367,10 +367,10 @@ impl KhpdDeque {
 
     /// Owner-side publish. Drains the pending buffer into one or
     /// more publication lines (`LINE_ITEMS` items per line). Reserves
-    /// the whole batch with ONE `tail.fetch_add(n_lines)` up front,
+    /// the whole batch with a single `tail.fetch_add(n_lines)` up front,
     /// then per-line: waits for `state == STATE_EMPTY`, fills items,
     /// and Release-stores the packed state. Returns the number of
-    /// LINES published.
+    /// lines published.
     pub fn publish(&self) -> Result<usize, PushError> {
         let mut p = self.pending.lock().expect("KHPD pending poisoned");
         if p.is_empty() {
@@ -472,7 +472,7 @@ impl KhpdDeque {
         if !won {
             return Steal::Retry;
         }
-        // We own the line; read items + release state to EMPTY for
+        // We own the line; read items + release state to `EMPTY` for
         // the next round at this physical slot.
         // SAFETY: line is in-bounds + aligned; CAS established
         // exclusive read access.

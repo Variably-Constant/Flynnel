@@ -7,7 +7,7 @@
 //!   per-CPU node membership and `/sys/devices/system/node/nodeN/distance`
 //!   for the SLIT (System Locality Information Table).
 //! - **Windows**: calls `GetLogicalProcessorInformationEx(RelationNumaNode)`
-//!   for node membership. Win32 does NOT expose SLIT, so distances
+//!   for node membership. Win32 does not expose SLIT, so distances
 //!   are filled uniformly: 10 for intra-node, 20 for inter-node.
 //! - **macOS / other**: single-node fallback (Apple M-series is one
 //!   NUMA domain; other platforms get the conservative default).

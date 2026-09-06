@@ -6,7 +6,7 @@
 //! run side-by-side with no data dependency between them). That
 //! is NOT the algorithmically meaningful MIMT shape. The shape
 //! that benefits from a pipelined CPU+GPU primitive is one where
-//! the GPU half consumes outputs the CPU half produced AND feeds
+//! the GPU half consumes outputs the CPU half produced and feeds
 //! the next CPU stage, iterated.
 //!
 //! Three algorithm families fit this shape:

@@ -161,11 +161,11 @@ impl DispatchProfile {
 
     /// Whether SIMC/MIMC mailbox routing fits this profile. The
     /// scheduler auto-routes the right-half of join through the
-    /// SMT-sibling mailbox when this is true AND the sibling has
+    /// SMT-sibling mailbox when this is true and the sibling has
     /// nothing else queued (gated at the call site).
     ///
-    /// **Current measurement (realistic_bench, Zen+ R7 2700,
-    /// 2026-06-06):** NO profile classification wins by routing
+    /// **Measured (realistic_bench, Zen+ R7 2700):** no profile
+    /// classification wins by routing
     /// `for_each_chunk`'s recursive bisection through the SMT-
     /// sibling mailbox. The bisect tree fans out across all
     /// primaries via random-victim peer steal; pinning right-

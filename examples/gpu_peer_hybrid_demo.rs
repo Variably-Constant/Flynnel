@@ -1,10 +1,10 @@
-//! One model for execution side AND data residence.
+//! One model for execution side and data residence.
 //!
 //! Each round, the call site's learned placement model picks CPU or
 //! device for the same logical step over a [`MirrorBuf`]; any
 //! transfer a flip requires is executed inside the timed section, so
 //! the model prices residence and compute together and converges to
-//! the side that wins END TO END on this host.
+//! the side that wins end to end on this host.
 //!
 //! Run with:
 //!   cargo run --release --features gpu-peer --example gpu_peer_hybrid_demo
@@ -51,7 +51,7 @@ fn main() {
     println!("\nplacements: {n_cpu} cpu | {n_dev} device | {n_race} race");
     println!("sequence:   {seq}");
 
-    // THE correctness property: exactly one application per round,
+    // The correctness property: exactly one application per round,
     // through every placement flip and residence transfer.
     let out = mirror.host_bytes(&mut peer).expect("sync host");
     let bad = out

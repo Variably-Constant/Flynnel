@@ -20,7 +20,7 @@
 //!
 //! `cpu_args` / `kernel_args` are separate views (host vs device
 //! pointers); each side touches only its own. Race, reprobe, and
-//! launch-failure fallback run BOTH sides sequentially (kernel
+//! launch-failure fallback run both sides sequentially (kernel
 //! first), so the two impls must compute the same result and
 //! tolerate running twice - the `hybrid_auto` contract. Every
 //! failure lands on the CPU impl.

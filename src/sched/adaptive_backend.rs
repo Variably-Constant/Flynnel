@@ -6,7 +6,7 @@
 //! ## Why backend selection fits the adaptive pattern
 //!
 //! Backend is consulted ONCE per dispatch (at the entry point that
-//! decides which `DispatchBackend` implementation to invoke), NOT
+//! decides which `DispatchBackend` implementation to invoke), not
 //! per push/pop on the deque hot path. So:
 //!
 //! - Per-op cost on the active deque: **zero** (no backend check)
@@ -19,12 +19,12 @@
 //! Registration ([`crate::backend::register_backend`]) and
 //! activation (this module) are separate concerns:
 //!
-//! - **Registration**: makes a backend AVAILABLE via the global
+//! - **Registration**: makes a backend available via the global
 //!   registry. CPU auto-registers; CUDA / TPU / WASM are opt-in
 //!   via Cargo features (consumer calls `register_backend` at
 //!   startup once the runtime is initialized).
 //! - **Activation**: marks one of the registered backends as the
-//!   ACTIVE one for the next dispatch. Adaptive workload-shift
+//!   active one for the next dispatch. Adaptive workload-shift
 //!   signals flip the active backend; the dispatcher consumes the
 //!   active tag at execute-time.
 //!
@@ -120,7 +120,7 @@ pub fn resolve_active_backend() -> (BackendRef, bool) {
 /// value. Per-op cost on the deque hot path: zero (backend is
 /// consulted at execute-entry, not per push/pop).
 ///
-/// The requested backend does NOT need to be registered at
+/// The requested backend does not need to be registered at
 /// migration time; subsequent dispatches gracefully fall back to
 /// CPU via [`resolve_active_backend`] when the target is not
 /// available. This lets the application optimistically set the

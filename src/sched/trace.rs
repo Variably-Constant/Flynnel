@@ -116,7 +116,7 @@ pub fn request_worker_flush() {
 }
 
 thread_local! {
-    /// Whether THIS worker thread has handled the current flush
+    /// Whether this worker thread has handled the current flush
     /// request. Reset whenever a fresh request arrives (i.e. when
     /// the global flag transitions to true while ours is also
     /// true, we re-flush).
@@ -124,7 +124,7 @@ thread_local! {
 }
 
 /// Worker_loop hook: check whether a flush has been requested. If
-/// yes AND this thread hasn't already handled this request, dump
+/// yes and this thread hasn't already handled this request, dump
 /// the trace buffer (tagged with `label`) and mark this thread
 /// done. Returns true if a dump happened.
 pub fn worker_loop_maybe_flush(label: &str) -> bool {
@@ -223,7 +223,7 @@ pub fn register_thread() -> u64 {
     THREAD_ID_GEN.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Dump THIS thread's trace buffer to stderr as CSV. Other workers
+/// Dump the calling thread's trace buffer to stderr as CSV. Other workers
 /// have to flush themselves before the dump can include them; the
 /// worker loop has a "trace dump" path that writes its buffer on
 /// demand.

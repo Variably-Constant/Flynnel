@@ -81,7 +81,7 @@ fn main() {
     // the first dispatch pays pool-init costs that pollute the trace.
     let _warmup = grep_flynnel(&plan, &haystack);
 
-    // -- MEASURED FLYNNEL DISPATCH --
+    // -- measured flynnel dispatch --
     let t0 = std::time::Instant::now();
     let n_flyn = grep_flynnel(&plan, &haystack);
     let flyn_ns = t0.elapsed().as_nanos() as u64;

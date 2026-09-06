@@ -59,7 +59,7 @@ use crate::sched::k_gating::KGating;
 use crate::sched::sleep::Parker;
 
 /// Per-worker mailbox capacity. Bounded because mailbox is a
-/// LOCALITY HINT primitive, not a deque substitute - if the
+/// Locality-hint primitive, not a deque substitute - if the
 /// mailbox fills, push_to_mailbox returns Err and the caller falls
 /// back to a regular tiered push. 16 slots covers small recursive-
 /// split bursts targeting the same SMT sibling.
@@ -70,8 +70,8 @@ const MAILBOX_CAPACITY: usize = 16;
 //
 // Rayon's central perf trick (rayon-core/src/registry.rs:411-423 +
 // join/mod.rs:132-172): when `join(a, b)` is called from inside a
-// worker thread, push the right-half job onto THAT worker's own local
-// Chase-Lev deque, NOT into the shared Injector. The local deque is
+// worker thread, push the right-half job onto that worker's own local
+// Chase-Lev deque rather than into the shared Injector. The local deque is
 // single-owner-writer LIFO; push/pop costs are a handful of nanoseconds
 // because the only atomic involved is the owner-side index. The
 // Injector is a global MPMC queue with retry loops; its push costs
@@ -100,7 +100,7 @@ pub(crate) struct WorkerCtx {
     /// read via the corresponding `AdaptiveStealer` in
     /// [`Self::stealers`].
     ///
-    /// Each [`AdaptiveWorker`] carries BOTH K_gating backings
+    /// Each [`AdaptiveWorker`] carries both K_gating backings
     /// (KHL PerSlot + Fcl CounterOnly) and routes per-push via an
     /// AtomicU32 active tag - per-op overhead measured at 0 ns
     /// (the AtomicU32 Acquire load on x86 lowers to a plain MOV;
@@ -117,7 +117,7 @@ pub(crate) struct WorkerCtx {
     pub(crate) index: usize,
     /// Count of burst pushes since the last `flush_all` call. The
     /// burst path (`push_tier_burst`) skips per-push JEC wake; the
-    /// flush emits ONE batched wake covering this count. Reset to
+    /// flush emits one batched wake covering this count. Reset to
     /// 0 inside `flush_all`. Owner-private (Cell).
     pub(crate) burst_pushed: Cell<u32>,
     /// Per-peer, per-tier stealer matrix. Each entry is an
@@ -126,7 +126,7 @@ pub(crate) struct WorkerCtx {
     /// the matching backing.
     pub(crate) stealers: Vec<[AdaptiveStealer; N_TIERS]>,
     /// Thief-side adaptive batch stash. Holds K_inner=3 batch
-    /// leftovers from EITHER KHL or Fcl backing (one stash slot
+    /// leftovers from either KHL or Fcl backing (one stash slot
     /// per backing inside [`AdaptiveStash`]).
     pub(crate) steal_stash: core::cell::UnsafeCell<AdaptiveStash>,
     /// Cluster size (logical CPUs per CCX) used by
@@ -136,7 +136,7 @@ pub(crate) struct WorkerCtx {
     pub(crate) ccx_size: usize,
     /// Per-worker mailbox for owner-directed work hand-off (URD-style
     /// SIMC/MIMC routing). The owner reads on every `find_work`
-    /// pass BEFORE the deque tiers - mailbox jobs are the most-
+    /// pass ahead of the deque tiers - mailbox jobs are the most-
     /// locality-warm work this worker has been given.
     ///
     /// Any peer may write via [`Self::push_to_mailbox`] when the
@@ -146,7 +146,7 @@ pub(crate) struct WorkerCtx {
     /// the caller falls back to a regular tiered push.
     pub(crate) mailbox: Arc<FlynnelRing<JobRef>>,
     /// Mailbox handles for every peer worker (including self at
-    /// `peer_mailboxes[index]`). Lets ANY worker push directly to
+    /// `peer_mailboxes[index]`). Lets any worker push directly to
     /// any OTHER worker's mailbox without going through the deque
     /// substrate. Indexed by peer worker idx.
     pub(crate) peer_mailboxes: Vec<Arc<FlynnelRing<JobRef>>>,
@@ -170,23 +170,23 @@ pub(crate) struct WorkerCtx {
     /// `Relaxed` adds (cheap on x86); observer threads read via
     /// `Relaxed` loads. Read [`WorkerStats`] for the contract.
     pub(crate) stats: Arc<WorkerStats>,
-    /// Parallel array of EVERY worker's stats (including self at
+    /// Parallel array of every worker's stats (including self at
     /// `peer_stats[index]`). Lets the thief code path increment the
-    /// VICTIM's `times_stolen_from` counter (`peer_stats[victim_idx]
+    /// victim's `times_stolen_from` counter (`peer_stats[victim_idx]
     /// .times_stolen_from`). Cheap to carry: one Arc clone per worker
     /// at arena construction.
     pub(crate) peer_stats: Vec<Arc<WorkerStats>>,
     /// Shared JEC sleep coordinator (one instance per LocalArena).
-    /// Used by push()'s wake path AND by the idle phase of the
+    /// Used by push()'s wake path and by the idle phase of the
     /// worker_loop.
     pub(crate) sleep: Arc<crate::sched::jec_sleep::Sleep>,
-    /// Index of the LAST victim from which we successfully stole a
+    /// Index of the most recent victim from which we successfully stole a
     /// job. `usize::MAX` sentinel = no previous steal. Adaptive
-    /// victim selection probes this victim FIRST before falling
+    /// victim selection probes this victim ahead of the rest, falling
     /// back to the xorshift-random pick. Rationale: victims that
     /// recently had jobs to steal are more likely to have more
     /// (work tends to come in bursts from a single producer like a
-    /// recursive split), AND the victim's deque buffer is already
+    /// recursive split), and the victim's deque buffer is already
     /// warm in our L2/L3 from the prior successful steal - the
     /// steal CAS lands without an L3 miss on the deque head index.
     /// Source: arxiv 2401.04494 (Adaptive Asynchronous Work-
@@ -213,7 +213,7 @@ pub(crate) struct WorkerCtx {
 }
 
 // NOTE: WorkerCtx deliberately carries no `PrivateLifoDeque`
-// per-worker fast cache. Bench result on Zen+ 2026-05-17 with that
+// per-worker fast cache. Measured on Zen+ with that
 // cache wired in (`FLYNNEL_SCHED_PRIVATE_DEQUE=on`):
 //   spmv_parallel/sched_1000  = 1.63 ms  (vs 290 µs Chase-Lev: 5.6x slower)
 //   spmv_parallel/sched_10000 = 14.89 ms (vs 2.37 ms Chase-Lev: 6.3x slower)
@@ -256,7 +256,7 @@ pub struct WorkerStats {
     /// work from any probed peer. High value -> low contention;
     /// workers are sitting idle. Low value -> high contention.
     pub peer_steal_misses: core::sync::atomic::AtomicU64,
-    /// Times THIS worker's deque was stolen from by a peer. Incremented
+    /// Times this worker's own deque was stolen from by a peer. Incremented
     /// by the thief side at the steal site. Used by the default
     /// continuation-steal-driven lazy bisect in
     /// [`crate::sched::par_iter::for_each_chunk`] to detect actual
@@ -298,10 +298,10 @@ impl WorkerStats {
 
 impl WorkerCtx {
     /// Owner-directed mailbox push (URD-style SIMC/MIMC hand-off).
-    /// ANY worker may call this against ANY peer's mailbox - the
+    /// Any worker may call this against any peer's mailbox - the
     /// caller's role is "producer who knows the target worker is
     /// cache-warm for similar work." The target worker drains its
-    /// mailbox FIRST in `find_work`, before its own deque tiers,
+    /// mailbox at the head of `find_work`, before its own deque tiers,
     /// because mailbox jobs are the most-locality-warm work it has
     /// been given.
     ///
@@ -346,7 +346,7 @@ impl WorkerCtx {
     }
 
     /// Burst-mode push: buffer this job into the owner accumulator
-    /// without auto-flushing. Caller MUST follow up with [`Self::flush_all`]
+    /// without auto-flushing. Caller must follow up with [`Self::flush_all`]
     /// before any wait-loop that expects thieves to see the pushed
     /// jobs. Routes to the default tier. Use this in producer-fast
     /// burst sites (cooperative_join_n_flat fan-out, for_each_chunk
@@ -358,9 +358,9 @@ impl WorkerCtx {
         self.push_tier_burst(job, DequeTier::default());
     }
 
-    /// Tiered burst push. Caller MUST be the owner thread; MUST
+    /// Tiered burst push. Caller must be the owner thread, and must
     /// follow up with [`Self::flush_all`] before wait-loop entry.
-    /// Increments the burst counter so flush_all can fire ONE JEC
+    /// Increments the burst counter so flush_all can fire a single JEC
     /// wake covering the entire burst (per-push wake is skipped).
     /// Also increments the WorkerStats burst-vs-single profile
     /// counter for observability / shape-aware downstream
@@ -376,10 +376,10 @@ impl WorkerCtx {
 
     /// Flush every tier's accumulator so any buffered burst jobs
     /// become visible to thieves. Issues a single batched JEC
-    /// wake notification covering ALL burst pushes since the last
+    /// wake notification covering every burst push since the last
     /// flush (including those that auto-flushed inside the
     /// accumulator at n_items=3). Call after a producer-fast
-    /// burst loop, BEFORE entering the wait loop.
+    /// burst loop, ahead of entering the wait loop.
     #[inline]
     pub(crate) fn flush_all(&self) {
         for tier in DequeTier::all() {
@@ -403,7 +403,7 @@ impl WorkerCtx {
         self.try_push_tier(job, DequeTier::default())
     }
 
-    /// Tiered single push. Caller MUST be the owner thread. Routes
+    /// Tiered single push. Caller must be the owner thread. Routes
     /// the job to the named [`DequeTier`]'s deque; peers stealing
     /// at distance `d` may take it only if `tier >= d` per the
     /// asymmetric steal discipline in
@@ -443,12 +443,12 @@ impl WorkerCtx {
         Ok(())
     }
 
-    /// Broadcast unpark to every peer parker. Caller MUST be the
+    /// Broadcast unpark to every peer parker. Caller must be the
     /// owner thread. The maximal-fanout counterpart of the
     /// single-peer rotor wake (`wake_one_peer` below): a
     /// single-wake cascade measures 5 of 16 workers dormant
-    /// through a Heavy/100k dispatch on Zen+ (trace data,
-    /// 2026-06-04), with the 11 that wake spreading over a
+    /// through a Heavy/100k dispatch on Zen+ (trace data),
+    /// with the 11 that wake spreading over a
     /// 25us..2238us window (89x spread); broadcast on the
     /// empty->non-empty transition closes that gap by issuing
     /// every unpark in parallel from the producer side.
@@ -485,7 +485,7 @@ impl WorkerCtx {
 
     /// Pick one peer parker by rotor and call unpark. Single-peer
     /// cascade pattern. Retained as a documented alternative wake
-    /// primitive; NOT wired into [`Self::push_tier`] (that path
+    /// primitive; not wired into [`Self::push_tier`] (that path
     /// uses `self.sleep.new_internal_jobs(...)` through the JEC
     /// coordinator instead of touching parkers directly).
     #[inline]
@@ -539,7 +539,7 @@ impl WorkerCtx {
     /// latency by hiding the L3/RAM fetch. Source: arxiv 2009.00202
     /// (Helper Without Threads).
     pub(crate) fn find_work(&self) -> Option<JobRef> {
-        // (FAST PATH) Public tier first. `DequeTier::default()` is
+        // Fast path: public tier first. `DequeTier::default()` is
         // Public, so raw `join` and par-iter helpers without a
         // deque_tier_hint route every push to the Public deque. A
         // distance-ordered walk (SmtLocal -> IntraCcx -> CrossCcx
@@ -655,9 +655,9 @@ impl WorkerCtx {
     }
 
     /// Prefetch the Stealer cache line for the most-recent
-    /// successful victim, so the NEXT `find_work` call's last-
+    /// successful victim, so the following `find_work` call's last-
     /// victim probe hits a warm line. Called from the successful-
-    /// steal path AFTER the captured-state prefetch but BEFORE the
+    /// steal path after the captured-state prefetch but before the
     /// caller's `execute()`. The execute body's runtime overlaps
     /// the prefetch's coherence fill; by the time control returns
     /// to find_work, the Stealer line is already in L1d/L2.
@@ -892,7 +892,7 @@ pub struct LocalArena {
     /// submit and lowers it after the latch is set. Reference-
     /// counted so nested `with_smt` calls compose.
     smt_requests: Arc<AtomicU32>,
-    /// Shared shutdown flag readable BY EVERY WORKER regardless
+    /// Shared shutdown flag readable by every worker regardless
     /// of whether its individual `Parker` has been initialized
     /// yet. Set by `Drop` to ensure workers caught between spawn
     /// and parker-slot-set still observe the shutdown signal and
@@ -986,7 +986,7 @@ impl DispatchScope {
 
     /// Construct a DispatchScope only if `use_jec_wake` differs from
     /// the current cell value; otherwise return `None`. Saves the
-    /// per-call TLS write on the common path AND the Drop-side
+    /// per-call TLS write on the common path and the Drop-side
     /// TLS write+read on scope exit.
     ///
     /// The DISPATCH_USE_JEC_WAKE cell defaults to `true`. The
@@ -1070,7 +1070,7 @@ impl LocalArena {
     /// workers; `JobPlan::with_smt()` raises the counter and the
     /// 8 SMT siblings join.
     ///
-    /// `cpu_set` covers BOTH primaries and siblings. With pinning
+    /// `cpu_set` covers both primaries and siblings. With pinning
     /// enabled, the first `primary_count` CoreIds pin primaries
     /// to physical cores and the remaining CoreIds pin siblings
     /// to SMT siblings. With pinning disabled (the default), the
@@ -1089,7 +1089,7 @@ impl LocalArena {
         // Each worker has [N_TIERS] KHL-backed deques; each peer
         // in the arena holds [N_TIERS] stealers per worker.
         //
-        // KHL_SLOT_CAPACITY sets each tier's ring size (in SLOTS,
+        // KHL_SLOT_CAPACITY sets each tier's ring size, counted in slots,
         // each holding up to 3 jobs). Sized large enough to absorb
         // producer bursts without triggering the spin-on-publish
         // back-pressure path; small enough to keep the buffer's
@@ -1122,7 +1122,7 @@ impl LocalArena {
         // ------- External-slot pool construction -------
         // Pre-allocate EXTERNAL_SLOT_COUNT external slots. Each slot
         // owns 4 AdaptiveWorker deques (so an external caller can
-        // push right-halves into its own deque) AND has its stealers
+        // push right-halves into its own deque) and has its stealers
         // registered in arena.stealers (so peers can see + steal
         // external-pushed work). This is the slot-pool design the
         // rayon Registry::in_worker pattern is built on.
@@ -1213,7 +1213,7 @@ impl LocalArena {
             let peer_mailboxes_for_worker: Vec<Arc<FlynnelRing<JobRef>>> =
                 mailboxes.iter().map(Arc::clone).collect();
             // Each worker carries a parallel array of every worker's
-            // stats so the thief code can increment the VICTIM's
+            // stats so the thief code can increment the victim's
             // `times_stolen_from` counter at the steal site.
             let peer_stats_for_worker: Vec<Arc<WorkerStats>> =
                 stats_vec.iter().map(Arc::clone).collect();
@@ -1242,8 +1242,8 @@ impl LocalArena {
                 // stolen StackJobs whose bodies themselves
                 // re-enter reduce_inner, so the effective
                 // nesting depth is the bisect depth * the
-                // wait-loop recursive-steal depth. Empirically
-                // verified 2026-06-16 via FLYNNEL_RC_DEBUG stack-
+                // wait-loop recursive-steal depth. Verified with a
+                // FLYNNEL_RC_DEBUG stack-
                 // pointer trace: 4 MiB overflowed on Windows at
                 // 16M items / max_budget=32; 8 MiB does not.
                 .stack_size(8 * 1024 * 1024)
@@ -1254,7 +1254,7 @@ impl LocalArena {
                     if shutdown.load(Ordering::Acquire) {
                         return;
                     }
-                    // Pin this worker BEFORE constructing the
+                    // Pin this worker before constructing the
                     // Parker so subsequent thread::current() calls
                     // and any cache pre-touches happen on the
                     // assigned core.
@@ -1262,7 +1262,7 @@ impl LocalArena {
                         let _ = core_affinity::set_for_current(core);
                     }
                     // Construct the Parker inside the worker so it
-                    // captures THIS thread's handle.
+                    // captures the calling thread's handle.
                     let parker = Arc::new(Parker::new(LOCAL_SPIN_ROUNDS));
                     park_slot
                         .set(Arc::clone(&parker))
@@ -1298,10 +1298,10 @@ impl LocalArena {
         }
 
         // ------- Build external slot WorkerCtx + Arc<ExternalSlot> -------
-        // Each slot's WorkerCtx has the FULL extended stealers /
+        // Each slot's WorkerCtx has the complete extended stealers /
         // mailboxes / stats / parkers so external callers can:
         //  - see all workers + other slots as victims for stealing
-        //  - have peers steal from THEIR pushed work (since the
+        //  - have peers steal from their pushed work (since the
         //    slot's stealers are at arena.stealers[n+slot_id])
         let mut external_slots: Vec<Arc<ExternalSlot>> =
             Vec::with_capacity(EXTERNAL_SLOT_COUNT);
@@ -1370,7 +1370,7 @@ impl LocalArena {
     /// concurrent external dispatch).
     ///
     /// The returned `ExternalSlotGuard` releases the claim on Drop
-    /// AND restores any prior TLS ctx pointer.
+    /// and restores any prior TLS ctx pointer.
     pub(crate) fn try_claim_external_slot(self: &Arc<Self>)
         -> Option<ExternalSlotGuard>
     {
@@ -1430,7 +1430,7 @@ impl LocalArena {
     }
 
 
-    /// Flip the active K_gating across EVERY worker and tier in
+    /// Flip the active K_gating across every worker and tier in
     /// this arena. Single Release-store pass over all
     /// `k_gating_tags`; new pushes route to the new backing
     /// starting immediately on each worker. Existing items in
@@ -1442,7 +1442,7 @@ impl LocalArena {
     /// tiers that's 64 atomic stores, ~30 ns total. Per-op cost
     /// on subsequent pushes is unchanged (AtomicU32 Acquire load
     /// adds 0.02 ns over direct dispatch, measured on Zen+ R7
-    /// 2700 2026-06-06).
+    /// 2700).
     pub fn migrate_all_workers_k_gating(&self, gating: KGating) {
         use core::sync::atomic::Ordering;
         let target = match gating.resolved() {
@@ -1586,7 +1586,7 @@ impl LocalArena {
 // ---------------------------------------------------------------------------
 // External slot pool: pre-allocated WorkerCtx slots that external
 // caller threads can claim/release on each external dispatch, so they
-// can be temporary workers without per-call WorkerCtx allocation AND
+// can be temporary workers without per-call WorkerCtx allocation and
 // have their stealers registered in arena.stealers so peers can
 // steal external-pushed work.
 // ---------------------------------------------------------------------------
@@ -1630,14 +1630,14 @@ pub(crate) struct ExternalSlot {
     ///
     /// SAFETY: WorkerCtx contains `Cell` fields (rng, last_victim,
     /// burst_pushed, wake_rotor) and an `UnsafeCell<AdaptiveStash>`.
-    /// These are touched ONLY by the claiming thread per the
+    /// These are touched only by the claiming thread per the
     /// `claimed` AtomicBool exclusion. Between claims the Cell
     /// values may be stale (from prior claimer), but they only
     /// affect heuristics (RNG seed, last-victim, etc.) and never
     /// correctness.
     ctx: core::cell::UnsafeCell<WorkerCtx>,
     /// Index in arena.stealers (and parkers / stats / mailboxes)
-    /// where THIS slot's stealer/mailbox/stats live. Workers
+    /// where this slot's own stealer/mailbox/stats live. Workers
     /// stealing from this slot use index = self.index_in_arena.
     index_in_arena: usize,
 }
@@ -1731,7 +1731,7 @@ impl LocalArena {
     /// Submit a `JobRef` to the global injector + unpark workers.
     ///
     /// Wake policy (tuned on the rayon crossover bench): if the
-    /// injector was empty BEFORE this push, the
+    /// injector was empty before this push, the
     /// pool was either at cold-start or all workers had drained
     /// to their parks; broadcast unpark fills the pool. If non-
     /// empty, a single rotated unpark is enough because workers
@@ -2153,7 +2153,7 @@ fn worker_loop(
         }
         // (3) Peer steal: probe up to PROBE_LARGE random peers in
         //     rotated order, each at all tiers the steal discipline
-        //     allows from our distance. Cilk's THE protocol +
+        //     allows from our distance. Cilk's `THE` protocol +
         //     KHPD-style per-tier filtering.
         // Held external slots first: each holds at most one caller's
         // wrapped join, and a random pick over the whole stealer

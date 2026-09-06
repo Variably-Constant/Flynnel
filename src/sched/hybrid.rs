@@ -12,7 +12,7 @@
 //!
 //! The hybrid path is worth it only when the GPU half's per-call
 //! work dominates the backend's launch latency. `join_hybrid`
-//! does NOT gate this internally: it always resolves the backend
+//! does not gate this internally: it always resolves the backend
 //! from the plan (falling through to the CPU backend when no
 //! hint is set or the hinted backend is not registered) and
 //! dispatches the second closure via
@@ -134,7 +134,7 @@ where
     }
 }
 
-/// Learned-placement hybrid dispatch: run ONE of two equivalent
+/// Learned-placement hybrid dispatch: run one of two equivalent
 /// implementations of the same computation, choosing the side this
 /// call site has measured to be faster at this batch size.
 ///
@@ -143,7 +143,7 @@ where
 /// model:
 ///
 /// - **Cold size bucket** (either side unmeasured for
-///   `log2(plan.batch_size)`): run BOTH concurrently in the
+///   `log2(plan.batch_size)`): run both concurrently in the
 ///   [`join_hybrid`] shape and time each. Racing IS the
 ///   calibration: the first call pays double work exactly once per
 ///   bucket instead of requiring an offline calibration pass. The
@@ -157,7 +157,7 @@ where
 /// The EWMAs live on a per-call-site
 /// [`crate::sched::call_site::CallSiteState`] (or the caller's own
 /// via [`JobPlan::with_site`]), keyed by log2 size bucket, and
-/// measure END-TO-END wall time: whatever transfer work the closure
+/// measure end-to-end wall time: whatever transfer work the closure
 /// performs is inside its own measurement, so no separate transfer
 /// model or data-residency tracking exists or is needed. The
 /// corresponding boundary: dispatches whose transfer cost depends

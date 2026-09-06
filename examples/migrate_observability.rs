@@ -212,10 +212,10 @@ fn assert_observer_drives_migration_to_latency_bound() {
         "test setup: active class must start at PortBound"
     );
 
-    // Feed 128 HIGH-VARIANCE samples (mean ~1500 ns).
-    // `classify_observed` keys on BOTH mean and cv^2:
-    //   mean_ns >= 500 AND cv2_per_mille >= 500 -> LatencyBound
-    //   mean_ns >= 500 AND cv2_per_mille <  500 -> MemoryBound/Streaming
+    // Feed 128 high-variance samples (mean ~1500 ns).
+    // `classify_observed` keys on both mean and cv^2:
+    //   mean_ns >= 500 and cv2_per_mille >= 500 -> LatencyBound
+    //   mean_ns >= 500 and cv2_per_mille <  500 -> MemoryBound/Streaming
     // Uniform high-cost samples (all 1500 ns) -> cv2=0 -> Streaming.
     // Long-dep-chain workloads have HIGH per-leaf variance
     // (some leaves chase faster than others), so the simulated
@@ -244,7 +244,7 @@ fn assert_observer_drives_migration_to_latency_bound() {
 /// Symmetric down-migration: feed FineGrain-shaped samples (~20 ns
 /// per leaf). FineGrain -> PortBound via the shared DispatchProfile,
 /// so the observable migration is LatencyBound -> PortBound. Proves
-/// the closing-loop responds to changing workload shape both up AND
+/// the closing-loop responds to changing workload shape both up and
 /// down, not just monotonically.
 fn assert_observer_drives_migration_to_fine_grain() {
     // Setup: start at LatencyBound (where the previous test left

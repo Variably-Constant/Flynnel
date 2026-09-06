@@ -63,7 +63,7 @@ pub struct AdaptiveWorker {
     /// steals also benefit from the skip-check, not just the
     /// owner-side pop path.
     ///
-    /// Flamegraph evidence (2026-06-19): flynnel_ring::pop at
+    /// Flamegraph evidence: flynnel_ring::pop at
     /// 0.19% SELF + steal_via_stash at 0.40% SELF when the thief
     /// side pays an unconditional dormant fallback; sharing the
     /// flag with stealers reclaims that 0.4%.
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn migration_preserves_orphan_items() {
         // Push on KHL, migrate to Fcl, then push more on Fcl.
-        // Pop should drain BOTH backings.
+        // Pop should drain both backings.
         let (w, _s) = new_adaptive(4, KGating::PerSlot);
         let j1 = StackJob::new(|_| 1u32, CoreLatch::new());
         let r1 = unsafe { j1.as_job_ref(4, 0, Variant::Fast) };

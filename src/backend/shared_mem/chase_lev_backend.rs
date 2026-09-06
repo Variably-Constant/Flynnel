@@ -234,7 +234,7 @@ impl SharedMemoryChaseLevBackend {
     /// First-iteration behavior: no prior call to warm the line, so
     /// the first call pays the full cold-slot miss. Subsequent calls
     /// see the win zone (~10-20 % improvement at cross-CCX pinning,
-    /// measured on Zen+ R7 2700 2026-06-06).
+    /// measured on Zen+ R7 2700).
     ///
     /// Use this over [`Self::drain_one`] when the worker thread is
     /// dedicated to draining from a single victim deque and you can

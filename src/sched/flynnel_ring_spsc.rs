@@ -80,14 +80,14 @@ struct SpscHeader<T> {
 unsafe impl<T: Send> Send for SpscHeader<T> {}
 unsafe impl<T: Send> Sync for SpscHeader<T> {}
 
-/// Single-producer handle. Only ONE thread may hold this; the
+/// Single-producer handle. Only one thread may hold this; the
 /// `&self` API does NOT make `Producer` safely shareable across
 /// producer threads. Sharing violates the SPSC invariant.
 pub struct Producer<T> {
     inner: Arc<SpscHeader<T>>,
 }
 
-/// Single-consumer handle. Only ONE thread may hold this.
+/// Single-consumer handle. Only one thread may hold this.
 pub struct Consumer<T> {
     inner: Arc<SpscHeader<T>>,
 }

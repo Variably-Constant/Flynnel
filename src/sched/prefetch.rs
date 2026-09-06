@@ -154,7 +154,7 @@ pub fn prefetch_into_l2<T>(slice: &[T]) {
 /// thread and want to warm cache for an upcoming hot loop on the
 /// same thread.
 ///
-/// Unlike [`prefetch_into_l3`] this runs immediately and does NOT
+/// Unlike [`prefetch_into_l3`] this runs immediately and does not
 /// depend on the IoPool. Use for in-loop prefetch where the
 /// channel-submit overhead would dominate the prefetch cost.
 #[inline]

@@ -17,7 +17,7 @@
 //! ## When Fcl does NOT win (and falls back gracefully)
 //!
 //! Single-push call sites (classic `join(a, b)` where the parent
-//! pushes ONE right-half then runs the left half inline) get no
+//! pushes a single right-half then runs the left half inline) get no
 //! batching benefit. The single right-half sits unflushed in the
 //! owner buffer where thieves cannot see it; we provide an explicit
 //! [`SchedFclDeque::flush`] for sites that know to publish before

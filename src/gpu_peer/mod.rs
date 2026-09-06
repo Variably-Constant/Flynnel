@@ -10,7 +10,7 @@
 //! without native atomics), and no data copies besides the payload
 //! writes themselves.
 //!
-//! Every timing constant is HOST-CALIBRATED at [`GpuPeer::init`]:
+//! Every timing constant is host-calibrated at [`GpuPeer::init`]:
 //! doorbell round-trip, cross-device clock error, the Fischer
 //! timed-lock margin (validated by a live contention self-test), the
 //! launch baseline, and the system-atomics capability flag. Nothing
@@ -212,7 +212,7 @@ impl WideKernel {
     }
 }
 
-/// A block of DEVICE-RESIDENT data the scheduler owns by index. Data
+/// A block of device-resident data the scheduler owns by index. Data
 /// pinned through [`GpuPeer::pin`] stays in the VRAM pool across any
 /// number of tasks; each resident task moves only an 8-byte param
 /// header over the bus. All tasks touching one handle ride the
@@ -258,7 +258,7 @@ pub struct GpuPeer {
     calibration: PeerCalibration,
     _module: Arc<CudaModule>,
     _stream: Arc<CudaStream>,
-    // Wide ops run on their OWN stream so they neither serialize behind
+    // Wide ops run on their own stream so they neither serialize behind
     // a resident poller quantum nor block doorbell traffic; the two run
     // concurrently, which is exactly when pause_poller matters.
     wide_stream: Arc<CudaStream>,
@@ -587,7 +587,7 @@ impl GpuPeer {
         Ok(())
     }
 
-    /// Pin a buffer of ANY size straight into VRAM, bypassing the
+    /// Pin a buffer of any size straight into VRAM, bypassing the
     /// doorbell.
     ///
     /// [`Self::pin`] carries its data in a slot payload, so it is
@@ -595,10 +595,10 @@ impl GpuPeer {
     /// doorbell op takes, useless for a corpus. This copies host to
     /// device directly and spans as many consecutive pool blocks as
     /// the data needs, which is what a workload that must stay
-    /// RESIDENT across many calls requires: upload once, query
+    /// resident across many calls requires: upload once, query
     /// forever, and only the query's own arguments ever cross again.
     ///
-    /// The returned handle names the FIRST block; `resident_ptr` gives
+    /// The returned handle names the first block; `resident_ptr` gives
     /// its device address and the span is contiguous by construction.
     pub fn pin_bulk(&mut self, data: &[u8]) -> Result<ResidentHandle, GpuPeerError> {
         let pool = self
@@ -678,7 +678,7 @@ impl GpuPeer {
             .map_err(|e| GpuPeerError::Driver(format!("fetch_bulk sync: {e:?}")))
     }
 
-    /// [`Self::pin`] WITHOUT waiting: zero-synchronization prefetch.
+    /// [`Self::pin`] without waiting: zero-synchronization prefetch.
     /// The upload rides the handle's lane, and lane FIFO order IS the
     /// dependency order - any task submitted on this handle
     /// afterwards executes after the data has landed, with no fence,
@@ -901,7 +901,7 @@ impl GpuPeer {
         &self.wide_stream
     }
 
-    /// Enqueue a [`WideKernel`] on the resident stream WITHOUT
+    /// Enqueue a [`WideKernel`] on the resident stream without
     /// synchronizing. Pointer arguments come first, then u32 scalars,
     /// matching the kernel signature; `grid_blocks` = 0 auto-sizes the
     /// grid from `scalars[0]` (an element count).

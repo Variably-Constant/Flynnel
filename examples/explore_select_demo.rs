@@ -1,5 +1,5 @@
 //! Episode racing with `explore_select`: N independent explorers each
-//! run a full trajectory to completion, and the FEWEST-ACTIONS one is
+//! run a full trajectory to completion, and the fewest-actions one is
 //! kept - regardless of which finished first.
 //!
 //! The winning explorer is deliberately made the SLOWEST to finish

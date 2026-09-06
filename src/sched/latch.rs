@@ -25,7 +25,7 @@
 //! `Latch::set` takes `*const Self` rather than `&self` because the
 //! publishing CAS may wake a thread that immediately deallocates the
 //! latch (e.g., when a `StackJob` finishes and its parent frame
-//! returns). Implementations MUST read every field they need BEFORE
+//! returns). Implementations must read every field they need before
 //! the publishing store; `SpinLatch::set` does this by copying
 //! `target_worker_index` to a local first, and `CountLatch` /
 //! `LockLatch` follow the same discipline.
@@ -40,7 +40,7 @@ const UNSET: u8 = 0;
 /// abort the park.
 const SLEEPY: u8 = 1;
 /// Latch not set; owning thread is parked on a condvar elsewhere
-/// (the latch only owns the lifecycle marker). The publisher MUST
+/// (the latch only owns the lifecycle marker). The publisher must
 /// wake the parked thread after setting.
 const SLEEPING: u8 = 2;
 /// Latch is set. Terminal state.
@@ -75,7 +75,7 @@ impl CoreLatch {
     /// this to declare intent to park. Returns `true` if the
     /// transition `UNSET -> SLEEPY` succeeded and the caller may
     /// proceed to [`Self::fall_asleep`]; returns `false` if the latch
-    /// was already set in the meantime (caller should NOT park).
+    /// was already set in the meantime (caller should not park).
     #[inline]
     pub fn get_sleepy(&self) -> bool {
         self.state
@@ -87,7 +87,7 @@ impl CoreLatch {
     /// this immediately before parking on its condvar. Returns `true`
     /// if the transition `SLEEPY -> SLEEPING` succeeded (caller may
     /// park); returns `false` if the latch was set after
-    /// `get_sleepy` (caller must NOT park).
+    /// `get_sleepy` (caller must not park).
     #[inline]
     pub fn fall_asleep(&self) -> bool {
         self.state
@@ -95,7 +95,7 @@ impl CoreLatch {
             .is_ok()
     }
 
-    /// Called by the owning thread after a wakeup that did NOT
+    /// Called by the owning thread after a wakeup that did not
     /// observe `SET` (e.g., a spurious condvar wake or the JEC-
     /// observed-injected-job path). Reverts `SLEEPING -> UNSET` so
     /// the thread can re-enter the work-search loop. No-op if the
@@ -127,7 +127,7 @@ impl CoreLatch {
     ///
     /// Caller must ensure `this` points to a valid `CoreLatch` for
     /// the duration of the swap. After the swap returns, callers
-    /// MUST NOT touch any field of `*this` except those captured by
+    /// must not touch any field of `*this` except those captured by
     /// value BEFORE this call: a parked thread may wake and
     /// deallocate the latch as soon as it observes `SET`.
     #[inline]
@@ -135,7 +135,7 @@ impl CoreLatch {
         // SAFETY: the `# Safety` clause on this function shifts
         // the validity-of-`this` precondition onto the caller;
         // here we may deref it once for the publishing atomic
-        // swap. We must NOT touch `*this` after the swap because
+        // swap. We must not touch `*this` after the swap because
         // a parked thread observing SLEEPING -> SET is free to
         // deallocate the latch.
         let old = unsafe { (*this).state.swap(SET, Ordering::AcqRel) };
@@ -184,7 +184,7 @@ impl Latch for CoreLatch {
 
 /// Wake-capable latch wrapper: holds a `CoreLatch` plus an
 /// `Arc<Parker>` for the worker that is waiting on this latch. When
-/// `Latch::set` fires AND the prior state was `SLEEPING`, the
+/// `Latch::set` fires and the prior state was `SLEEPING`, the
 /// publisher unparks the parker, releasing the parked worker.
 ///
 /// This is the missing piece that lets the join wait loop in
@@ -484,7 +484,7 @@ impl LockLatch {
     }
 
     /// Test whether the latch is SET without blocking. Single
-    /// Acquire load on the fast-path AtomicBool; does NOT take
+    /// Acquire load on the fast-path AtomicBool; does not take
     /// the mutex. Callers spinning on `is_set` before falling
     /// through to `wait` pay no syscall per spin iteration.
     pub fn is_set(&self) -> bool {
@@ -560,9 +560,9 @@ mod tests {
     #[test]
     fn spin_latch_wakes_parked_thread() {
         // E2E test of the SpinLatch wake-capable wrapper. The Parker
-        // is constructed on the WAITER thread (captures
+        // is constructed on the waiter thread (captures
         // thread::current() at construction), then handed to the
-        // SETTER thread via a channel along with the latch. This
+        // setter thread via a channel along with the latch. This
         // mirrors the real flynnel usage where each worker's parker
         // is owned by that worker, and a thief on a different
         // thread calls Latch::set.
@@ -574,7 +574,7 @@ mod tests {
 
         let waiter = thread::spawn(move || {
             // Waiter owns the Parker; capture its own thread handle
-            // so SpinLatch::set's unpark targets THIS thread.
+            // so SpinLatch::set's unpark targets the waiting thread.
             let parker = Arc::new(crate::sched::sleep::Parker::new(0));
             let latch = Arc::new(SpinLatch::new(parker));
             // Hand a clone of the latch to the setter thread.
@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn count_latch_only_sets_on_final_decrement() {
         // Build a 3-participant count latch on a dummy parker.
-        // First two decrements MUST leave the inner state unset;
+        // First two decrements must leave the inner state unset;
         // third decrement transitions to SET.
         let parker = Arc::new(crate::sched::sleep::Parker::new(0));
         let latch = CountLatch::new(3, parker);
@@ -724,7 +724,7 @@ mod tests {
     fn spin_latch_already_set_does_not_park() {
         // Edge case: latch is already SET when waiter attempts the
         // handshake. get_sleepy must fail because the state is SET,
-        // not UNSET. The waiter must NOT park.
+        // not unset. The waiter must not park.
         let parker = Arc::new(crate::sched::sleep::Parker::new(0));
         let latch = SpinLatch::new(parker);
         unsafe { Latch::set(&latch) };
@@ -747,7 +747,7 @@ mod tests {
     #[test]
     fn fall_asleep_requires_sleepy_first() {
         let l = CoreLatch::new();
-        // UNSET -> SLEEPING is NOT a valid direct transition.
+        // `UNSET` -> `SLEEPING` is not a valid direct transition.
         assert!(!l.fall_asleep(), "UNSET -> SLEEPING must fail");
         assert!(l.get_sleepy());
         assert!(l.fall_asleep(), "SLEEPY -> SLEEPING should succeed");
@@ -833,7 +833,7 @@ mod tests {
     fn set_synchronizes_publisher_and_observer() {
         // Acquire-Release sanity check: data written by the
         // publisher BEFORE set must be visible to the observer
-        // AFTER is_set returns true.
+        // after is_set returns true.
         let l = Arc::new(CoreLatch::new());
         let payload: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 

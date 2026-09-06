@@ -289,7 +289,7 @@ pub struct NotifyReceiver<T: Send> {
 
 impl<T: Send> NotifyReceiver<T> {
     /// Blocking receive. Returns `Some(t)` on a successful pop;
-    /// `None` when the hub is shut down AND the ring is drained.
+    /// `None` when the hub is shut down and the ring is drained.
     pub fn recv(&self) -> Option<T> {
         loop {
             match self.inner.ring.pop() {

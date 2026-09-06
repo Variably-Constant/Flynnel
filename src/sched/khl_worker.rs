@@ -137,7 +137,7 @@ unsafe impl Send for KhlWorker {}
 
 impl KhlWorker {
     /// Construct a new KHL-backed owner adapter + paired stealer.
-    /// Capacity is in SLOTS; each slot carries up to 3 jobs.
+    /// Capacity is counted in slots; each slot carries up to 3 jobs.
     pub fn new(slot_capacity: usize) -> (Self, KhlStealer) {
         let (inner, stealer) = new_khl(slot_capacity);
         (
@@ -216,7 +216,7 @@ impl KhlWorker {
     }
 
     /// Approximate is-empty. Returns true when stash, accumulator,
-    /// AND inner ring are all empty. Hint only - concurrent thief
+    /// and inner ring are all empty. Hint only - concurrent thief
     /// CAS may invalidate immediately after return.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -229,7 +229,7 @@ impl KhlWorker {
     }
 
     /// Clone a fresh thief handle. Stash construction is the
-    /// CALLER's responsibility (the thief-side stash lives in
+    /// caller's responsibility (the thief-side stash lives in
     /// WorkerCtx, shared across all peer-tier steal results).
     #[inline]
     pub fn stealer(&self) -> KhlStealer {
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn push_one_always_flushes_for_join_pattern() {
-        // The WorkerCtx use case: push ONE job (a join right-half),
+        // The WorkerCtx use case: push a single job (a join right-half),
         // then a thief on another thread takes it. Without
         // auto-flush, the thief would never see the job.
         let (w, s) = KhlWorker::new(4);

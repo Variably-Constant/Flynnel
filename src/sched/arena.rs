@@ -20,7 +20,7 @@
 //!
 //! ## Worker count
 //!
-//! Default `global_local_arena()` worker count = ALL logical
+//! Default `global_local_arena()` worker count = all logical
 //! threads per node (= 16 on R7 2700), matching rayon's
 //! convention; SMT-2 siblings gain 10-30% on latency-bound work
 //! and break even on most other shapes. For IMUL-saturated work
@@ -210,7 +210,7 @@ where
 {
     let ctx_ptr = current_worker_ctx();
     if !ctx_ptr.is_null() {
-        // FAST PATH: already in a worker. Push job_b to OUR own
+        // Fast path: already in a worker. Push job_b to our own
         // local Chase-Lev deque, run a inline, drain.
         // SAFETY: ctx_ptr was set by worker_loop on this same
         // thread and is valid until worker_loop returns.
@@ -271,7 +271,7 @@ fn push_with_tier_hint(ctx: &WorkerCtx, job: JobRef, plan: &JobPlan) -> Result<(
 //   JOIN_A_BODY_NS         - sum of cycles spent in `a()` (left half work
 //                            for this frame, which for reduce_inner is
 //                            itself the recursive sub-tree)
-//   JOIN_WAIT_NS           - sum of cycles spent in the wait loop AFTER
+//   JOIN_WAIT_NS           - sum of cycles spent in the wait loop after
 //                            `a()` returned (find_work probing + stolen
 //                            job execution + the idle latch poll)
 //
@@ -407,8 +407,8 @@ where
     // restores broad-steal semantics for backlogged-sibling cases.
     let sibling = ctx.index ^ 1;
     // Mailbox-route only when the caller opted in via
-    // `plan.use_mailbox_routing` AND the sibling has truly nothing
-    // queued (mailbox empty AND SmtLocal deque empty). Without the
+    // `plan.use_mailbox_routing` and the sibling has truly nothing
+    // queued (mailbox empty and SmtLocal deque empty). Without the
     // opt-in flag, the default path is a regular deque push so
     // broad work-stealing is preserved for latency-bound + IMUL-
     // saturated workloads where mailbox concentration hurts.

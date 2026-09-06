@@ -12,16 +12,16 @@
 //!
 //! Each worker iterates between four phases:
 //!
-//! 1. ACTIVE: running a job (not counted as inactive).
-//! 2. IDLE: finished a job, spinning `yield_now` inside
+//! 1. `ACTIVE`: running a job (not counted as inactive).
+//! 2. `IDLE`: finished a job, spinning `yield_now` inside
 //!    `no_work_found`; counted as `awake_but_idle`. After
 //!    `ROUNDS_UNTIL_SLEEPY` yields the worker transitions to:
-//! 3. SLEEPY: announces itself by incrementing JEC (making it
+//! 3. `SLEEPY`: announces itself by incrementing JEC (making it
 //!    even); producers will see this and bump JEC back to odd if
 //!    they post new work. Still counted as `awake_but_idle`.
 //!    After `rounds_until_sleeping()` more yields the worker
 //!    transitions to:
-//! 4. SLEEPING: locks its Mutex, waits on Condvar; counted as
+//! 4. `SLEEPING`: locks its Mutex, waits on Condvar; counted as
 //!    both `inactive` AND `sleeping`. Awoken by
 //!    `wake_specific_thread` (which clears the mutex and notifies).
 //!
@@ -279,7 +279,7 @@ static SPIN_WINDOW: AtomicU32 = AtomicU32::new(DEFAULT_SPIN_WINDOW_ROUNDS);
 /// (let the controller shrink it), the same opt-in model the GPU
 /// poller's pause lever uses.
 static ADAPTIVE: AtomicBool = AtomicBool::new(false);
-/// Controller evidence since the last adjust: workers that PARKED
+/// Controller evidence since the last adjust: workers that parked
 /// (the spin was wasted - work did not arrive in the window) versus
 /// workers RESCUED mid-spin (the spin paid off - it avoided a
 /// park/unpark syscall pair).

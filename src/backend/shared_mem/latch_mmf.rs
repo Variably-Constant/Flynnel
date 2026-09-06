@@ -292,7 +292,7 @@ impl MmfLatchArena {
     /// a Chase-Lev slot's `latch_offset` field). The returned cell
     /// has `state = UNSET` (Release-stored) and `result_len = 0`.
     ///
-    /// Note: `result_bytes` is NOT zeroed by `alloc`; it may still
+    /// Note: `result_bytes` is not zeroed by `alloc`; it may still
     /// hold data from the previous publisher when a wrap-around
     /// reuses the cell. Safety of subsequent reads relies on
     /// `result_len` bounding the copy in [`Self::read_result`] and

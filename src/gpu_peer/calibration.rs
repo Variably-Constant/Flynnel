@@ -1,5 +1,5 @@
 //! Host calibration: every timing constant the substrate relies on is
-//! MEASURED on the running machine at init, validated by live
+//! Measured on the running machine at init, validated by live
 //! self-tests, and stored in the region header so attaching processes
 //! inherit the same numbers. Nothing here is baked from any reference
 //! box: a host with a coherent CPU-GPU link measures a smaller
@@ -299,7 +299,7 @@ pub fn calibrate(
 
 /// Outcome of one Fischer self-test run.
 enum SelfTest {
-    /// Zero violations WITH contention evidence on both sides.
+    /// Zero violations, with contention evidence on both sides.
     Pass { cpu_contended: u32, gpu_contended: u32 },
     /// Mutual exclusion observed broken at this Delta.
     Violated,
@@ -491,8 +491,8 @@ fn cas_conservation_probe(
             unclaimed += 1;
         }
     }
-    // Conservation AND real contention: every slot claimed exactly
-    // once, with BOTH sides winning a meaningful share (>= 5% each).
+    // Conservation and real contention: every slot claimed exactly
+    // once, with both sides winning a meaningful share (>= 5% each).
     // A lopsided sweep means the race barely happened and proves
     // nothing - refuse the flag.
     let conserved = unclaimed == 0 && cpu_won + gpu_won == n as u64;

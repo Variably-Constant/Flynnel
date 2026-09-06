@@ -107,7 +107,7 @@ impl Parker {
 
     /// Construct a Parker with an explicit wait strategy. Used by
     /// benches + tests that need to A/B against the auto-picked
-    /// strategy. Callers MUST NOT pass [`WaitStrategy::Waitpkg`] on
+    /// strategy. Callers must not pass [`WaitStrategy::Waitpkg`] on
     /// a host where [`crate::cpu_info::has_waitpkg`] returns false
     /// (the inline `UMONITOR`/`UMWAIT` opcodes would raise `#UD`).
     pub fn with_strategy(spin_rounds: u32, wait_strategy: WaitStrategy) -> Self {
@@ -146,7 +146,7 @@ impl Parker {
     ///    unpark hands control back to the caller, which then walks
     ///    the peer stealers in its main loop.
     pub fn park_until<F: FnMut() -> bool>(&self, mut is_ready: F) -> bool {
-        // Snapshot wake_counter BEFORE the spin floor so the WAITPKG
+        // Snapshot wake_counter ahead of the spin floor so the waitpkg
         // path can detect any unpark that fires after this snapshot
         // (whether during the spin floor or during the UMWAIT itself).
         let initial_wake = self.wake_counter.load(Ordering::Acquire);
@@ -211,7 +211,7 @@ impl Parker {
     /// next park return and exits its loop.
     ///
     /// Routes through [`Self::unpark`] so the wake_counter increments
-    /// AND the std::thread permit fires - the WAITPKG observer
+    /// and the std::thread permit fires - the waitpkg observer
     /// returns from UMWAIT on the cache-line transition and then
     /// observes `shutdown == true` on its post-park check.
     pub fn shutdown(&self) {
@@ -225,7 +225,7 @@ impl Parker {
     /// UMONITOR setup, then UMWAIT until the line transitions OR
     /// a TSC deadline fires (~10ms).
     ///
-    /// Returning here does NOT mean wake_counter actually changed -
+    /// Returning here does not mean wake_counter actually changed -
     /// UMWAIT can return on signals, interrupts, or its hint
     /// expiry. The caller (`park_until`) re-checks `is_ready` and
     /// `shutdown` after wake_via_waitpkg returns and decides
@@ -233,7 +233,7 @@ impl Parker {
     #[cfg(target_arch = "x86_64")]
     fn wait_via_waitpkg(&self, initial_wake: u64) {
         // 10 ms deadline cap so a missed wake (e.g. shutdown raced
-        // with a UMONITOR that armed AFTER the shutdown unpark)
+        // with a UMONITOR that armed after the shutdown unpark)
         // does not block forever. The deadline TSC is computed
         // assuming a ~2.5 GHz TSC frequency; off-by-2x error is
         // immaterial because the caller re-enters park_until on
@@ -410,7 +410,7 @@ mod tests {
     fn unpark_before_park_is_observable_via_permit() {
         // std::thread::park's permit semantics: unpark before park
         // stores a permit; next park returns immediately. We test
-        // this through park_until: helper unparks BEFORE owner
+        // this through park_until: helper unparks before owner
         // calls park_until. The owner's first park sees the
         // permit and returns; the subsequent re-check observes
         // ready=true.
@@ -419,7 +419,7 @@ mod tests {
         let p_clone = Arc::clone(&p);
         let ready_clone = Arc::clone(&ready);
 
-        // Pre-store an unpark permit on the owner thread BEFORE
+        // Pre-store an unpark permit on the owner thread before
         // it calls park_until. We do this by having the owner be
         // the main thread, and a helper that unparks then sets
         // ready.

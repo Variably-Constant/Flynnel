@@ -8,7 +8,7 @@
 //! The bench measures wall-clock time from `unpark` to the owner's
 //! observable return from `park_until`. That captures BOTH the
 //! syscall transition cost (StdPark) or the UMWAIT-return cost
-//! (WAITPKG) AND the inter-thread coherence transfer on the
+//! (`WAITPKG`) and the inter-thread coherence transfer on the
 //! wake_counter / permit cache line.
 //!
 //! ## Bench-audit (HARD RULE 3)

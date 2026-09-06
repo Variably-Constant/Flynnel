@@ -33,7 +33,7 @@
 //!
 //! Where LOH wins per the cost model: bursty dispatch (parallel-for,
 //! fan-out, fork-join leaves) where the per-burst migration amortizes
-//! over many items per cache-line bounce. Where LOH does NOT win:
+//! over many items per cache-line bounce. Where LOH does not win:
 //! single-item request-reply, because there's no batching to amortize
 //! against.
 

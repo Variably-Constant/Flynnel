@@ -30,7 +30,7 @@ fn main() {
     println!("calibrated: doorbell median {} ns, Delta {} ns, launch {} ns\n",
              cal.rtt_median_ns, cal.delta_ns, cal.launch_ns);
 
-    // Workload: BLOCKS blocks of f32s; each round adds 1.0 everywhere.
+    // Workload: `BLOCKS` blocks of f32s; each round adds 1.0 everywhere.
     let block_f32 = (peer.geometry().payload_max() / 4).min(1000);
     let blocks = 4096usize;
     let mut data = vec![0f32; blocks * block_f32];
@@ -96,7 +96,7 @@ fn main() {
         let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1e3;
         assert_eq!(gpu_done, gpu_blocks);
 
-        // Verify the WHOLE buffer advanced by exactly one round.
+        // Verify the whole buffer advanced by exactly one round.
         let expect = (round + 1) as f32;
         let bad = data.iter().filter(|&&v| v != expect).count();
         println!("{round:>5} | {:>8}% | {cpu_blocks:>10} | {gpu_blocks:>10} | {cpu_ms:>6.1} | {gpu_ms:>6.1} | {}",

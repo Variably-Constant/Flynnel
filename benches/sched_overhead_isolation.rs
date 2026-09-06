@@ -97,7 +97,7 @@ fn bench_scheduler_overhead(c: &mut Criterion) {
                 );
             });
 
-            // flynnel with PER-ELEMENT closure shape (matches rayon's
+            // flynnel with a per-element closure shape (matches rayon's
             // body shape: closure invoked per element, not per leaf).
             // Isolates whether the per-leaf vs per-element closure
             // shape matters for the gap.
