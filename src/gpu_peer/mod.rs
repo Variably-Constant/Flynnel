@@ -723,6 +723,35 @@ impl GpuPeer {
         }
     }
 
+    /// [`Self::submit_user`] pinned to `lane`, for diagnostics that
+    /// need to control which lane's blocks stay warm.
+    ///
+    /// A handle's own lane owns its resident block, so passing a
+    /// different lane here reads that block from another lane's
+    /// team. Pass `None` unless the op does not touch resident data.
+    /// `lane` is taken modulo the lane count.
+    pub fn submit_user_on_lane(
+        &mut self,
+        op: u32,
+        handle: Option<&ResidentHandle>,
+        args: &[u8],
+        lane: u32,
+    ) -> Result<Ticket, GpuPeerError> {
+        if op < layout::OP_USER_BASE {
+            return Err(GpuPeerError::Unavailable("op below OP_USER_BASE"));
+        }
+        let (block, count) = match handle {
+            Some(h) => (h.block, h.bytes),
+            None => (layout::NO_BLOCK, 0u32),
+        };
+        let mut payload = Vec::with_capacity(RESIDENT_PARAMS_BYTES + args.len());
+        payload.extend_from_slice(&block.to_le_bytes());
+        payload.extend_from_slice(&count.to_le_bytes());
+        payload.extend_from_slice(args);
+        let lanes = self.region.geometry().lanes.max(1);
+        self.submit_on_lane(lane % lanes, op, &payload)
+    }
+
     /// Submit a resident-block task (`OP_ADD1_F32_V` / `OP_SUM_U32_V`).
     /// Only the 8-byte param header crosses the bus; the data stays
     /// in VRAM. Tasks on one handle execute in submission order (lane
