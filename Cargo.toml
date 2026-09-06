@@ -248,6 +248,10 @@ name = "gpu_peer_user_ops_demo"
 required-features = ["gpu-peer"]
 
 [[example]]
+name = "gpu_peer_lane_stall"
+required-features = ["gpu-peer"]
+
+[[example]]
 name = "gpu_peer_group_demo"
 required-features = ["gpu-peer"]
 
