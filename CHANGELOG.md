@@ -61,32 +61,29 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   the spin its item cost earns. `par_iter::measured_collapse_threshold_ns`
   is public and reports `None` until the host profile is measured.
 - Gate-shaped cells on a Ryzen 9 7900X, built there with
-  `-C target-cpu=native`, medians of five interleaved runs of 1000
-  calls each with the host's busy-core count sampled before every
-  round (median 1.10 of 24). A light body at 10k items 15.2 to
-  11.3 us, which is 4.02x to 5.43x over serial; at 100k 60.3 to
-  57.1 us. A body of about 80 ns per item through
-  `for_each_chunk_triple_min_leaf` at 1k 11.4 to 9.1 us (3.80x to
-  4.76x) and at 10k 47.7 to 41.7 us. A heavy body at 100k reads 658
-  to 674 us, the one cell that did not improve.
-- The same cells on a Ryzen 7 2700, from binaries cross-built on the
-  other host so the measuring machine stayed idle: light at 10k 39.0
-  to 27.1 us (1.83x to 2.63x), the 80 ns body at 1k 24.6 to 22.1 us
-  and at 10k 137.7 to 115.2 us, heavy at 100k 2294 to 2237 us. Light
-  at 100k reads 131.2 to 136.6 us, the cell that did not improve
-  here. The two hosts disagree about which of those two cells loses,
-  which is what a difference at the edge of the run-to-run spread
-  looks like.
-- The cold-dispatch bench on the 2700, medians of seven interleaved
-  rounds, as a ratio against rayon where lower is better: 128 items
-  of 500us 1.15 to 1.02, 1024 items of 100us 1.07 to 0.99, 16384
-  items of 10us 1.12 to 1.02, 32 items of 1ms 1.01 to 0.98, and the
-  heavy shapes flat (5 items of 100ms 1.00 to 0.99, 16 items of 10ms
-  1.01 to 1.00). Three rounds were not enough to settle the 1024-item
-  cell, which read 1.14 to 1.00 in one session and 1.03 to 1.17 in
-  the next; seven rounds resolve it. While the spin budget was a
-  single host-wide value the same bench regressed the heavy shapes,
-  which is what deciding it per plan fixed.
+  `-C target-cpu=native` and measured on an idle host, medians of
+  five interleaved runs of 1000 calls each with the busy-core count
+  sampled before every round (median 0.07 of 24). A light body at
+  10k items 13.5 to 11.1 us, which is 3.70x to 4.50x over serial. A
+  body of about 80 ns per item through
+  `for_each_chunk_triple_min_leaf` at 1k 10.4 to 9.0 us and at 10k
+  44.5 to 40.5 us. Two cells are flat: the light body at 100k, 56.9
+  to 56.8 us, and a heavy body at 100k, 633.6 to 633.9 us.
+- The cold-dispatch bench on a Ryzen 7 2700, from a binary
+  cross-built on the other host so the measuring machine stayed
+  idle, medians of seven interleaved rounds, as a ratio against
+  rayon where lower is better. The one movement outside its own
+  noise is 16384 items of 10us, 1.14 to 1.04. Every other shape sits
+  inside the spread described next, the heavy ones flat at 1.00.
+- What "inside the spread" means here, because it decides which of
+  the figures above are claims. The same base binary measured in two
+  separate sessions disagrees with itself by up to 13 points at 128
+  items of 500us and 6 points at 1024 items of 100us, against 2
+  points at 16384 items of 10us. A cell's own repeat spread is the
+  floor a difference has to clear, and this bench does not resolve a
+  few points either way at its mid sizes. Earlier sessions reported
+  movement at those cells in both directions, which was the spread
+  rather than the code.
 - Probing every worker peer per round instead of four was measured
   and is not adopted: the light cells gained within noise and the
   heavy cell lost the same.
