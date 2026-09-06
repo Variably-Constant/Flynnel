@@ -433,8 +433,25 @@ impl GpuPeer {
         self.lane_set.is_done(&self.region, ticket)
     }
 
-    /// Wait (bounded) for completion; returns the slot status word.
+    /// Wait (bounded) for completion and return the slot's status
+    /// word, which is always [`STATUS_DONE`].
+    ///
+    /// A slot that completed without doing its work returns
+    /// `Err(Unavailable)` rather than its status, so a caller that
+    /// only tests for an error cannot read an unfilled payload as an
+    /// answer. `Err(Timeout)` still means the slot never completed.
+    /// [`Self::wait_status`] returns the raw word instead.
     pub fn wait(&mut self, ticket: Ticket, timeout: Duration) -> Result<u32, GpuPeerError> {
+        let status = self.wait_status(ticket, timeout)?;
+        if status != STATUS_DONE {
+            return Err(GpuPeerError::Unavailable("slot completed with a failed status"));
+        }
+        Ok(status)
+    }
+
+    /// [`Self::wait`] without the status check: returns whatever the
+    /// slot's status word holds once it completes.
+    pub fn wait_status(&mut self, ticket: Ticket, timeout: Duration) -> Result<u32, GpuPeerError> {
         let t0 = Instant::now();
         let mut spins = 0u32;
         while !self.lane_set.is_done(&self.region, ticket) {
