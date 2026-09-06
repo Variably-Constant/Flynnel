@@ -145,6 +145,34 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   worker; `trace::worker_flushes_done` counts completed worker dumps
   so a tracer can wait for them before exit.
 
+- `FLYNNEL_PROFILE_SAMPLES=1` prints every sample behind each point of
+  the host dispatch calibration, so the spread can be read off one run
+  rather than inferred from repeated ones. The estimator is unchanged
+  and still takes the fastest of nine, but that is now documented as
+  the biased-low choice it is: on a Ryzen 7 2700 a dispatched point
+  read 6200 ns against a 9600 ns median of the same nine samples,
+  while serial points repeat to within a percent. The bias is kept
+  because both corrections measured worse. Taking the median of each
+  point separately gave dispatch costs from 300 to 6700 ns over six
+  calibrations of an idle host, since it differences two numbers of
+  comparable size never observed together; pairing the samples and
+  differencing within each iteration held a spread comparable to the
+  current one but drew 38700 ns on one calibration, which raised the
+  collapse threshold and took the light 10k cell from 25.8 to 49.4 us.
+  Under-estimating dispatch spends overhead on work that did not need
+  the pool; over-estimating it forfeits the parallelism outright.
+
+### Tests
+
+- `for_each_chunk_small_input_runs_serial` supplies an explicit
+  per-item cost, which is what the inline collapse gates on, so the
+  routing it asserts follows the plan rather than a live probe of the
+  body. Without one it failed on a loaded host, and identically on a
+  tree predating the change it was blamed on.
+  `for_each_chunk_small_input_without_an_estimate` keeps the probed
+  path and asserts what holds there whichever way it routes: every
+  item processed exactly once.
+
 ### GPU peer
 
 - A lane's poller launches, drains and counts independently of the
