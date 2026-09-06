@@ -489,23 +489,30 @@ pub fn jec_wake_threshold_ns() -> u64 {
 }
 
 /// Measure this host's dispatch profile now, on the calling thread,
-/// and install it. A compute-bound body (eight dependent
-/// multiply-rotate steps per item) is timed serial against
-/// dispatched through the pool, medians of five each: once at two
-/// leaves for the dispatch cost; then over doubling counts from
-/// four leaves for the collapse crossover, the serial time at which
-/// the dispatched body finishes no later than the serial one,
-/// interpolated between the last two counts, three sweeps after one
-/// discarded warm-up dispatch, median taken, floored at the dispatch
-/// cost; then the same doubling sweep dispatched under the polling
-/// scope against the wake scope for the wake-path crossover. A sweep
-/// whose second side never catches up reports the serial time at the
-/// largest count swept, so a calibration on a loaded host collapses
-/// more work inline and wakes later, never the reverse. Callers
-/// arriving while one calibration runs wait for its values; a call
-/// after it re-measures and replaces them. The test
-/// `host_dispatch_profile_is_measured_and_cached` prints the values
-/// and the cost on the running host.
+/// and install it.
+///
+/// A compute-bound body, eight dependent multiply-rotate steps per
+/// item, is timed serial against dispatched through the pool after
+/// sixteen discarded warm-up dispatches. Every timed point and every
+/// crossover sweep is the fastest of nine, not a median: interference
+/// only adds time to a measurement, so the fastest run is the closest
+/// reading of the cost itself.
+///
+/// Three values come out. The dispatch cost is one join over two
+/// leaves minus the same body serial. The collapse threshold is the
+/// serial time at which the dispatched body first finishes no later
+/// than serial, found over doubling counts from four leaves and
+/// interpolated between the last two, floored at the dispatch cost.
+/// The wake threshold is the same sweep run under the polling scope
+/// against the wake scope.
+///
+/// A sweep whose second side never catches up reports the serial time
+/// at the largest count swept, so a calibration taken on a loaded
+/// host collapses more work inline and wakes later, never the
+/// reverse.
+///
+/// Callers arriving while one calibration runs wait for its values; a
+/// call after it re-measures and replaces them.
 pub fn calibrate_host_dispatch() -> HostDispatchProfile {
     use std::sync::atomic::Ordering;
     let _one_at_a_time = HOST_DISPATCH_CALIBRATION
@@ -530,15 +537,22 @@ pub fn calibrate_inline_collapse_threshold() -> u64 {
 fn measure_host_dispatch() -> HostDispatchProfile {
     const LEAF: usize = 256;
     const MAX_ITEMS: usize = 1 << 17;
-    fn median5<F: FnMut()>(mut f: F) -> u64 {
-        let mut t: [u64; 5] = [0; 5];
-        for slot in t.iter_mut() {
+    /// Samples per timed point, and sweeps per crossover.
+    const SAMPLES: usize = 9;
+
+    /// The fastest of [`SAMPLES`] timings of `f`.
+    ///
+    /// Interference can only add time to a measurement, never remove
+    /// it, so the fastest observation is the one least contaminated
+    /// by whatever else the host was doing.
+    fn fastest<F: FnMut()>(mut f: F) -> u64 {
+        let mut best = u64::MAX;
+        for _ in 0..SAMPLES {
             let t0 = std::time::Instant::now();
             f();
-            *slot = t0.elapsed().as_nanos() as u64;
+            best = best.min(t0.elapsed().as_nanos() as u64);
         }
-        t.sort_unstable();
-        t[2]
+        best
     }
     // Eight dependent multiply-rotate steps per item: compute-bound
     // at about eight nanoseconds an item, so the dispatched version
@@ -582,8 +596,8 @@ fn measure_host_dispatch() -> HostDispatchProfile {
         let mut prev: Option<(u64, i64)> = None;
         loop {
             let plan = JobPlan::new(0, n as u32);
-            let a = median5(|| first(&plan, &mut v[..n]));
-            let b = median5(|| second(&plan, &mut v[..n]));
+            let a = fastest(|| first(&plan, &mut v[..n]));
+            let b = fastest(|| second(&plan, &mut v[..n]));
             let diff = b as i64 - a as i64;
             if diff <= 0 {
                 return match prev {
@@ -602,9 +616,13 @@ fn measure_host_dispatch() -> HostDispatchProfile {
             n <<= 1;
         }
     }
-    fn median_of<const N: usize>(mut t: [u64; N]) -> u64 {
-        t.sort_unstable();
-        t[N / 2]
+    /// The fastest of [`SAMPLES`] runs of `sweep_once`.
+    fn fastest_sweep<F: FnMut() -> u64>(mut sweep_once: F) -> u64 {
+        let mut best = u64::MAX;
+        for _ in 0..SAMPLES {
+            best = best.min(sweep_once());
+        }
+        best
     }
     let mut v: Vec<u64> = (0..MAX_ITEMS as u64).collect();
     // The first dispatches wake a cold pool and fault the buffer in;
@@ -619,20 +637,14 @@ fn measure_host_dispatch() -> HostDispatchProfile {
     // whatever the sweep read.
     let two = 2 * LEAF;
     let plan_two = JobPlan::new(0, two as u32);
-    let serial_two = median5(|| body(&mut v[..two]));
-    let pool_two = median5(|| dispatched(&plan_two, &mut v[..two]));
+    let serial_two = fastest(|| body(&mut v[..two]));
+    let pool_two = fastest(|| dispatched(&plan_two, &mut v[..two]));
     let dispatch_cost_ns = pool_two.saturating_sub(serial_two).max(1);
     let serial_vs_pool = |v: &mut [u64]| {
         sweep(v, |_, items| body(items), dispatched)
     };
-    let collapse_threshold_ns = median_of([
-        serial_vs_pool(&mut v),
-        serial_vs_pool(&mut v),
-        serial_vs_pool(&mut v),
-        serial_vs_pool(&mut v),
-        serial_vs_pool(&mut v),
-    ])
-    .max(dispatch_cost_ns);
+    let collapse_threshold_ns =
+        fastest_sweep(|| serial_vs_pool(&mut v)).max(dispatch_cost_ns);
     // The wake path against polling: the same dispatched body under
     // the two dispatch scopes.
     let polling_vs_wake = |v: &mut [u64]| {
@@ -648,13 +660,7 @@ fn measure_host_dispatch() -> HostDispatchProfile {
             },
         )
     };
-    let jec_wake_threshold_ns = median_of([
-        polling_vs_wake(&mut v),
-        polling_vs_wake(&mut v),
-        polling_vs_wake(&mut v),
-        polling_vs_wake(&mut v),
-        polling_vs_wake(&mut v),
-    ]);
+    let jec_wake_threshold_ns = fastest_sweep(|| polling_vs_wake(&mut v));
     HostDispatchProfile { dispatch_cost_ns, collapse_threshold_ns, jec_wake_threshold_ns }
 }
 
