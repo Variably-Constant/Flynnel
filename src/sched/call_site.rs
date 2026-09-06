@@ -30,7 +30,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::sched::adaptive_profile::{
     WorkloadClass, class_tag_decode, class_tag_encode, classify_observed,
@@ -204,6 +204,11 @@ pub struct CallSiteState {
     /// collection-merge reducer each converge on their own average.
     reduce_cost_sum_cycles: AtomicU64,
     reduce_cost_samples: AtomicU32,
+    /// True once a body this site ran on the calling thread took
+    /// longer than the collapse threshold that admitted it. While
+    /// set, the site's calls dispatch regardless of the caller's
+    /// per-item estimate.
+    collapse_overran: AtomicBool,
 }
 
 impl CallSiteState {
@@ -234,6 +239,24 @@ impl CallSiteState {
             split_backend_ns_per_item_by_size: [const { AtomicU64::new(0) }; PLACEMENT_BUCKETS],
             reduce_cost_sum_cycles: AtomicU64::new(0),
             reduce_cost_samples: AtomicU32::new(0),
+            collapse_overran: AtomicBool::new(false),
+        }
+    }
+
+    /// True once this site ran a collapsed body slower than the
+    /// collapse threshold, which means its estimate reads low enough
+    /// to have made the wrong call.
+    #[inline]
+    pub fn collapse_overran(&self) -> bool {
+        self.collapse_overran.load(Ordering::Relaxed)
+    }
+
+    /// Record that a collapsed body took `elapsed_ns` against a
+    /// threshold of `threshold_ns`. Latches when it ran over.
+    #[inline]
+    pub fn note_collapsed_body(&self, elapsed_ns: u64, threshold_ns: u64) {
+        if elapsed_ns > threshold_ns {
+            self.collapse_overran.store(true, Ordering::Relaxed);
         }
     }
 

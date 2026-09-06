@@ -675,13 +675,35 @@ fn runs_on_caller(plan: &JobPlan, n: usize) -> bool {
 }
 
 /// True when the caller's explicit estimate puts `n` items under
-/// [`inline_collapse_threshold_ns`].
+/// [`inline_collapse_threshold_ns`], and this site has not already
+/// run a collapsed body slower than that threshold.
+///
+/// An estimate low enough to admit work that then overruns costs the
+/// difference between running inline and running on the pool, which
+/// is unbounded in the size of the underestimate. One overrun at a
+/// site is enough to stop trusting it there.
 #[inline]
 fn collapses_inline(plan: &JobPlan, n: usize) -> bool {
+    if plan.site.is_some_and(|s| s.get().collapse_overran()) {
+        return false;
+    }
     plan.estimated_per_item_ns_explicit
         && plan.effective_ns_per_elem().is_some_and(|per| {
             (per as u64).saturating_mul(n as u64) < inline_collapse_threshold_ns()
         })
+}
+
+/// Run `body` on the calling thread, recording it as a leaf and
+/// latching the site when it outruns the collapse threshold.
+#[inline]
+fn run_on_caller<R>(plan: &JobPlan, body: impl FnOnce() -> R) -> R {
+    let t0 = std::time::Instant::now();
+    let out = record_leaf(plan.site, body);
+    if let Some(site) = plan.site {
+        site.get()
+            .note_collapsed_body(t0.elapsed().as_nanos() as u64, inline_collapse_threshold_ns());
+    }
+    out
 }
 
 /// Apply `op` to every element of `items` in parallel by
@@ -753,7 +775,7 @@ where
     // downstream measures actual cost; let it run instead of
     // shortcutting here based on a guess.
     if runs_on_caller(plan, n) {
-        record_leaf(plan.site, || op(items));
+        run_on_caller(plan, || op(items));
         return;
     }
 
@@ -1380,7 +1402,7 @@ where
     // caller's own estimate: the body runs here, as in
     // for_each_chunk.
     if runs_on_caller(plan, n) {
-        record_leaf(plan.site, || op(out, a, b));
+        run_on_caller(plan, || op(out, a, b));
         return;
     }
     let leaf = min_leaf.max(1);
@@ -1535,7 +1557,7 @@ where
     // caller's own estimate: the body runs here, as in
     // for_each_chunk.
     if runs_on_caller(plan, n) {
-        record_leaf(plan.site, || op(0, items));
+        run_on_caller(plan, || op(0, items));
         return;
     }
     let leaf = min_leaf.max(1);
@@ -3611,5 +3633,38 @@ mod tests {
                     "{shape:?} carries no factor, so the observer still decides"),
             }
         }
+    }
+
+    /// A body admitted inline by an estimate that reads far too low
+    /// latches its site, and later calls dispatch instead.
+    #[test]
+    fn a_collapsed_body_that_overruns_stops_its_site_collapsing() {
+        use crate::sched::call_site::{CallSiteState, SiteRef};
+        static SITE: CallSiteState = CallSiteState::new();
+        let site = SiteRef::new(&SITE);
+        let threshold = host_dispatch_profile().collapse_threshold_ns;
+        assert!(threshold > 0, "measured by the query above");
+        assert!(!SITE.collapse_overran(), "a fresh site has not overrun");
+
+        // One nanosecond an item puts any size under the threshold,
+        // while the body sleeps well past it.
+        let n = 64usize;
+        let mut items = vec![0u8; n];
+        let plan = JobPlan::new(0, n as u32)
+            .with_site(site)
+            .with_estimated_per_item_ns(1);
+        assert!(collapses_inline(&plan, n), "the estimate admits it inline");
+
+        let over = std::time::Duration::from_nanos(threshold.saturating_mul(4));
+        for_each_chunk(&plan, &mut items, |chunk| {
+            std::thread::sleep(over);
+            for x in chunk.iter_mut() {
+                *x = x.wrapping_add(1);
+            }
+        });
+
+        assert!(SITE.collapse_overran(), "the overrun latched the site");
+        assert!(!collapses_inline(&plan, n),
+            "the same plan no longer collapses at this site");
     }
 }
