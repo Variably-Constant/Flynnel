@@ -145,6 +145,38 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   worker; `trace::worker_flushes_done` counts completed worker dumps
   so a tracer can wait for them before exit.
 
+### GPU peer
+
+- A lane's poller launches, drains and counts independently of the
+  others. Each lane carries its own launch count, exit counter
+  (`HDR_LANE_EXITS_OFF`) and generation word (`HDR_LANE_GEN_OFF`), and
+  runs as its own grid on its own stream; before, one stream carried
+  every lane and no lane relaunched until every block of the previous
+  launch had exited. A submit on a lane whose block had parked
+  therefore waited for whichever block was still working, for as long
+  as that block's work lasted. On an RTX 3070 with one lane held by a
+  device-side spin and another timed after a 10 ms gap, the timed
+  lane's p50 was 139.918 ms against a 150 ms feeder and 389.871 ms
+  against a 400 ms feeder, the second past the 250 ms quantum; both now
+  read 0.140 ms and 0.122 ms against a control of 0.24 ms, with no
+  separation at 1, 2 or 4 blocks per lane. A lane still holds one team
+  at a time, which is what keeps a second team from reading a slot the
+  first has not retired: the ring tail advances only at retirement, so
+  the generation word cannot prevent that read once a block is inside
+  an op. `examples/gpu_peer_lane_stall` is the measuring arm.
+- `GpuPeer::init` rejects a lane count above `MAX_POLLER_LANES` (64),
+  which is what the per-lane header words address.
+- Both sides of the team barrier are bounded by the quantum: rank 0
+  stops waiting for a rank that never arrives and marks the slot
+  `STATUS_ERR`, and a follower stops waiting for a retirement that will
+  not be published.
+- `GpuPeer::wait` returns `Err(Unavailable)` for a slot that completed
+  with a failed status, so a caller testing only for an error cannot
+  read an unfilled payload as an answer. `GpuPeer::wait_status` returns
+  the raw status word instead.
+- `GpuPeer::submit_user_on_lane` places a user op on a caller-chosen
+  lane, for diagnostics that need a particular lane warm.
+
 ## 0.2.3 - 2026-09-05
 
 ### Scheduler
