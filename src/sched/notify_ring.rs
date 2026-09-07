@@ -202,11 +202,21 @@ impl<T: Send> NotifyHub<T> {
     /// of a stage thread's closure so panic-unwind triggers
     /// shutdown automatically.
     ///
-    /// ```ignore
-    /// scope.spawn(move || {
-    ///     let _shutdown = hub.shutdown_on_drop();
-    ///     while let Some(item) = rx.recv() { stage(item); }
+    /// ```
+    /// use flynnel::sched::notify_ring::NotifyHub;
+    ///
+    /// let hub = NotifyHub::<u32>::new(4, 1);
+    /// let rx = hub.register_consumer();
+    ///
+    /// // The stage that owns the hub hands it to the guard, so the
+    /// // shutdown fires however that stage ends.
+    /// std::thread::scope(|scope| {
+    ///     scope.spawn(move || {
+    ///         let _shutdown = hub.shutdown_on_drop();
+    ///     });
     /// });
+    ///
+    /// assert!(rx.recv().is_none(), "a shut-down hub releases its consumers");
     /// ```
     pub fn shutdown_on_drop(self) -> NotifyShutdownOnDrop<T> {
         NotifyShutdownOnDrop { hub: self }

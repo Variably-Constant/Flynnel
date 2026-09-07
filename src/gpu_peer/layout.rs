@@ -73,6 +73,33 @@ pub const HDR_FISCHER_STARTED_OFF: usize = 0x148;
 /// without contention on both sides proves nothing and is treated as
 /// inconclusive, never as a grant.
 pub const HDR_FISCHER_GPU_CONT_OFF: usize = 0x14C;
+/// Count of barrier expiries: block teams that did not fully arrive
+/// before rank 0's deadline (u32, device-scope atomic).
+///
+/// Read with [`super::GpuPeer::barrier_stalls`]. Zero on any run where
+/// no team missed its deadline, which is every run on an unloaded host
+/// observed so far.
+pub const HDR_STALL_COUNT_OFF: usize = 0x150;
+/// Largest ring depth (`head - tail`) observed at a barrier expiry
+/// (u32, device-scope atomic maximum).
+///
+/// This separates the two mechanisms that can produce a stall. A team
+/// split by a quantum boundary landing between two ranks' clock reads
+/// happens on whatever the lane was holding, so a trickle shows one or
+/// two. A lane relaunched late and draining a backlog claims from a
+/// full ring, so it shows a depth near `slots_per_lane`. The count says
+/// stalls happened; this says which kind.
+pub const HDR_STALL_MAX_DEPTH_OFF: usize = 0x154;
+/// Longest time rank 0 spent at the team barrier on a slot the whole
+/// team did reach, in nanoseconds (u32, device-scope atomic maximum).
+///
+/// This is the margin the deadline is spending. The deadline is a whole
+/// quantum, chosen as the figure already to hand rather than measured;
+/// this says how much of it a healthy team actually needs. A deadline
+/// can safely be shortened to some multiple of this and no further,
+/// and shortening it is what decides how long a caller waits before
+/// being told a team was lost.
+pub const HDR_BARRIER_WAIT_MAX_OFF: usize = 0x158;
 /// Calibration globaltimer samples (`u64[GTS_SLOTS]`).
 pub const HDR_GTS_OFF: usize = 0x180;
 /// Calibration timestamp slots (`u64[GTS_SLOTS]` at [`HDR_GTS_OFF`]).
@@ -83,8 +110,8 @@ pub const GTS_SLOTS: usize = 400;
 /// lets one lane relaunch while another is still working.
 pub const HDR_LANE_EXITS_OFF: usize = 0xE00;
 /// Per-lane active poller generation (`u32[MAX_POLLER_LANES]`). A
-/// straggler from an older launch of THAT lane exits at its next poll;
-/// lanes do not supersede one another.
+/// straggler exits at its next poll when an older launch of its own
+/// lane is superseded; one lane never supersedes another.
 pub const HDR_LANE_GEN_OFF: usize = 0xF00;
 /// Lanes addressable by the two per-lane arrays above, which occupy
 /// the header from [`HDR_LANE_EXITS_OFF`] to [`HDR_BYTES`].
@@ -152,8 +179,21 @@ pub const NO_BLOCK: u32 = u32::MAX;
 pub const STATUS_SUBMITTED: u32 = 0;
 /// Status: consumer completed the operation.
 pub const STATUS_DONE: u32 = 1;
-/// Status: consumer rejected the descriptor (unknown op / bad len).
+/// Status: consumer rejected the descriptor (unknown op / bad len), or
+/// the user op reported failure.
 pub const STATUS_ERR: u32 = 2;
+/// Status: a block team did not fully arrive before rank 0's deadline,
+/// so the slot was retired without every rank's contribution.
+///
+/// Distinct from [`STATUS_ERR`] because the two want different
+/// responses: a lost rank may be fixed by a retry or a smaller
+/// `blocks_per_lane`, while an op reporting failure will not be. Only
+/// reachable when `blocks_per_lane > 1`.
+///
+/// A caller testing `!= STATUS_DONE` treats this as a failure without
+/// change; one that wants the distinction reads the raw word from
+/// [`super::GpuPeer::wait_status`].
+pub const STATUS_TEAM_INCOMPLETE: u32 = 3;
 
 /// Capability: doorbell handshake measured working.
 pub const FLAG_DOORBELL_OK: u64 = 1 << 0;
@@ -214,6 +254,27 @@ impl Geometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Status words are `#define`d in kernels/gpu_peer.cu and read back
+    /// here from the slot descriptor, so a value that drifts on one side
+    /// is a caller misreading an outcome with nothing to say so. The
+    /// offsets below are pinned for the same reason; these were not.
+    #[test]
+    fn status_words_match_the_kernel_defines() {
+        assert_eq!(STATUS_SUBMITTED, 0);
+        assert_eq!(STATUS_DONE, 1);
+        assert_eq!(STATUS_ERR, 2);
+        assert_eq!(STATUS_TEAM_INCOMPLETE, 3);
+
+        // Each outcome must be its own word: a caller distinguishing a
+        // lost rank from a failed op can only do so while these differ.
+        let all = [STATUS_SUBMITTED, STATUS_DONE, STATUS_ERR, STATUS_TEAM_INCOMPLETE];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two status words collide");
+            }
+        }
+    }
 
     #[test]
     fn offsets_match_the_kernel_defines() {

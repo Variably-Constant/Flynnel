@@ -79,7 +79,7 @@ fn main() {
         assert_eq!(peer.wait(t, Duration::from_secs(5)).expect("wait"), STATUS_DONE,
                    "user task {i}");
         let mut buf = vec![0u8; RESIDENT_PARAMS_BYTES + 8];
-        peer.read_result(t, &mut buf);
+        peer.read_result(t, &mut buf).expect("fits");
         last_elem0 = f32::from_le_bytes(buf[12..16].try_into().expect("4B"));
         peer.reap(t).expect("in order");
     }

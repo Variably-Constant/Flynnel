@@ -61,7 +61,7 @@ fn main() {
             assert_eq!(status, STATUS_DONE, "gpu block {b}");
             let dst = &mut gpu_half[b * block_f32..(b + 1) * block_f32];
             let mut bytes = vec![0u8; block_f32 * 4];
-            peer.read_result(t, &mut bytes);
+            peer.read_result(t, &mut bytes).expect("block fits the slot");
             for (i, c) in bytes.chunks_exact(4).enumerate() {
                 dst[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             }

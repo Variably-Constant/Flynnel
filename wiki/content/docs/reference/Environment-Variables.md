@@ -78,6 +78,20 @@ Enable per-`join_in_worker` dispatch tracing to stderr. Accumulates three proces
 
 Default: off.
 
+### `FLYNNEL_HOST_PROFILE_NS=<dispatch>,<collapse>,<wake>`
+
+Pin the host dispatch profile to the three nanosecond counts given, and skip the calibration entirely. Read by [`src/sched/par_iter.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/par_iter.rs) inside `calibrate_host_dispatch`.
+
+For comparing this scheduler against one that does not measure its own dispatch cost. Without a pin the two arms differ in whether they adapt as well as in how they schedule, and the ratio mixes the two; pinning the same cost on both sides leaves only the scheduling difference, and the adaptive gain can then be reported separately.
+
+All three fields are required, because pinning some and measuring the rest yields a profile that is neither and defeats the comparison. Zero is refused in any field, since an installed collapse threshold of zero is what marks a profile as not yet calibrated. Anything that does not parse is reported on stderr and the host is measured instead, so a mistyped pin is loud rather than silently honoured as some other value.
+
+```
+FLYNNEL_HOST_PROFILE_NS=4000,12000,20000
+```
+
+Default: unset, and the host is measured.
+
 ### `FLYNNEL_PROFILE_SAMPLES=<any value>`
 
 Print every sample behind each point of the host dispatch calibration to stderr: the minimum, the median, the maximum, and the sorted samples. Read by [`src/sched/par_iter.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/par_iter.rs) inside `measure_host_dispatch`, so it costs nothing outside the one calibration per process.
@@ -127,6 +141,7 @@ The detection helpers in `flynnel::backend::detect` do not read env vars directl
 | `FLYNNEL_ADAPTIVE_SPIN=1` | off | Opt in to the adaptive spin-window controller |
 | `FLYNNEL_TRACE=on` | off | Enable scheduler-event tracing |
 | `FLYNNEL_TRACE_DISPATCH=<any>` | off | Per-`join_in_worker` dispatch trace to stderr |
+| `FLYNNEL_HOST_PROFILE_NS=d,c,w` | unset (measured) | Pin the host dispatch profile and skip calibration |
 | `FLYNNEL_PROFILE_SAMPLES=<any>` | off | Every sample behind each host-dispatch calibration point to stderr |
 | `FLYNNEL_LOCKLATCH_DIAGNOSE=1` | off | Per-`LockLatch::wait()` diagnostic to stderr |
 | `FLYNNEL_ENABLE_FLAT_FANOUT=1` | off | Flat-fanout path in reduce_chunks (bench-only) |

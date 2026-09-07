@@ -22,6 +22,39 @@
 //! (watchdog-safe on display GPUs) that parks when idle and costs one
 //! launch to wake; a continuously fed queue never pays the wake cost
 //! (see the poller module docs).
+//!
+//! # What the peer does to a caller's CUDA state
+//!
+//! Streams: the peer creates every stream it uses - one per lane, one
+//! for wide launches - and never makes a caller's stream current. Work
+//! a consumer enqueues on [`GpuPeer::wide_stream`] is FIFO-ordered with
+//! the peer's own wide launches; everything else it owns is separate.
+//!
+//! Context: the peer operates on the device primary context, and makes
+//! it current on whatever thread reaches one of its bind points. That
+//! matters to a consumer that built its own context - cudarc's
+//! `new_non_primary` is how one is obtained - because such a context is
+//! replaced on the calling thread, after which the consumer's launches
+//! run on the primary context instead of the one it built.
+//! [`GpuPeer::init`] reports this, to stderr and through
+//! [`GpuPeer::displaced_foreign_context`], so a consumer can fall back
+//! rather than discover it at a launch far from the cause. A consumer
+//! holding the primary context, which is what `CudaContext::new`
+//! returns, shares it with the peer and is unaffected.
+//!
+//! Device-wide state: [`l2_persist::L2Persist`] resets the persisting-L2
+//! window and limit on drop. Those are context-wide rather than
+//! stream-local, so a consumer that sets its own persisting-L2 window
+//! will find it cleared.
+//!
+//! # Slot capacity
+//!
+//! A lane slot carries [`Geometry::payload_max`] payload bytes, and
+//! both directions are bounded by that one figure: submitting more is
+//! refused with [`GpuPeerError::PayloadTooLarge`], and so is reading
+//! more, because the bytes past a slot belong to the next one. Read
+//! that figure from the running geometry rather than deriving it from a
+//! slot size.
 
 pub mod calibration;
 pub mod group;
@@ -41,6 +74,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cudarc::driver::sys as cu;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 
@@ -48,7 +82,7 @@ pub use calibration::PeerCalibration;
 pub use lanes::{LaneSet, RegionWords, Ticket};
 pub use layout::{
     Geometry, OP_ADD1_F32, OP_ADD1_F32_V, OP_H2V, OP_NOP, OP_SUM_U32, OP_SUM_U32_V, OP_V2H,
-    RESIDENT_PARAMS_BYTES, STATUS_DONE, STATUS_ERR,
+    RESIDENT_PARAMS_BYTES, STATUS_DONE, STATUS_ERR, STATUS_TEAM_INCOMPLETE,
 };
 pub use group::{GroupHandle, PeerGroup};
 pub use l2_persist::{L2BenchReport, L2Capability, L2Persist};
@@ -143,6 +177,15 @@ pub struct GpuPeerConfig {
     pub slots_per_lane: u32,
     /// Poller quantum (bounded residency per launch).
     pub quantum_ns: u64,
+    /// How long rank 0 waits for the rest of its block team before
+    /// retiring the slot [`STATUS_TEAM_INCOMPLETE`].
+    ///
+    /// Only consulted when `blocks_per_lane > 1`. This is what a caller
+    /// waits to learn that a team was lost, so it trades reporting
+    /// latency against abandoning teams that would have assembled. A
+    /// healthy team on a measured host needs 2.4 to 13 microseconds;
+    /// the default leaves several hundred times that.
+    pub barrier_deadline_ns: u64,
     /// Idle time after which a resident quantum parks.
     pub idle_exit_ns: u64,
     /// CUDA device ordinal.
@@ -180,6 +223,7 @@ impl Default for GpuPeerConfig {
             slot_bytes: 4096,
             slots_per_lane: 64,
             quantum_ns: 250_000_000,
+            barrier_deadline_ns: 5_000_000,
             idle_exit_ns: 2_000_000,
             device_ordinal: 0,
             vram_block_bytes: 65_536,
@@ -263,6 +307,54 @@ pub struct GpuPeer {
     // concurrently, which is exactly when pause_poller matters.
     wide_stream: Arc<CudaStream>,
     _ctx: Arc<CudaContext>,
+    /// Set when init found a different context current on its thread.
+    displaced_foreign_context: bool,
+}
+
+/// The calling thread's current CUDA context, or `None` when the
+/// driver is uninitialized or no context is current.
+///
+/// A failed query and an absent context are the same answer here:
+/// both mean the caller had nothing for this peer to displace.
+fn current_context() -> Option<cu::CUcontext> {
+    let mut ctx: cu::CUcontext = core::ptr::null_mut();
+    // SAFETY: out-parameter write to a local; the driver reports its
+    // own uninitialized state through the return code rather than
+    // touching the pointer.
+    let rc: cu::CUresult = unsafe { cu::cuCtxGetCurrent(&mut ctx) };
+    if rc == cu::CUresult::CUDA_SUCCESS && !ctx.is_null() { Some(ctx) } else { None }
+}
+
+/// Report a context this peer displaced on the calling thread.
+///
+/// Flynnel operates on the device primary context and makes it current
+/// on whatever thread reaches its bind points. A caller holding a
+/// different context - one built with cudarc's `new_non_primary`, say -
+/// keeps working right up until a peer call rebinds its thread, after
+/// which its launches land on the wrong context with nothing to say
+/// so. That is undiagnosable from the far end, so it is named here, at
+/// the one moment the mismatch can be introduced.
+/// Returns whether a context was displaced, so a caller can act on it
+/// rather than only read about it. The report is the default because
+/// refusing would change `init`'s success contract for every consumer
+/// over a configuration none is known to have;
+/// [`GpuPeer::displaced_foreign_context`] is how a consumer that would
+/// rather fall back chooses that for itself.
+fn warn_on_foreign_context(prior: Option<cu::CUcontext>) -> bool {
+    let Some(prior) = prior else { return false };
+    match current_context() {
+        Some(ours) if ours != prior => {
+            eprintln!(
+                "flynnel gpu_peer: a different CUDA context was current on this \
+                 thread ({prior:?}) and the peer's primary context ({ours:?}) has \
+                 replaced it. The peer operates on the device primary context; \
+                 work the caller enqueues after this point runs on the primary \
+                 context, not the one it built."
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 impl GpuPeer {
@@ -273,8 +365,15 @@ impl GpuPeer {
     /// Returns `Err` - never panics - when no device is present, so
     /// callers can fall back to CPU-only dispatch.
     pub fn init(config: GpuPeerConfig) -> Result<Self, GpuPeerError> {
+        // Read the caller's context before creating ours, because
+        // creation binds: cudarc's CudaContext::new ends in
+        // bind_to_thread, so afterwards the current context is always
+        // the one this call retained and the comparison would be with
+        // itself.
+        let prior = current_context();
         let ctx = CudaContext::new(config.device_ordinal)
             .map_err(|e| GpuPeerError::NoDevice(format!("{e:?}")))?;
+        let displaced = warn_on_foreign_context(prior);
         let stream = ctx.default_stream();
         let module = match &config.user_ops_cuda {
             None => match ctx.load_module(Ptx::from_src(PEER_PTX)) {
@@ -393,6 +492,7 @@ impl GpuPeer {
             vbytes,
             vblocks,
             config.blocks_per_lane,
+            config.barrier_deadline_ns,
         );
         let wide_stream = ctx
             .new_stream()
@@ -407,7 +507,22 @@ impl GpuPeer {
             _stream: stream,
             wide_stream,
             _ctx: ctx,
+            displaced_foreign_context: displaced,
         })
+    }
+
+    /// Whether [`Self::init`] replaced a different CUDA context that
+    /// was current on the calling thread.
+    ///
+    /// The peer operates on the device primary context and makes it
+    /// current where it binds. A consumer that builds its own context -
+    /// cudarc's `new_non_primary` is the way to get one - can read this
+    /// and decide for itself whether to keep using the peer or fall
+    /// back, rather than inheriting a policy chosen here. `false` on
+    /// every host where the caller had no context of its own, or had
+    /// the same primary context, which is every consumer known today.
+    pub fn displaced_foreign_context(&self) -> bool {
+        self.displaced_foreign_context
     }
 
     /// The host-measured constants and capability flags.
@@ -490,15 +605,84 @@ impl GpuPeer {
         Ok(self.lane_set.status(&self.region, ticket))
     }
 
-    /// Copy a completed ticket's result payload into `dst`.
-    pub fn read_result(&self, ticket: Ticket, dst: &mut [u8]) {
-        self.lane_set.read_result(&self.region, ticket, dst);
+    /// Copy a completed ticket's result payload into `dst`, filling it
+    /// entirely.
+    ///
+    /// `dst.len()` may not exceed the slot's payload capacity, which
+    /// is `self.region().geometry().payload_max()`. Read that figure
+    /// rather than deriving it from a slot size: a longer buffer is
+    /// refused with [`GpuPeerError::PayloadTooLarge`], because the
+    /// bytes past a slot belong to the next one.
+    ///
+    /// # Where a user op's bytes land
+    ///
+    /// This copies the slot payload from its start, while a user op is
+    /// handed that payload advanced past the [`RESIDENT_PARAMS_BYTES`]
+    /// parameter block. So an op writing its own byte 0 appears at
+    /// `dst[RESIDENT_PARAMS_BYTES]`, and a buffer sized for the op's
+    /// own layout must add that prefix to fit what comes back.
+    ///
+    /// The two sides count from different places, which is easy to
+    /// carry incorrectly into a size calculation: an op needing `n`
+    /// bytes of its own requires `RESIDENT_PARAMS_BYTES + n` here, and
+    /// that total is what must fit `payload_max()`.
+    pub fn read_result(&self, ticket: Ticket, dst: &mut [u8]) -> Result<(), GpuPeerError> {
+        self.lane_set.read_result(&self.region, ticket, dst)
     }
 
     /// Release the ticket's slot for reuse (in submission order per
     /// lane).
     pub fn reap(&mut self, ticket: Ticket) -> Result<(), GpuPeerError> {
         self.lane_set.reap(ticket)
+    }
+
+    /// Barrier expiries since this peer started, and the largest ring
+    /// depth seen at one: `(count, max_depth)`.
+    ///
+    /// A count above zero means some block team did not fully arrive
+    /// before rank 0's deadline, and those slots came back
+    /// [`STATUS_TEAM_INCOMPLETE`]. Both are zero when
+    /// `blocks_per_lane` is 1, since a lane of one block has no
+    /// barrier to miss.
+    ///
+    /// This counter is the only thing that sees them. A consumer
+    /// measuring 12500 queries found three and six stalls leaving no
+    /// mark on either signal it had: the 99th percentile there is the
+    /// 125th slowest query, which a handful of expiries cannot reach,
+    /// and recall moved 0.0005 while the count went 0, 3, 6. The same
+    /// expiries dominated the percentile in an earlier run of 300
+    /// queries. So a latency tail exposes them only when the window is
+    /// short enough for a few events to be most of it, which is the
+    /// window least worth measuring.
+    ///
+    /// The depth is what separates the two ways a team can be split. A
+    /// quantum boundary falling between two ranks' clock reads splits
+    /// whatever the lane happened to be holding, so a lightly fed lane
+    /// reports one or two. A lane relaunched late and draining a
+    /// backlog claims from a full ring and reports a depth near
+    /// `slots_per_lane`. The count says stalls happened; the depth says
+    /// which kind, and the host cannot recover it afterwards because
+    /// the ring has moved on by the time a status is read.
+    pub fn barrier_stalls(&self) -> (u32, u32) {
+        (
+            self.region.load_u32(layout::HDR_STALL_COUNT_OFF),
+            self.region.load_u32(layout::HDR_STALL_MAX_DEPTH_OFF),
+        )
+    }
+
+    /// Longest time rank 0 spent at the team barrier on a slot the whole
+    /// team reached, in nanoseconds.
+    ///
+    /// The deadline a team is given is a whole quantum, 250 ms by
+    /// default. This is what a healthy team on this host actually needs,
+    /// and the ratio between them is the margin that default spends. It
+    /// is the figure to consult before shortening the deadline: a
+    /// shorter one tells a caller sooner that a team was lost, at the
+    /// cost of abandoning teams that would have assembled.
+    ///
+    /// Zero when `blocks_per_lane` is 1, since there is no barrier.
+    pub fn barrier_wait_max_ns(&self) -> u32 {
+        self.region.load_u32(layout::HDR_BARRIER_WAIT_MAX_OFF)
     }
 
     /// Submit on a SPECIFIC lane (bounded backpressure wait).
@@ -714,7 +898,7 @@ impl GpuPeer {
         Ok((ResidentHandle { block, lane, bytes: data.len() as u32 }, t))
     }
 
-    /// Submit a USER opcode (>= [`layout::OP_USER_BASE`], implemented
+    /// Submit a user opcode (>= [`layout::OP_USER_BASE`], implemented
     /// by the CUDA source registered via
     /// [`GpuPeerConfig::user_ops_cuda`]). With a handle, the task
     /// rides the handle's lane (ordered with its other tasks) and the
@@ -807,9 +991,10 @@ impl GpuPeer {
         }
         let n = out.len().min(handle.len());
         let mut buf = vec![0u8; RESIDENT_PARAMS_BYTES + n];
-        self.read_result(t, &mut buf);
-        out[..n].copy_from_slice(&buf[RESIDENT_PARAMS_BYTES..]);
+        let read = self.read_result(t, &mut buf);
         self.reap(t)?;
+        read?;
+        out[..n].copy_from_slice(&buf[RESIDENT_PARAMS_BYTES..]);
         Ok(())
     }
 
@@ -1060,5 +1245,139 @@ impl GpuPeer {
 impl Drop for GpuPeer {
     fn drop(&mut self) {
         self.poller.shutdown(&self.region);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The foreign-context detector fires, and the ordering that lets
+    /// it fire is what this pins.
+    ///
+    /// cudarc's `CudaContext::new` ends in `bind_to_thread`, so a
+    /// detector that read the current context once the peer's own had
+    /// been created would compare that context against itself, report
+    /// nothing on every host, and be indistinguishable from a working
+    /// guard. Moving the read in `init` below the creation makes this
+    /// test go quiet, which is the regression it exists to catch.
+    ///
+    /// Requires a CUDA device.
+    #[test]
+    fn init_reports_displacing_a_foreign_context() {
+        // A non-primary context is the only thing the peer's primary
+        // context can displace; every consumer today holds the primary
+        // one, where there is nothing to report.
+        let foreign = CudaContext::new_non_primary(0, 0)
+            .expect("a CUDA device is required for this test");
+        foreign.bind_to_thread().expect("make the foreign context current");
+        let before = current_context().expect("the foreign context is current");
+
+        let peer = GpuPeer::init(GpuPeerConfig::default()).expect("peer init");
+        assert!(
+            peer.displaced_foreign_context(),
+            "init replaced a context the caller had current and must say so"
+        );
+
+        let after = current_context().expect("a context is current after init");
+        assert_ne!(
+            after, before,
+            "the report is only meaningful if the context actually changed"
+        );
+    }
+
+    /// A device pointer from a displaced context is rejected rather
+    /// than silently misread.
+    ///
+    /// This is what decides how loud the displacement report has to be.
+    /// If the driver refuses the pointer, a consumer whose context was
+    /// replaced gets a CUDA error at its next launch - confusing and
+    /// far from the cause, but not silent. If instead the pointer reads
+    /// as valid and returns another context's memory, the report is the
+    /// only warning that will ever arrive, and its absence would cost
+    /// wrong numbers rather than a failed call.
+    ///
+    /// Allocates under a non-primary context, lets `init` rebind the
+    /// thread to the primary one, then reads the pointer back through
+    /// the raw driver API while the primary context is current.
+    ///
+    /// Requires a CUDA device.
+    #[test]
+    fn a_pointer_from_a_displaced_context_is_refused_not_misread() {
+        const N: usize = 256;
+        const PATTERN: u8 = 0xAB;
+
+        let foreign = CudaContext::new_non_primary(0, 0)
+            .expect("a CUDA device is required for this test");
+        foreign.bind_to_thread().expect("make the foreign context current");
+
+        let mut dptr: cu::CUdeviceptr = 0;
+        // SAFETY: the foreign context is current; dptr is an out
+        // parameter written only on success.
+        let alloc = unsafe { cu::cuMemAlloc_v2(&mut dptr, N) };
+        assert_eq!(alloc, cu::CUresult::CUDA_SUCCESS, "allocate under the foreign context");
+        // SAFETY: dptr owns N bytes in the current context.
+        let set = unsafe { cu::cuMemsetD8_v2(dptr, PATTERN, N) };
+        assert_eq!(set, cu::CUresult::CUDA_SUCCESS);
+        // SAFETY: no arguments; drains the fill before the rebind.
+        let sync = unsafe { cu::cuCtxSynchronize() };
+        assert_eq!(sync, cu::CUresult::CUDA_SUCCESS);
+
+        let peer = GpuPeer::init(GpuPeerConfig::default()).expect("peer init");
+        assert!(
+            peer.displaced_foreign_context(),
+            "the peer must have replaced the context this pointer belongs to, \
+             or the test is not exercising a displacement at all"
+        );
+
+        let mut back = [0u8; N];
+        // SAFETY: back is N bytes of writable host memory. dptr belongs
+        // to the displaced context, which is the condition under test;
+        // the driver reports what it thinks of that through the return
+        // code rather than by writing.
+        let copy = unsafe {
+            cu::cuMemcpyDtoH_v2(back.as_mut_ptr().cast::<core::ffi::c_void>(), dptr, N)
+        };
+
+        // Which branch this takes is the finding, so it is reported
+        // rather than only asserted: a one-sided assertion passes
+        // whichever way the driver answers and would leave the question
+        // open.
+        if copy == cu::CUresult::CUDA_SUCCESS {
+            let intact = back.iter().all(|&b| b == PATTERN);
+            println!(
+                "displaced-context pointer: driver ACCEPTED the read, bytes \
+                 {} what was written",
+                if intact { "match" } else { "DO NOT match" }
+            );
+            assert!(
+                intact,
+                "the driver accepted a pointer from the displaced context and \
+                 returned bytes that are not the ones written to it. That is a \
+                 silent cross-context read, and the displacement report is then \
+                 the only warning a consumer will ever get"
+            );
+        } else {
+            println!("displaced-context pointer: driver REFUSED the read with {copy:?}");
+        }
+
+        // SAFETY: freeing under whichever context now owns it; a
+        // failure here is the same class of refusal being measured and
+        // is not a reason to fail the test.
+        let _free: cu::CUresult = unsafe { cu::cuMemFree_v2(dptr) };
+    }
+
+    /// The detector stays quiet when there is nothing to displace.
+    ///
+    /// Without this, a detector that reported unconditionally would
+    /// pass the test above while being useless.
+    #[test]
+    fn init_reports_nothing_when_it_displaces_nothing() {
+        let peer = GpuPeer::init(GpuPeerConfig::default())
+            .expect("a CUDA device is required for this test");
+        assert!(
+            !peer.displaced_foreign_context(),
+            "the peer's own primary context is not a foreign one"
+        );
     }
 }

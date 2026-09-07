@@ -28,11 +28,12 @@
 //!   evidence (an SmtLocal default regresses realistic_bench
 //!   Heavy/100k 35x because peer-steal is blocked from the
 //!   SMT-sibling deque).
-//! - **Narrower tiers**: callers that KNOW locality wins (recursive
-//!   splits handing off to the SMT sibling; SLAW-style bisection
-//!   leaves) call
-//!   [`crate::sched::arena_local::WorkerCtx::push_tier`] with a
-//!   narrower tier to keep the cache line on the closest core.
+//! - **Narrower tiers**: a caller with grounds to expect a locality
+//!   win (recursive splits handing off to the SMT sibling; SLAW-style
+//!   bisection leaves) calls `WorkerCtx::push_tier_burst` with a
+//!   narrower tier to keep the cache line on the closest core. That
+//!   type is crate-internal, so the path is written here as code
+//!   rather than as a link nothing outside the crate could follow.
 //!
 //! Tier hinting through the dispatcher-level routing layer lives in
 //! the unified [`crate::sched::plan::JobPlan`] surface.
@@ -111,14 +112,15 @@ impl Default for DequeTier {
     /// **The default is Public, not SmtLocal, despite SmtLocal being
     /// the tightest cache.** Reason: any peer at any distance must
     /// be able to steal from the default-pushed deque. SmtLocal-tier
-    /// pushes are visible ONLY to SMT-sibling thieves (the steal
+    /// pushes reach SMT-sibling thieves and nobody else (the steal
     /// discipline enforced by [`thief_may_steal`]), so a single hot
     /// producer pushing to SmtLocal pins all its work to one physical
     /// core pair - catastrophic regression on workloads that need
-    /// cross-CCX parallelism. Producers that KNOW the locality
-    /// benefit applies (e.g., recursive splits that hand off to the
-    /// SMT sibling) call [`crate::sched::arena_local::WorkerCtx::push_tier`]
-    /// explicitly with a narrower tier.
+    /// cross-CCX parallelism. A producer with grounds to expect the
+    /// locality benefit (e.g. recursive splits that hand off to the
+    /// SMT sibling) calls `WorkerCtx::push_tier_burst` explicitly with
+    /// a narrower tier; that type is crate-internal, so the path is
+    /// written as code rather than as a link.
     fn default() -> Self {
         Self::Public
     }

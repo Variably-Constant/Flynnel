@@ -1,11 +1,17 @@
-//! End-to-end adaptive-routing tests replaying the workload shapes
-//! real Flynnel consumers dispatch, with real compute in every leaf.
-//! Each test asserts the observable routing outcome: wall-clock
-//! parallel speedup against a serial baseline run of the identical
-//! closure, plus tier / plan-field / site observables where the
-//! surface exposes them.
+//! End-to-end adaptive-routing tests over CONSTRUCTED workloads, with
+//! real compute in every leaf. Each asserts the observable routing
+//! outcome: wall-clock parallel speedup against a serial baseline run
+//! of the identical closure, plus tier / plan-field / site observables
+//! where the surface exposes them.
 //!
-//! Shapes covered (each named for the consumer pattern it replays):
+//! The shapes below were chosen to span the routing surface, not taken
+//! from any consumer. Names like "lexer fan-out" describe the shape of
+//! the work, not a caller that dispatches it. Tests derived from call
+//! sites that actually exist live in `real_consumer_call_shapes.rs`;
+//! this file is the synthetic complement and should not be read as
+//! evidence about how the crate is used.
+//!
+//! Shapes covered:
 //! - lexer fan-out: `JobPlan::new(0, n).with_leaf_shape(PortCompute)`
 //!   + `for_each_chunk_indexed_min_leaf(_, _, 1, ..)` over heavy parts
 //! - model-training fan-out: same shape at n = 8 (the batch >= 8
@@ -355,6 +361,59 @@ fn streaming_byte_scan_32mb() {
     });
     assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), expect);
     assert_speedup("streaming_byte_scan_32mb", serial, parallel, 0.8);
+}
+
+/// A pointer-chasing batch under `MemoryBound`, the shape a desktop
+/// compositor dispatches when it fills icon slots from a store.
+///
+/// The other three profiles reach a real dispatch somewhere in the
+/// suite; this one had only the plan-field assertions in plan.rs, so
+/// nothing ran work through it. Its distinguishing choice is engaging
+/// the SMT siblings on work that stalls rather than saturates a port,
+/// which is a routing decision no field assertion exercises.
+#[test]
+fn memorybound_profile_pointer_chase() {
+    let _g = pool_guard();
+    require_parallel_host();
+    warm_pool();
+    let n = 4096usize;
+
+    // Each item walks a private cyclic permutation, so the loop is
+    // dependent loads rather than arithmetic and cannot be vectorized
+    // into something the profile no longer describes.
+    let stride = 97usize;
+    let table: Vec<u32> = (0..n).map(|i| ((i * stride) % n) as u32).collect();
+    let chase = |seed: usize, steps: usize| -> u64 {
+        let mut at = seed % n;
+        let mut acc = 0u64;
+        for _ in 0..steps {
+            at = table[at] as usize;
+            acc = acc.wrapping_add(at as u64);
+        }
+        acc
+    };
+    const STEPS: usize = 4096;
+
+    let mut expect = vec![0u64; n];
+    let serial = median3(|| {
+        for (i, slot) in expect.iter_mut().enumerate() {
+            *slot = chase(i, STEPS);
+        }
+    });
+
+    let plan = JobPlan::set_profile(0, n as u32, DispatchProfile::MemoryBound);
+    assert!(plan.use_smt, "MemoryBound engages the siblings to cover the stalls");
+
+    let mut out = vec![0u64; n];
+    let parallel = median3(|| {
+        for_each_chunk_indexed_min_leaf(&plan, &mut out, 1, |start, slots| {
+            for (i, s) in slots.iter_mut().enumerate() {
+                *s = chase(start + i, STEPS);
+            }
+        });
+    });
+    assert_eq!(out, expect, "the profile must not change the answers");
+    assert_speedup("memorybound_profile_pointer_chase", serial, parallel, 0.8);
 }
 
 #[test]

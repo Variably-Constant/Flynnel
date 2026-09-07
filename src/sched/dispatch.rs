@@ -25,13 +25,16 @@
 //! 2700 the per-push AtomicU32 Acquire load adds 0.02 ns over
 //! direct dispatch (noise floor).
 //!
-//! ```ignore
+//! ```
 //! use flynnel::sched::dispatch::AdaptiveDispatcher;
 //! use flynnel::sched::workload_shape::WorkloadShape;
 //!
+//! let closures: Vec<Box<dyn FnOnce() -> u32 + Send>> =
+//!     (0..8u32).map(|i| Box::new(move || i) as _).collect();
 //! let results = AdaptiveDispatcher::new()
 //!     .with_shape(WorkloadShape::ProducerFast { burst: 64 })
 //!     .execute_cooperative(closures);
+//! assert_eq!(results, (0..8u32).collect::<Vec<_>>());
 //! ```
 //!
 //! No deque, K-axis, or Flynn-axis name appears in user code; the

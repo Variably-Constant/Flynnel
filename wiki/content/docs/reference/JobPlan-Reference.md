@@ -289,8 +289,8 @@ All builders take `self` by value and return `Self`, supporting chains like `Job
 | `with_variant(Variant)` | Sets `variant`. |
 | `with_numa_hint(node: u32)` | Sets `numa_hint = Some(node)`. |
 | `with_smt()` | Sets `use_smt = true`. |
-| `with_cost_ns_per_elem(ns: u32)` | Sets `estimated_per_item_ns = Some(ns)`. Drives leaf-count derivation in `for_each_chunk` and the inline-collapse fast path. Canonical name in the scheduler-tuning vocabulary; `with_estimated_per_item_ns` is the legacy alias. |
-| `with_estimated_per_item_ns(ns: u32)` | Same as `with_cost_ns_per_elem`. |
+| `with_cost_ns_per_elem(ns: u32)` | Sets `estimated_per_item_ns = Some(ns)`. Drives leaf-count derivation in `for_each_chunk` and the inline-collapse fast path, and re-runs the static classifier with the figure so `use_smt`, `oversubscription_log2`, `use_mailbox_routing` and `deque_tier_hint` follow from it rather than from the size-only guess `new` made. A profile set through `set_profile` or `for_op_generic` is left alone: that is the caller speaking too, so only the estimate lands. Canonical name in the scheduler-tuning vocabulary; `with_estimated_per_item_ns` is the legacy alias. |
+| `with_estimated_per_item_ns(ns: u32)` | The same call as `with_cost_ns_per_elem`, which delegates to it. |
 | `with_spin_before_yield_ns(ns: u64)` | Sets `spin_before_yield_ns = Some(ns)`. How long a thread waiting on a half of this dispatch polls the latch before yielding its core; `0` yields at once. Takes the decision away from the classifier and the host profile. |
 | `with_oversubscription_log2(log2: u8)` | Sets `oversubscription_log2 = Some(log2)`. Overrides the per-call leaf-count multiplier (`log2 = 0` means 1 leaf per worker, `log2 = 3` means 8). Clamps to `[0, 3]`. |
 | `with_workers(n: u32)` | Sets `worker_cap = Some(n)`. Caps the worker count for this dispatch; `1` forces serial execution on the calling thread. |

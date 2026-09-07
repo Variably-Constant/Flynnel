@@ -50,6 +50,9 @@ typedef unsigned long long u64;
 #define HDR_FISCHER_ACQS_OFF 0x140ULL
 #define HDR_FISCHER_STARTED_OFF 0x148ULL
 #define HDR_FISCHER_GPU_CONT_OFF 0x14CULL
+#define HDR_STALL_COUNT_OFF      0x150ULL
+#define HDR_STALL_MAX_DEPTH_OFF  0x154ULL
+#define HDR_BARRIER_WAIT_MAX_OFF 0x158ULL
 #define HDR_GTS_OFF          0x180ULL   // u64[400]
 #define HDR_LANE_EXITS_OFF   0xE00ULL   // u32[64], one per lane
 #define HDR_LANE_GEN_OFF     0xF00ULL   // u32[64], one per lane
@@ -84,6 +87,11 @@ typedef unsigned long long u64;
 
 #define STATUS_DONE  1u
 #define STATUS_ERR   2u
+// A block team that did not fully arrive before rank 0's deadline. Kept
+// distinct from STATUS_ERR so a caller can tell a lost rank, which a
+// retry or a smaller team may fix, from its own op reporting failure,
+// which neither will.
+#define STATUS_TEAM_INCOMPLETE 3u
 
 // User opcodes start here. When the host registers user CUDA source,
 // this file is NVRTC-compiled together with it (-DFLYNNEL_USER_OPS)
@@ -142,6 +150,7 @@ extern "C" __global__ void flynnel_peer_poller(
     unsigned char* vram_base,      // 0 when no resident pool
     u32 vram_block_bytes,
     u32 vram_blocks,
+    u64 barrier_deadline_ns,       // how long rank 0 waits for its team
     u32 blocks_per_lane,           // >1 gives each lane a block team
     u32 lane_base)                 // first lane this grid serves
 {
@@ -308,7 +317,16 @@ extern "C" __global__ void flynnel_peer_poller(
                 if (s_user_err) op = ~0u;
             }
         }
-        // OP_NOP and unknown ops fall through; unknown marks STATUS_ERR.
+        else if (op != OP_NOP) {
+            // Anything the chain did not recognise. Without this a
+            // mistyped or out-of-range opcode completes as done and
+            // the caller reads the payload it submitted back as a
+            // result.
+            op = ~0u;
+        }
+        // OP_NOP does no work and completes; a rank above 0 that fell
+        // through the first branch is carrying its team's op and takes
+        // its status from rank 0.
 
         __syncthreads();
         __threadfence_system();
@@ -324,14 +342,40 @@ extern "C" __global__ void flynnel_peer_poller(
                     // must degrade this call to an error rather than
                     // hold the lane forever. A team that cannot finish
                     // a slot within a whole quantum is not going to.
-                    const u64 deadline = gtimer() + quantum_ns;
+                    const u64 t_barrier = gtimer();
+                    const u64 deadline = t_barrier + barrier_deadline_ns;
                     u32 whole_team = 1u;
                     while (atomicAdd((u32*)team_arrive, 0u) < blocks_per_lane) {
                         if (gtimer() > deadline) { whole_team = 0u; break; }
                     }
+                    if (whole_team) {
+                        // What a healthy team actually costs at this
+                        // barrier. The deadline is a whole quantum; this
+                        // is the margin that choice is spending.
+                        u64 waited = gtimer() - t_barrier;
+                        atomicMax((u32*)(base + HDR_BARRIER_WAIT_MAX_OFF),
+                                  (u32)(waited > 0xFFFFFFFFull ? 0xFFFFFFFFull : waited));
+                    }
                     st_vol(team_arrive, 0u);
                     __threadfence_system();
-                    st_vol(d_status, (op == ~0u || !whole_team) ? STATUS_ERR : STATUS_DONE);
+                    if (!whole_team) {
+                        // Ring depth at the moment the deadline was
+                        // spent. A boundary landing on a trickle shows
+                        // one or two; a lane draining a backlog shows a
+                        // depth near the ring size. Recorded here
+                        // because the host cannot see the ring as it
+                        // was once the slot has retired.
+                        u32 h = ld_vol(head);
+                        u32 t = ld_vol(tail);
+                        atomicAdd((u32*)(base + HDR_STALL_COUNT_OFF), 1u);
+                        atomicMax((u32*)(base + HDR_STALL_MAX_DEPTH_OFF), h - t);
+                    }
+                    // A failing op outranks an incomplete team: the op
+                    // ran and reported, which is the more specific fact.
+                    st_vol(d_status,
+                           (op == ~0u)   ? STATUS_ERR :
+                           (!whole_team) ? STATUS_TEAM_INCOMPLETE :
+                                           STATUS_DONE);
                     __threadfence_system();
                     st_vol(tail, ld_vol(tail) + 1u);
                     __threadfence_system();
@@ -347,7 +391,7 @@ extern "C" __global__ void flynnel_peer_poller(
                 // retirement nobody will publish holds a block that
                 // the next launch needs.
                 const u32 want = my_gen_local + 1u;
-                const u64 deadline = gtimer() + quantum_ns;
+                const u64 deadline = gtimer() + barrier_deadline_ns;
                 while (ld_vol(team_gen) != want) {
                     if (gtimer() > deadline) break;
                 }

@@ -437,10 +437,12 @@ static HOST_JEC_WAKE_THRESHOLD_NS: std::sync::atomic::AtomicU64 = std::sync::ato
 /// installed values.
 static HOST_DISPATCH_CALIBRATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// This host's measured dispatch profile, measured once per process
-/// by the first query (10-40 ms on the bench hosts) or earlier by
-/// [`calibrate_host_dispatch`] at start-up. No value is ever handed
-/// out that was not measured on this host.
+/// This host's dispatch profile, measured once per process by the
+/// first query (10-40 ms on the bench hosts) or earlier by
+/// [`calibrate_host_dispatch`] at start-up. Measured on this host
+/// unless `FLYNNEL_HOST_PROFILE_NS` pins it, which a comparison
+/// against a non-adaptive scheduler needs so both sides face the same
+/// dispatch cost.
 pub fn host_dispatch_profile() -> HostDispatchProfile {
     use std::sync::atomic::Ordering;
     let collapse = HOST_COLLAPSE_THRESHOLD_NS.load(Ordering::Relaxed);
@@ -513,21 +515,136 @@ pub fn jec_wake_threshold_ns() -> u64 {
 ///
 /// Callers arriving while one calibration runs wait for its values; a
 /// call after it re-measures and replaces them.
+///
+/// # Installing is the side effect, not the return
+///
+/// All three figures are stored into the process globals before this
+/// returns, so calling it arms them for every dispatch in the process
+/// whether or not the caller keeps what comes back. A call site that
+/// binds the result and only prints it has still changed how the whole
+/// program routes.
+///
+/// [`pinned_host_profile`] is the way to hold them fixed: with
+/// `FLYNNEL_HOST_PROFILE_NS` set, this installs those values and
+/// measures nothing, which is what a caller comparing arms wants - a
+/// measured profile is a per-run variable, and one taken on a loaded
+/// host differs from one taken on an idle host.
 pub fn calibrate_host_dispatch() -> HostDispatchProfile {
     use std::sync::atomic::Ordering;
     let _one_at_a_time = HOST_DISPATCH_CALIBRATION
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let p = measure_host_dispatch();
+    let p = match pinned_host_profile() {
+        Some(pinned) => pinned,
+        None => measure_host_dispatch(),
+    };
     HOST_DISPATCH_COST_NS.store(p.dispatch_cost_ns, Ordering::Relaxed);
     HOST_JEC_WAKE_THRESHOLD_NS.store(p.jec_wake_threshold_ns, Ordering::Relaxed);
     HOST_COLLAPSE_THRESHOLD_NS.store(p.collapse_threshold_ns, Ordering::Relaxed);
     p
 }
 
+/// Place the crossover between the last two timed counts.
+///
+/// `prev` is the previous count's `first` time and the gap that count
+/// showed; `a` and `diff` are the same for the count where the gap
+/// reached zero. The crossover falls between them in proportion to how
+/// much of the gap each closed.
+///
+/// Both orderings are required before interpolating, and neither is
+/// incidental. `d_prev > diff` says the gap actually narrowed. `a >
+/// a_prev` says the larger count cost more, which is what puts the
+/// crossover between the two - a contended host can time the larger
+/// count faster, and `a - a_prev` is over u64: it panics in debug and
+/// wraps in release, where the wrapped span produces a threshold that
+/// then governs every dispatch on that host. A pair that fails either
+/// test carries no crossover to place, so the measurement is reported
+/// as it stands.
+fn interpolate_crossover(prev: Option<(u64, i64)>, a: u64, diff: i64) -> u64 {
+    match prev {
+        Some((a_prev, d_prev)) if d_prev > diff && a > a_prev => {
+            let span = (a - a_prev) as f64;
+            let frac = d_prev as f64 / (d_prev - diff) as f64;
+            a_prev + (span * frac) as u64
+        }
+        _ => a,
+    }
+}
+
 /// [`calibrate_host_dispatch`], returning the collapse threshold.
 pub fn calibrate_inline_collapse_threshold() -> u64 {
     calibrate_host_dispatch().collapse_threshold_ns
+}
+
+/// The profile pinned by `FLYNNEL_HOST_PROFILE_NS`, or `None` when
+/// the variable is unset and the host is to be measured.
+///
+/// Reading a pinned profile skips the calibration entirely, so a
+/// caller comparing this scheduler against one that never measures
+/// its dispatch cost can hold that cost equal on both sides. Without
+/// it the two differ in whether they adapt as well as in how they
+/// schedule, and the ratio mixes the two.
+fn pinned_host_profile() -> Option<HostDispatchProfile> {
+    let raw = std::env::var_os("FLYNNEL_HOST_PROFILE_NS")?;
+    match raw.to_str() {
+        Some(text) => parse_pinned_profile(text),
+        None => {
+            eprintln!(
+                "flynnel: FLYNNEL_HOST_PROFILE_NS is not valid UTF-8; measuring this host instead"
+            );
+            None
+        }
+    }
+}
+
+/// `dispatch,collapse,wake` in nanoseconds, all three required.
+///
+/// All three because pinning some and measuring the rest yields a
+/// profile that is neither pinned nor measured, which defeats the
+/// comparison the pin exists to make. Zero is refused because the
+/// installed collapse threshold doubles as the "not yet calibrated"
+/// marker. A value that does not parse is reported and the caller
+/// measures the host, so a mistyped pin is loud rather than silently
+/// honoured as something else.
+fn parse_pinned_profile(text: &str) -> Option<HostDispatchProfile> {
+    let mut fields = text.split(',');
+    let mut take = |what: &str| -> Option<u64> {
+        let Some(field) = fields.next() else {
+            eprintln!(
+                "flynnel: FLYNNEL_HOST_PROFILE_NS wants dispatch,collapse,wake in ns; the {what} field is missing, so measuring this host instead"
+            );
+            return None;
+        };
+        match field.trim().parse::<u64>() {
+            Ok(0) => {
+                eprintln!(
+                    "flynnel: FLYNNEL_HOST_PROFILE_NS {what} is zero, which marks an uncalibrated profile; measuring this host instead"
+                );
+                None
+            }
+            Ok(ns) => Some(ns),
+            Err(e) => {
+                eprintln!(
+                    "flynnel: FLYNNEL_HOST_PROFILE_NS {what} field {field:?} is not a nanosecond count ({e}); measuring this host instead"
+                );
+                None
+            }
+        }
+    };
+    let dispatch_cost_ns = take("dispatch")?;
+    let collapse_threshold_ns = take("collapse")?;
+    let jec_wake_threshold_ns = take("wake")?;
+    if fields.next().is_some() {
+        eprintln!(
+            "flynnel: FLYNNEL_HOST_PROFILE_NS takes exactly dispatch,collapse,wake; measuring this host instead"
+        );
+        return None;
+    }
+    Some(HostDispatchProfile {
+        dispatch_cost_ns,
+        collapse_threshold_ns,
+        jec_wake_threshold_ns,
+    })
 }
 
 /// The measurements behind [`host_dispatch_profile`]. Dispatch goes
@@ -539,6 +656,11 @@ fn measure_host_dispatch() -> HostDispatchProfile {
     const MAX_ITEMS: usize = 1 << 17;
     /// Samples per timed point, and sweeps per crossover.
     const SAMPLES: usize = 9;
+
+    /// Samples behind the dispatch cost. Larger than [`SAMPLES`]
+    /// because one of these times a single join rather than a sweep
+    /// over doubling sizes, so the whole set costs a few milliseconds.
+    const DIRECT_SAMPLES: usize = 1024;
 
     /// The fastest of [`SAMPLES`] timings of `f`.
     ///
@@ -627,14 +749,7 @@ fn measure_host_dispatch() -> HostDispatchProfile {
             let b = fastest(|| second(&plan, &mut v[..n]));
             let diff = b as i64 - a as i64;
             if diff <= 0 {
-                return match prev {
-                    Some((a_prev, d_prev)) if d_prev > diff => {
-                        let span = (a - a_prev) as f64;
-                        let frac = d_prev as f64 / (d_prev - diff) as f64;
-                        a_prev + (span * frac) as u64
-                    }
-                    _ => a,
-                };
+                return interpolate_crossover(prev, a, diff);
             }
             if n >= v.len() {
                 return a;
@@ -659,14 +774,29 @@ fn measure_host_dispatch() -> HostDispatchProfile {
         dispatched(&warm, &mut v[..4 * LEAF]);
     }
     body(&mut v);
-    // The pool's own dispatch cost: one join over two leaves against
-    // the same body serial. Below this much work no dispatch can pay,
-    // whatever the sweep read.
-    let two = 2 * LEAF;
-    let plan_two = JobPlan::new(0, two as u32);
-    let serial_two = fastest(|| body(&mut v[..two]));
-    let pool_two = fastest(|| dispatched(&plan_two, &mut v[..two]));
-    let dispatch_cost_ns = pool_two.saturating_sub(serial_two).max(1);
+    // The pool's own dispatch cost: one join whose two halves are a
+    // single item each, so the time is the dispatch rather than a
+    // difference between two larger numbers. Below this much work no
+    // dispatch can pay, whatever the sweep read.
+    //
+    // Observed rather than differenced, and the median rather than the
+    // fastest, for the same reason. The sweeps above subtract one
+    // timing from another of comparable size, where the fastest of
+    // each side suppresses cancellation noise; nothing is subtracted
+    // here, so the median estimates the cost a dispatch actually pays.
+    // On a Ryzen 7 2700 across ten processes this reads 1900 to 2700
+    // ns where the subtraction read 1 to 2300, the 1 being a floor
+    // engaging on a difference that had gone to zero.
+    let plan_two = JobPlan::new(0, 2);
+    let mut samples = [0u64; DIRECT_SAMPLES];
+    for slot in &mut samples {
+        let (lo, hi) = v[..2].split_at_mut(1);
+        let t0 = std::time::Instant::now();
+        join_context(&plan_two, |_| body(lo), |_| body(hi));
+        *slot = t0.elapsed().as_nanos() as u64;
+    }
+    samples.sort_unstable();
+    let dispatch_cost_ns = samples[DIRECT_SAMPLES / 2].max(1);
     let serial_vs_pool = |v: &mut [u64]| {
         sweep(v, |_, items| body(items), dispatched)
     };
@@ -709,6 +839,11 @@ fn runs_on_caller(plan: &JobPlan, n: usize) -> bool {
 /// difference between running inline and running on the pool, which
 /// is unbounded in the size of the underestimate. One overrun at a
 /// site is enough to stop trusting it there.
+///
+/// The latch is per site and lives for the process, so a site that
+/// overran once dispatches every later call from that source
+/// location whatever its size. A benchmark that sweeps sizes through
+/// one call site measures its own order as well as the sizes.
 #[inline]
 fn collapses_inline(plan: &JobPlan, n: usize) -> bool {
     if plan.site.is_some_and(|s| s.get().collapse_overran()) {
@@ -1345,8 +1480,8 @@ where
     };
 
     if !should_split {
-        // No steal pressure observed: run the WHOLE remaining slice
-        // inline as one leaf.
+        // No steal pressure observed, so the entire remaining slice
+        // runs inline as one leaf rather than splitting further.
         record_leaf_sampled(plan.site, || op(items));
         return;
     }
@@ -1803,8 +1938,8 @@ where
     };
 
     if !should_split {
-        // No steal pressure observed: run the WHOLE remaining slice
-        // inline as one leaf. This is the rayon continuation-stealing
+        // No steal pressure observed, so the entire remaining slice
+        // runs inline as one leaf rather than splitting further. This is the rayon continuation-stealing
         // pattern: only fork further when somebody is starving.
         record_leaf(plan.site, || op(start, items));
         return;
@@ -3027,6 +3162,45 @@ mod tests {
 
     use crate::sched::plan::JobPlan;
 
+    /// The crossover interpolation survives timings that arrive out of
+    /// order, which a contended host produces.
+    ///
+    /// The sweep times a body at n and then at 2n and expects the
+    /// larger count to cost more. Under load it does not always, and
+    /// the span between them is a u64 subtraction: unguarded it panics
+    /// in debug and wraps in release, and a wrapped span sets the
+    /// collapse threshold that governs every dispatch on that host.
+    /// This is reachable from `calibrate_inline_collapse_threshold`,
+    /// which a consumer calls at startup.
+    #[test]
+    fn crossover_interpolation_survives_unordered_timings() {
+        // Ordered pair: the crossover falls between the two counts.
+        let placed = interpolate_crossover(Some((100, 40)), 200, -40);
+        assert!(
+            (100..=200).contains(&placed),
+            "an ordered pair interpolates between its two costs, got {placed}"
+        );
+
+        // The larger count timed faster, which the model does not
+        // describe. Reporting the measurement is correct; underflowing
+        // is not.
+        assert_eq!(
+            interpolate_crossover(Some((200, 40)), 100, -40),
+            100,
+            "an unordered pair has no crossover to place and must report the \
+             measurement rather than subtract past zero"
+        );
+
+        // Equal costs are equally unordered: span zero carries nothing.
+        assert_eq!(interpolate_crossover(Some((100, 40)), 100, -40), 100);
+
+        // A gap that did not narrow is not a crossing either.
+        assert_eq!(interpolate_crossover(Some((100, -40)), 200, -40), 200);
+
+        // No previous count at all.
+        assert_eq!(interpolate_crossover(None, 175, -1), 175);
+    }
+
     #[test]
     fn for_each_chunk_zero_items_is_noop() {
         let mut v: Vec<u32> = Vec::new();
@@ -3188,11 +3362,51 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_profile_parses_all_three_fields_or_none() {
+        let p = parse_pinned_profile("1000,5000,20000").expect("three counts parse");
+        assert_eq!(p.dispatch_cost_ns, 1000);
+        assert_eq!(p.collapse_threshold_ns, 5000);
+        assert_eq!(p.jec_wake_threshold_ns, 20000);
+        assert_eq!(
+            parse_pinned_profile(" 1000 , 5000 , 20000 ").expect("spacing is tolerated"),
+            p,
+            "a value spaced out for readability pins the same profile"
+        );
+
+        // Every rejection falls back to measuring rather than pinning
+        // a value the caller did not mean.
+        assert!(parse_pinned_profile("1000,5000").is_none(), "a missing field is refused");
+        assert!(
+            parse_pinned_profile("1000,5000,20000,7").is_none(),
+            "a fourth field is refused rather than ignored"
+        );
+        assert!(
+            parse_pinned_profile("0,5000,20000").is_none(),
+            "zero marks an uncalibrated profile and cannot be pinned"
+        );
+        assert!(
+            parse_pinned_profile("1000,0,20000").is_none(),
+            "zero is refused in the collapse field too"
+        );
+        assert!(parse_pinned_profile("1000,fast,20000").is_none(), "a non-count is refused");
+        assert!(parse_pinned_profile("").is_none(), "an empty value is refused");
+    }
+
+    #[test]
     fn host_dispatch_profile_is_measured_and_cached() {
         let t0 = std::time::Instant::now();
         let p = calibrate_host_dispatch();
         let cost = t0.elapsed();
-        assert!(p.dispatch_cost_ns > 0, "a measured dispatch cost is positive");
+        // Not merely positive: the max(1) floor is positive, and a
+        // floored value is a measurement that produced nothing wearing
+        // the shape of one that did. A dispatch pushes a job, arms a
+        // latch and wakes a worker, so it cannot cost tens of
+        // nanoseconds on any host this runs on.
+        assert!(
+            p.dispatch_cost_ns > 100,
+            "a dispatch cost of {} ns is a failed measurement, not a fast pool",
+            p.dispatch_cost_ns
+        );
         assert!(p.collapse_threshold_ns >= p.dispatch_cost_ns, "the collapse threshold is floored at the dispatch cost");
         assert!(p.jec_wake_threshold_ns > 0, "a measured wake threshold is positive");
         assert_eq!(host_dispatch_profile(), p, "the query hands out the installed profile");

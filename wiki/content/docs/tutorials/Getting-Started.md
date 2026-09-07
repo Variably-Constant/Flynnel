@@ -9,15 +9,15 @@ A 5-minute walkthrough that gets you from `cargo add flynnel` to running paralle
 
 ```toml
 [dependencies]
-flynnel = "0.3"
+flynnel = "0.4"
 ```
 
 Optional features:
 
 ```toml
-flynnel = { version = "0.3", features = ["verify-chain"] }            # BLAKE3 verify-chain
-flynnel = { version = "0.3", features = ["cuda-reference"] }          # NVIDIA reference backend
-flynnel = { version = "0.3", features = ["tpu-jax-reference"] }       # Google TPU reference backend
+flynnel = { version = "0.4", features = ["verify-chain"] }            # BLAKE3 verify-chain
+flynnel = { version = "0.4", features = ["cuda-reference"] }          # NVIDIA reference backend
+flynnel = { version = "0.4", features = ["tpu-jax-reference"] }       # Google TPU reference backend
 ```
 
 Minimum Rust: **1.96** (edition 2024, let-chains).

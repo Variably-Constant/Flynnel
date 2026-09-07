@@ -92,7 +92,10 @@ impl<B: MatrixModeBackend> Drop for RegionGuard<B> {
 ///
 /// # Example (pseudocode for a future AMX backend)
 ///
-/// ```ignore
+/// The shape a backend's caller writes, in outline rather than as
+/// compilable code, since the tile intrinsics differ per backend:
+///
+/// ```text
 /// run_in_region::<AmxBf16>(&amx_config, |ctx| {
 ///     for tile in tiles {
 ///         ctx.tdpbf16ps(...);

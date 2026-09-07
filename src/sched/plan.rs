@@ -512,10 +512,21 @@ impl JobPlan {
     ) -> Self {
         self.leaf_shape = shape;
         // Re-classify using the shape as the strongest signal.
+        //
+        // Only an estimate the caller supplied is offered to the
+        // classifier. `new` seeds this field from the process-active
+        // profile, and that default describes no particular call, so
+        // letting it reach the fine-grain corner would drop a shape the
+        // caller named in favour of a number the caller never wrote.
+        let caller_estimate = if self.estimated_per_item_ns_explicit {
+            self.estimated_per_item_ns
+        } else {
+            None
+        };
         let class = crate::sched::adaptive_profile::infer_class_static_with_shape(
             self.k_outer,
             self.batch_size,
-            self.estimated_per_item_ns,
+            caller_estimate,
             shape,
         );
         let profile = class.to_dispatch_profile();
@@ -785,9 +796,18 @@ impl JobPlan {
     /// new classification. The caller's hint is authoritative -- it
     /// overrides the (k_outer, batch_size)-only guess that
     /// [`Self::new`] made before the hint was available.
+    ///
+    /// A profile the caller named is not that guess, so a plan built
+    /// through [`Self::set_profile`] or [`Self::for_op_generic`] keeps
+    /// its profile and takes only the estimate. Both are the caller
+    /// speaking, and re-classifying would answer one by discarding the
+    /// other.
     pub fn with_estimated_per_item_ns(mut self, ns_per_item: u32) -> Self {
         self.estimated_per_item_ns = Some(ns_per_item);
         self.estimated_per_item_ns_explicit = true;
+        if self.profile_explicit {
+            return self;
+        }
         let class = crate::sched::adaptive_profile::infer_class_static_with_shape(
             self.k_outer,
             self.batch_size,
@@ -851,16 +871,15 @@ impl JobPlan {
         self
     }
 
-    /// Builder: caller-supplied per-element cost estimate. Same
-    /// shape as [`Self::with_estimated_per_item_ns`] but the
-    /// canonical name in the scheduler-tuning vocabulary.
-    /// `for_each_chunk` reads this to derive the optimal leaf
-    /// count (cap dispatch overhead at a fraction of per-leaf
-    /// work) and the inline-collapse threshold.
-    pub fn with_cost_ns_per_elem(mut self, ns_per_elem: u32) -> Self {
-        self.estimated_per_item_ns = Some(ns_per_elem);
-        self.estimated_per_item_ns_explicit = true;
-        self
+    /// Builder: caller-supplied per-element cost estimate. The
+    /// canonical name in the scheduler-tuning vocabulary for
+    /// [`Self::with_estimated_per_item_ns`], and the same call:
+    /// `for_each_chunk` reads it to derive the optimal leaf count
+    /// (cap dispatch overhead at a fraction of per-leaf work) and the
+    /// inline-collapse threshold, and it re-runs the classifier on the
+    /// same terms.
+    pub fn with_cost_ns_per_elem(self, ns_per_elem: u32) -> Self {
+        self.with_estimated_per_item_ns(ns_per_elem)
     }
 
     /// Builder: how long a thread waiting on a half of this dispatch

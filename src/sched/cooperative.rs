@@ -50,7 +50,7 @@ use crate::sched::plan::JobPlan;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use flynnel::sched::{JobPlan, cooperative_join_n};
 ///
 /// let plan = JobPlan::new(8, 1);
@@ -181,7 +181,7 @@ where
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use flynnel::sched::{JobPlan, cooperative_join_n_flat};
 ///
 /// let plan = JobPlan::new(8, 1);

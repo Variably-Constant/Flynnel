@@ -53,6 +53,11 @@ pub struct Poller {
     /// what lets a doorbell op use the whole device rather than the
     /// single SM one block occupies.
     blocks_per_lane: u32,
+    /// How long rank 0 waits for its team before retiring the slot as
+    /// incomplete. Separate from the quantum: a healthy team assembles
+    /// in microseconds, so tying this to the quantum made a caller wait
+    /// a quarter second to learn a team was lost.
+    barrier_deadline_ns: u64,
     /// While paused, the poller holds no resident quantum and
     /// `ensure_running` will not launch one - the device is left free
     /// for a heavy wide op. Cleared by `resume`.
@@ -73,6 +78,7 @@ impl Poller {
         vram_block_bytes: u32,
         vram_blocks: u32,
         blocks_per_lane: u32,
+        barrier_deadline_ns: u64,
     ) -> Self {
         Self {
             streams,
@@ -84,6 +90,7 @@ impl Poller {
             vram_block_bytes,
             vram_blocks,
             blocks_per_lane: blocks_per_lane.max(1),
+            barrier_deadline_ns: barrier_deadline_ns.max(1),
             paused: false,
         }
     }
@@ -152,10 +159,12 @@ impl Poller {
         b.arg(&self.vram_base);
         b.arg(&self.vram_block_bytes);
         b.arg(&self.vram_blocks);
+        let barrier_deadline = self.barrier_deadline_ns;
+        b.arg(&barrier_deadline);
         b.arg(&self.blocks_per_lane);
         b.arg(&lane);
         // SAFETY: argument types match flynnel_peer_poller(u8*, u32,
-        // u32, u32, u64, u64, u32, u8*, u32, u32, u32, u32); the grid
+        // u32, u32, u64, u64, u32, u8*, u32, u32, u64, u32, u32); the grid
         // is one lane's team of consecutive blocks, which is what the
         // kernel's lane = lane_base + blockIdx.x / blocks_per_lane
         // assumes; dev_base is the live registered mapping and

@@ -96,13 +96,13 @@ fn main() {
         if pending.len() >= window {
             let t = pending.pop_front().expect("nonempty");
             assert_eq!(peer.wait(t, Duration::from_secs(5)).expect("wait"), STATUS_DONE);
-            peer.read_result(t, &mut out);   // results come back over the bus
+            peer.read_result(t, &mut out).expect("fits");   // results come back over the bus
             peer.reap(t).expect("reap");
         }
     }
     while let Some(t) = pending.pop_front() {
         assert_eq!(peer.wait(t, Duration::from_secs(5)).expect("wait"), STATUS_DONE);
-        peer.read_result(t, &mut out);
+        peer.read_result(t, &mut out).expect("fits");
         peer.reap(t).expect("reap");
     }
     let dt_base = t0.elapsed();
@@ -117,7 +117,7 @@ fn main() {
     let t = peer.submit_resident(OP_SUM_U32_V, &handles[0]).expect("submit");
     assert_eq!(peer.wait(t, Duration::from_secs(5)).expect("wait"), STATUS_DONE);
     let mut buf = vec![0u8; RESIDENT_PARAMS_BYTES + 8];
-    peer.read_result(t, &mut buf);
+    peer.read_result(t, &mut buf).expect("fits");
     peer.reap(t).expect("reap");
     let got = u64::from_le_bytes(buf[8..16].try_into().expect("8 bytes"));
     let expect = (per_handle as f32).to_bits() as u64 * n_f32 as u64;

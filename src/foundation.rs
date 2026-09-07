@@ -140,8 +140,8 @@ pub enum HwClass {
     Avx512Vnni,
     /// AVX-512 VBMI2: byte/word compress-expand and funnel shifts
     /// (Ice Lake+, Zen 4+). The string/byte-processing rung -
-    /// filtering, tokenized scans, index-search kernels. First
-    /// consumer: the Lattice index search's AVX-512 matcher form.
+    /// filtering, tokenized scans, index-search kernels. First taken up
+    /// by a full-text index search's AVX-512 matcher form.
     /// Detection: `avx512vbmi2`.
     Avx512Vbmi2,
     /// AVX-VNNI, VEX-encoded: int8 dot on hybrid Intel clients whose

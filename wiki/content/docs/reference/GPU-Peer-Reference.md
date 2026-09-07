@@ -43,8 +43,9 @@ compile-time platform assumptions exist anywhere in the module.
 
 ```rust
 pub struct GpuPeerConfig { region_path, lanes, slot_bytes, slots_per_lane,
-                           quantum_ns, idle_exit_ns, device_ordinal,
-                           blocks_per_lane }
+                           quantum_ns, barrier_deadline_ns, idle_exit_ns,
+                           device_ordinal, vram_block_bytes, vram_blocks,
+                           blocks_per_lane, user_ops_cuda }
 pub struct GpuPeer;
 impl GpuPeer {
     pub fn init(config: GpuPeerConfig) -> Result<Self, GpuPeerError>;
@@ -53,8 +54,11 @@ impl GpuPeer {
     pub fn is_done(&self, ticket: Ticket) -> bool;
     pub fn wait(&mut self, ticket: Ticket, timeout: Duration) -> Result<u32, GpuPeerError>;
     pub fn wait_status(&mut self, ticket: Ticket, timeout: Duration) -> Result<u32, GpuPeerError>;
-    pub fn read_result(&self, ticket: Ticket, dst: &mut [u8]);
+    pub fn read_result(&self, ticket: Ticket, dst: &mut [u8]) -> Result<(), GpuPeerError>;
     pub fn reap(&mut self, ticket: Ticket) -> Result<(), GpuPeerError>;
+    pub fn barrier_stalls(&self) -> (u32, u32);
+    pub fn barrier_wait_max_ns(&self) -> u32;
+    pub fn displaced_foreign_context(&self) -> bool;
     pub fn timed_lock_acquire(&self, timeout: Duration) -> Result<(), GpuPeerError>;
     pub fn timed_lock_release(&self);
     // Resident blocks and wide ops (detailed in the sections below):
@@ -233,6 +237,38 @@ the correct shape on a host with no device to spread across. Clamp the
 quotient to whatever team size the user op supports: a hook that opens
 with `if (team_rank != 0u) return 0u;` serves one rank and stays on one
 SM whatever the config says.
+
+#### When a team does not assemble
+
+Rank 0 does not wait forever. `GpuPeerConfig::barrier_deadline_ns`
+bounds the wait and defaults to 5 ms; past it rank 0 retires the slot
+with `STATUS_TEAM_INCOMPLETE`, which is distinct from the `STATUS_ERR`
+a user op sets by returning non-zero. A caller that tests only for
+`STATUS_DONE` needs no change; one that reports why a slot failed can
+now tell a lost rank from a refused op.
+
+The payload of such a slot has holes in it - the ranks that did not
+arrive wrote nothing - so it is not an answer, and the status is the
+only thing that says so.
+
+Two accessors report what the guard has seen since init:
+
+```rust
+let (expiries, worst_depth) = peer.barrier_stalls();
+let worst_healthy_wait_ns = peer.barrier_wait_max_ns();
+```
+
+`worst_depth` is the ring depth at the deepest expiry, which separates
+a boundary landing on a lightly fed lane (one or two) from a lane
+draining a backlog (a depth near `slots_per_lane`).
+
+Reach for the counter rather than a latency percentile. A consumer
+measuring 12500 queries per arm found three and six expiries left no
+mark on either signal they had: the 99th percentile over that many
+queries is the 125th slowest, which a handful of events cannot reach,
+and recall moved 0.0005 across arms whose counts went 0, 3, 6. A tail
+exposes these only when the window is short enough for a few events to
+be most of it.
 
 ### Batching wide ops and quiescing the poller
 
@@ -756,6 +792,66 @@ round-robins and the hook receives a null block. The precompiled-PTX
 build (no NVRTC needed) rejects user ops cleanly. These are
 block-cooperative like every doorbell op; a large user op belongs on
 `launch_wide` instead.
+
+### Pinning the opcode on both sides
+
+The device source is a string, so the opcode it compares against is a
+literal that no compiler checks against `OP_USER_BASE`. Binding only
+the host constant does not fix that; it moves the coupling from
+host-against-crate to host-against-your-own-device-source, and the two
+failures are not equally visible. A host that submits an opcode the
+device does not recognise fails at the device and says so. A host that
+submits one the device recognises and rejects fails every call as an
+ordinary error, which reads as a broken accelerator rather than a
+version skew.
+
+Pin both sides at compile time:
+
+```rust
+const OP_KNN: u32 = flynnel::gpu_peer::layout::OP_USER_BASE;
+const _: () = assert!(OP_KNN == 100, "OP_USER_BASE moved; update the literal in the device source");
+```
+
+Write the device hook so an opcode it does not handle returns non-zero
+rather than falling through to zero. A trailing `return 0u` completes
+the slot as done over a payload the hook never wrote, and the caller
+reads its own arguments back as a result.
+
+### The round trip is not symmetric
+
+`submit_user` writes an eight-byte resident-parameter block ahead of
+the args, and the hook's `payload` pointer is advanced past it. So the
+args a caller submits are the hook's payload starting at zero: what
+the host puts at `args[k]` the device reads at `payload[k]`.
+
+`read_result` copies from the start of the slot payload, which is the
+resident-parameter block. So the same byte comes back at `dst[k + 8]`.
+A caller reading a result at the offset it wrote the argument is off
+by eight, and the values it finds there are its own inputs shifted -
+which looks like a kernel that computed something slightly wrong
+rather than a buffer read at the wrong place.
+
+```rust
+const HEADER: usize = 20;                   // this op's own args header
+const RESIDENT_PREFIX: usize = 8;           // what a read prepends
+
+let mut args = vec![0u8; HEADER + n * 8];   // header, inputs, outputs
+args[..4].copy_from_slice(&(n as u32).to_le_bytes());
+// ... fill the input plane at args[HEADER..]
+
+let t = peer.submit_user(OP_FIELD, None, &args)?;
+peer.wait_status(t, timeout)?;
+
+let mut res = vec![0u8; RESIDENT_PREFIX + args.len()];
+peer.read_result(t, &mut res)?;
+let outputs = &res[RESIDENT_PREFIX + HEADER + n * 4..];
+```
+
+Size `dst` to `RESIDENT_PREFIX + args.len()` as above, not to
+`args.len()`: a buffer that omits the prefix stops eight bytes short
+of the end of the result. `read_result` refuses a `dst` longer than
+the payload with `PayloadTooLarge`, so the slot has to be sized for
+the prefix too.
 
 ## Zero-synchronization prefetch
 

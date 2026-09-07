@@ -5,6 +5,137 @@ measurements from `benches/` and `tests/` on the two bench hosts, an
 RTX 3070 with a Ryzen 7 2700 (16 threads) and an RTX 5070 with a
 Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
+## 0.4.0 - 2026-09-07
+
+### Breaking
+
+- `GpuPeer::read_result` returns `Result<(), GpuPeerError>` and refuses
+  a `dst` longer than the slot's payload with `PayloadTooLarge`, naming
+  both the length and the capacity. It previously copied `dst.len()`
+  bytes with no check, so a buffer longer than the payload read across
+  the slot boundary into the next slot's descriptor, and past the last
+  slot outside the mapping. The only guard was a `debug_assert` against
+  the whole region, which is the wrong bound and is compiled out in
+  release. Every submit path already refused an oversized buffer the
+  same way; the read path now matches them. Callers testing the result
+  need a `?` or an `expect`.
+
+### GPU peer
+
+- `STATUS_TEAM_INCOMPLETE` is set when a block team does not fully
+  arrive before rank 0's deadline. It was `STATUS_ERR`, which is also
+  what a user op returning non-zero sets, so a caller learned a slot
+  was refused and nothing more. A failing op still outranks an
+  incomplete team. Additive: a caller testing `!= STATUS_DONE` is
+  unaffected.
+
+- `GpuPeerConfig::barrier_deadline_ns` sets how long rank 0 waits for
+  its team, defaulting to 5 ms. It was the poller quantum, 250 ms. On
+  an RTX 5070 with a Ryzen 9 7900X, over thirty-two submissions per
+  size, a team that assembles costs 1.7 us at two blocks, 5.2 us at
+  four, 13.7 us at eight and 53.4 us at sixty-four, the widest team any
+  consumer here configures; a loaded host roughly doubles the small
+  sizes. The margin at 64 is the one that matters, because that setting
+  was chosen while the 250 ms quantum bounded the wait, and it is 94
+  times the measured cost. Only consulted when `blocks_per_lane > 1`.
+
+- `GpuPeer::barrier_stalls` reports how many teams missed that deadline
+  and the largest ring depth at one; `GpuPeer::barrier_wait_max_ns`
+  reports the longest wait on a slot the whole team reached. Depth
+  separates a boundary landing on a lightly fed lane, which shows one
+  or two, from a lane draining a backlog, which shows a depth near the
+  ring size. A consumer measuring 12500 queries per arm saw three and
+  six expiries leave no mark on either signal it had: the 99th
+  percentile there is the 125th slowest query, and recall moved 0.0005
+  across arms counting 0, 3 and 6.
+
+- `GpuPeer::displaced_foreign_context` reports whether `init` replaced a
+  CUDA context that was current on the calling thread. The peer
+  operates on the device primary context and makes it current where it
+  binds, and a consumer holding its own context sees no error when that
+  happens: a device pointer from the displaced context still reads
+  back correctly through `cuMemcpyDtoH`. The displacement is also
+  written to stderr.
+
+- `blocks_per_lane > 1` has tests. The barrier, the rank-0 retirement
+  and the follower generation wait had none, and a consumer runs teams
+  in production.
+
+### Scheduler
+
+- The host profile's dispatch cost is observed rather than
+  differenced. It was a dispatched timing minus a serial one at the
+  same size, which recovers a quantity smaller than either operand, so
+  the noise on the dispatched side exceeded the thing being measured.
+  Across twelve draws on an idle Ryzen 7 2700 it read 1, 400 and 10200
+  ns among values clustered near 2000, with one draw at 250400; the 1
+  was the floor engaging on a difference that had reached zero. It is
+  now the median of a thousand timings of one join whose halves are a
+  single item each, so the dispatch is what is timed. The same twelve
+  draws now span 2100 to 5500 ns and the floor never engages. The
+  workload cells are unchanged: across four alternating runs per arm,
+  every cell differs by less than its own repeat spread. This value
+  sizes leaves through `adaptive_min_leaf`; the collapse threshold that
+  decides routing was already stable and is untouched.
+
+- A leaf shape the caller names outranks an estimate the caller did
+  not. `JobPlan::new` seeds `estimated_per_item_ns` from the
+  process-active profile and marks it non-explicit; the shape
+  classifier's fine-grain guard read that estimate without asking
+  whether the caller supplied it, so below roughly 4200 items an
+  explicit `with_leaf_shape` was classified fine-grain and discarded.
+  The plan still reported carrying the shape, so nothing a caller could
+  inspect showed the drop. `with_estimated_per_item_ns` is unchanged: a
+  figure the caller passes still governs. A consumer dispatching 32 to
+  a few hundred items with `LatencyCompute` and no estimate was routed
+  as though no shape had been given at all five of its sites, on work
+  measured at 38 to 48 percent device wait.
+
+- `with_cost_ns_per_elem` and `with_estimated_per_item_ns` are the same
+  call. The first stored the figure and returned; the second stored it
+  and re-ran the static classifier, so `use_smt`,
+  `oversubscription_log2`, `use_mailbox_routing` and `deque_tier_hint`
+  followed from the caller's cost. The README and the JobPlan reference
+  both say the two are equivalent and that the first is the canonical
+  name, so a caller taking the documented advice set a field and
+  changed no routing. At every size tested the two produced different
+  plans from identical input.
+
+- A profile the caller named survives a cost hint given after it. That
+  classifier pass overwrote `use_smt` and the rest whether or not the
+  profile had been set explicitly, so `set_profile(MemoryBound)`
+  followed by a cost hint routed as whatever the classifier inferred
+  while the plan still reported `MemoryBound`. The builder's own
+  documentation says the hint overrides the size-only guess `new` made;
+  a named profile is not that guess. Both remain in force now: the
+  estimate lands, the profile stands.
+
+- The host calibration no longer subtracts past zero. Its crossover
+  interpolation took the span between two timed counts as
+  `a - a_prev` over `u64`, guarded only by the gap having narrowed and
+  never by the larger count having cost more. A contended host times
+  2n faster than n often enough to matter: that panics in debug, and
+  in release it wraps, producing a collapse threshold that then governs
+  every dispatch for the life of the process. Reachable from
+  `calibrate_inline_collapse_threshold`, so a busy machine at process
+  start is the whole condition.
+
+- `calibrate_host_dispatch`'s documentation says that installing the
+  three figures into the process globals is the effect of calling it,
+  not of using what it returns. A call site that binds the result and
+  only prints it has still armed the whole program.
+
+- `FLYNNEL_HOST_PROFILE_NS=<dispatch>,<collapse>,<wake>` pins the host
+  dispatch profile to three nanosecond counts and skips the
+  calibration. It exists for comparing this scheduler against one that
+  never measures its own dispatch cost: unpinned, the two arms differ
+  in whether they adapt as well as in how they schedule, and a ratio
+  between them mixes the two. All three fields are required, zero is
+  refused in any of them because an installed collapse threshold of
+  zero is what marks a profile as uncalibrated, and anything that does
+  not parse is reported on stderr and the host measured instead. Unset,
+  which is the default, nothing changes.
+
 ## 0.3.0 - 2026-09-06
 
 ### Scheduler
@@ -162,8 +293,27 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   Under-estimating dispatch spends overhead on work that did not need
   the pool; over-estimating it forfeits the parallelism outright.
 
+### GPU peer
+
+- An opcode the kernel does not recognise is marked failed instead of
+  completing. The dispatch chain had no branch for one, so `op` kept
+  its submitted value and the slot was written `STATUS_DONE`; the
+  comment claiming otherwise had never been true. A caller who mistyped
+  an opcode, or submitted a user op before its source was composed in,
+  received success and read the payload it had submitted back as a
+  result. `GpuPeer::wait` could not protect against it, because the
+  slot never carried a failed status to convert into an error. Measured
+  against 0.3.0 on an RTX 5070: opcode 42, past the last built-in and
+  below `OP_USER_BASE`, returned `Ok(STATUS_DONE)` from both `wait` and
+  `wait_status`; both now report the failure.
+
 ### Tests
 
+- `tests/gpu_peer_status_contract.rs` exercises the failed-slot
+  contract against a slot that genuinely fails on the device rather
+  than a constructed status: `wait` reports an error, `wait_status`
+  hands back the raw failed word, and an `OP_NOP` control still
+  completes, so the test can tell the two apart.
 - `for_each_chunk_small_input_runs_serial` supplies an explicit
   per-item cost, which is what the inline collapse gates on, so the
   routing it asserts follows the plan rather than a live probe of the

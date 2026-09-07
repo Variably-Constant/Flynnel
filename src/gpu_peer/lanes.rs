@@ -192,10 +192,27 @@ impl LaneSet {
         r.load_u32(self.geometry.slot_off(t.lane, t.seq) + SLOT_STATUS_OFF)
     }
 
-    /// Copy a completed ticket's result payload into `dst`.
-    pub fn read_result<R: RegionWords>(&self, r: &R, t: Ticket, dst: &mut [u8]) {
+    /// Copy a completed ticket's result payload into `dst`, filling it
+    /// entirely.
+    ///
+    /// `dst.len()` may not exceed [`Geometry::payload_max`]; a longer
+    /// buffer is refused with [`GpuPeerError::PayloadTooLarge`] rather
+    /// than served from the bytes that follow the slot. The submit
+    /// paths refuse an oversized payload the same way, so a slot is
+    /// bounded in both directions by the same figure.
+    pub fn read_result<R: RegionWords>(
+        &self,
+        r: &R,
+        t: Ticket,
+        dst: &mut [u8],
+    ) -> Result<(), GpuPeerError> {
+        let max = self.geometry.payload_max();
+        if dst.len() > max {
+            return Err(GpuPeerError::PayloadTooLarge { len: dst.len(), max });
+        }
         let slot = self.geometry.slot_off(t.lane, t.seq);
         r.read_bytes(slot + SLOT_PAYLOAD_OFF, dst);
+        Ok(())
     }
 
     /// Release `ticket`'s slot for reuse. In-order per lane: `ticket`
@@ -315,7 +332,7 @@ pub(crate) mod tests {
             );
         }
         assert!(ls.try_submit(&r, OP_ADD1_F32, &[0u8; 8]).expect("fits").is_none());
-        // GPU consuming does NOT free slots for reuse...
+        // Consuming on the GPU leaves the ring as full as it was...
         fake_consume_all(&r);
         assert!(ls.try_submit(&r, OP_ADD1_F32, &[0u8; 8]).expect("fits").is_none());
         // ...reaping does.
@@ -350,6 +367,56 @@ pub(crate) mod tests {
             ls.try_submit(&r, OP_ADD1_F32, &big),
             Err(GpuPeerError::PayloadTooLarge { .. })
         ));
+    }
+
+    /// A read of exactly the slot's capacity fills the caller's buffer
+    /// entirely, and one byte more is refused instead of being served
+    /// from the neighbouring slot.
+    ///
+    /// The two submissions are adjacent slots on one lane carrying
+    /// distinguishable bytes, so the boundary the refusal protects is
+    /// a real one: were the read unchecked, the extra byte would be
+    /// the neighbour's, and a caller reading a status word alone could
+    /// not tell that from its own result.
+    #[test]
+    fn a_read_past_the_slot_is_refused_rather_than_served_from_the_next() {
+        let g = g4();
+        let max = g.payload_max();
+        let r = MemRegion::new(g);
+        let mut ls = LaneSet::new(g);
+
+        let mine = ls
+            .try_submit(&r, OP_ADD1_F32, &vec![0xAAu8; max])
+            .expect("capacity fits")
+            .expect("lane free");
+        let neighbour = ls
+            .try_submit_on(&r, mine.lane, OP_ADD1_F32, &vec![0xBBu8; max])
+            .expect("capacity fits")
+            .expect("lane free");
+        assert_eq!(neighbour.seq, mine.seq + 1, "the next slot on the same lane");
+        fake_consume_all(&r);
+
+        let mut exact = vec![0u8; max];
+        ls.read_result(&r, mine, &mut exact).expect("capacity is readable");
+        assert!(
+            exact.iter().all(|&b| b == 0xAA),
+            "a read of the full capacity fills the whole buffer"
+        );
+
+        match ls.read_result(&r, mine, &mut vec![0u8; max + 1]) {
+            Err(GpuPeerError::PayloadTooLarge { len, max: reported }) => {
+                assert_eq!(len, max + 1, "the refusal names the length it refused");
+                assert_eq!(reported, max, "and the capacity it measured against");
+            }
+            other => panic!("a read past the slot must be refused, got {other:?}"),
+        }
+
+        let mut theirs = vec![0u8; max];
+        ls.read_result(&r, neighbour, &mut theirs).expect("capacity is readable");
+        assert!(
+            theirs.iter().all(|&b| b == 0xBB),
+            "the bytes past the boundary belong to the next submission"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //!
 //! ## Shape
 //!
-//! ```rust,ignore
+//! ```
 //! struct AddOp { a: u32, b: u32 }
 //!
 //! impl flynnel::sched::Marshal for AddOp {
@@ -85,7 +85,17 @@ pub trait Marshal {
 /// [`Marshal::marshal_args`] and returns either a result blob or an
 /// error. Typical usage:
 ///
-/// ```rust,ignore
+/// ```
+/// # struct AddOp { a: u32, b: u32 }
+/// # impl flynnel::sched::Marshal for AddOp {
+/// #     const HANDLER_NAME: &'static str = "flynnel.doc.register.add";
+/// #     fn marshal_args(&self) -> Vec<u8> {
+/// #         let mut buf = Vec::with_capacity(8);
+/// #         buf.extend_from_slice(&self.a.to_le_bytes());
+/// #         buf.extend_from_slice(&self.b.to_le_bytes());
+/// #         buf
+/// #     }
+/// # }
 /// flynnel::sched::register_marshal_handler::<AddOp>(|args| {
 ///     let a = u32::from_le_bytes(args[0..4].try_into().unwrap());
 ///     let b = u32::from_le_bytes(args[4..8].try_into().unwrap());

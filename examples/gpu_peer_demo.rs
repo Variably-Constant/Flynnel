@@ -50,7 +50,7 @@ fn main() {
         let ticket = peer.submit(OP_ADD1_F32, &payload).expect("submit");
         let status = peer.wait(ticket, Duration::from_secs(5)).expect("wait");
         assert_eq!(status, STATUS_DONE, "block {m} must complete");
-        peer.read_result(ticket, &mut result);
+        peer.read_result(ticket, &mut result).expect("result fits the slot");
         for (i, chunk) in result.chunks_exact(4).enumerate() {
             let got = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let want = ((m + i) % 1000) as f32 + 1.0;
@@ -82,7 +82,7 @@ fn main() {
             let (m0, t) = pending.pop_front().expect("window nonempty");
             let status = peer.wait(t, Duration::from_secs(5)).expect("wait");
             assert_eq!(status, STATUS_DONE, "block {m0}");
-            peer.read_result(t, &mut result);
+            peer.read_result(t, &mut result).expect("result fits the slot");
             let first =
                 f32::from_le_bytes([result[0], result[1], result[2], result[3]]);
             assert_eq!(first, (m0 % 1000) as f32 + 1.0, "block {m0} spot check");
@@ -110,7 +110,7 @@ fn main() {
     let status = peer.wait(ticket, Duration::from_secs(5)).expect("wait");
     assert_eq!(status, STATUS_DONE);
     let mut sum_bytes = [0u8; 8];
-    peer.read_result(ticket, &mut sum_bytes);
+    peer.read_result(ticket, &mut sum_bytes).expect("result fits the slot");
     let got = u64::from_le_bytes(sum_bytes);
     peer.reap(ticket).expect("reap");
     assert_eq!(got, expect);
