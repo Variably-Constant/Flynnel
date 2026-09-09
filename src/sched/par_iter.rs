@@ -572,12 +572,89 @@ pub fn calibrate_host_dispatch() -> HostDispatchProfile {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let p = match pinned_host_profile() {
         Some(pinned) => pinned,
-        None => measure_host_dispatch(),
+        None => stored_or_measured(),
     };
     HOST_DISPATCH_COST_NS.store(p.dispatch_cost_ns, Ordering::Relaxed);
     HOST_JEC_WAKE_THRESHOLD_NS.store(p.jec_wake_threshold_ns, Ordering::Relaxed);
     HOST_COLLAPSE_THRESHOLD_NS.store(p.collapse_threshold_ns, Ordering::Relaxed);
     p
+}
+
+/// The host's profile from the persisted table when one is there and
+/// was measured on a quiet host, otherwise a fresh measurement, which
+/// is published for the next process to read.
+///
+/// Every path that cannot reach the table still returns a profile,
+/// because measuring is what the caller would have done with no table
+/// at all. What it does not do is stay quiet about why: a table that is
+/// unreadable and a host that has never been measured produce the same
+/// numbers, and only the diagnostic tells them apart.
+///
+/// A stored record whose samples spread like a loaded host is passed
+/// over and measured again. Persisting a measurement taken under load
+/// would hand every later process on the machine that load's numbers.
+#[cfg(feature = "persisted-calibration")]
+fn stored_or_measured() -> HostDispatchProfile {
+    use crate::sched::calibration_store::{
+        CalibrationStore, CpuCalibration, HostStamp, StoreError, calibration_dir,
+    };
+    let Some(dir) = calibration_dir() else {
+        // No cache location on this platform; nothing to report.
+        return measure_host_dispatch().0;
+    };
+    let stamp = HostStamp::detect();
+    let store = match CalibrationStore::open_or_create(&dir, &stamp) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "flynnel: the calibration table under {} is unusable ({e:?}); \
+                 this process measures its own dispatch profile",
+                dir.display()
+            );
+            return measure_host_dispatch().0;
+        }
+    };
+    if let Some((cpu, _accel)) = store.read()
+        && cpu.is_trustworthy()
+    {
+        return HostDispatchProfile {
+            dispatch_cost_ns: cpu.dispatch_cost_ns,
+            collapse_threshold_ns: cpu.collapse_threshold_ns,
+            jec_wake_threshold_ns: cpu.jec_wake_threshold_ns,
+        };
+    }
+    let (profile, spread) = measure_host_dispatch();
+    match store.try_acquire_writer() {
+        Ok(writer) => {
+            writer.beat();
+            writer.publish(
+                &CpuCalibration::new(
+                    profile.dispatch_cost_ns,
+                    profile.collapse_threshold_ns,
+                    profile.jec_wake_threshold_ns,
+                    spread,
+                    SAMPLES as u32,
+                ),
+                &[],
+            );
+        }
+        // Another process on this host is measuring the same table. Its
+        // record serves the next start; this process keeps the profile
+        // it measured. Expected under a parallel test run, so it is not
+        // worth a line on stderr.
+        Err(StoreError::WriterActive) => {}
+        Err(e) => eprintln!(
+            "flynnel: measured this host but could not publish it ({e:?}); \
+             the next process measures again"
+        ),
+    }
+    profile
+}
+
+/// The measured profile, with nothing persisted.
+#[cfg(not(feature = "persisted-calibration"))]
+fn stored_or_measured() -> HostDispatchProfile {
+    measure_host_dispatch().0
 }
 
 /// Place the crossover between the last two timed counts.
@@ -687,7 +764,7 @@ fn parse_pinned_profile(text: &str) -> Option<HostDispatchProfile> {
 /// through a join bisect of its own with a fixed leaf and plans
 /// without an explicit estimate, so nothing here consults the values
 /// it produces.
-fn measure_host_dispatch() -> HostDispatchProfile {
+fn measure_host_dispatch() -> (HostDispatchProfile, u32) {
     const LEAF: usize = 256;
     const MAX_ITEMS: usize = 1 << 17;
     /// Samples per timed point, and sweeps per crossover.
@@ -802,7 +879,10 @@ fn measure_host_dispatch() -> HostDispatchProfile {
     /// low and spreads wider than the median of the same runs. The
     /// timing points inside a sweep keep their own minimum, which is
     /// where suppressing that noise is the right move.
-    fn median_sweep<F: FnMut() -> u64>(mut sweep_once: F) -> u64 {
+    /// Returns the median beside what the rest of the samples say about
+    /// it: the spread is how far apart the extremes fell, and a host
+    /// carrying other work spreads an order wider than an idle one.
+    fn median_sweep<F: FnMut() -> u64>(mut sweep_once: F) -> (u64, u32) {
         let mut samples = [0u64; SAMPLES];
         for slot in &mut samples {
             *slot = sweep_once();
@@ -810,13 +890,14 @@ fn measure_host_dispatch() -> HostDispatchProfile {
         samples.sort_unstable();
         if std::env::var_os("FLYNNEL_PROFILE_SAMPLES").is_some() {
             eprintln!(
-                "profile sweep: min {} median {} max {} samples {samples:?}",
+                "profile sweep: min {} median {} max {} spread {} per mille samples {samples:?}",
                 samples[0],
                 samples[SAMPLES / 2],
-                samples[SAMPLES - 1]
+                samples[SAMPLES - 1],
+                sample_spread_per_mille(&samples),
             );
         }
-        samples[SAMPLES / 2]
+        (samples[SAMPLES / 2], sample_spread_per_mille(&samples))
     }
     let mut v: Vec<u64> = (0..MAX_ITEMS as u64).collect();
     // The first dispatches wake a cold pool and fault the buffer in;
@@ -852,8 +933,8 @@ fn measure_host_dispatch() -> HostDispatchProfile {
     let serial_vs_pool = |v: &mut [u64]| {
         sweep(v, |_, items| body(items), dispatched)
     };
-    let collapse_threshold_ns =
-        median_sweep(|| serial_vs_pool(&mut v)).max(dispatch_cost_ns);
+    let (collapse_median, collapse_spread) = median_sweep(|| serial_vs_pool(&mut v));
+    let collapse_threshold_ns = collapse_median.max(dispatch_cost_ns);
     // The wake path against polling: the same dispatched body under
     // the two dispatch scopes.
     let polling_vs_wake = |v: &mut [u64]| {
@@ -869,8 +950,25 @@ fn measure_host_dispatch() -> HostDispatchProfile {
             },
         )
     };
-    let jec_wake_threshold_ns = median_sweep(|| polling_vs_wake(&mut v));
-    HostDispatchProfile { dispatch_cost_ns, collapse_threshold_ns, jec_wake_threshold_ns }
+    let (jec_wake_threshold_ns, wake_spread) = median_sweep(|| polling_vs_wake(&mut v));
+    (
+        HostDispatchProfile { dispatch_cost_ns, collapse_threshold_ns, jec_wake_threshold_ns },
+        collapse_spread.max(wake_spread),
+    )
+}
+
+/// Spread of a sorted sample set in parts per thousand of its median.
+///
+/// A calibration keeps the median of its samples; this is what the rest
+/// of them say about how far that median can be trusted. An idle host
+/// lands in the tens, a host carrying other work in the hundreds.
+pub fn sample_spread_per_mille(sorted: &[u64]) -> u32 {
+    if sorted.len() < 2 {
+        return 0;
+    }
+    let median = sorted[sorted.len() / 2].max(1);
+    let span = sorted[sorted.len() - 1].saturating_sub(sorted[0]);
+    (span.saturating_mul(1000) / median).min(u32::MAX as u64) as u32
 }
 
 /// True when this dispatch runs its body on the calling thread: the

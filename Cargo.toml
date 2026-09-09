@@ -118,10 +118,19 @@ default = [
     "verify-chain",
     "cuda-reference",
     "gpu-peer",
+    "persisted-calibration",
     "shared-memory-worker-reference",
     "tpu-jax-reference",
     "wasm-reference",
 ]
+# Enable the per-host calibration table
+# (`crate::sched::calibration_store`): the measured dispatch thresholds
+# and device capabilities live in a memory-mapped file keyed by a host
+# stamp, so a process that finds its host's table reads it instead of
+# measuring. Pulls in memmap2 for the mapping. Without it every process
+# measures for itself, and two processes on one host can disagree by
+# more than the decisions those numbers drive.
+persisted-calibration = ["dep:memmap2"]
 # Enable the BLAKE3-rooted verification-chain helper (VerifyChain).
 verify-chain = ["dep:blake3"]
 # Enable the cudarc-based reference CUDA backend
