@@ -184,5 +184,58 @@ fn bench_stable_estimate(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_stabilisers, bench_stable_estimate);
+/// The regime a consumer's sites are actually in: an estimate so far
+/// under the worker floor that `max()` supplies the whole target and
+/// the estimate contributes nothing.
+///
+/// 4096 items at 100 ns gives a target of 0.41, which the floor lifts
+/// to the worker count. A caller here cannot cross a boundary at any
+/// estimate, so both mechanisms are pure cost, and a cost that only
+/// appears when the floor binds would show here and nowhere else.
+fn bench_pinned_target(c: &mut Criterion) {
+    const PINNED_ITEMS: usize = 4096;
+    const PINNED_EST_NS: u32 = 100;
+
+    let mut group = c.benchmark_group("seed_depth_pinned_target");
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(8));
+    group.sample_size(20);
+
+    let mut buf: Vec<u64> = (0..PINNED_ITEMS as u64).collect();
+
+    static NEITHER: CallSiteState = CallSiteState::new();
+    static BOTH: CallSiteState = CallSiteState::new();
+
+    group.bench_function("neither", |b| {
+        set_seed_hysteresis(false);
+        set_estimate_smoothing(false);
+        b.iter(|| {
+            dispatch(SiteRef::new(&NEITHER), &mut buf, PINNED_EST_NS);
+            dispatch(SiteRef::new(&NEITHER), &mut buf, PINNED_EST_NS);
+            black_box(buf[0]);
+        });
+    });
+
+    group.bench_function("both", |b| {
+        set_seed_hysteresis(true);
+        set_estimate_smoothing(true);
+        b.iter(|| {
+            dispatch(SiteRef::new(&BOTH), &mut buf, PINNED_EST_NS);
+            dispatch(SiteRef::new(&BOTH), &mut buf, PINNED_EST_NS);
+            black_box(buf[0]);
+        });
+    });
+
+    set_seed_hysteresis(false);
+    set_estimate_smoothing(false);
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_stabilisers,
+    bench_stable_estimate,
+    bench_pinned_target
+);
 criterion_main!(benches);
