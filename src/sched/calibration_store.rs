@@ -159,9 +159,9 @@ impl HostStamp {
 #[cfg(target_arch = "x86_64")]
 fn cpuid_identity() -> (String, u32) {
     use std::arch::x86_64::__cpuid_count;
-    // SAFETY: CPUID leaves 0 and 1 are architectural on every x86_64
-    // part; the intrinsic reads registers and touches no memory.
-    let (leaf0, leaf1) = unsafe { (__cpuid_count(0, 0), __cpuid_count(1, 0)) };
+    // Leaves 0 and 1 are architectural on every x86_64 part, so both
+    // reads are defined on any host this branch compiles for.
+    let (leaf0, leaf1) = (__cpuid_count(0, 0), __cpuid_count(1, 0));
     let mut bytes = [0u8; 12];
     bytes[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
     bytes[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
@@ -243,11 +243,26 @@ pub enum AccelKind {
     GpuPeer = 2,
 }
 
+/// The doorbell handshake completed and was measured.
+pub const ACCEL_DOORBELL_OK: u32 = 1 << 0;
+/// The Fischer lock self-test passed at the recorded margin.
+pub const ACCEL_TIMED_LOCK_OK: u32 = 1 << 1;
+/// Cross-device compare-and-swap conserved claims, which a coherent
+/// link allows and a PCIe one does not.
+pub const ACCEL_SYS_ATOMICS_OK: u32 = 1 << 2;
+
 /// One device's capabilities and the timings measured against it.
 ///
 /// The capability fields are read from the driver and do not vary with
-/// load. The timing fields are measured and do, which is why each
-/// carries the same spread the CPU record carries.
+/// what else is running. The timing fields are measured and do, which
+/// is why the record carries the spread of the samples behind them on
+/// the same scale the CPU record uses.
+///
+/// The fields mirror what the GPU peer already measures at every init:
+/// a doorbell round trip at three points of its distribution, the
+/// cross-device clock error, the visibility bound derived from them,
+/// the validated Fischer margin, and a launch-and-synchronise baseline
+/// the doorbell path is competing against.
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct AccelCalibration {
@@ -255,7 +270,7 @@ pub struct AccelCalibration {
     pub kind: u32,
     /// Device ordinal as the driver enumerates it.
     pub ordinal: u32,
-    /// Compute capability, major times 10 plus minor.
+    /// Compute capability, major times ten plus minor.
     pub capability: u32,
     /// Multiprocessor count.
     pub multiprocessors: u32,
@@ -263,17 +278,27 @@ pub struct AccelCalibration {
     pub clock_khz: u32,
     /// Device memory in mebibytes.
     pub memory_mib: u32,
-    /// Round trip from a host doorbell write to the device's
-    /// acknowledgement.
-    pub doorbell_rtt_ns: u64,
-    /// Host-to-device clock offset.
-    pub clock_offset_ns: i64,
-    /// Margin the Fischer lock adds over the measured round trip.
-    pub fischer_margin_ns: u64,
-    /// Spread of the timing samples in parts per thousand of their
-    /// median, on the same scale as [`CpuCalibration::spread_per_mille`].
+    /// `ACCEL_*` capability bits established by the self-tests.
+    pub flags: u32,
+    /// Spread of the round-trip distribution in parts per thousand of
+    /// its median, on the same scale as
+    /// [`CpuCalibration::spread_per_mille`].
     pub spread_per_mille: u32,
-    _pad: [u8; 12],
+    /// Doorbell round trip, minimum observed.
+    pub rtt_min_ns: u64,
+    /// Doorbell round trip, median.
+    pub rtt_median_ns: u64,
+    /// Doorbell round trip, 99th percentile.
+    pub rtt_p99_ns: u64,
+    /// One-way visibility bound.
+    pub one_way_ns: u64,
+    /// Cross-device clock alignment error.
+    pub clock_err_ns: u64,
+    /// Fischer margin the self-test validated.
+    pub delta_ns: u64,
+    /// Kernel launch and synchronise baseline.
+    pub launch_ns: u64,
+    _pad: [u8; 24],
 }
 
 impl Default for AccelCalibration {
@@ -285,25 +310,85 @@ impl Default for AccelCalibration {
             multiprocessors: 0,
             clock_khz: 0,
             memory_mib: 0,
-            doorbell_rtt_ns: 0,
-            clock_offset_ns: 0,
-            fischer_margin_ns: 0,
+            flags: 0,
             spread_per_mille: 0,
-            _pad: [0; 12],
+            rtt_min_ns: 0,
+            rtt_median_ns: 0,
+            rtt_p99_ns: 0,
+            one_way_ns: 0,
+            clock_err_ns: 0,
+            delta_ns: 0,
+            launch_ns: 0,
+            _pad: [0; 24],
         }
     }
 }
 
 impl AccelCalibration {
+    /// A device record whose spread is derived from the round-trip
+    /// distribution it already carries.
+    ///
+    /// The peer measures the round trip at three points, so how far
+    /// apart they fell is the device's equivalent of the CPU sweep's
+    /// sample spread, and it costs nothing extra: a device with another
+    /// process resident on it stretches the tail without moving the
+    /// minimum, which is exactly what this reads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: AccelKind,
+        ordinal: u32,
+        capability: u32,
+        multiprocessors: u32,
+        clock_khz: u32,
+        memory_mib: u32,
+        flags: u32,
+        rtt_min_ns: u64,
+        rtt_median_ns: u64,
+        rtt_p99_ns: u64,
+        one_way_ns: u64,
+        clock_err_ns: u64,
+        delta_ns: u64,
+        launch_ns: u64,
+    ) -> Self {
+        let spread_per_mille = crate::sched::par_iter::sample_spread_per_mille(&[
+            rtt_min_ns,
+            rtt_median_ns,
+            rtt_p99_ns,
+        ]);
+        Self {
+            kind: kind as u32,
+            ordinal,
+            capability,
+            multiprocessors,
+            clock_khz,
+            memory_mib,
+            flags,
+            spread_per_mille,
+            rtt_min_ns,
+            rtt_median_ns,
+            rtt_p99_ns,
+            one_way_ns,
+            clock_err_ns,
+            delta_ns,
+            launch_ns,
+            _pad: [0; 24],
+        }
+    }
+
     /// Whether this slot describes a device.
     pub fn is_present(&self) -> bool {
         self.kind != AccelKind::None as u32
     }
 
     /// Whether the device was idle enough for the timings to describe
-    /// it rather than whatever else was running on it.
+    /// it rather than whatever else was resident on it.
     pub fn is_trustworthy(&self) -> bool {
         self.is_present() && self.spread_per_mille <= PROVISIONAL_SPREAD_PER_MILLE
+    }
+
+    /// Whether a capability bit is set.
+    pub fn has(&self, flag: u32) -> bool {
+        self.flags & flag != 0
     }
 }
 
@@ -608,14 +693,19 @@ impl Drop for WriterGuard<'_> {
     fn drop(&mut self) {
         let hdr = self.store.header();
         let me = std::process::id();
-        // Release only our own claim: a lease taken from us as stale
-        // belongs to whoever took it.
-        let _ = hdr.writer_pid.compare_exchange(
-            me,
-            NO_WRITER,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        // Release only this process's own claim. A lease taken from us
+        // as stale belongs to whoever took it, and clearing that would
+        // hand a third process the same table to write at the same
+        // time.
+        if let Err(holder) =
+            hdr.writer_pid
+                .compare_exchange(me, NO_WRITER, Ordering::AcqRel, Ordering::Acquire)
+        {
+            eprintln!(
+                "flynnel: the calibration lease held by pid {me} was taken by pid {holder} \
+                 mid-measurement; leaving it with the new holder"
+            );
+        }
     }
 }
 
@@ -670,9 +760,20 @@ pub fn now_unix_s() -> u64 {
 mod tests {
     use super::*;
 
+    /// Remove a test's directory, saying so when something other than
+    /// its absence stopped it: a table left behind is one the next run
+    /// of this test would attach to instead of creating.
+    fn cleanup(dir: &Path) {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("calibration test left {} behind: {e}", dir.display()),
+        }
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("flynnel-cal-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        cleanup(&d);
         d
     }
 
@@ -709,7 +810,7 @@ mod tests {
             store.read().is_none(),
             "a table nobody has measured into must not offer a record"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -718,19 +819,22 @@ mod tests {
         let s = stamp(12, 24);
         let store = CalibrationStore::open_or_create(&dir, &s).expect("create");
         let cpu = sample_cpu();
-        let accel = [AccelCalibration {
-            kind: AccelKind::Cuda as u32,
-            ordinal: 0,
-            capability: 89,
-            multiprocessors: 46,
-            clock_khz: 2_505_000,
-            memory_mib: 12_282,
-            doorbell_rtt_ns: 3_400,
-            clock_offset_ns: -120,
-            fischer_margin_ns: 800,
-            spread_per_mille: 55,
-            _pad: [0; 12],
-        }];
+        let accel = [AccelCalibration::new(
+            AccelKind::GpuPeer,
+            0,
+            89,
+            46,
+            2_505_000,
+            12_282,
+            ACCEL_DOORBELL_OK | ACCEL_TIMED_LOCK_OK,
+            3_000,
+            3_400,
+            3_700,
+            1_970,
+            120,
+            19_700,
+            41_000,
+        )];
         {
             let w = store.try_acquire_writer().expect("no other writer");
             w.beat();
@@ -741,8 +845,43 @@ mod tests {
         assert_eq!(got_accel.len(), 1, "one device was published");
         assert_eq!(got_accel[0], accel[0], "the device record survives too");
         assert!(got_cpu.is_trustworthy(), "41 per mille is a quiet host");
-        assert!(got_accel[0].is_trustworthy(), "55 per mille is a quiet device");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            got_accel[0].is_trustworthy(),
+            "a round trip of 3000/3400/3700 is a device nothing else is resident on"
+        );
+        assert!(
+            got_accel[0].has(ACCEL_DOORBELL_OK) && got_accel[0].has(ACCEL_TIMED_LOCK_OK),
+            "the capability bits survive the round trip"
+        );
+        assert!(
+            !got_accel[0].has(ACCEL_SYS_ATOMICS_OK),
+            "a bit that was not set does not read as set"
+        );
+        cleanup(&dir);
+    }
+
+    /// A device carrying someone else's work stretches the tail of the
+    /// round trip without moving its minimum, and that is what makes
+    /// the record provisional rather than the host's calibration.
+    #[test]
+    fn a_device_timed_under_load_is_not_trustworthy() {
+        let quiet = AccelCalibration::new(
+            AccelKind::GpuPeer, 0, 89, 46, 2_505_000, 12_282,
+            ACCEL_DOORBELL_OK, 3_000, 3_400, 3_700, 1_970, 120, 19_700, 41_000,
+        );
+        let loaded = AccelCalibration::new(
+            AccelKind::GpuPeer, 0, 89, 46, 2_505_000, 12_282,
+            ACCEL_DOORBELL_OK, 3_000, 3_400, 9_400, 4_820, 120, 48_200, 41_000,
+        );
+        assert!(quiet.is_trustworthy(), "a tight distribution describes the device");
+        assert!(
+            !loaded.is_trustworthy(),
+            "a p99 nearly three times the minimum describes what else was running"
+        );
+        assert!(
+            !AccelCalibration::default().is_trustworthy(),
+            "an empty slot describes no device at all"
+        );
     }
 
     #[test]
@@ -759,7 +898,7 @@ mod tests {
         let (got, accel) = reopened.read().expect("the record persists across handles");
         assert_eq!(got, cpu, "a later attach reads the published record");
         assert!(accel.is_empty(), "no devices were published");
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -773,7 +912,7 @@ mod tests {
             table_path(&dir, &b),
             "a different stamp names a different file, so neither reads the other's numbers"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -787,7 +926,7 @@ mod tests {
         let _again = store
             .try_acquire_writer()
             .expect("a dropped guard leaves the lease free");
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
