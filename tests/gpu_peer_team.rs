@@ -22,6 +22,8 @@ use flynnel::gpu_peer::{
     GpuPeer, GpuPeerConfig, STATUS_DONE, STATUS_ERR, STATUS_TEAM_INCOMPLETE, layout,
 };
 
+mod common;
+
 /// op 200 marks the payload byte at its own rank, so a result carries
 /// one distinguishable mark per rank that ran; one thread per block
 /// writes and the ranks write to disjoint bytes. op 201 holds every rank
@@ -92,6 +94,7 @@ fn impatient_team_peer(blocks_per_lane: u32, barrier_deadline_ns: u64) -> GpuPee
 /// writing.
 #[test]
 fn every_rank_of_a_team_contributes_to_the_result() {
+    let _device = common::device();
     for team in [1u32, 2, 4, 8, 64] {
         let mut peer = team_peer(team);
         // One byte per rank past the resident prefix, with room for the
@@ -147,6 +150,7 @@ fn every_rank_of_a_team_contributes_to_the_result() {
 /// on every rank that got to return at all.
 #[test]
 fn a_team_that_does_not_assemble_reports_an_incomplete_team_not_an_error() {
+    let _device = common::device();
     let mut peer = impatient_team_peer(4, 20_000_000);
     let payload = vec![0u8; 64];
     let t = peer
@@ -184,6 +188,7 @@ fn a_team_that_does_not_assemble_reports_an_incomplete_team_not_an_error() {
 /// submission is judged.
 #[test]
 fn a_lane_serves_correctly_after_one_of_its_teams_times_out() {
+    let _device = common::device();
     const TEAM: u32 = 4;
     let mut peer = impatient_team_peer(TEAM, 20_000_000);
 
@@ -261,6 +266,7 @@ fn a_lane_serves_correctly_after_one_of_its_teams_times_out() {
 /// deadline is exercised, and the production route to it is not.
 #[test]
 fn a_slot_behind_an_unwinding_team_never_reports_done_with_a_rank_missing() {
+    let _device = common::device();
     const TEAM: u32 = 4;
     let mut peer = impatient_team_peer(TEAM, 20_000_000);
 
@@ -316,6 +322,7 @@ fn a_slot_behind_an_unwinding_team_never_reports_done_with_a_rank_missing() {
 /// instrument is measuring something other than what it names.
 #[test]
 fn a_barrier_expiry_records_its_count_and_the_ring_depth() {
+    let _device = common::device();
     let mut peer = impatient_team_peer(4, 20_000_000);
     assert_eq!(peer.barrier_stalls(), (0, 0), "a fresh peer has stalled nothing");
 
@@ -350,11 +357,20 @@ fn a_barrier_expiry_records_its_count_and_the_ring_depth() {
 /// and the margin at the size actually used is the thing that decides
 /// whether the change is safe.
 ///
-/// The number is the output and is printed. What is asserted is the
-/// margin, which is the property that would break first on hardware
-/// slower than this one.
+/// The number is the output and is printed. What is asserted is a ten
+/// times margin, which is the property that would break first on
+/// hardware slower than this one.
+///
+/// The 64-block case is what the bound has to survive: 2, 4 and 8 clear
+/// any bound by hundreds of times, and 64 measures 55 us against the
+/// 5 ms deadline. It reached 412 us once, on a run where another test
+/// binary held the device at the same time, which put it at 82 percent
+/// of this bound and turned the assertion into a reading of the
+/// neighbour. The device lock in [`common`] is what makes 55 the figure
+/// this test sees.
 #[test]
 fn a_healthy_team_costs_far_less_at_the_barrier_than_its_deadline() {
+    let _device = common::device();
     const DEADLINE_NS: u64 = 5_000_000;
     for team in [2u32, 4, 8, 64] {
         let mut peer = impatient_team_peer(team, DEADLINE_NS);
@@ -382,9 +398,9 @@ fn a_healthy_team_costs_far_less_at_the_barrier_than_its_deadline() {
         assert_eq!(stalls, 0, "team {team}: no team should have missed on an idle host");
         assert!(
             (waited as u64) < DEADLINE_NS / 10,
-            "team {team}: a healthy team waited {waited} ns, within an order of \
-             magnitude of its {DEADLINE_NS} ns deadline. The default rests on \
-             that margin being large, and without it the deadline abandons \
+            "team {team}: a healthy team waited {waited} ns, within an order \
+             of magnitude of its {DEADLINE_NS} ns deadline. The default rests \
+             on that margin being large, and without it the deadline abandons \
              teams that assemble normally"
         );
     }
@@ -406,6 +422,7 @@ fn a_healthy_team_costs_far_less_at_the_barrier_than_its_deadline() {
 /// about, and it is unaffected by who else is on the machine.
 #[test]
 fn a_team_submission_does_not_approach_its_barrier_deadline() {
+    let _device = common::device();
     let mut peer = team_peer(4);
     let t = peer
         .submit_user(layout::OP_USER_BASE + 100, None, &[0u8; 64])

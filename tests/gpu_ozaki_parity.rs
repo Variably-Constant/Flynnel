@@ -5,17 +5,18 @@
 //! device with int8 tensor cores.
 #![cfg(feature = "gpu-peer")]
 
-use std::sync::{Mutex, MutexGuard};
 
 use flynnel::gpu_peer::linalg::cpu;
 use flynnel::gpu_peer::ozaki::{error_bound, ozaki_gemm_batched, OzakiKernels};
 use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig};
 
-/// One device at a time: each test builds its own peer and pool.
-static GPU: Mutex<()> = Mutex::new(());
+mod common;
 
-fn serial() -> MutexGuard<'static, ()> {
-    GPU.lock().unwrap_or_else(|e| e.into_inner())
+/// One device at a time, across test binaries as well as within this
+/// one: each test builds its own peer and pool, and cargo runs the
+/// binaries concurrently.
+fn serial() -> common::DeviceLock {
+    common::device()
 }
 
 fn peer() -> GpuPeer {

@@ -6,7 +6,6 @@
 //! calls. Requires a CUDA device.
 #![cfg(feature = "gpu-peer")]
 
-use std::sync::{Mutex, MutexGuard};
 
 use flynnel::JobPlan;
 use flynnel::gpu_peer::linalg::{
@@ -15,10 +14,12 @@ use flynnel::gpu_peer::linalg::{
 };
 use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig};
 
-static GPU: Mutex<()> = Mutex::new(());
+mod common;
 
-fn serial() -> MutexGuard<'static, ()> {
-    GPU.lock().unwrap_or_else(|e| e.into_inner())
+/// One device at a time, across test binaries as well as within this
+/// one; cargo runs the binaries concurrently.
+fn serial() -> common::DeviceLock {
+    common::device()
 }
 
 fn peer() -> GpuPeer {

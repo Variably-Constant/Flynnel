@@ -29,15 +29,17 @@
 //! Requires a CUDA device and NVRTC.
 #![cfg(feature = "gpu-peer")]
 
-use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig, STATUS_DONE, layout};
 
-static GPU: Mutex<()> = Mutex::new(());
+mod common;
 
-fn serial() -> MutexGuard<'static, ()> {
-    GPU.lock().unwrap_or_else(|e| e.into_inner())
+/// One device at a time, across test binaries as well as within this
+/// one; cargo runs the binaries concurrently, and these shapes are the
+/// ones whose timings a neighbour distorts most.
+fn serial() -> common::DeviceLock {
+    common::device()
 }
 
 /// The field op's shape: read the point count out of the payload

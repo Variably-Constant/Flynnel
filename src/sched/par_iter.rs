@@ -462,14 +462,27 @@ pub fn host_dispatch_profile() -> HostDispatchProfile {
 /// [`HostDispatchProfile::collapse_threshold_ns`]. Classifier
 /// defaults never trigger the collapse; only
 /// [`JobPlan::with_estimated_per_item_ns`] does.
+///
+/// Measured once per process on first use and cached for that
+/// process's life, so it is a per-process value rather than a constant
+/// of the machine: a figure read in one process does not describe
+/// another. The `FLYNNEL_HOST_PROFILE_NS` environment variable pins
+/// all three figures and skips the measurement, which is what an
+/// experiment comparing arms across processes needs.
 pub fn inline_collapse_threshold_ns() -> u64 {
     host_dispatch_profile().collapse_threshold_ns
 }
 
-/// The pool's measured cost of one dispatch on this host:
+/// The pool's measured cost of one dispatch in this process:
 /// [`HostDispatchProfile::dispatch_cost_ns`]. A leaf is sized to
 /// carry about this much work, and the probe's dispatch decision
 /// compares against [`inline_collapse_threshold_ns`].
+///
+/// Per process rather than per host: four processes on one Ryzen 9
+/// 7900X read 900 to 1100 ns, twelve on a Ryzen 7 2700 read 2100 to
+/// 5500 ns. A figure read in one process does not describe another,
+/// and the first read in a loaded process fixes that load's cost for
+/// the rest of that process.
 pub fn pool_dispatch_cost_ns() -> u64 {
     host_dispatch_profile().dispatch_cost_ns
 }
@@ -758,13 +771,29 @@ fn measure_host_dispatch() -> HostDispatchProfile {
             n <<= 1;
         }
     }
-    /// The fastest of [`SAMPLES`] runs of `sweep_once`.
-    fn fastest_sweep<F: FnMut() -> u64>(mut sweep_once: F) -> u64 {
-        let mut best = u64::MAX;
-        for _ in 0..SAMPLES {
-            best = best.min(sweep_once());
+    /// The median of [`SAMPLES`] runs of `sweep_once`.
+    ///
+    /// A crossover is derived from two timings rather than being one,
+    /// so the minimum of several runs is whichever run's cancellation
+    /// noise happened to fall furthest in one direction. That is biased
+    /// low and spreads wider than the median of the same runs. The
+    /// timing points inside a sweep keep their own minimum, which is
+    /// where suppressing that noise is the right move.
+    fn median_sweep<F: FnMut() -> u64>(mut sweep_once: F) -> u64 {
+        let mut samples = [0u64; SAMPLES];
+        for slot in &mut samples {
+            *slot = sweep_once();
         }
-        best
+        samples.sort_unstable();
+        if std::env::var_os("FLYNNEL_PROFILE_SAMPLES").is_some() {
+            eprintln!(
+                "profile sweep: min {} median {} max {} samples {samples:?}",
+                samples[0],
+                samples[SAMPLES / 2],
+                samples[SAMPLES - 1]
+            );
+        }
+        samples[SAMPLES / 2]
     }
     let mut v: Vec<u64> = (0..MAX_ITEMS as u64).collect();
     // The first dispatches wake a cold pool and fault the buffer in;
@@ -801,7 +830,7 @@ fn measure_host_dispatch() -> HostDispatchProfile {
         sweep(v, |_, items| body(items), dispatched)
     };
     let collapse_threshold_ns =
-        fastest_sweep(|| serial_vs_pool(&mut v)).max(dispatch_cost_ns);
+        median_sweep(|| serial_vs_pool(&mut v)).max(dispatch_cost_ns);
     // The wake path against polling: the same dispatched body under
     // the two dispatch scopes.
     let polling_vs_wake = |v: &mut [u64]| {
@@ -817,7 +846,7 @@ fn measure_host_dispatch() -> HostDispatchProfile {
             },
         )
     };
-    let jec_wake_threshold_ns = fastest_sweep(|| polling_vs_wake(&mut v));
+    let jec_wake_threshold_ns = median_sweep(|| polling_vs_wake(&mut v));
     HostDispatchProfile { dispatch_cost_ns, collapse_threshold_ns, jec_wake_threshold_ns }
 }
 
@@ -2311,7 +2340,7 @@ where
     // target shape) and loses 3-4x on uniform cost (matmul-shaped
     // work), so the site's observed cv^2 is the routing signal:
     //
-    // - cv^2 known and LOW (uniform leaves): force SLAW at any n.
+    // - cv^2 known and low (uniform leaves): force SLAW at any n.
     // - cv^2 known and high (irregular leaves): let the site's
     //   policy arms A/B heartbeat (arm 1) against SLAW (arm 0) from
     //   n >= HEARTBEAT_MIN_ITEMS, adopting whichever EWMA wins and

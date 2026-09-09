@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig, STATUS_DONE, STATUS_ERR};
 
+mod common;
+
 /// Unknown to the kernel: past every built-in, below `OP_USER_BASE`.
 const OP_UNKNOWN: u32 = 42;
 
@@ -27,6 +29,7 @@ fn peer() -> GpuPeer {
 
 #[test]
 fn a_failed_slot_reaches_the_caller_as_an_error() {
+    let _device = common::device();
     let mut peer = peer();
 
     // The control first, so a run where nothing works cannot pass by
@@ -52,6 +55,7 @@ fn a_failed_slot_reaches_the_caller_as_an_error() {
 
 #[test]
 fn wait_status_hands_back_the_failed_word_instead_of_an_error() {
+    let _device = common::device();
     let mut peer = peer();
 
     let bad = peer.submit(OP_UNKNOWN, &[]).expect("submit an unknown op");

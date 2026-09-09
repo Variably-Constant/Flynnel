@@ -13,15 +13,18 @@
 //! Requires a CUDA device.
 #![cfg(feature = "gpu-peer")]
 
-use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig, GpuPeerError, STATUS_DONE, STATUS_ERR, layout};
 
-static GPU: Mutex<()> = Mutex::new(());
+mod common;
 
-fn serial() -> MutexGuard<'static, ()> {
-    GPU.lock().unwrap_or_else(|e| e.into_inner())
+/// One device at a time, across test binaries as well as within this
+/// one. See [`common`]: cargo runs the binaries concurrently, so a
+/// per-binary mutex leaves the parity suites and the peer tests driving
+/// the device together.
+fn serial() -> common::DeviceLock {
+    common::device()
 }
 
 fn peer() -> GpuPeer {

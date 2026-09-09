@@ -88,9 +88,17 @@ where
         }
         CooperativeRouting::ForceDeque => cooperative_join_n_flat(plan, closures),
         CooperativeRouting::Auto => {
-            // Population heuristic: N < n_workers routes to tree
-            // (under-populated pool); N >= n_workers routes to mailbox
-            // (matches the gate inside cooperative_join_n_flat_mailbox).
+            // Population heuristic: a fan-out narrower than the pool
+            // routes to tree, a wider one to mailbox.
+            //
+            // The count is summed across every NUMA node, while the
+            // gate inside cooperative_join_n_flat_mailbox counts the
+            // one node its worker belongs to. The two agree on a
+            // single-node host. On a multi-node host this is the
+            // larger number, so a fan-out between the two counts takes
+            // the tree rather than the mailbox that node would have
+            // allowed, and the gate demotes anything this sends on to
+            // Deque when the node cannot populate it.
             let n_workers = global_local_arena().total_workers();
             if n < n_workers {
                 cooperative_join_n_tree(plan, closures)
@@ -278,17 +286,15 @@ where
     if !ctx_ptr.is_null() {
         // SAFETY: same as cooperative_join_n_flat.
         let ctx = unsafe { &*ctx_ptr };
-        // Architectural gate: mailbox-distribute is only correct
-        // when N >= n_workers. When N < n_workers, mailbox-pushed
-        // closures target a SPECIFIC subset of workers; the parent
-        // and the remaining (n_workers - N) workers cannot help via
-        // peer-steal (peer-steal probes deques, not mailboxes), so
-        // the parent spins idle while a subset processes serially.
-        // Measured 4.4x slower than the deque variant on the Zen+
-        // R7 2700 N=8 / n_workers=16 case. Fall through to deque
-        // mode to preserve broad-steal load balance for under-
-        // populated calls.
-        let n_workers = ctx.stealers.len();
+        // Mailbox-distribute reaches only the workers it targets, and
+        // peer-steal reads deques rather than mailboxes, so a fan-out
+        // narrower than the pool leaves the parent and the untargeted
+        // workers idle for the wait. Deque mode keeps them fed.
+        //
+        // The comparison is against the worker count, which is what
+        // `fan_out_in_worker` also gates and round-robins on. The
+        // stealer table is longer by `EXTERNAL_SLOT_COUNT`.
+        let n_workers = ctx.sleep.worker_count();
         let mode = if n >= n_workers {
             FanOutMode::Mailbox
         } else {
@@ -296,9 +302,10 @@ where
         };
         return fan_out_in_worker(ctx, plan, closures, mode);
     }
-    // External path: we do not yet have a worker context (so no
-    // n_workers signal). Default to Deque so the worker the wrapper
-    // lands on can apply the same gate inside fan_out_in_worker.
+    // External path: no worker context yet, so the worker count is not
+    // reachable here. `fan_out_in_worker` applies the gate when the
+    // wrapper lands on a worker, and demotes this to Deque itself when
+    // the fan-out is narrower than the pool.
     fan_out_external(plan, closures, FanOutMode::Mailbox)
 }
 
@@ -395,13 +402,24 @@ where
         .collect();
 
     let numa_hint_byte = plan.numa_hint.unwrap_or(NUMA_HINT_ANY as u32) as u8;
-    let n_workers = ctx.stealers.len();
-    // Mailbox-distribute gate: only correct when N >= n_workers.
-    // See cooperative_join_n_flat_mailbox doc + root-cause comment
-    // for why N < n_workers regresses 4.4x: parent + (n_workers - N)
-    // workers stay idle during the wait because peer-steal cannot
-    // probe mailboxes. Demote to Deque mode when the workload is
-    // under-populated relative to the pool.
+    // The count of threads that drain a mailbox, which is the worker
+    // count and not `ctx.stealers.len()`. The stealer table carries
+    // `EXTERNAL_SLOT_COUNT` further entries for external submitters;
+    // a mailbox at one of those indices is popped only by a thread
+    // that has claimed that slot, and `find_work` pops `self.mailbox`
+    // alone, so a job routed there is not reachable by peer-steal.
+    //
+    // Both uses below depend on this being the worker count. The
+    // round-robin takes its modulus from it, so a larger value spreads
+    // targets past the last worker; the gate compares against it, so a
+    // larger value also delays the mode that would expose that.
+    let n_workers = ctx.sleep.worker_count();
+    // Mailbox-distribute gate: mailbox mode leaves the parent and any
+    // worker without a target idle for the wait, because peer-steal
+    // reads deques rather than mailboxes. Deque mode keeps them fed,
+    // so it is the mode for a fan-out narrower than the pool. Mailbox
+    // at 8 closures on a 16-worker Ryzen 7 2700 runs 4.4x the deque
+    // variant.
     let effective_mode = match mode {
         FanOutMode::Mailbox if n < n_workers => FanOutMode::Deque,
         other => other,
@@ -829,5 +847,34 @@ mod tests {
             flat,
             vec![0, 1, 2, 100, 101, 102, 200, 201, 202, 300, 301, 302]
         );
+    }
+
+    #[test]
+    fn flat_mailbox_completes_once_its_gate_opens() {
+        // Mailbox mode engages at N >= the worker count and routes each
+        // closure to one worker's mailbox. `find_work` pops only the
+        // worker's own mailbox and peer-steal reads deques, so a closure
+        // routed to an index past the last worker is never executed and
+        // the join's CountLatch never reaches zero.
+        //
+        // N is the worker count plus EXTERNAL_SLOT_COUNT because that is
+        // the width at which a round-robin over the stealer table first
+        // covers every external slot. The join runs on its own thread so
+        // a failure is a timeout rather than a hung test binary.
+        let n = global_local_arena().total_workers()
+            + crate::sched::arena_local::EXTERNAL_SLOT_COUNT;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let p = JobPlan::new(8, 1);
+            let closures: Vec<Box<dyn FnOnce() -> u32 + Send>> = (0..n)
+                .map(|i| Box::new(move || i as u32) as _)
+                .collect();
+            tx.send(cooperative_join_n_flat_mailbox(&p, closures))
+                .expect("the test thread holds the receiver until it times out");
+        });
+        let results = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("mailbox fan-out at N >= worker count must complete");
+        assert_eq!(results, (0..n as u32).collect::<Vec<_>>());
     }
 }

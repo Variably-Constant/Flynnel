@@ -5,6 +5,110 @@ measurements from `benches/` and `tests/` on the two bench hosts, an
 RTX 3070 with a Ryzen 7 2700 (16 threads) and an RTX 5070 with a
 Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
+## Unreleased
+
+### Scheduler
+
+- `cooperative_join_n_flat_mailbox` picks its mode and its mailbox
+  targets from the worker count. Both read `ctx.stealers.len()`, which
+  is the worker count plus `EXTERNAL_SLOT_COUNT`, so the two uses were
+  the same binding and moved together: the gate opened at 32 above the
+  pool width, and the round-robin at `(ctx.index + 1 + i) % n_workers`
+  spread targets across the whole stealer table.
+
+  The first fan-out wide enough to open the gate was therefore also the
+  first whose targets reached past the last worker. Indices at or above
+  the worker count are external slots, and a slot's mailbox is drained
+  only by a thread that has claimed that slot; `find_work` pops a
+  thread's own mailbox and peer-steal reads deques, so nothing else
+  reaches one. `push_to_mailbox` accepts those indices because the
+  mailbox vector is allocated for slots too, and the ring holds 16
+  against a per-target depth of 1, so the full-mailbox fallback onto
+  the caller's deque never fires. The join's latch counts every
+  dispatched closure, so a fan-out at that width does not complete.
+
+  On a 24-worker host the gate opened at 56, where roughly 32 of 55
+  dispatched closures were routed to slot mailboxes. A 56-closure
+  fan-out sat 39 minutes inside a 2 second warm-up while the same
+  fan-out in deque mode completed. No caller reached this: the gate had
+  never opened, because `cooperative_join_n` routes on the worker count
+  and so never asked for a fan-out wide enough.
+
+  Mailbox mode now engages at N at or above the worker count instead of
+  32 above it, so a fan-out in that band takes owner-directed
+  distribution where it previously demoted to the shared deque. That
+  band has not been measured against deque mode on any host.
+  `cooperative_join_n_flat` and its callers are unaffected: the changed
+  binding is read only by the gate and by the mailbox arm's target
+  computation, and a deque fan-out reaches neither.
+
+- `NumaArena::primary_workers` and `NumaArena::smt_extension_workers`
+  sum the counts `LocalArena` already published per node.
+  `total_workers` was the only count reachable across nodes and counts
+  SMT siblings whether or not they are awake. A consumer sizing to
+  physical cores gated a kernel on `total_workers() <= 16`, read 24 on
+  a twelve-core host, and never ran that kernel there.
+
+- The collapse and wake crossovers are the median of the calibration's
+  nine sweeps rather than the fastest. Nine were already run and eight
+  discarded. A crossover is derived from two timings rather than being
+  one, so the fastest of several runs is whichever run's cancellation
+  noise fell furthest in one direction: biased low, and far wider in
+  spread than the median of the same samples. The timing points inside
+  a sweep keep their own minimum, where suppressing that noise is what
+  it is for.
+
+  Measured across nine processes on a Ryzen 9 7900X, both statistics
+  taken from the same samples: the fastest spans 42400 to 68600 ns, a
+  62 percent spread; the median spans 68200 to 71000, 4.1 percent. Two
+  of the nine installed a threshold about 40 percent below the median
+  of their own sweeps. A consumer reported the same 57 percent spread
+  from four of its own processes, which is what prompted this.
+
+  The threshold rises, so more work collapses inline, and that is worth
+  what it costs. Measured with the two thresholds pinned as the only
+  difference between arms, alternating, on a host at 1.12 of 24 cores:
+  a cell whose work falls between them runs 86.3 us dispatched against
+  9.3 us inline. A cell under both thresholds reads 6.3 and 6.4 across
+  the arms and one over both reads 92.7 and 93.3, so the two controls
+  make the same decision in both arms and the middle cell is the
+  measurement. The eight pre-existing workload cells move between -0.05
+  and +0.03 with the sign flipping four up and four down, which is
+  noise. So the old statistic's low draws were not merely unstable, they
+  dispatched work that cost nine times more dispatched than inline.
+
+  `benches/cold_workloads.rs` gains the three cells this was measured
+  with. Every shape it had sat orders above the threshold - the smallest
+  is 32 ms of work - so none of them reached the decision at all.
+
+  The spread figures above were taken on a loaded host and are not
+  comparable to the 14.4 us in the 0.3.0 entry; only the two spreads,
+  computed from one set of samples, are compared.
+
+- `inline_collapse_threshold_ns` and `pool_dispatch_cost_ns` say that
+  their figures are per process rather than properties of the machine:
+  measured once on first use and cached for that process's life, so a
+  figure read in one process does not describe another. The 0.3.0 entry
+  below gives a range across six processes for the Ryzen 7 2700 but a
+  single 14.4 us figure for the 7900X, which reads as a constant of
+  that chip and was one draw. A consumer compared a threshold printed
+  in one process against behaviour in another and reported a
+  contradiction in the collapse control flow; there was none.
+
+### Tests
+
+- The GPU test binaries take one cross-process lock on the device.
+  Each file declared its own `static Mutex`, which serializes the tests
+  inside that binary and nothing else, and cargo runs the binaries
+  concurrently; two of them had no lock at all. The 64-block barrier
+  wait in `gpu_peer_team` printed 51264, 53440 and 412416 ns across
+  three runs on one host, an eight times swing decided by which other
+  binary was resident, and an assertion bounding it was reading its
+  neighbour. Serialized, the wait reads 55008 ns. The lock is a file,
+  since a `Mutex` does not reach across processes, and it is advisory:
+  a process that does not ask still gets the device. A lock left behind
+  by a killed process is reclaimed after 120 seconds.
+
 ## 0.4.0 - 2026-09-07
 
 ### Breaking

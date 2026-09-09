@@ -183,9 +183,32 @@ impl NumaArena {
         }
     }
 
-    /// Total worker count across all nodes.
+    /// Every worker thread across all nodes, primaries and SMT
+    /// siblings together.
+    ///
+    /// This counts the siblings whether or not they are awake, and
+    /// they are parked unless a dispatch with `use_smt` is in flight.
+    /// So on a 12-core host with SMT this reads 24 while 12 threads
+    /// run. A caller sizing something to physical cores wants
+    /// [`Self::primary_workers`]; this is the right count only for
+    /// "how many threads exist".
     pub fn total_workers(&self) -> usize {
         self.nodes.iter().map(|a| a.worker_count()).sum()
+    }
+
+    /// The always-active workers across all nodes: one per physical
+    /// core under the default sizing, excluding the SMT siblings that
+    /// park unless a `use_smt` dispatch wakes them.
+    pub fn primary_workers(&self) -> usize {
+        self.nodes.iter().map(|a| a.primary_count()).sum()
+    }
+
+    /// The SMT-sibling workers across all nodes, which are parked
+    /// unless an active SMT request keeps them awake. Zero on a host
+    /// without SMT, and zero when the primaries already cover every
+    /// logical thread.
+    pub fn smt_extension_workers(&self) -> usize {
+        self.nodes.iter().map(|a| a.smt_extension_count()).sum()
     }
 
     /// Iterate every per-worker stats handle across every node.
@@ -494,6 +517,42 @@ mod tests {
         let mut rng = 0x9E37_79B9_7F4A_7C15;
         assert!(!arena.try_run_one(&mut rng),
             "try_run_one must return false when no work pending");
+        drop(arena);
+    }
+
+    /// The three worker counts agree, and the primaries are the count
+    /// a caller sizing to physical cores needs.
+    ///
+    /// A caller wanting one worker per physical core has only
+    /// `total_workers` to reach for unless the primaries are exposed
+    /// too, and on an SMT host that count is the parked siblings as
+    /// well. A consumer gated a kernel on `total_workers() <= 16`,
+    /// read 24 on a twelve-core host, and never ran the kernel.
+    #[test]
+    fn worker_counts_split_primaries_from_smt_siblings() {
+        let arena = NumaArena::new(Some(2));
+        let total = arena.total_workers();
+        let primary = arena.primary_workers();
+        let smt = arena.smt_extension_workers();
+
+        assert_eq!(
+            primary + smt,
+            total,
+            "primaries {primary} plus siblings {smt} must account for \
+             every one of the {total} workers"
+        );
+        assert!(primary > 0, "an arena with no always-active worker runs nothing");
+        assert!(
+            primary <= total,
+            "primaries {primary} cannot exceed the {total} threads spawned"
+        );
+        // Two per node was requested above, so the primaries are that
+        // many per node however the host's SMT is configured.
+        assert_eq!(
+            primary,
+            2 * arena.node_count(),
+            "an explicit workers_per_node sets the primary count per node"
+        );
         drop(arena);
     }
 }

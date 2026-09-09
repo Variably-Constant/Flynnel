@@ -97,6 +97,44 @@ const SHAPES: &[Shape] = &[
         sqrt_iters: 833,
         desc: "16384 items x 10us",
     },
+    // Three cells bracketing the inline-collapse threshold. Every shape
+    // above sits orders over it - the smallest is 32 ms of work against
+    // a threshold measured at 14.4 us on a Ryzen 9 7900X and 16.0 to
+    // 30.2 us across six processes on a Ryzen 7 2700 - so none of them
+    // reaches the decision that `inline_collapse_threshold_ns` makes,
+    // and a change to that threshold moves none of them.
+    //
+    // These are placed by what the collapse consults, which is the
+    // hinted arm's `iters * 12` ns per item times the item count: 30,
+    // 55 and 100 us. The work they actually perform is smaller, because
+    // the 12 ns figure is calibrated on the millions-of-iterations
+    // shapes above and a ten-iteration chain pipelines better - 55 us
+    // hinted measures about 9 us run inline. The hint is what the
+    // decision reads, so the cells sit where they are meant to sit in
+    // the decision, and the labels say hinted rather than claiming a
+    // duration these cells do not have.
+    //
+    // The outer two are controls, either side of the threshold in both
+    // arms and expected to match; the middle one is where a shift in
+    // the threshold shows.
+    Shape {
+        label: "collapse_under_256x30us",
+        n_items: 256,
+        sqrt_iters: 10,
+        desc: "256 items, 30us hinted",
+    },
+    Shape {
+        label: "collapse_near_256x55us",
+        n_items: 256,
+        sqrt_iters: 18,
+        desc: "256 items, 55us hinted",
+    },
+    Shape {
+        label: "collapse_over_256x100us",
+        n_items: 256,
+        sqrt_iters: 33,
+        desc: "256 items, 100us hinted",
+    },
 ];
 
 /// Samples per (shape, contender) cell. Median + p10/p90 reported.
