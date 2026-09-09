@@ -14,7 +14,7 @@
 //! - launch+sync baseline: the cost a wake-from-idle pays and the
 //!   number the doorbell path is beating;
 //! - visibility bound `L = p99/2 + clock_err`, Fischer margin
-//!   `Delta = clamp(10 x L, 5us ..= 100us)` - then VALIDATED by a
+//!   `Delta = clamp(10 x L, 5us ..= 100us)` - then validated by a
 //!   real CPU-vs-GPU contention run (escalating x2 on violation);
 //! - system-atomics conservation probe deciding `sys_atomics_ok`.
 

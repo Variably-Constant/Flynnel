@@ -96,7 +96,7 @@ pub use vram::VramPool;
 /// that file's header).
 pub(crate) const PEER_PTX: &str = include_str!("../../kernels/gpu_peer.ptx");
 
-/// The kernel SOURCE, embedded so user opcodes can be NVRTC-composed
+/// The kernel source, embedded so user opcodes can be NVRTC-composed
 /// with the poller at init into one module (device-function linkage
 /// requires a single compilation unit).
 const PEER_CU: &str = include_str!("../../kernels/gpu_peer.cu");
@@ -418,7 +418,7 @@ impl Default for GpuPeerConfig {
 
 /// A full user kernel compiled for the wide-launch path.
 ///
-/// The doorbell user-op ([`GpuPeer::submit_user`]) runs on ONE block
+/// The doorbell user-op ([`GpuPeer::submit_user`]) runs on a single block
 /// of 256 threads - one SM - which is right for many small
 /// latency-sensitive ops but caps a single large data-parallel op
 /// (a big convolution, a full-image stencil) at one SM. A
@@ -580,7 +580,7 @@ impl GpuPeer {
                 }
             },
             Some(user_src) => {
-                // Compose poller + user ops into ONE compilation unit
+                // Compose poller + user ops into a single compilation unit
                 // so the device-function call links, then JIT.
                 let src = format!("#define FLYNNEL_USER_OPS 1\n{PEER_CU}\n{user_src}\n");
                 let ptx = cudarc::nvrtc::compile_ptx(src).map_err(|e| {
@@ -1314,7 +1314,7 @@ impl GpuPeer {
     /// doorbell op. One-off convenience: it pays a stream sync (a
     /// WDDM command-buffer flush) per call. For a chain of many small
     /// dependent kernels use [`Self::launch_wide_async`] +
-    /// [`Self::sync_wide`], which pays ONE flush for the whole batch.
+    /// [`Self::sync_wide`], which pays a single flush for the whole batch.
     pub fn launch_wide(
         &self,
         kernel: &WideKernel,
