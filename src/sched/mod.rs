@@ -64,6 +64,7 @@ pub mod race;
 pub mod mode_region;
 pub mod io_pool;
 pub mod bg_calibration;
+pub mod occupancy;
 #[cfg(feature = "persisted-calibration")]
 pub mod calibration_store;
 #[cfg(feature = "verify-chain")]

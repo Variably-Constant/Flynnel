@@ -10,25 +10,37 @@
 //! 233, 365 and 382 ns for the same operation across four runs and
 //! seeded 32, 32, 64 and 64 leaves.
 //!
-//! Each iteration here alternates the estimate across such a boundary,
-//! which is the worst case rather than the typical one: a caller whose
-//! estimate is stable pays nothing for either stabiliser, and a caller
-//! whose estimate straddles a boundary pays the full cost of the flip.
+//! ## Three regimes, because callers live in all of them
 //!
-//! ## The four arms
+//! - `straddle` - the estimate alternates across a boundary every
+//!   dispatch. The worst case, and the only one either mechanism can
+//!   help.
+//! - `stable` - the estimate is fixed at a target the worker floor
+//!   barely binds. Both mechanisms are pure cost here.
+//! - `pinned` - the estimate is so far under the floor that `max()`
+//!   supplies the whole target and the estimate reaches nothing. A
+//!   consumer's sites are mostly here.
 //!
-//! - `neither` - what ships today.
-//! - `hysteresis` - a change of depth needs two agreeing calls.
-//! - `smoothing` - the estimate is averaged against the site's history.
-//! - `both`.
+//! The two cost regimes decide whether either mechanism is shippable: a
+//! cost there is paid by every caller, including those that can never
+//! cross a boundary.
 //!
-//! Every arm runs in one process, back to back, because the quantity
-//! under test is a decision driven by a measured estimate: arms split
-//! across processes carry whatever else differed between them, and on
-//! a shared host that is the larger effect.
+//! ## Why every regime is registered twice, in opposite order
 //!
-//! Each arm owns a `static CallSiteState`, so the depth one arm settled
-//! on and the average it learned do not reach the next.
+//! Criterion runs arms sequentially, so a load that arrives or departs
+//! during a group lands on some arms and not others. A measured
+//! position effect of 2.6x on a first arm has been seen on this host,
+//! which is larger than anything being measured here.
+//!
+//! Registering each regime forward and reversed makes that visible
+//! rather than assumed: an effect present in one order and absent in
+//! the other is the box, and one whose ratio survives both is the code.
+//! This is what lets the bench be read on a host that cannot be made
+//! quiet, which is the only kind available.
+//!
+//! Every arm owns a distinct `CallSiteState`, so the depth one arm
+//! settles on and the average it learns never become another's starting
+//! condition.
 
 #![allow(clippy::missing_docs_in_private_items)]
 
@@ -41,19 +53,25 @@ use flynnel::JobPlan;
 use flynnel::sched::call_site::{CallSiteState, SiteRef};
 use flynnel::sched::par_iter::{for_each_chunk, set_estimate_smoothing, set_seed_hysteresis};
 
-/// Items per dispatch. With the 1 ms leaf target and 24 workers the
-/// leaf count crosses 32 at an estimate near 976 ns, so the two hints
-/// below straddle it.
-const ITEMS: usize = 32_768;
+/// One site per arm per ordering, so nothing a site learns crosses
+/// between them.
+static SITES: [CallSiteState; 16] = [const { CallSiteState::new() }; 16];
 
-/// The two estimates the caller alternates between, one either side of
-/// the boundary. Their ratio is 1.5, inside the 1.71 spread one
-/// operation actually showed across runs.
-const EST_LOW_NS: u32 = 800;
-const EST_HIGH_NS: u32 = 1_200;
+/// Which stabilisers an arm runs with.
+#[derive(Copy, Clone)]
+struct Arm {
+    name: &'static str,
+    hysteresis: bool,
+    smoothing: bool,
+}
+
+const NEITHER: Arm = Arm { name: "neither", hysteresis: false, smoothing: false };
+const HYSTERESIS: Arm = Arm { name: "hysteresis", hysteresis: true, smoothing: false };
+const SMOOTHING: Arm = Arm { name: "smoothing", hysteresis: false, smoothing: true };
+const BOTH: Arm = Arm { name: "both", hysteresis: true, smoothing: true };
 
 /// Per-item work: a dependent chain, so the cost is the chain rather
-/// than anything the optimiser can vectorise away.
+/// than anything the optimizer can vectorize away.
 #[inline(never)]
 fn item_work(seed: u64) -> u64 {
     let mut x = seed;
@@ -66,7 +84,6 @@ fn item_work(seed: u64) -> u64 {
     x
 }
 
-/// One dispatch at the given estimate.
 fn dispatch(site: SiteRef, buf: &mut [u64], est_ns: u32) {
     let plan = JobPlan::new(0, buf.len() as u32)
         .with_site(site)
@@ -78,164 +95,76 @@ fn dispatch(site: SiteRef, buf: &mut [u64], est_ns: u32) {
     });
 }
 
-/// A pair of dispatches straddling the boundary: the unit of work every
-/// arm is timed over, so the arms differ only in how the scheduler
-/// reacts to the second estimate.
-fn straddling_pair(site: SiteRef, buf: &mut [u64]) {
-    dispatch(site, buf, EST_LOW_NS);
-    dispatch(site, buf, EST_HIGH_NS);
-}
-
-fn bench_stabilisers(c: &mut Criterion) {
-    let mut group = c.benchmark_group("seed_depth_stability");
-    group.warm_up_time(Duration::from_secs(2));
-    group.measurement_time(Duration::from_secs(8));
-    group.sample_size(20);
-
-    let mut buf: Vec<u64> = (0..ITEMS as u64).collect();
-
-    static NEITHER: CallSiteState = CallSiteState::new();
-    static HYSTERESIS: CallSiteState = CallSiteState::new();
-    static SMOOTHING: CallSiteState = CallSiteState::new();
-    static BOTH: CallSiteState = CallSiteState::new();
-
-    group.bench_function("neither", |b| {
-        set_seed_hysteresis(false);
-        set_estimate_smoothing(false);
-        b.iter(|| {
-            straddling_pair(SiteRef::new(&NEITHER), &mut buf);
-            black_box(buf[0]);
-        });
-    });
-
-    group.bench_function("hysteresis", |b| {
-        set_seed_hysteresis(true);
-        set_estimate_smoothing(false);
-        b.iter(|| {
-            straddling_pair(SiteRef::new(&HYSTERESIS), &mut buf);
-            black_box(buf[0]);
-        });
-    });
-
-    group.bench_function("smoothing", |b| {
-        set_seed_hysteresis(false);
-        set_estimate_smoothing(true);
-        b.iter(|| {
-            straddling_pair(SiteRef::new(&SMOOTHING), &mut buf);
-            black_box(buf[0]);
-        });
-    });
-
-    group.bench_function("both", |b| {
-        set_seed_hysteresis(true);
-        set_estimate_smoothing(true);
-        b.iter(|| {
-            straddling_pair(SiteRef::new(&BOTH), &mut buf);
-            black_box(buf[0]);
-        });
-    });
-
-    // Leave the process as it was found, so a later group in the same
-    // binary is not measured under whatever the last arm set.
-    set_seed_hysteresis(false);
-    set_estimate_smoothing(false);
-
-    group.finish();
-}
-
-/// The control the four arms above need: the same pair of dispatches
-/// with an estimate that does not move, where neither stabiliser has
-/// anything to do. A cost here is a cost paid by every caller, not only
-/// by one whose estimate straddles a boundary.
-fn bench_stable_estimate(c: &mut Criterion) {
-    let mut group = c.benchmark_group("seed_depth_stable_estimate");
-    group.warm_up_time(Duration::from_secs(2));
-    group.measurement_time(Duration::from_secs(8));
-    group.sample_size(20);
-
-    let mut buf: Vec<u64> = (0..ITEMS as u64).collect();
-
-    static NEITHER: CallSiteState = CallSiteState::new();
-    static BOTH: CallSiteState = CallSiteState::new();
-
-    group.bench_function("neither", |b| {
-        set_seed_hysteresis(false);
-        set_estimate_smoothing(false);
-        b.iter(|| {
-            dispatch(SiteRef::new(&NEITHER), &mut buf, EST_LOW_NS);
-            dispatch(SiteRef::new(&NEITHER), &mut buf, EST_LOW_NS);
-            black_box(buf[0]);
-        });
-    });
-
-    group.bench_function("both", |b| {
-        set_seed_hysteresis(true);
-        set_estimate_smoothing(true);
-        b.iter(|| {
-            dispatch(SiteRef::new(&BOTH), &mut buf, EST_LOW_NS);
-            dispatch(SiteRef::new(&BOTH), &mut buf, EST_LOW_NS);
-            black_box(buf[0]);
-        });
-    });
-
-    set_seed_hysteresis(false);
-    set_estimate_smoothing(false);
-
-    group.finish();
-}
-
-/// The regime a consumer's sites are actually in: an estimate so far
-/// under the worker floor that `max()` supplies the whole target and
-/// the estimate contributes nothing.
+/// Register one regime's arms in the given order.
 ///
-/// 4096 items at 100 ns gives a target of 0.41, which the floor lifts
-/// to the worker count. A caller here cannot cross a boundary at any
-/// estimate, so both mechanisms are pure cost, and a cost that only
-/// appears when the floor binds would show here and nowhere else.
-fn bench_pinned_target(c: &mut Criterion) {
-    const PINNED_ITEMS: usize = 4096;
-    const PINNED_EST_NS: u32 = 100;
-
-    let mut group = c.benchmark_group("seed_depth_pinned_target");
+/// `estimates` is the pair a single iteration dispatches with: two
+/// different values straddle a boundary, two equal ones hold still.
+/// `site_base` indexes this regime's block of [`SITES`], and `order`
+/// distinguishes the forward registration from the reversed one so the
+/// two never share a site.
+fn register(
+    c: &mut Criterion,
+    group_name: &str,
+    items: usize,
+    estimates: (u32, u32),
+    arms: &[Arm],
+    site_base: usize,
+) {
+    let mut group = c.benchmark_group(group_name);
     group.warm_up_time(Duration::from_secs(2));
     group.measurement_time(Duration::from_secs(8));
     group.sample_size(20);
 
-    let mut buf: Vec<u64> = (0..PINNED_ITEMS as u64).collect();
+    let mut buf: Vec<u64> = (0..items as u64).collect();
 
-    static NEITHER: CallSiteState = CallSiteState::new();
-    static BOTH: CallSiteState = CallSiteState::new();
-
-    group.bench_function("neither", |b| {
-        set_seed_hysteresis(false);
-        set_estimate_smoothing(false);
-        b.iter(|| {
-            dispatch(SiteRef::new(&NEITHER), &mut buf, PINNED_EST_NS);
-            dispatch(SiteRef::new(&NEITHER), &mut buf, PINNED_EST_NS);
-            black_box(buf[0]);
+    for (i, arm) in arms.iter().enumerate() {
+        let site = SiteRef::new(&SITES[site_base + i]);
+        group.bench_function(arm.name, |b| {
+            set_seed_hysteresis(arm.hysteresis);
+            set_estimate_smoothing(arm.smoothing);
+            b.iter(|| {
+                dispatch(site, &mut buf, estimates.0);
+                dispatch(site, &mut buf, estimates.1);
+                black_box(buf[0]);
+            });
         });
-    });
+    }
 
-    group.bench_function("both", |b| {
-        set_seed_hysteresis(true);
-        set_estimate_smoothing(true);
-        b.iter(|| {
-            dispatch(SiteRef::new(&BOTH), &mut buf, PINNED_EST_NS);
-            dispatch(SiteRef::new(&BOTH), &mut buf, PINNED_EST_NS);
-            black_box(buf[0]);
-        });
-    });
-
+    // Leave the process as found, so a later group is not measured
+    // under whatever the last arm set.
     set_seed_hysteresis(false);
     set_estimate_smoothing(false);
-
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_stabilisers,
-    bench_stable_estimate,
-    bench_pinned_target
-);
+/// 32768 items on a 24-worker host crosses a boundary near 976 ns, so
+/// 800 and 1200 straddle it. Their ratio is 1.5, inside the 1.71 one
+/// operation actually showed across runs.
+fn bench_straddle(c: &mut Criterion) {
+    let fwd = [NEITHER, HYSTERESIS, SMOOTHING, BOTH];
+    let rev = [BOTH, SMOOTHING, HYSTERESIS, NEITHER];
+    register(c, "straddle", 32_768, (800, 1_200), &fwd, 0);
+    register(c, "straddle_rev", 32_768, (800, 1_200), &rev, 4);
+}
+
+/// The same dispatches with the estimate held still, where neither
+/// mechanism has anything to do.
+fn bench_stable(c: &mut Criterion) {
+    let fwd = [NEITHER, BOTH];
+    let rev = [BOTH, NEITHER];
+    register(c, "stable", 32_768, (800, 800), &fwd, 8);
+    register(c, "stable_rev", 32_768, (800, 800), &rev, 10);
+}
+
+/// 4096 items at 100 ns gives a target of 0.41, which the worker floor
+/// lifts to the worker count: the estimate reaches the decision not at
+/// all. A cost that appears only when the floor binds shows here.
+fn bench_pinned(c: &mut Criterion) {
+    let fwd = [NEITHER, BOTH];
+    let rev = [BOTH, NEITHER];
+    register(c, "pinned", 4_096, (100, 100), &fwd, 12);
+    register(c, "pinned_rev", 4_096, (100, 100), &rev, 14);
+}
+
+criterion_group!(benches, bench_straddle, bench_stable, bench_pinned);
 criterion_main!(benches);

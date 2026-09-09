@@ -695,7 +695,25 @@ fn stored_or_measured() -> HostDispatchProfile {
             jec_wake_threshold_ns: cpu.jec_wake_threshold_ns,
         };
     }
+    let occupancy_window = crate::sched::occupancy::OccupancyWindow::start();
     let (profile, spread) = measure_host_dispatch();
+    let occupancy = occupancy_window.sample();
+    if !occupancy.is_trustworthy() {
+        // The calibration did not get the cores it was timing against,
+        // so its figures describe this host's other tenants as much as
+        // this host. They serve the process that measured them, because
+        // that process is living under the same load; they do not go
+        // into the table, which outlives it and is read by starts that
+        // will not be.
+        eprintln!(
+            "flynnel: calibrated at {} percent occupancy, under the {} the table \
+             accepts; keeping these figures for this process and leaving the \
+             table to a quieter start",
+            occupancy.percent(),
+            crate::sched::occupancy::TRUSTWORTHY_OCCUPANCY_PCT,
+        );
+        return profile;
+    }
     match store.try_acquire_writer() {
         Ok(writer) => {
             writer.beat();
@@ -836,6 +854,26 @@ fn parse_pinned_profile(text: &str) -> Option<HostDispatchProfile> {
 /// through a join bisect of its own with a fixed leaf and plans
 /// without an explicit estimate, so nothing here consults the values
 /// it produces.
+/// Reports a dispatch's occupancy to its call site as the dispatch
+/// ends, however it ends.
+///
+/// The classifier consumes it: leaf times gathered while the pool was
+/// off its cores carry the machine's other tenants, and the figure the
+/// classifier derives from them is a variance, which preemption
+/// inflates by landing on some leaves and not others.
+struct ReportOccupancy {
+    window: crate::sched::occupancy::OccupancyWindow,
+    site: crate::sched::call_site::SiteRef,
+}
+
+impl Drop for ReportOccupancy {
+    fn drop(&mut self) {
+        self.site
+            .get()
+            .record_occupancy(self.window.sample().percent());
+    }
+}
+
 /// Samples per timed point, and sweeps per crossover.
 ///
 /// A persisted record carries this count beside the spread those
@@ -1156,6 +1194,13 @@ where
         .apply_site_class();
     let plan = &plan_owned;
     let _flush_on_exit = FlushLeafStatsOnExit;
+    // Declared after the flush guard so it drops before it: the
+    // classifier ticks on the flush, and it must read this dispatch's
+    // occupancy rather than the previous one's.
+    let _occupancy = plan.site.map(|site| ReportOccupancy {
+        window: crate::sched::occupancy::OccupancyWindow::start(),
+        site,
+    });
     // Wake path against polling: at small total work the sleep
     // counter's CAS and condvar wake cost more than they save, and
     // workers find pushed work by spinning (`ROUNDS_UNTIL_SLEEPING`

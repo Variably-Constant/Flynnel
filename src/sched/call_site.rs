@@ -217,6 +217,10 @@ pub struct CallSiteState {
     depth_run: AtomicU32,
     /// Per-item estimate smoothed across this site's calls.
     estimate_ewma_ns: AtomicU64,
+    /// What fraction of its interval the most recent dispatch at this
+    /// site actually spent on a core, in hundredths. Starts at 100, so
+    /// a site nothing has reported for classifies as it always did.
+    recent_occupancy_pct: AtomicU32,
 }
 
 /// No seed depth is in force for a site yet.
@@ -264,7 +268,25 @@ impl CallSiteState {
             pending_depth: AtomicU32::new(DEPTH_UNSET),
             depth_run: AtomicU32::new(0),
             estimate_ewma_ns: AtomicU64::new(0),
+            recent_occupancy_pct: AtomicU32::new(100),
         }
+    }
+
+    /// Report what fraction of its interval the dispatch just finished
+    /// at this site spent on a core.
+    ///
+    /// The classifier reads this before it migrates a site: leaf times
+    /// gathered while the pool was off its cores describe the machine's
+    /// other tenants, and a uniform workload measured that way looks
+    /// irregular.
+    pub fn record_occupancy(&self, percent: u32) {
+        self.recent_occupancy_pct
+            .store(percent.min(100), Ordering::Relaxed);
+    }
+
+    /// The occupancy of the most recent dispatch at this site.
+    pub fn recent_occupancy(&self) -> u32 {
+        self.recent_occupancy_pct.load(Ordering::Relaxed)
     }
 
     /// The seed depth to dispatch with, given the depth this call's
@@ -442,6 +464,20 @@ impl CallSiteState {
         self.last_count.store(count, Ordering::Relaxed);
         self.last_sum_ns.store(sum, Ordering::Relaxed);
         self.last_sumsq.store(sumsq, Ordering::Relaxed);
+
+        // Leaves timed while the pool was off its cores carry the
+        // machine's other tenants in every figure derived from them,
+        // and the derived figure here is a variance: preemption lands
+        // on some leaves and not others, so a uniform workload reads as
+        // irregular and migrates to a shape that costs several times
+        // more on exactly that workload. The window is spent rather
+        // than kept - its snapshots have advanced - because it
+        // describes the machine and this site's class does not.
+        if self.recent_occupancy_pct.load(Ordering::Relaxed)
+            < crate::sched::occupancy::TRUSTWORTHY_OCCUPANCY_PCT
+        {
+            return;
+        }
 
         let mean_ns = dsum / dcount;
         let scaled_mean = (dsum >> 8) / dcount;
