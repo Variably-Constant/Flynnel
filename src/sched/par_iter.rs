@@ -942,6 +942,28 @@ where
     T: Send,
     F: Fn(&mut [T]) + Sync,
 {
+    for_each_chunk_min_leaf(plan, items, MIN_LEAF_ITEMS, op)
+}
+
+/// Same as [`for_each_chunk`] but the recursion floor is
+/// caller-supplied.
+///
+/// The floor is a ceiling on the leaf size the cost model may pick,
+/// so a smaller value lets the SLAW budget cap the chunk count
+/// instead of the floor doing it. Heavy per-element ops pass 1 and
+/// get a leaf per item, where the default 256 caps the leaf count at
+/// `n / 256` and runs a small batch serially.
+#[track_caller]
+pub fn for_each_chunk_min_leaf<T, F>(
+    plan: &JobPlan,
+    items: &mut [T],
+    min_leaf: usize,
+    op: F,
+)
+where
+    T: Send,
+    F: Fn(&mut [T]) + Sync,
+{
     let n = items.len();
     crate::sched::trace::emit(
         crate::sched::trace::TraceEvent::DispatchEnter,
@@ -1017,7 +1039,7 @@ where
     // behavior; the lower-bound-at-1 unlocks the small-N + heavy
     // case where rayon already parallelizes and flynnel was
     // serializing.
-    let effective_min_leaf = adaptive_min_leaf(plan, MIN_LEAF_ITEMS);
+    let effective_min_leaf = adaptive_min_leaf(plan, min_leaf.max(1));
 
 
     // Probe-and-decide path: when the caller hasn't given us a cost

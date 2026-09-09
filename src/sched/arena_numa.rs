@@ -211,6 +211,19 @@ impl NumaArena {
         self.nodes.iter().map(|a| a.smt_extension_count()).sum()
     }
 
+    /// The workers on the sub-arena the calling thread belongs to.
+    ///
+    /// This is the population a fan-out dispatched from this thread
+    /// can reach on its own node, and it is the count the mailbox
+    /// gates compare against: a worker's `ctx.sleep` covers its own
+    /// node's workers, not the box's. Equal to
+    /// [`Self::total_workers`] when there is one node, and smaller on
+    /// a multi-socket host, where a caller sizing a fan-out to
+    /// `total_workers` names threads its node does not own.
+    pub fn local_worker_count(&self) -> usize {
+        self.nodes[self.resolve_node_idx(None)].worker_count()
+    }
+
     /// Iterate every per-worker stats handle across every node.
     /// Used by [`crate::sched::split_observer`] to compute pool-
     /// wide steal pressure.
@@ -553,6 +566,32 @@ mod tests {
             2 * arena.node_count(),
             "an explicit workers_per_node sets the primary count per node"
         );
+        drop(arena);
+    }
+
+    /// One node's workers are a share of the box's, and the whole of
+    /// them when there is one node.
+    ///
+    /// `cooperative_join_n`'s Auto arm and the mailbox gates it routes
+    /// to must read the same population, or the arm offers the mailbox
+    /// path a fan-out that path will demote.
+    #[test]
+    fn local_worker_count_is_one_node_of_the_total() {
+        let arena = NumaArena::new(Some(2));
+        let total = arena.total_workers();
+        let local = arena.local_worker_count();
+
+        assert!(local > 0, "the calling thread's node runs no workers");
+        assert!(
+            local <= total,
+            "one node's {local} workers cannot exceed the {total} across every node"
+        );
+        if arena.node_count() == 1 {
+            assert_eq!(
+                local, total,
+                "with one node that node holds every worker"
+            );
+        }
         drop(arena);
     }
 }

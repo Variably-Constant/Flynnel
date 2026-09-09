@@ -91,15 +91,13 @@ where
             // Population heuristic: a fan-out narrower than the pool
             // routes to tree, a wider one to mailbox.
             //
-            // The count is summed across every NUMA node, while the
-            // gate inside cooperative_join_n_flat_mailbox counts the
-            // one node its worker belongs to. The two agree on a
-            // single-node host. On a multi-node host this is the
-            // larger number, so a fan-out between the two counts takes
-            // the tree rather than the mailbox that node would have
-            // allowed, and the gate demotes anything this sends on to
-            // Deque when the node cannot populate it.
-            let n_workers = global_local_arena().total_workers();
+            // The count is the calling thread's own node, which is the
+            // population the gate inside cooperative_join_n_flat_mailbox
+            // compares against: a worker's `ctx.sleep` covers the
+            // workers of the node it belongs to. Both read the same
+            // number, so a fan-out this arm routes to mailbox is one
+            // that path can populate.
+            let n_workers = global_local_arena().local_worker_count();
             if n < n_workers {
                 cooperative_join_n_tree(plan, closures)
             } else {
