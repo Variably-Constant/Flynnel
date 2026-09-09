@@ -562,8 +562,9 @@ impl CalibrationStore {
     /// Read the CPU record and the devices, retrying while a writer is
     /// in the payload.
     ///
-    /// Returns `None` when nothing has been measured into this table
-    /// yet, which is the state a freshly created one is in.
+    /// `None` means the read never caught the payload between writers,
+    /// not that the table is empty: a fresh table reads back as a
+    /// zeroed record, which `is_trustworthy` refuses.
     pub fn read(&self) -> Option<(CpuCalibration, Vec<AccelCalibration>)> {
         let hdr = self.header();
         // A writer holds the payload for the length of one memcpy, so a
@@ -586,9 +587,11 @@ impl CalibrationStore {
             }
             fence(Ordering::Acquire);
             if hdr.seq_version.load(Ordering::Acquire) == before {
-                if cpu.samples == 0 {
-                    return None;
-                }
+                // An empty CPU record is returned rather than hidden: a
+                // table may hold devices and no host profile, and
+                // reporting nothing would lose them. Whether either
+                // half is worth using is `is_trustworthy`'s answer, not
+                // this one's.
                 return Some((cpu, accel));
             }
         }
@@ -802,14 +805,17 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_table_has_nothing_measured_in_it() {
+    fn a_fresh_table_offers_a_record_nothing_will_use() {
         let dir = temp_dir("fresh");
         let s = stamp(12, 24);
         let store = CalibrationStore::open_or_create(&dir, &s).expect("create");
+        let (cpu, accel) = store.read().expect("a fresh table reads back");
+        assert_eq!(cpu.samples, 0, "nothing has been measured into it");
         assert!(
-            store.read().is_none(),
-            "a table nobody has measured into must not offer a record"
+            !cpu.is_trustworthy(),
+            "so a caller must measure rather than take this"
         );
+        assert!(accel.is_empty(), "and it describes no devices");
         cleanup(&dir);
     }
 

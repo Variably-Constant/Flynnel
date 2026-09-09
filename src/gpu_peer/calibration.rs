@@ -240,13 +240,58 @@ pub fn calibrate(
     let clock_err_ns = ((mx - mn) / 2).max(1) as u64;
 
     let one_way_ns = rtt_p99_ns / 2 + clock_err_ns;
-    let mut delta_ns = derive_delta_ns(one_way_ns);
+    let delta_ns = derive_delta_ns(one_way_ns);
 
-    // ---- Fischer self-test at the derived Delta ----
-    // Same grant discipline as the atomics flag: a violation
-    // escalates Delta x2; a run without contention evidence is
-    // INCONCLUSIVE and retried, never counted as a pass; the grant
-    // requires two consecutive contended zero-violation runs.
+    let validated = validate(region, stream, kernels, delta_ns)?;
+
+    let cal = PeerCalibration {
+        rtt_min_ns,
+        rtt_median_ns,
+        rtt_p99_ns,
+        one_way_ns,
+        clock_err_ns,
+        delta_ns: validated.delta_ns,
+        launch_ns,
+        doorbell_ok: true,
+        timed_lock_ok: validated.timed_lock_ok,
+        sys_atomics_ok: validated.sys_atomics_ok,
+        lock_cpu_contended: validated.lock_cpu_contended,
+        lock_gpu_contended: validated.lock_gpu_contended,
+    };
+    cal.store(region);
+    Ok(cal)
+}
+
+/// What a validation run establishes about this device, now.
+struct Validated {
+    /// The margin that survived, which a violation escalates.
+    delta_ns: u64,
+    timed_lock_ok: bool,
+    sys_atomics_ok: bool,
+    lock_cpu_contended: u32,
+    lock_gpu_contended: u32,
+}
+
+/// Validate a margin against the live device and probe cross-device
+/// atomics.
+///
+/// A violation escalates the margin twofold; a run with no contention
+/// evidence is inconclusive and retried rather than counted as a pass;
+/// each grant takes two consecutive contended runs without a
+/// violation. The atomics flag unlocks protocols, so a false positive
+/// there costs more than a false negative and it takes the same two
+/// clean runs.
+///
+/// Every start runs this, including one that took its timings from a
+/// stored record. A margin validated under one set of conditions is not
+/// evidence about the next, and a margin that is wrong surfaces as a
+/// lock violation under contention rather than as a slow path.
+fn validate(
+    region: &PeerRegion,
+    stream: &Arc<CudaStream>,
+    kernels: &CalibKernels,
+    mut delta_ns: u64,
+) -> Result<Validated, GpuPeerError> {
     let mut timed_lock_ok = false;
     let mut passes = 0u32;
     let mut lock_cpu_contended = 0u32;
@@ -271,27 +316,40 @@ pub fn calibrate(
             }
         }
     }
-
-    // ---- system-atomics conservation probe ----
-    // The flag UNLOCKS protocols, so a false positive is worse than a
-    // false negative: grant only on two consecutive fully-contended
-    // conserving runs.
     let sys_atomics_ok = cas_conservation_probe(region, stream, kernels)?
         && cas_conservation_probe(region, stream, kernels)?;
-
-    let cal = PeerCalibration {
-        rtt_min_ns,
-        rtt_median_ns,
-        rtt_p99_ns,
-        one_way_ns,
-        clock_err_ns,
+    Ok(Validated {
         delta_ns,
-        launch_ns,
-        doorbell_ok: true,
         timed_lock_ok,
         sys_atomics_ok,
         lock_cpu_contended,
         lock_gpu_contended,
+    })
+}
+
+/// Calibrate from a stored record's timings, validating the margin
+/// against this device anyway.
+///
+/// The round trip, the clock error and the launch baseline are
+/// properties of a (host, device, driver) combination and are taken as
+/// they stand. The margin and the atomics flag are not taken: they are
+/// re-established here, because what they assert is that this device
+/// behaved a particular way under contention, and only a run on it can
+/// say that.
+pub fn calibrate_with_prior(
+    region: &PeerRegion,
+    stream: &Arc<CudaStream>,
+    kernels: &CalibKernels,
+    prior: PeerCalibration,
+) -> Result<PeerCalibration, GpuPeerError> {
+    let validated = validate(region, stream, kernels, derive_delta_ns(prior.one_way_ns))?;
+    let cal = PeerCalibration {
+        delta_ns: validated.delta_ns,
+        timed_lock_ok: validated.timed_lock_ok,
+        sys_atomics_ok: validated.sys_atomics_ok,
+        lock_cpu_contended: validated.lock_cpu_contended,
+        lock_gpu_contended: validated.lock_gpu_contended,
+        ..prior
     };
     cal.store(region);
     Ok(cal)

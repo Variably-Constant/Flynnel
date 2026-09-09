@@ -161,6 +161,188 @@ impl std::error::Error for GpuPeerError {
     }
 }
 
+/// Calibrate this peer, taking the timing half from the host's stored
+/// record when there is one for this device and it was measured on a
+/// device nothing else was resident on.
+///
+/// The margin and the atomics flag are re-established on every start
+/// whichever path this takes, because what they assert is how this
+/// device behaved under contention and only a run on it can say that.
+///
+/// Every way of failing to reach the table ends in a full measurement,
+/// which is what this did before there was one. What it does not do is
+/// fail quietly: a table that cannot be read and a device that has
+/// never been measured produce the same calibration, and only the
+/// diagnostic separates them.
+#[cfg(feature = "persisted-calibration")]
+fn calibrate_or_reuse(
+    region: &PeerRegion,
+    stream: &Arc<CudaStream>,
+    kernels: &calibration::CalibKernels,
+    ordinal: usize,
+) -> Result<PeerCalibration, GpuPeerError> {
+    use crate::sched::calibration_store::{
+        ACCEL_DOORBELL_OK, ACCEL_SYS_ATOMICS_OK, ACCEL_TIMED_LOCK_OK, AccelCalibration, AccelKind,
+        CalibrationStore, HostStamp, StoreError, calibration_dir,
+    };
+
+    let Some(dir) = calibration_dir() else {
+        return calibration::calibrate(region, stream, kernels);
+    };
+    let stamp = HostStamp::detect();
+    let store = match CalibrationStore::open_or_create(&dir, &stamp) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "flynnel gpu peer: the calibration table under {} is unusable ({e:?}); \
+                 measuring this device",
+                dir.display()
+            );
+            return calibration::calibrate(region, stream, kernels);
+        }
+    };
+
+    let stored = store.read().and_then(|(_cpu, accel)| {
+        accel
+            .into_iter()
+            .find(|a| a.ordinal as usize == ordinal && a.is_trustworthy())
+    });
+
+    let cal = match stored {
+        Some(prior) => calibration::calibrate_with_prior(
+            region,
+            stream,
+            kernels,
+            PeerCalibration {
+                rtt_min_ns: prior.rtt_min_ns,
+                rtt_median_ns: prior.rtt_median_ns,
+                rtt_p99_ns: prior.rtt_p99_ns,
+                one_way_ns: prior.one_way_ns,
+                clock_err_ns: prior.clock_err_ns,
+                delta_ns: prior.delta_ns,
+                launch_ns: prior.launch_ns,
+                doorbell_ok: true,
+                timed_lock_ok: false,
+                sys_atomics_ok: false,
+                lock_cpu_contended: 0,
+                lock_gpu_contended: 0,
+            },
+        )?,
+        None => calibration::calibrate(region, stream, kernels)?,
+    };
+
+    if !cal.doorbell_ok {
+        // Nothing worth storing: the substrate did not come up.
+        return Ok(cal);
+    }
+    let caps = device_capabilities(ordinal);
+    let mut flags = ACCEL_DOORBELL_OK;
+    if cal.timed_lock_ok {
+        flags |= ACCEL_TIMED_LOCK_OK;
+    }
+    if cal.sys_atomics_ok {
+        flags |= ACCEL_SYS_ATOMICS_OK;
+    }
+    let record = AccelCalibration::new(
+        AccelKind::GpuPeer,
+        ordinal as u32,
+        caps.capability,
+        caps.multiprocessors,
+        caps.clock_khz,
+        caps.memory_mib,
+        flags,
+        cal.rtt_min_ns,
+        cal.rtt_median_ns,
+        cal.rtt_p99_ns,
+        cal.one_way_ns,
+        cal.clock_err_ns,
+        cal.delta_ns,
+        cal.launch_ns,
+    );
+    match store.try_acquire_writer() {
+        Ok(writer) => {
+            writer.beat();
+            // The CPU half is carried through untouched. This path
+            // measured a device, not a host, and writing a host record
+            // from here would claim a calibration nothing performed.
+            let (cpu, mut slots) = match store.read() {
+                Some((cpu, accel)) => (cpu, accel),
+                None => (Default::default(), Vec::new()),
+            };
+            match slots.iter().position(|a| a.ordinal as usize == ordinal) {
+                Some(i) => slots[i] = record,
+                None => slots.push(record),
+            }
+            writer.publish(&cpu, &slots);
+        }
+        // Another process is measuring this host. Its record serves the
+        // next start; this one keeps what it just established.
+        Err(StoreError::WriterActive) => {}
+        Err(e) => eprintln!(
+            "flynnel gpu peer: calibrated device {ordinal} but could not publish it ({e:?})"
+        ),
+    }
+    Ok(cal)
+}
+
+/// Calibrate this peer with nothing persisted.
+#[cfg(not(feature = "persisted-calibration"))]
+fn calibrate_or_reuse(
+    region: &PeerRegion,
+    stream: &Arc<CudaStream>,
+    kernels: &calibration::CalibKernels,
+    _ordinal: usize,
+) -> Result<PeerCalibration, GpuPeerError> {
+    calibration::calibrate(region, stream, kernels)
+}
+
+/// What the driver reports about a device, as opposed to what a probe
+/// measures against it. Zero for anything the driver declines to answer.
+#[cfg(feature = "persisted-calibration")]
+struct DeviceCapabilities {
+    capability: u32,
+    multiprocessors: u32,
+    clock_khz: u32,
+    memory_mib: u32,
+}
+
+#[cfg(feature = "persisted-calibration")]
+fn device_capabilities(ordinal: usize) -> DeviceCapabilities {
+    let mut dev: cu::CUdevice = 0;
+    // SAFETY: an out parameter and an ordinal; the driver validates the
+    // ordinal and reports failure rather than writing on a bad one.
+    let got = unsafe { cu::cuDeviceGet(&mut dev, ordinal as i32) };
+    if got != cu::CUresult::CUDA_SUCCESS {
+        return DeviceCapabilities {
+            capability: 0,
+            multiprocessors: 0,
+            clock_khz: 0,
+            memory_mib: 0,
+        };
+    }
+    let attr = |a: cu::CUdevice_attribute| -> u32 {
+        let mut v: i32 = 0;
+        // SAFETY: valid device handle from cuDeviceGet.
+        let r = unsafe { cu::cuDeviceGetAttribute(&mut v, a, dev) };
+        if r == cu::CUresult::CUDA_SUCCESS && v > 0 { v as u32 } else { 0 }
+    };
+    let mut bytes: usize = 0;
+    // SAFETY: an out parameter and a valid device handle.
+    let mem = unsafe { cu::cuDeviceTotalMem_v2(&mut bytes, dev) };
+    let memory_mib = if mem == cu::CUresult::CUDA_SUCCESS {
+        (bytes / (1024 * 1024)) as u32
+    } else {
+        0
+    };
+    DeviceCapabilities {
+        capability: attr(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR) * 10
+            + attr(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR),
+        multiprocessors: attr(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT),
+        clock_khz: attr(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CLOCK_RATE),
+        memory_mib,
+    }
+}
+
 /// Construction parameters. The defaults suit control-plane traffic
 /// (4 KB slots); bulk streaming raises `slot_bytes`.
 #[derive(Debug, Clone)]
@@ -451,7 +633,8 @@ impl GpuPeer {
             }
         };
         let region = PeerRegion::create(&ctx, &path, geometry, remove_on_drop)?;
-        let calibration = calibration::calibrate(&region, &stream, &kernels)?;
+        let calibration =
+            calibrate_or_reuse(&region, &stream, &kernels, config.device_ordinal)?;
         if !calibration.doorbell_ok {
             return Err(GpuPeerError::Unavailable(
                 "doorbell handshake failed during calibration",
