@@ -364,7 +364,30 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
         _ => workers,
     };
     let depth = (target_leaf_count as u64).next_power_of_two().trailing_zeros() as usize;
-    depth.max(workers_log2)
+    let depth = depth.max(workers_log2);
+    // The seeded leaf count is a power of two, so a target between two
+    // of them is served by the next one up: a target of 33 seeds 64.
+    // `FLYNNEL_SEED_DEPTH` reports the target beside what it rounded
+    // to, which is the difference a caller pays for in dispatch.
+    //
+    // One line per distinct shape rather than per dispatch. The key is
+    // the pair the result depends on, so a bench sweeping sizes prints
+    // once per size and a caller repeating one shape prints once.
+    if std::env::var_os("FLYNNEL_SEED_DEPTH").is_some() {
+        static LAST_SHAPE: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(u64::MAX);
+        let ns = plan.estimated_per_item_ns.unwrap_or(0);
+        let key = ((items as u64) << 32) | ns as u64;
+        if LAST_SHAPE.swap(key, core::sync::atomic::Ordering::Relaxed) != key {
+            eprintln!(
+                "seed depth: items {items} per_item_ns {:?} workers {workers} \
+                 target_leaves {target_leaf_count} seeded_leaves {} depth {depth}",
+                plan.estimated_per_item_ns,
+                1usize << depth
+            );
+        }
+    }
+    depth
 }
 
 #[inline]
