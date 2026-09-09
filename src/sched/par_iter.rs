@@ -323,6 +323,61 @@ const LEAF_SAMPLE_STRIDE: u32 = 8;
 /// chunk-size target more closely.
 const TARGET_LEAF_WORK_NS: u64 = 1_000_000;
 
+/// Seeded from `FLYNNEL_SEED_HYSTERESIS` on first use, then settable.
+static SEED_HYSTERESIS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Seeded from `FLYNNEL_ESTIMATE_EWMA` on first use, then settable.
+static ESTIMATE_SMOOTHING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Reads both environment variables once, before either is answered.
+static STABILISERS_FROM_ENV: std::sync::Once = std::sync::Once::new();
+
+fn stabilisers_from_env() {
+    STABILISERS_FROM_ENV.call_once(|| {
+        use std::sync::atomic::Ordering;
+        SEED_HYSTERESIS.store(
+            std::env::var_os("FLYNNEL_SEED_HYSTERESIS").is_some(),
+            Ordering::Relaxed,
+        );
+        ESTIMATE_SMOOTHING.store(
+            std::env::var_os("FLYNNEL_ESTIMATE_EWMA").is_some(),
+            Ordering::Relaxed,
+        );
+    });
+}
+
+/// Whether a change of seed depth needs corroboration before it takes
+/// effect.
+fn seed_hysteresis_enabled() -> bool {
+    stabilisers_from_env();
+    SEED_HYSTERESIS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a caller's per-item estimate is smoothed against its call
+/// site's history before it reaches a bucketed decision.
+fn estimate_smoothing_enabled() -> bool {
+    stabilisers_from_env();
+    ESTIMATE_SMOOTHING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn seed-depth hysteresis on or off, returning what it was.
+///
+/// Settable rather than read once so a bench can put every arm in one
+/// process and measure them back to back. Arms compared across
+/// processes carry whatever else differed between those processes,
+/// which for a decision driven by a measured estimate is the thing
+/// being measured.
+pub fn set_seed_hysteresis(on: bool) -> bool {
+    stabilisers_from_env();
+    SEED_HYSTERESIS.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn estimate smoothing on or off, returning what it was.
+pub fn set_estimate_smoothing(on: bool) -> bool {
+    stabilisers_from_env();
+    ESTIMATE_SMOOTHING.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Compute the eager seed-split depth for bisect_lazy_steal_driven.
 /// Returns the number of initial split levels before lazy mode
 /// (steal-pressure-driven) kicks in.
@@ -355,7 +410,15 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
     let workers = workers.max(1);
     let items = items.max(1);
     let workers_log2 = (workers as u64).next_power_of_two().trailing_zeros() as usize;
-    let target_leaf_count = match plan.estimated_per_item_ns {
+    // The estimate the boundary is compared against: the caller's as
+    // given, or this site's smoothed history of it.
+    let estimate_ns = match (plan.estimated_per_item_ns, plan.site) {
+        (Some(ns), Some(site)) if ns > 0 && estimate_smoothing_enabled() => {
+            Some(site.get().smooth_estimate_ns(ns))
+        }
+        (other, _) => other,
+    };
+    let target_leaf_count = match estimate_ns {
         Some(ns) if ns > 0 => {
             let total_work_ns = (ns as u64).saturating_mul(items as u64);
             let from_work = (total_work_ns / TARGET_LEAF_WORK_NS).max(workers as u64);
@@ -365,6 +428,13 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
     };
     let depth = (target_leaf_count as u64).next_power_of_two().trailing_zeros() as usize;
     let depth = depth.max(workers_log2);
+    // A change of depth needs corroboration, so one estimate landing
+    // the far side of a boundary cannot halve or double the leaf count
+    // by itself.
+    let depth = match plan.site {
+        Some(site) if seed_hysteresis_enabled() => site.get().stabilise_seed_depth(depth),
+        _ => depth,
+    };
     // The seeded leaf count is a power of two, so a target between two
     // of them is served by the next one up: a target of 33 seeds 64.
     // `FLYNNEL_SEED_DEPTH` reports the target beside what it rounded
@@ -380,9 +450,11 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
         let key = ((items as u64) << 32) | ns as u64;
         if LAST_SHAPE.swap(key, core::sync::atomic::Ordering::Relaxed) != key {
             eprintln!(
-                "seed depth: items {items} per_item_ns {:?} workers {workers} \
-                 target_leaves {target_leaf_count} seeded_leaves {} depth {depth}",
+                "seed depth: items {items} per_item_ns {:?} effective_ns {:?} \
+                 workers {workers} target_leaves {target_leaf_count} \
+                 seeded_leaves {} depth {depth}",
                 plan.estimated_per_item_ns,
+                estimate_ns,
                 1usize << depth
             );
         }
@@ -764,11 +836,16 @@ fn parse_pinned_profile(text: &str) -> Option<HostDispatchProfile> {
 /// through a join bisect of its own with a fixed leaf and plans
 /// without an explicit estimate, so nothing here consults the values
 /// it produces.
+/// Samples per timed point, and sweeps per crossover.
+///
+/// A persisted record carries this count beside the spread those
+/// samples showed, so a later reader can weigh how much the stored
+/// median is worth.
+const SAMPLES: usize = 9;
+
 fn measure_host_dispatch() -> (HostDispatchProfile, u32) {
     const LEAF: usize = 256;
     const MAX_ITEMS: usize = 1 << 17;
-    /// Samples per timed point, and sweeps per crossover.
-    const SAMPLES: usize = 9;
 
     /// Samples behind the dispatch cost. Larger than [`SAMPLES`]
     /// because one of these times a single join rather than a sweep

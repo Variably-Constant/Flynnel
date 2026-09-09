@@ -209,7 +209,27 @@ pub struct CallSiteState {
     /// set, the site's calls dispatch regardless of the caller's
     /// per-item estimate.
     collapse_overran: AtomicBool,
+    /// Seed-depth hysteresis: the depth in force, the depth a recent
+    /// call asked for instead, and how many consecutive calls have
+    /// asked for it.
+    active_depth: AtomicU32,
+    pending_depth: AtomicU32,
+    depth_run: AtomicU32,
+    /// Per-item estimate smoothed across this site's calls.
+    estimate_ewma_ns: AtomicU64,
 }
+
+/// No seed depth is in force for a site yet.
+const DEPTH_UNSET: u32 = u32::MAX;
+
+/// Consecutive calls that must agree on a different seed depth before
+/// it takes effect.
+///
+/// The same value and the same reason as [`SITE_MIGRATION_HYSTERESIS`]:
+/// the seeded leaf count is a bucketed decision driven by a measured
+/// quantity, and one reading that lands the far side of a boundary
+/// must not move it alone.
+pub const SEED_DEPTH_HYSTERESIS: u32 = 2;
 
 impl CallSiteState {
     /// Fresh, unclassified site. Usable in `static` position.
@@ -240,6 +260,75 @@ impl CallSiteState {
             reduce_cost_sum_cycles: AtomicU64::new(0),
             reduce_cost_samples: AtomicU32::new(0),
             collapse_overran: AtomicBool::new(false),
+            active_depth: AtomicU32::new(DEPTH_UNSET),
+            pending_depth: AtomicU32::new(DEPTH_UNSET),
+            depth_run: AtomicU32::new(0),
+            estimate_ewma_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// The seed depth to dispatch with, given the depth this call's
+    /// estimate asks for.
+    ///
+    /// The first call takes what it is given. After that a different
+    /// depth must be asked for by [`SEED_DEPTH_HYSTERESIS`] consecutive
+    /// calls before it takes effect, so one estimate landing the far
+    /// side of a power-of-two boundary does not halve or double the
+    /// leaf count on its own.
+    pub fn stabilise_seed_depth(&self, observed: usize) -> usize {
+        let obs = observed as u32;
+        let active = self.active_depth.load(Ordering::Relaxed);
+        if active == DEPTH_UNSET {
+            self.active_depth.store(obs, Ordering::Relaxed);
+            return observed;
+        }
+        if obs == active {
+            // The site is asking for what it already has; any run
+            // toward a change is broken.
+            self.depth_run.store(0, Ordering::Relaxed);
+            return observed;
+        }
+        let previous_pending = self.pending_depth.swap(obs, Ordering::Relaxed);
+        let run = if previous_pending == obs {
+            self.depth_run
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1)
+        } else {
+            self.depth_run.store(1, Ordering::Relaxed);
+            1
+        };
+        if run >= SEED_DEPTH_HYSTERESIS {
+            self.active_depth.store(obs, Ordering::Relaxed);
+            self.depth_run.store(0, Ordering::Relaxed);
+            return observed;
+        }
+        active as usize
+    }
+
+    /// The per-item estimate smoothed across this site's calls.
+    ///
+    /// The first estimate seeds the average and is returned as it
+    /// stands. Later ones move it at the rate the policy-arm timings
+    /// use, so a reading well off this site's own history moves the
+    /// decisions it drives by a fraction of the distance rather than
+    /// all of it.
+    pub fn smooth_estimate_ns(&self, observed: u32) -> u32 {
+        if observed == 0 {
+            return observed;
+        }
+        ewma_update(&self.estimate_ewma_ns, observed as u64);
+        match ewma_value(&self.estimate_ewma_ns) {
+            0 => observed,
+            v => v.min(u32::MAX as u64) as u32,
+        }
+    }
+
+    /// The seed depth in force, or `None` before this site's first
+    /// dispatch. Diagnostics and tests.
+    pub fn seeded_depth(&self) -> Option<u32> {
+        match self.active_depth.load(Ordering::Relaxed) {
+            DEPTH_UNSET => None,
+            d => Some(d),
         }
     }
 
@@ -846,6 +935,85 @@ mod tests {
         SPREAD.record_batch_site_only(a * 4 + b * 4, asc * asc * 4 + bsc * bsc * 4, 8);
         assert!(UNIFORM.cv2_per_mille().unwrap() < 20);
         assert!(SPREAD.cv2_per_mille().unwrap() >= 500);
+    }
+
+    #[test]
+    fn a_seed_depth_change_needs_corroboration() {
+        static S: CallSiteState = CallSiteState::new();
+        assert_eq!(S.seeded_depth(), None, "a fresh site has seeded nothing");
+        assert_eq!(
+            S.stabilise_seed_depth(5),
+            5,
+            "the first dispatch takes the depth its estimate asks for"
+        );
+        assert_eq!(
+            S.stabilise_seed_depth(6),
+            5,
+            "one estimate the far side of a boundary does not move the depth"
+        );
+        assert_eq!(
+            S.stabilise_seed_depth(6),
+            6,
+            "a second consecutive call asking the same thing does"
+        );
+        assert_eq!(S.seeded_depth(), Some(6));
+    }
+
+    #[test]
+    fn a_run_toward_a_new_depth_restarts_when_a_third_value_intervenes() {
+        static S: CallSiteState = CallSiteState::new();
+        assert_eq!(S.stabilise_seed_depth(5), 5);
+        assert_eq!(S.stabilise_seed_depth(6), 5);
+        assert_eq!(
+            S.stabilise_seed_depth(7),
+            5,
+            "a different candidate breaks the run toward 6"
+        );
+        assert_eq!(
+            S.stabilise_seed_depth(6),
+            5,
+            "so 6 starts its run again rather than arriving already seconded"
+        );
+        assert_eq!(S.stabilise_seed_depth(6), 6);
+    }
+
+    #[test]
+    fn a_depth_the_site_already_holds_clears_a_pending_run() {
+        static S: CallSiteState = CallSiteState::new();
+        assert_eq!(S.stabilise_seed_depth(5), 5);
+        assert_eq!(S.stabilise_seed_depth(6), 5);
+        assert_eq!(
+            S.stabilise_seed_depth(5),
+            5,
+            "asking for what is already in force is not a change"
+        );
+        assert_eq!(
+            S.stabilise_seed_depth(6),
+            5,
+            "and it broke the run, so 6 needs two agreeing calls again"
+        );
+        assert_eq!(S.stabilise_seed_depth(6), 6);
+    }
+
+    #[test]
+    fn a_smoothed_estimate_moves_part_of_the_way() {
+        static S: CallSiteState = CallSiteState::new();
+        assert_eq!(
+            S.smooth_estimate_ns(240),
+            240,
+            "the first estimate seeds the average and stands as given"
+        );
+        let jumped = S.smooth_estimate_ns(400);
+        assert!(
+            jumped > 240 && jumped < 400,
+            "a reading well off this site's history moves the average part of \
+             the way rather than all of it, got {jumped}"
+        );
+        assert_eq!(
+            S.smooth_estimate_ns(0),
+            0,
+            "an absent estimate is passed through rather than folded in"
+        );
     }
 
     #[test]
