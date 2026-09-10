@@ -85,9 +85,9 @@
 
 #![allow(clippy::missing_docs_in_private_items)]
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -138,9 +138,19 @@ fn stall_report_armed() -> bool {
 /// never woke. Both are bounded by the fan-out width however many
 /// iterations run, which an event log is not.
 struct StallWatch {
-    started: Vec<AtomicBool>,
-    finished: Vec<AtomicBool>,
-    threads: Mutex<BTreeSet<String>>,
+    /// The dispatch in which each index last started, and last finished.
+    ///
+    /// A generation stamp rather than a flag so that opening a dispatch
+    /// costs nothing. Clearing 1024 atomics and two locks per iteration
+    /// would be paid thousands of times a second by the armed run, and
+    /// a race that needs a particular interleaving is exactly what such
+    /// a cost suppresses - an instrument that removes what it is
+    /// pointed at reports the absence as a finding.
+    started: Vec<AtomicU64>,
+    finished: Vec<AtomicU64>,
+    /// Each thread that has run a closure, against the last dispatch it
+    /// ran one in.
+    threads: Mutex<BTreeMap<String, u64>>,
     /// Incremented at every dispatch entry. The watchdog reports only
     /// when it reads the same value twice a stall apart, so a slow run
     /// that keeps dispatching is never mistaken for a stopped one.
@@ -152,6 +162,18 @@ struct StallWatch {
     arm: Mutex<String>,
 }
 
+thread_local! {
+    /// The last dispatch this thread announced itself in.
+    ///
+    /// Keeps the threads lock to one acquisition per thread per
+    /// dispatch instead of one per closure.
+    static ANNOUNCED_IN: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+/// The generation no dispatch has, so a stamp left by no run reads as
+/// absent rather than as dispatch zero.
+const NO_DISPATCH: u64 = 0;
+
 /// The widest fan-out any group registers.
 const WIDEST_FAN_OUT: usize = 1024;
 
@@ -161,66 +183,108 @@ const STALL_AFTER: Duration = Duration::from_secs(25);
 fn stall_watch() -> &'static StallWatch {
     static WATCH: OnceLock<StallWatch> = OnceLock::new();
     WATCH.get_or_init(|| StallWatch {
-        started: (0..WIDEST_FAN_OUT).map(|_| AtomicBool::new(false)).collect(),
-        finished: (0..WIDEST_FAN_OUT).map(|_| AtomicBool::new(false)).collect(),
-        threads: Mutex::new(BTreeSet::new()),
-        generation: AtomicU64::new(0),
+        started: (0..WIDEST_FAN_OUT)
+            .map(|_| AtomicU64::new(NO_DISPATCH))
+            .collect(),
+        finished: (0..WIDEST_FAN_OUT)
+            .map(|_| AtomicU64::new(NO_DISPATCH))
+            .collect(),
+        threads: Mutex::new(BTreeMap::new()),
+        generation: AtomicU64::new(NO_DISPATCH),
         width: AtomicUsize::new(0),
         arm: Mutex::new(String::new()),
     })
 }
 
 impl StallWatch {
-    /// Clear the maps and open a new dispatch.
+    /// Open a new dispatch.
+    ///
+    /// The arm name and width are written before the generation, so a
+    /// closure that reads the new generation finds the two describing
+    /// its own dispatch.
     fn begin(&self, arm: &str, n: usize) {
-        for i in 0..n.min(WIDEST_FAN_OUT) {
-            self.started[i].store(false, Ordering::Relaxed);
-            self.finished[i].store(false, Ordering::Relaxed);
+        {
+            let mut held = self.arm.lock().expect("stall watch arm");
+            if *held != arm {
+                held.clear();
+                held.push_str(arm);
+            }
         }
-        self.threads.lock().expect("stall watch threads").clear();
-        *self.arm.lock().expect("stall watch arm") = arm.to_string();
         self.width.store(n, Ordering::Relaxed);
         self.generation.fetch_add(1, Ordering::Release);
     }
 
     fn record_start(&self, i: usize) {
+        let generation = self.generation.load(Ordering::Acquire);
         if i < WIDEST_FAN_OUT {
-            // Recorded before the thread name so an index that appears
-            // with no thread is a closure that began and whose runner
-            // never reached the lock, rather than a lost write.
-            self.started[i].store(true, Ordering::Relaxed);
+            // Stamped before the thread name, so an index carrying this
+            // dispatch with its runner absent from the thread list is a
+            // closure that began and whose thread had already announced
+            // itself, rather than a lost write.
+            self.started[i].store(generation, Ordering::Relaxed);
         }
-        let name = std::thread::current()
-            .name()
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{:?}", std::thread::current().id()));
-        self.threads.lock().expect("stall watch threads").insert(name);
+        let fresh = ANNOUNCED_IN.with(|seen| {
+            if seen.get() == generation {
+                return false;
+            }
+            seen.set(generation);
+            true
+        });
+        if fresh {
+            let name = std::thread::current()
+                .name()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{:?}", std::thread::current().id()));
+            self.threads
+                .lock()
+                .expect("stall watch threads")
+                .insert(name, generation);
+        }
     }
 
     fn record_finish(&self, i: usize) {
         if i < WIDEST_FAN_OUT {
-            self.finished[i].store(true, Ordering::Relaxed);
+            let generation = self.generation.load(Ordering::Acquire);
+            self.finished[i].store(generation, Ordering::Relaxed);
         }
     }
 
     /// Print what the stalled dispatch reached.
     fn report(&self) {
+        let generation = self.generation.load(Ordering::Acquire);
         let n = self.width.load(Ordering::Relaxed).min(WIDEST_FAN_OUT);
         let arm = self.arm.lock().expect("stall watch arm").clone();
         let never: Vec<usize> = (0..n)
-            .filter(|&i| !self.started[i].load(Ordering::Relaxed))
+            .filter(|&i| self.started[i].load(Ordering::Relaxed) != generation)
             .collect();
         let unfinished: Vec<usize> = (0..n)
             .filter(|&i| {
-                self.started[i].load(Ordering::Relaxed)
-                    && !self.finished[i].load(Ordering::Relaxed)
+                self.started[i].load(Ordering::Relaxed) == generation
+                    && self.finished[i].load(Ordering::Relaxed) != generation
             })
             .collect();
-        let threads = self.threads.lock().expect("stall watch threads").clone();
+        let threads = self.threads.lock().expect("stall watch threads");
+        let ran: Vec<&String> = threads
+            .iter()
+            .filter(|(_, &g)| g == generation)
+            .map(|(name, _)| name)
+            .collect();
+        let idle: Vec<&String> = threads
+            .iter()
+            .filter(|(_, &g)| g != generation)
+            .map(|(name, _)| name)
+            .collect();
 
-        eprintln!("STALL in {arm} at fan-out {n}");
-        eprintln!("  threads that ran a closure: {}", threads.len());
-        for t in &threads {
+        eprintln!("STALL in {arm} at fan-out {n}, dispatch {generation}");
+        eprintln!("  threads that ran a closure in it: {}", ran.len());
+        for t in &ran {
+            eprintln!("    {t}");
+        }
+        // Threads seen in an earlier dispatch and not this one. These
+        // are the workers that exist and did not wake, which is the
+        // distinction a count of running threads cannot make.
+        eprintln!("  threads that ran in an earlier dispatch only: {}", idle.len());
+        for t in &idle {
             eprintln!("    {t}");
         }
         eprintln!("  closures that never started: {}", never.len());
