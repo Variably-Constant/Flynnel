@@ -38,3 +38,7 @@ kaggle/flynnel-src.tar.gz
 .dolt/
 *.db
 .beads-credential-key
+
+# Bytecode from the python helpers under examples/
+__pycache__/
+*.pyc
