@@ -28,9 +28,10 @@
 //! ## Why every regime is registered twice, in opposite order
 //!
 //! Criterion runs arms sequentially, so a load that arrives or departs
-//! during a group lands on some arms and not others. A measured
-//! position effect of 2.6x on a first arm has been seen on this host,
-//! which is larger than anything being measured here.
+//! during a group lands on some arms and not others. Two of this
+//! bench's six groups have read 61 and 68 percent apart between their
+//! two orders, against arms whose own intervals are near one percent -
+//! so a shifting load moves a group by far more than this resolves.
 //!
 //! Registering each regime forward and reversed makes that visible
 //! rather than assumed: an effect present in one order and absent in
@@ -51,6 +52,14 @@
 //! measurement, which is a different quantity from the one the arm is
 //! named for. Without the line a suppressed run and a settled one
 //! produce identical output.
+//!
+//! It answers a different question from the two orders, and neither
+//! subsumes the other. Alternation catches load that arrives or departs
+//! during a group, because that lands on some arms and not others;
+//! load present across both orders degrades them equally and they
+//! agree. So a pair of orders can agree while every arm in them ran on
+//! a class it was never allowed to revise. The occupancy figure is what
+//! distinguishes that from a quiet measurement.
 
 #![allow(clippy::missing_docs_in_private_items)]
 
