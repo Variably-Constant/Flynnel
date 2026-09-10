@@ -41,6 +41,16 @@
 //! Every arm owns a distinct `CallSiteState`, so the depth one arm
 //! settles on and the average it learns never become another's starting
 //! condition.
+//!
+//! ## What the occupancy line says
+//!
+//! Each arm reports its site's last occupancy and how many classifier
+//! windows that site discarded for having been timed off-core. A
+//! non-zero suppressed count means the arm ran on the class it held
+//! before the load arrived rather than one it learned during the
+//! measurement, which is a different quantity from the one the arm is
+//! named for. Without the line a suppressed run and a settled one
+//! produce identical output.
 
 #![allow(clippy::missing_docs_in_private_items)]
 
@@ -118,7 +128,8 @@ fn register(
     let mut buf: Vec<u64> = (0..items as u64).collect();
 
     for (i, arm) in arms.iter().enumerate() {
-        let site = SiteRef::new(&SITES[site_base + i]);
+        let state = &SITES[site_base + i];
+        let site = SiteRef::new(state);
         group.bench_function(arm.name, |b| {
             set_seed_hysteresis(arm.hysteresis);
             set_estimate_smoothing(arm.smoothing);
@@ -128,6 +139,13 @@ fn register(
                 black_box(buf[0]);
             });
         });
+        eprintln!(
+            "occupancy {}/{} pct={} suppressed={}",
+            group_name,
+            arm.name,
+            state.recent_occupancy(),
+            state.suppressed_migrations(),
+        );
     }
 
     // Leave the process as found, so a later group is not measured

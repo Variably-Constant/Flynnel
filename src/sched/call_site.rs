@@ -221,6 +221,13 @@ pub struct CallSiteState {
     /// site actually spent on a core, in hundredths. Starts at 100, so
     /// a site nothing has reported for classifies as it always did.
     recent_occupancy_pct: AtomicU32,
+    /// Classifier windows this site discarded because the leaves in
+    /// them were timed off-core.
+    ///
+    /// A gate that refuses silently leaves the next reader with a site
+    /// that never learned and no way to tell that from a site with
+    /// nothing to learn. This is what says which.
+    suppressed_migrations: AtomicU32,
 }
 
 /// No seed depth is in force for a site yet.
@@ -269,7 +276,20 @@ impl CallSiteState {
             depth_run: AtomicU32::new(0),
             estimate_ewma_ns: AtomicU64::new(0),
             recent_occupancy_pct: AtomicU32::new(100),
+            suppressed_migrations: AtomicU32::new(0),
         }
+    }
+
+    /// Classifier windows discarded at this site for having been timed
+    /// off-core.
+    ///
+    /// Non-zero means this site's class is older than its leaf history:
+    /// it is running on what it learned before the machine got busy. A
+    /// bench of this path on a shared host should print it, because
+    /// without it a suppressed run and a settled one produce the same
+    /// output.
+    pub fn suppressed_migrations(&self) -> u32 {
+        self.suppressed_migrations.load(Ordering::Relaxed)
     }
 
     /// Report what fraction of its interval the dispatch just finished
@@ -476,6 +496,7 @@ impl CallSiteState {
         if self.recent_occupancy_pct.load(Ordering::Relaxed)
             < crate::sched::occupancy::TRUSTWORTHY_OCCUPANCY_PCT
         {
+            self.suppressed_migrations.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
