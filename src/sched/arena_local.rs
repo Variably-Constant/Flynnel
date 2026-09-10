@@ -1089,13 +1089,9 @@ impl LocalArena {
         // Each worker has [N_TIERS] KHL-backed deques; each peer
         // in the arena holds [N_TIERS] stealers per worker.
         //
-        // KHL_SLOT_CAPACITY sets each tier's ring size, counted in slots,
-        // each holding up to 3 jobs). Sized large enough to absorb
-        // producer bursts without triggering the spin-on-publish
-        // back-pressure path; small enough to keep the buffer's
-        // cold-page footprint bounded. 256 slots = 768 jobs per
-        // tier per worker, ~16KB per tier per worker.
-        const ADAPTIVE_SLOT_CAPACITY: usize = 256;
+        // The ring size is `ADAPTIVE_SLOT_CAPACITY`, at module scope so
+        // a caller sizing a fan-out against it reads the same number
+        // this constructor uses.
         // Initial gating: KGating::Auto resolves to the host-
         // calibrated winner. On Zen+ R7 2700 (the bench host),
         // calibration picks PerSlot (KHL active).
@@ -1610,6 +1606,24 @@ const _: () = assert!(EXTERNAL_SLOT_COUNT <= 64);
 /// before peers steal them or the caller pops them back. 64 slots
 /// (~192 jobs per tier) is plenty.
 const EXTERNAL_SLOT_DEQUE_CAPACITY: usize = 64;
+
+/// Each worker tier's ring size, counted in slots that hold up to
+/// [`JOBS_PER_SLOT`] jobs each: 256 slots is 768 jobs per tier per
+/// worker, about 16 KB.
+///
+/// Sized to absorb producer bursts without reaching the spin-on-publish
+/// back-pressure path in `SchedKhlDeque::publish`, and small enough to
+/// keep the buffer's cold-page footprint bounded.
+///
+/// A fan-out wider than `ADAPTIVE_SLOT_CAPACITY * JOBS_PER_SLOT` does
+/// reach that path, which is why the cooperative deque fan-out switches
+/// to the refusing push past its first burst instead of waiting on a
+/// consumer it has not woken yet.
+pub(crate) const ADAPTIVE_SLOT_CAPACITY: usize = 256;
+
+/// Jobs packed into one ring slot: three burst pushes fill one
+/// cache-line slot and a thief takes all three per coherence transfer.
+pub(crate) const JOBS_PER_SLOT: usize = 3;
 
 /// One pre-allocated external-worker slot. The deques + ctx live on
 /// the heap for the lifetime of the arena. Peers can steal from

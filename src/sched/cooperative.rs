@@ -129,7 +129,7 @@ where
 /// this loop has not yet woken - and cannot wake, because the wake is
 /// below it. At 256 slots that bound is 768 jobs, which a 1024-way
 /// fan-out exceeds by 255.
-const DEQUE_FIRST_BURST: usize = 3;
+const DEQUE_FIRST_BURST: usize = crate::sched::arena_local::JOBS_PER_SLOT;
 
 /// How many times the worker count a fan-out must reach before
 /// owner-directed mailbox distribution beats random peer-steal.
@@ -950,12 +950,20 @@ mod tests {
         // of the 1024 closures unstarted, all 24 workers parked, one
         // thread at exactly one core.
         //
-        // 2048 is well past the bound, so the refusing push and the
-        // inline run of what it refuses are both exercised.
+        // The width is derived from the ring rather than written as a
+        // number, so raising the capacity cannot leave this passing
+        // while testing nothing - which is what a hardcoded 2048 would
+        // do the moment the ring grew past it.
         //
-        // The join runs on its own thread so a failure is a timeout
-        // rather than a hung test binary.
-        let n = 2048usize;
+        // Twice the bound, so the refusing push and the inline run of
+        // what it refuses are both exercised well clear of the edge.
+        let n = 2 * crate::sched::arena_local::ADAPTIVE_SLOT_CAPACITY
+            * crate::sched::arena_local::JOBS_PER_SLOT;
+        assert!(
+            n > crate::sched::arena_local::ADAPTIVE_SLOT_CAPACITY
+                * crate::sched::arena_local::JOBS_PER_SLOT,
+            "the fan-out must exceed the ring or this tests nothing"
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let p = JobPlan::new(8, 1);
