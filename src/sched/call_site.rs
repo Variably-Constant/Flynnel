@@ -216,8 +216,11 @@ pub struct CallSiteState {
     pending_depth: AtomicU32,
     depth_run: AtomicU32,
     /// What fraction of its interval the most recent dispatch at this
-    /// site actually spent on a core, in hundredths. Starts at 100, so
-    /// a site nothing has reported for reads as it always did.
+    /// site spent on a core, in hundredths, or [`OCCUPANCY_UNREPORTED`]
+    /// before any dispatch has said.
+    ///
+    /// A site with no dispatches and a site whose pool held its cores
+    /// throughout are different findings, so they do not share a value.
     recent_occupancy_pct: AtomicU32,
     /// On-core ticks and elapsed ticks summed across every worker that
     /// has run a leaf for this site, in the same unit.
@@ -242,6 +245,12 @@ pub struct CallSiteState {
 
 /// No seed depth is in force for a site yet.
 const DEPTH_UNSET: u32 = u32::MAX;
+
+/// No dispatch at a site has reported its pool's occupancy yet.
+///
+/// Distinct from every occupancy a dispatch can report, which are
+/// hundredths and so at most 100.
+pub const OCCUPANCY_UNREPORTED: u32 = u32::MAX;
 
 /// Consecutive calls that must agree on a different seed depth before
 /// it takes effect.
@@ -284,7 +293,7 @@ impl CallSiteState {
             active_depth: AtomicU32::new(DEPTH_UNSET),
             pending_depth: AtomicU32::new(DEPTH_UNSET),
             depth_run: AtomicU32::new(0),
-            recent_occupancy_pct: AtomicU32::new(100),
+            recent_occupancy_pct: AtomicU32::new(OCCUPANCY_UNREPORTED),
             pool_thread_ticks: AtomicU64::new(0),
             pool_wall_ticks: AtomicU64::new(0),
             last_seed_depth: AtomicU32::new(DEPTH_UNSET),
@@ -347,9 +356,13 @@ impl CallSiteState {
             .store(percent.min(100), Ordering::Relaxed);
     }
 
-    /// The occupancy of the most recent dispatch at this site.
-    pub fn recent_occupancy(&self) -> u32 {
-        self.recent_occupancy_pct.load(Ordering::Relaxed)
+    /// The occupancy of the most recent dispatch at this site, or
+    /// `None` if no dispatch has reported one.
+    pub fn recent_occupancy(&self) -> Option<u32> {
+        match self.recent_occupancy_pct.load(Ordering::Relaxed) {
+            OCCUPANCY_UNREPORTED => None,
+            pct => Some(pct),
+        }
     }
 
     /// The seed depth to dispatch with, given the depth this call's

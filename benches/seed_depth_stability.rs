@@ -148,11 +148,17 @@ fn register(
                 black_box(buf[0]);
             });
         });
+        // An arm whose dispatches never reported reads "none" rather
+        // than a number, so a missing measurement is not a measurement.
+        let pct = match state.recent_occupancy() {
+            Some(p) => p.to_string(),
+            None => "none".to_string(),
+        };
         eprintln!(
             "occupancy {}/{} pct={} flips={}",
             group_name,
             arm.name,
-            state.recent_occupancy(),
+            pct,
             state.seed_depth_flips(),
         );
     }

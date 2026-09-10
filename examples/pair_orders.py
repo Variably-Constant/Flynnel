@@ -54,7 +54,11 @@ ANY_TIME = re.compile(r"\btime:\s*\[")
 # removed leaves the others readable instead of matching nothing and
 # reporting the whole column as absent.
 OCCUPANCY = re.compile(r"^occupancy\s+(\S+)/(\S+)\s+(.*)$")
-FIELD = re.compile(r"([a-z_]+)=(\d+)")
+# A value may be `none`, which a bench prints when no dispatch reported
+# one. It is kept as the string rather than turned into a zero, because
+# a site that never reported and a pool that got none of its cores are
+# different findings.
+FIELD = re.compile(r"([a-z_]+)=(\d+|none)")
 
 SCALE = {"ns": 1.0, "us": 1e3, "µs": 1e3, "μs": 1e3, "ms": 1e6, "s": 1e9}
 
@@ -99,7 +103,8 @@ def parse(path):
             o = OCCUPANCY.match(line.strip())
             if o:
                 base, order = split_order(o.group(1))
-                fields = {k: int(v) for k, v in FIELD.findall(o.group(3))}
+                fields = {k: (v if v == "none" else int(v))
+                          for k, v in FIELD.findall(o.group(3))}
                 if fields:
                     figures.setdefault((base, o.group(2)), {})[order] = fields
                 continue
@@ -195,7 +200,7 @@ def main():
                 ",".join("%s=%s" % kv for kv in sorted(f[k].items()))
                 if k in f else "-"
                 for k in ("fwd", "rev"))
-            if any(v.get("flips", 0) for v in f.values()):
+            if any(v.get("flips") not in (0, None, "none") for v in f.values()):
                 flipping.append((base, arm, f))
         else:
             note = ""

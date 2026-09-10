@@ -111,7 +111,13 @@ fn register(c: &mut Criterion, group_name: &str, order: &[usize], site_base: usi
                 black_box(buf[0]);
             });
         });
-        eprintln!("smoothness {group_name}/n{items} pct={}", state.recent_occupancy());
+        // A size whose dispatches never reported reads "none" rather
+        // than a number, so a missing measurement is not a measurement.
+        let pct = match state.recent_occupancy() {
+            Some(p) => p.to_string(),
+            None => "none".to_string(),
+        };
+        eprintln!("smoothness {group_name}/n{items} pct={pct}");
     }
 
     group.finish();
