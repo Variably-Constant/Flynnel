@@ -231,28 +231,29 @@ fn register(
     group.finish();
 }
 
-fn bench_fine(c: &mut Criterion) {
-    let table = build_table();
+/// Register a shape forward and reversed, taking both group names from
+/// the shape so the pair cannot drift apart from each other or from the
+/// arm the reader is looking at.
+fn both_orders(c: &mut Criterion, shape: Shape, site_base: usize, table: &[u64]) {
     let mut rev = PROFILES;
     rev.reverse();
-    register(c, "fine", Shape::Fine, &PROFILES, 0, &table);
-    register(c, "fine_rev", Shape::Fine, &rev, 5, &table);
+    register(c, shape.name(), shape, &PROFILES, site_base, table);
+    register(c, &format!("{}_rev", shape.name()), shape, &rev, site_base + 5, table);
+}
+
+fn bench_fine(c: &mut Criterion) {
+    let table = build_table();
+    both_orders(c, Shape::Fine, 0, &table);
 }
 
 fn bench_heavy(c: &mut Criterion) {
     let table = build_table();
-    let mut rev = PROFILES;
-    rev.reverse();
-    register(c, "heavy", Shape::Heavy, &PROFILES, 10, &table);
-    register(c, "heavy_rev", Shape::Heavy, &rev, 15, &table);
+    both_orders(c, Shape::Heavy, 10, &table);
 }
 
 fn bench_gather(c: &mut Criterion) {
     let table = build_table();
-    let mut rev = PROFILES;
-    rev.reverse();
-    register(c, "gather", Shape::Gather, &PROFILES, 20, &table);
-    register(c, "gather_rev", Shape::Gather, &rev, 25, &table);
+    both_orders(c, Shape::Gather, 20, &table);
 }
 
 criterion_group!(benches, bench_fine, bench_heavy, bench_gather);
