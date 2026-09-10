@@ -7,10 +7,15 @@
 //! irregular, and the thread is not getting its core - and nothing in
 //! those measurements separates them.
 //!
-//! That conflation is not merely noise. A site whose leaves are uniform
-//! but preempted reads as irregular, and an irregular classification
-//! routes to a shape that costs 3-4x on uniform work, so a busy machine
-//! makes the scheduler choose worse rather than merely run slower.
+//! That conflation is not merely noise. Preemption lands on some leaves
+//! and not others, so it enters the classifier as variance: a site whose
+//! leaves are uniform reads as irregular, and the class it migrates to
+//! selects a different fan-out shape and a different SMT setting. A busy
+//! machine therefore moves the scheduler's choice rather than only its
+//! speed, and the choice persists after the load has gone.
+//!
+//! How much a wrong class costs is not measured. The gate rests on the
+//! decision being wrong, not on a figure for what it is worth.
 //!
 //! The separation is available directly. A thread's own CPU time
 //! advances only while it is on a core; wall time advances regardless.

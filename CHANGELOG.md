@@ -9,6 +9,130 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Scheduler
 
+- `sched::occupancy` reports what fraction of a measured interval the
+  measuring thread was actually on a core, and two learners refuse a
+  measurement taken below `TRUSTWORTHY_OCCUPANCY_PCT`, which is 85.
+
+  Every adaptive input in the scheduler was derived from wall time: the
+  calibrated dispatch cost and its two thresholds, a call site's
+  coefficient of variation, the policy-arm averages. Wall time rises and
+  spreads for two unrelated reasons - the work is expensive or
+  irregular, and the thread is not getting its core - and nothing
+  separated them. Preemption lands on some leaves and not others, so it
+  reaches the classifier as variance rather than as a uniform slowdown:
+  a site whose leaves are uniform reads as irregular, migrates class,
+  and the class it lands on selects a different fan-out shape and a
+  different SMT setting. `Streaming` parks SMT siblings because both
+  threads would contend for the bandwidth it is already saturating;
+  `Gather` wakes them to interleave cache-miss loads. So a busy host
+  moved the scheduler's choice rather than only its speed, and the
+  choice outlived the load that caused it. What a wrong class costs is
+  not measured; the gate rests on the decision being wrong.
+
+  `OccupancyWindow` reads the thread clock and the wall clock at
+  construction and again at `sample`, so the two cover the same interval
+  by construction rather than by a caller pairing them. The source is
+  `QueryThreadCycleTime` on Windows and `CLOCK_THREAD_CPUTIME_ID` on
+  Linux. The Windows figure is cycles rather than nanoseconds; both
+  sides of the ratio carry the same unknown frequency and the absolute
+  is never read alone. A platform with no thread clock reports full
+  occupancy, so it behaves as it did rather than refusing everything.
+
+  The two gates refuse rather than adapt. A calibration taken below the
+  threshold still serves the process that measured it, which lives under
+  that same load, but does not enter the persisted table, which outlives
+  it. The classifier does not migrate a site's class on a window below
+  it; the window is spent rather than kept, because it describes the
+  machine and the site's class does not.
+
+  Nothing routes on occupancy. A dispatch's shape still depends only on
+  its workload, so identical code behaves identically whatever else is
+  running. Whether a loaded host wants a narrower fan-out is a separate
+  question with no measurement behind it.
+
+- `CallSiteState::suppressed_migrations` counts the classifier windows a
+  site discarded for having been timed off-core. The gate above refused
+  silently, and a site that never learned then reads exactly like a site
+  with nothing to learn: both sit on the class they started with. A
+  non-zero count says the site is running on what it learned before the
+  machine got busy, which is a different claim from having settled
+  there.
+
+- `sched::calibration_store` persists measured dispatch costs and device
+  capabilities per host in a memory-mapped file, behind the new
+  `persisted-calibration` feature, which is on by default and pulls in
+  `memmap2`. Without it every process measures its own at first use, and
+  that measurement is only as good as the host was quiet - the entry
+  below records a 62 percent spread across nine processes on one host,
+  two of which installed a threshold about 40 percent below the median
+  of their own sweeps.
+
+  A process that finds a table for its own host reads it and measures
+  nothing. One that does not takes the writer lease, measures, and
+  publishes. The table is keyed by a `HostStamp` - vendor, cpuid
+  signature, architecture, operating system, primary and total worker
+  counts, layout version - so a different chip, a different core count
+  or a different probe set is a different table rather than a stale one.
+  `LAYOUT_VERSION` enters the stamp, so raising it makes the next start
+  on every host measure again.
+
+  Three things make a read safe. The magic is written last, after every
+  other field is in place, so a process attaching to a region another is
+  still laying out sees a zero magic and waits rather than reading an
+  unwritten record as real. Readers take the record under a SeqLock: the
+  writer raises `seq_version` to an odd value before touching the
+  payload and to the next even value after, and a reader that observes
+  an odd version, or a different version either side of its copy,
+  retries, so a record is never half old and half new. A writer that
+  dies mid-measurement leaves its pid in the header and stops beating,
+  and a later start whose heartbeat has not advanced within
+  `LEASE_GRACE_EPOCHS` takes the lease from it - without which one
+  killed process would stop every later start on the host from ever
+  calibrating.
+
+  A record whose own nine samples spread more than
+  `PROVISIONAL_SPREAD_PER_MILLE` of their median, which is 250, is
+  marked provisional and a later start on a quieter host overwrites it.
+  The calibration already takes nine samples and keeps their median, so
+  the spread costs nothing to compute and is the sharpest available
+  signal for whether the host was quiet.
+
+  The directory is `FLYNNEL_CALIBRATION_DIR` when set, otherwise
+  `%LOCALAPPDATA%\flynnel\calibration` on Windows and
+  `$XDG_CACHE_HOME/flynnel/calibration` or `~/.cache/flynnel/calibration`
+  elsewhere. A host with more than `MAX_ACCEL` devices records the first
+  eight and leaves the rest unrecorded rather than overflowing.
+
+- `for_each_chunk_min_leaf` takes the recursion floor from the caller,
+  as `for_each_chunk_indexed_min_leaf` and `for_each_chunk_triple_min_leaf`
+  already did. `for_each_chunk` was the only member of the family with
+  the floor fixed at `MIN_LEAF_ITEMS`, so a heavy-per-element op on a
+  plain `&mut [T]` had no way to ask for a leaf per item and ran a small
+  batch serially. `for_each_chunk` now delegates with the old default,
+  so its behavior is unchanged.
+
+- `cooperative_join_n`'s `Auto` arm compares the fan-out against the
+  calling thread's own node rather than against every node summed.
+  `NumaArena::total_workers` spans all nodes; the two gates inside
+  `cooperative_join_n_flat_mailbox` read `ctx.sleep.worker_count()`,
+  which counts one node, because each worker's context carries a clone
+  of its own arena's sleep coordinator. On a single-node host a sum of
+  one term equals that term and the two agreed. On a two-node host with
+  24 workers each, `Auto` routed to mailbox at 48 while the gate inside
+  that path opened at 24, so a fan-out between the two went to the tree
+  shape where the population heuristic intended mailbox.
+  `NumaArena::local_worker_count` is the new accessor, resolving through
+  the node lookup that already existed. This host is single-node, so the
+  band is empty here and the change is a no-op on it; whether mailbox
+  beats tree in that band is unmeasured on any host.
+
+- `set_seed_hysteresis` and `set_estimate_smoothing` switch the two
+  seed-depth stabilizers at run time rather than once per process, so
+  every arm of a comparison fits in one process. Arms measured across
+  separate processes cannot be told apart from whatever else differed
+  between those processes, which on a shared host is most of what
+  matters.
+
 - `cooperative_join_n_flat_mailbox` picks its mode and its mailbox
   targets from the worker count. Both read `ctx.stealers.len()`, which
   is the worker count plus `EXTERNAL_SLOT_COUNT`, so the two uses were
@@ -92,10 +216,66 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   below gives a range across six processes for the Ryzen 7 2700 but a
   single 14.4 us figure for the 7900X, which reads as a constant of
   that chip and was one draw. A consumer compared a threshold printed
-  in one process against behaviour in another and reported a
+  in one process against behavior in another and reported a
   contradiction in the collapse control flow; there was none.
 
+### GPU peer
+
+- A peer start reuses the host's stored record for its device instead of
+  re-measuring the round trip, when there is one and it was taken on a
+  device nothing else was resident on. The round trip, the clock error
+  and the launch baseline are properties of a host, device and driver
+  combination and are taken as they stand.
+
+  The margin and the atomics flag are not taken. They are re-established
+  on every start whichever path it takes, because what they assert is
+  how this device behaved under contention, and only a run on it can say
+  that. A stored record therefore shortens a start without ever standing
+  in for a safety property.
+
+  Whether the stored record is usable is decided the same way the CPU
+  half is. The peer already times the round trip at three points, so how
+  far apart they fell is the device's equivalent of the CPU sweep's
+  sample spread and costs nothing extra: another process resident on the
+  device stretches the tail without moving the minimum, which is what
+  that spread reads. The capability fields are read from the driver and
+  do not vary with what else is running, so they are stored beside the
+  timings and reused unconditionally.
+
+  Every way of failing to reach the table ends in a full measurement,
+  which is what a start did before there was a table. What it does not
+  do is fail quietly: a table that cannot be read and a device that has
+  never been measured produce the same calibration, and a diagnostic on
+  stderr is the only thing separating them.
+
+  A device publish carries the host's CPU half through untouched rather
+  than writing a default beside it. That path measured a device, not a
+  host, and a default record reads as a completed measurement of one
+  sample with zero spread, which is the shape a reader trusts most.
+
 ### Tests
+
+- `benches/seed_depth_stability.rs` measures what seed-depth hysteresis
+  and estimate smoothing cost against each other and against neither, in
+  three regimes: an estimate that alternates across a power-of-two
+  boundary every dispatch, one held still, and one so far under the
+  worker floor that the estimate reaches the decision not at all. The
+  two cost regimes are what decide whether either mechanism is
+  shippable, because a cost there is paid by every caller including
+  those that can never cross a boundary.
+
+  Every regime is registered twice, in opposite arm order. Criterion
+  runs arms sequentially, so a load arriving during a group lands on
+  some arms and not others, and an effect present in one order and
+  absent in the other is the box while one whose ratio survives both is
+  the code. On the first run this separated the groups rather than the
+  arms: the four arms of the straddle group, which ran first, agree
+  across both orders to within 3 percent, while the two groups that ran
+  after a compile storm arrived disagree between orders by 61 and 68
+  percent, which is unreadable rather than noisy. Each arm owns a
+  distinct `CallSiteState`, so the depth one settles on never becomes
+  another's starting condition, and each prints its site's occupancy and
+  suppressed-migration count so a degraded run marks itself.
 
 - The GPU test binaries take one cross-process lock on the device.
   Each file declared its own `static Mutex`, which serializes the tests
@@ -104,7 +284,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   wait in `gpu_peer_team` printed 51264, 53440 and 412416 ns across
   three runs on one host, an eight times swing decided by which other
   binary was resident, and an assertion bounding it was reading its
-  neighbour. Serialized, the wait reads 55008 ns. The lock is a file,
+  neighbor. Serialized, the wait reads 55008 ns. The lock is a file,
   since a `Mutex` does not reach across processes, and it is advisory:
   a process that does not ask still gets the device. A lock left behind
   by a killed process is reclaimed after 120 seconds.
@@ -399,7 +579,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### GPU peer
 
-- An opcode the kernel does not recognise is marked failed instead of
+- An opcode the kernel does not recognize is marked failed instead of
   completing. The dispatch chain had no branch for one, so `op` kept
   its submitted value and the slot was written `STATUS_DONE`; the
   comment claiming otherwise had never been true. A caller who mistyped
