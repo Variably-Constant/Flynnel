@@ -110,7 +110,9 @@ for_each_chunk(&plan, &mut data, |chunk: &mut [f64]| {
 
 ## 6. `cooperative_join_n(plan, closures)`: N-way SIMC dispatch
 
-Fan out N closures across the worker pool with one sync boundary. Each closure runs on a different worker; the results are collected in the input order.
+Fan out N closures across the worker pool with one sync boundary. Results are collected in the input order whatever runs where.
+
+Which worker runs which closure is not fixed, and depends on N. Below the pool count the fan-out is a balanced tree; from there to 32 times the pool it pushes onto the calling worker's own deque and random peer-steal distributes them; at or above that it pushes each closure to one specific worker's mailbox, which is the only shape where a closure has a worker chosen for it in advance. Do not write a closure that depends on landing anywhere in particular.
 
 ```rust
 use flynnel::{JobPlan, cooperative_join_n};
