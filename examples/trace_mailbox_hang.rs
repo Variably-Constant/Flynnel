@@ -6,21 +6,24 @@
 //!
 //! ```text
 //! cargo run --release --example trace_mailbox_hang -- 8 rayon 1 2> hang.csv
-//! cargo run --release --example trace_mailbox_hang -- 8 alone 4000 2> alone.csv
+//! cargo run --release --example trace_mailbox_hang -- 1000 alone 300 mailbox,deque
 //! ```
 //!
 //! Arguments: how far above the local worker count to fan out
 //! (default 8); whether a `rayon` scope fan-out runs first or the
-//! fan-out runs `alone`; how many times to repeat it (default 1); and
-//! `deque` to take the plain fan-out rather than the mailbox one. The
-//! first two arms differ in nothing else, so a completion in one and a
-//! stall in the other attributes the difference to the foreign pool.
+//! fan-out runs `alone`; how many times to repeat each shape (default
+//! 1); and the shapes to run, comma-separated, in order (default
+//! `mailbox`). The first two arms differ in nothing else, so a
+//! completion in one and a stall in the other attributes the difference
+//! to the foreign pool.
 //!
-//! The shape argument exists because the stall reproduced on the DEQUE
-//! arm at 1024 while the mailbox arm at the same width completed. Both
-//! shapes reach the same wait path, so the question is which of them
-//! the defect needs, and running one binary both ways is what answers
-//! it without a second harness to differ in other respects.
+//! The shape argument is a sequence rather than a single choice because
+//! neither shape alone reproduces the stall: 300 iterations of 1024
+//! closures complete in under a tenth of a second in both, while the
+//! criterion sweep stalls on a deque arm that ran directly after a
+//! mailbox arm in the same process. A single shape cannot express a run
+//! whose earlier arm leaves state behind, so the sequence is the
+//! experiment and one shape on its own is the control for it.
 //!
 //! The repeat count exists because a single call is the one thing this
 //! does that a criterion sweep does not: criterion calls the same
@@ -69,8 +72,44 @@ use flynnel::{JobPlan, for_each_chunk};
 /// `Entering` is sent before each call rather than after, so a silence
 /// names the iteration that stalled instead of the last that finished.
 enum Progress {
-    Entering(usize),
+    Entering(&'static str, usize),
     Finished(usize, Duration),
+}
+
+/// Which fan-out entry point one block of iterations calls.
+///
+/// Both reach the same wait path and differ in how a pushed job is made
+/// visible to a worker, so a stall in one and completion in the other
+/// separates the wait from the push.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Mailbox,
+    Deque,
+}
+
+impl Shape {
+    /// The shapes named by a comma-separated list, in order, or the
+    /// first word that names none.
+    ///
+    /// A sequence rather than a single shape because the stall was seen
+    /// on a deque arm that ran after a mailbox arm in the same process,
+    /// and one arm alone reproduces neither.
+    fn sequence(text: &str) -> Result<Vec<Shape>, String> {
+        text.split(',')
+            .map(|word| match word.trim() {
+                "mailbox" => Ok(Shape::Mailbox),
+                "deque" => Ok(Shape::Deque),
+                other => Err(other.to_string()),
+            })
+            .collect()
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Shape::Mailbox => "mailbox",
+            Shape::Deque => "deque",
+        }
+    }
 }
 
 /// How long to wait for the next report before calling it stalled.
@@ -129,18 +168,28 @@ fn main() {
     let over: usize = argument(&args, 1, 8, "over");
     let arm = args.get(2).map(String::as_str).unwrap_or("rayon");
     let repeats: usize = argument(&args, 3, 1, "repeats").max(1);
-    // Which fan-out shape stalls is the open question: the observed
-    // stall at 1024 was the deque arm, and the mailbox arm at the same
-    // width completed. Both reach the same wait path.
-    let deque = args.get(4).map(String::as_str) == Some("deque");
+    let shapes = match args.get(4) {
+        None => vec![Shape::Mailbox],
+        Some(text) => match Shape::sequence(text) {
+            Ok(shapes) => shapes,
+            Err(word) => {
+                eprintln!("shape {word:?} is not one of mailbox, deque");
+                std::process::exit(2);
+            }
+        },
+    };
     if !trace::is_enabled() {
         eprintln!("the trace switch is not set; the run will report completion but record nothing");
     }
 
     let workers = global_local_arena().local_worker_count();
     let n = workers + over;
-    let shape = if deque { "deque" } else { "mailbox" };
-    println!("workers {workers}, fan-out {n}, arm {arm}, repeats {repeats}, shape {shape}");
+    let written: Vec<&str> = shapes.iter().map(|s| s.name()).collect();
+    let total = shapes.len() * repeats;
+    println!(
+        "workers {workers}, fan-out {n}, arm {arm}, repeats {repeats} per shape, shapes {}",
+        written.join(",")
+    );
 
     if arm == "rayon" {
         let mut warm: Vec<u64> = (0..n as u64).collect();
@@ -160,30 +209,34 @@ fn main() {
     std::thread::spawn(move || {
         let started = Instant::now();
         let mut last = 0usize;
-        for iteration in 0..repeats {
-            let plan = JobPlan::new(8, 1);
-            let closures: Vec<Box<dyn FnOnce() -> u32 + Send>> = (0..n)
-                .map(|i| {
-                    Box::new(move || {
-                        trace::emit(TraceEvent::LeafStart, i as u32);
-                        let out = i as u32;
-                        trace::emit(TraceEvent::LeafEnd, i as u32);
-                        out
-                    }) as _
-                })
-                .collect();
-            // Reported before the call rather than after, so a stall
-            // says which iteration it stalled on rather than which one
-            // last finished.
-            if let Err(e) = tx.send(Progress::Entering(iteration)) {
-                eprintln!("the harness stopped listening at iteration {iteration}: {e}");
-                return;
+        for shape in shapes {
+            for iteration in 0..repeats {
+                let plan = JobPlan::new(8, 1);
+                let closures: Vec<Box<dyn FnOnce() -> u32 + Send>> = (0..n)
+                    .map(|i| {
+                        Box::new(move || {
+                            trace::emit(TraceEvent::LeafStart, i as u32);
+                            let out = i as u32;
+                            trace::emit(TraceEvent::LeafEnd, i as u32);
+                            out
+                        }) as _
+                    })
+                    .collect();
+                // Reported before the call rather than after, so a stall
+                // says which iteration it stalled on rather than which one
+                // last finished.
+                if let Err(e) = tx.send(Progress::Entering(shape.name(), iteration)) {
+                    eprintln!(
+                        "the harness stopped listening in {} at iteration {iteration}: {e}",
+                        shape.name()
+                    );
+                    return;
+                }
+                last = match shape {
+                    Shape::Deque => cooperative_join_n_flat(&plan, closures).len(),
+                    Shape::Mailbox => cooperative_join_n_flat_mailbox(&plan, closures).len(),
+                };
             }
-            last = if deque {
-                cooperative_join_n_flat(&plan, closures).len()
-            } else {
-                cooperative_join_n_flat_mailbox(&plan, closures).len()
-            };
         }
         if let Err(e) = tx.send(Progress::Finished(last, started.elapsed())) {
             // Finished, but after the main thread had already reported
@@ -193,23 +246,27 @@ fn main() {
         }
     });
 
-    let mut reached = 0usize;
+    let mut reached = ("none", 0usize);
     let outcome = loop {
         match rx.recv_timeout(STALL_AFTER) {
-            Ok(Progress::Entering(i)) => reached = i,
+            Ok(Progress::Entering(shape, i)) => reached = (shape, i),
             other => break other,
         }
     };
 
+    let (shape, iteration) = reached;
     match outcome {
-        Ok(Progress::Entering(_)) => unreachable!("the loop breaks on anything else"),
+        Ok(Progress::Entering(..)) => unreachable!("the loop breaks on anything else"),
         Ok(Progress::Finished(count, wall)) => {
-            println!("completed {repeats} x {count} closures in {wall:?}");
+            println!("completed {steps} x {count} closures in {wall:?}", steps = total);
         }
         Err(RecvTimeoutError::Timeout) => {
+            // Which shape it stalled in is the whole answer when a
+            // sequence runs: the arm that stops is not necessarily the
+            // one that caused it to.
             println!(
                 "STALLED: no progress in {STALL_AFTER:?} at fan-out {n}, \
-                 on iteration {reached} of {repeats}"
+                 in shape {shape} on iteration {iteration} of {repeats}"
             );
         }
         Err(RecvTimeoutError::Disconnected) => {
@@ -217,8 +274,8 @@ fn main() {
             // the join itself panicked. That is a different failure from
             // a stall and the trace below means something different too.
             println!(
-                "the fan-out thread ended without sending on iteration {reached}: \
-                 it panicked rather than stalled"
+                "the fan-out thread ended without sending in shape {shape} \
+                 on iteration {iteration}: it panicked rather than stalled"
             );
         }
     }
