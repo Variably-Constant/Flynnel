@@ -286,6 +286,30 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   another's starting condition, and each prints its site's occupancy and
   suppressed-migration count so a degraded run marks itself.
 
+- `benches/simc_cooperative.rs` registers every size twice, in opposite
+  arm order. Criterion measures arms sequentially, so a load arriving
+  partway through a group moves the arms it covers and not the others,
+  and a confidence interval does not catch it: an interval describes
+  spread within an arm, so two arms can hold tight disjoint intervals
+  and still be separated by the machine.
+
+  That is not hypothetical for this sweep. Its founding figures and a
+  re-run at the same commit disagree by 53 percent at N=16 and by a
+  factor of five at N=8, and the re-run's rayon numbers are incoherent
+  on their own terms - 73 us at N=8 against 21.5 us at N=16, slower
+  with less work. The original argument that rayon beat
+  `cooperative_join_n_flat` by 16 percent rested on non-overlapping
+  intervals, which is the evidence this defeats, so those numbers are
+  withdrawn rather than re-argued.
+
+  A ratio surviving both orders is the code; one present in one order
+  and absent or reversed in the other is the host, and the group is
+  unreadable rather than noisy. The four shapes are now an enum behind
+  one dispatch function, so both orders run identical code and differ
+  only in registration sequence. The sweep doubles to roughly six and a
+  half minutes, which buys telling a contaminated run from a clean one
+  without a second quiet window to compare against.
+
 - The GPU test binaries take one cross-process lock on the device.
   Each file declared its own `static Mutex`, which serializes the tests
   inside that binary and nothing else, and cargo runs the binaries
