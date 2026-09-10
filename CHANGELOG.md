@@ -50,11 +50,21 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   clamped. A platform with no thread clock reports full occupancy, so it
   behaves as it did rather than reading every interval as idle.
 
-  What it measures is the thread that opened the window, which for a
-  dispatch is the caller across its own join wait - so a well-spread
-  dispatch reads low because the caller is waiting, not because the
-  machine is busy. Measuring the pool instead is the next step and is
-  why nothing consumes the figure yet.
+  What a dispatch reports is its POOL's: each worker contributes its own
+  on-core and elapsed counts for the leaves it ran, summed per call
+  site, and a dispatch takes the difference across itself. Measuring the
+  calling thread instead gave the opposite of the intended reading,
+  because a dispatch is exactly the interval in which the caller stops
+  working and waits for its leaves - the better the spread, the longer
+  the wait and the lower the figure. On an idle host the regimes ordered
+  backwards from load: the floor-bound one that barely parallelizes read
+  100 percent, the one that spreads furthest read 60.
+
+  The counts ride the existing leaf buffer, read once when a site's
+  batch opens and once when it flushes, so they cost two clock reads per
+  batch of up to four leaves rather than two per leaf. A dispatch whose
+  leaves never reached that path reports nothing rather than zero, which
+  would read as total contention instead of as no reading.
 
 - `sched::calibration_store` persists measured dispatch costs and device
   capabilities per host in a memory-mapped file, behind the new

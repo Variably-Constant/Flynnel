@@ -212,32 +212,27 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(40));
         let s = w.sample();
         if thread_cpu_ns() == 0 {
-            // No thread clock: the gate is inert and reports full
+            // No thread clock: the figure is inert and reports full
             // occupancy, so there is nothing to assert about sleeping.
             assert_eq!(s.percent(), 100);
             return;
         }
         assert!(
-            s.percent() < TRUSTWORTHY_OCCUPANCY_PCT,
+            s.percent() < 50,
             "a sleeping thread used almost no core, yet read {}%",
             s.percent()
-        );
-        assert!(
-            !s.is_trustworthy(),
-            "a measurement taken while off-core must not be trusted"
         );
     }
 
     #[test]
-    fn a_zero_length_window_is_trustworthy_rather_than_undefined() {
-        let s = OccupancySample { thread_ns: 0, wall_ns: 0 };
+    fn a_zero_length_window_reads_full_rather_than_undefined() {
+        let s = OccupancySample { thread_ticks: 0, wall_ticks: 0 };
         assert_eq!(s.percent(), 100, "no interval divides by no interval");
-        assert!(s.is_trustworthy());
     }
 
     #[test]
     fn occupancy_saturates_rather_than_exceeding_the_interval() {
-        let s = OccupancySample { thread_ns: 2_000, wall_ns: 1_000 };
+        let s = OccupancySample { thread_ticks: 2_000, wall_ticks: 1_000 };
         assert_eq!(
             s.percent(),
             100,
