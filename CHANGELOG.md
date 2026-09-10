@@ -47,6 +47,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   Below one slot's worth nothing changed, so narrow fan-outs take the
   same path as before.
 
+  The widths that do change are measured, because deferring the first
+  broadcast had been measured at 3.7x on N = 8 and the early wake had
+  to be shown not to undo it. Both trees at N = 8, 12, 16, 24 and 32,
+  four passes alternating which tree ran first, every width in both
+  registration orders, on a 24-worker Zen 4 under a measurement lease:
+  no width moves further than the spread of one binary against itself,
+  and the direction reverses with registration order at three of the
+  five. The deque arm reads up to 7.7 percent faster on the fixed tree,
+  and the mailbox arm - which this change cannot reach, and which is
+  measured back to back with it in the same group - reads up to 7.1
+  percent faster beside it, so that figure is the host rather than the
+  change.
+
 ### Scheduler
 
 - The cooperative fan-out's mailbox gate moves from the worker count to
