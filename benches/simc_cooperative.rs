@@ -40,6 +40,21 @@
 //!   internal fan_out_external path wraps in a parent StackJob
 //!   submitted onto the global arena so the inner fan_out_in_worker
 //!   call runs on a Flynnel worker thread (per current_worker_ctx).
+//!
+//! ## Every size is registered twice, in opposite arm order
+//!
+//! Criterion measures arms sequentially, so a load that arrives or
+//! departs partway through a group shifts the means of the arms it
+//! covers and not the others. Confidence intervals do not defend
+//! against this: they describe spread within an arm, so two arms can
+//! have tight disjoint intervals and still be separated by the machine
+//! rather than by the code.
+//!
+//! A ratio that holds in both orders is the code. One that appears in
+//! one order and is absent or reversed in the other is the host, and
+//! the group is unreadable rather than merely noisy. This is what lets
+//! the sweep be read on a shared host, which is the only kind
+//! available here.
 
 #![allow(clippy::missing_docs_in_private_items)]
 
@@ -68,85 +83,67 @@ fn fixed_cost_work(seed: u64) -> u64 {
     x
 }
 
-/// Run the 4-way A/B at a specific N (closure count).
+/// One fan-out shape.
 ///
-/// Which path the mailbox arm takes depends on the gate inside
-/// [`cooperative_join_n_flat_mailbox`], which compares N against the
-/// worker count. At or above it each closure is pushed to one
-/// worker's mailbox; below it the fan-out demotes to the shared
-/// deque, so both flynnel shape arms run the same code there.
-fn bench_n(c: &mut Criterion, n_closures: usize) {
-    let mut group = c.benchmark_group(format!("simc_cooperative_n{n_closures}"));
-    group.warm_up_time(Duration::from_secs(2));
-    group.measurement_time(Duration::from_secs(5));
+/// `Deque` pushes N-1 closures onto the calling worker's local deque
+/// and lets random-victim peer-steal distribute them. `Mailbox` pushes
+/// each closure to one worker's mailbox, behind a gate comparing N
+/// against the worker count: below it the fan-out demotes to the
+/// shared deque, so `Deque` and `Mailbox` run the same code there.
+/// `Routed` is the entry point a caller uses, whose `Auto` arm picks
+/// between the tree and mailbox variants. `Rayon` is the closest
+/// equivalent outside the crate.
+#[derive(Copy, Clone)]
+enum Arm {
+    Deque,
+    Mailbox,
+    Routed,
+    Rayon,
+}
 
-    let plan = JobPlan::new(2, 1);
+impl Arm {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Deque => "flynnel_baseline_deque",
+            Self::Mailbox => "flynnel_mailbox",
+            Self::Routed => "flynnel_routed",
+            Self::Rayon => "rayon_scope_spawn",
+        }
+    }
+}
 
-    // ---- flynnel cooperative_join_n_flat (BASELINE: deque) ----
-    // Existing behavior: N-1 closures pushed onto the calling
-    // worker's local deque (Public tier). Peer-steal via random
-    // victim selection distributes them across workers.
-    group.bench_function("flynnel_baseline_deque", |b| {
-        b.iter(|| {
-            let closures: Vec<Box<dyn FnOnce() -> u64 + Send>> = (0..n_closures)
-                .map(|i| {
-                    let b: Box<dyn FnOnce() -> u64 + Send> =
-                        Box::new(move || fixed_cost_work(i as u64));
-                    b
-                })
-                .collect();
-            let results = cooperative_join_n_flat::<u64>(&plan, closures);
-            black_box(results);
-        });
-    });
+/// Build the closure set one iteration fans out.
+///
+/// Rebuilt per iteration because each variant consumes it, so the
+/// allocation is inside every arm's timed region and not only some.
+fn closures(n: usize) -> Vec<Box<dyn FnOnce() -> u64 + Send>> {
+    (0..n)
+        .map(|i| {
+            let b: Box<dyn FnOnce() -> u64 + Send> = Box::new(move || fixed_cost_work(i as u64));
+            b
+        })
+        .collect()
+}
 
-    // ---- flynnel cooperative_join_n_flat_mailbox ----
-    // SIMC owner-directed distribution behind the architectural gate.
-    // The gate demotes to deque mode below the worker count, where a
-    // fan-out narrower than the pool would leave the parent and every
-    // untargeted worker idle for the wait: peer-steal reads deques,
-    // so it cannot reach a closure sitting in someone's mailbox.
-    group.bench_function("flynnel_mailbox", |b| {
-        b.iter(|| {
-            let closures: Vec<Box<dyn FnOnce() -> u64 + Send>> = (0..n_closures)
-                .map(|i| {
-                    let b: Box<dyn FnOnce() -> u64 + Send> =
-                        Box::new(move || fixed_cost_work(i as u64));
-                    b
-                })
-                .collect();
-            let results = cooperative_join_n_flat_mailbox::<u64>(&plan, closures);
-            black_box(results);
-        });
-    });
-
-    // ---- flynnel cooperative_join_n, the shape the routing picks ----
-    // The entry point a caller uses. Its Auto arm routes below
-    // `total_workers` to the tree variant and at or above it to the
-    // mailbox variant, which then applies its own gate. On a 24-worker
-    // host N=8 and N=16 reach the tree variant, which neither of the
-    // arms above measures.
-    group.bench_function("flynnel_routed", |b| {
-        b.iter(|| {
-            let closures: Vec<Box<dyn FnOnce() -> u64 + Send>> = (0..n_closures)
-                .map(|i| {
-                    let b: Box<dyn FnOnce() -> u64 + Send> =
-                        Box::new(move || fixed_cost_work(i as u64));
-                    b
-                })
-                .collect();
-            let results = cooperative_join_n::<u64>(&plan, closures);
-            black_box(results);
-        });
-    });
-
-    // ---- rayon scope::spawn equivalent ----
-    group.bench_function("rayon_scope_spawn", |b| {
-        b.iter(|| {
-            let results: std::sync::Mutex<Vec<u64>> =
-                std::sync::Mutex::new(vec![0u64; n_closures]);
+/// Fan out `n` closures through one shape and materialize the results.
+///
+/// Every arm produces a `Vec<u64>` in caller order, so the timed region
+/// covers the result-gather phase equally.
+fn run_arm(arm: Arm, plan: &JobPlan, n: usize) {
+    match arm {
+        Arm::Deque => {
+            black_box(cooperative_join_n_flat::<u64>(plan, closures(n)));
+        }
+        Arm::Mailbox => {
+            black_box(cooperative_join_n_flat_mailbox::<u64>(plan, closures(n)));
+        }
+        Arm::Routed => {
+            black_box(cooperative_join_n::<u64>(plan, closures(n)));
+        }
+        Arm::Rayon => {
+            let results: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(vec![0u64; n]);
             rayon::scope(|s| {
-                for i in 0..n_closures {
+                for i in 0..n {
                     let results_ref = &results;
                     s.spawn(move |_| {
                         let r = fixed_cost_work(i as u64);
@@ -155,10 +152,33 @@ fn bench_n(c: &mut Criterion, n_closures: usize) {
                 }
             });
             black_box(results.into_inner().unwrap());
+        }
+    }
+}
+
+/// Register one group's arms at `n_closures`, in the order given.
+fn register(c: &mut Criterion, group_name: String, n_closures: usize, arms: &[Arm]) {
+    let mut group = c.benchmark_group(group_name);
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(5));
+
+    let plan = JobPlan::new(2, 1);
+
+    for arm in arms {
+        group.bench_function(arm.name(), |b| {
+            b.iter(|| run_arm(*arm, &plan, n_closures));
         });
-    });
+    }
 
     group.finish();
+}
+
+/// Run the 4-way A/B at a specific N, forward and reversed.
+fn bench_n(c: &mut Criterion, n_closures: usize) {
+    const FWD: [Arm; 4] = [Arm::Deque, Arm::Mailbox, Arm::Routed, Arm::Rayon];
+    const REV: [Arm; 4] = [Arm::Rayon, Arm::Routed, Arm::Mailbox, Arm::Deque];
+    register(c, format!("simc_cooperative_n{n_closures}"), n_closures, &FWD);
+    register(c, format!("simc_cooperative_n{n_closures}_rev"), n_closures, &REV);
 }
 
 fn bench_simc_cooperative(c: &mut Criterion) {
