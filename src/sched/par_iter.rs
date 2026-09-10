@@ -323,26 +323,19 @@ const LEAF_SAMPLE_STRIDE: u32 = 8;
 /// chunk-size target more closely.
 const TARGET_LEAF_WORK_NS: u64 = 1_000_000;
 
-/// Seeded from `FLYNNEL_SEED_HYSTERESIS` on first use, then settable.
+/// On unless `FLYNNEL_SEED_HYSTERESIS=0` turns it off, then settable.
 static SEED_HYSTERESIS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-/// Seeded from `FLYNNEL_ESTIMATE_EWMA` on first use, then settable.
-static ESTIMATE_SMOOTHING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-/// Reads both environment variables once, before either is answered.
+    std::sync::atomic::AtomicBool::new(true);
+/// Reads the environment once, before the setting is answered.
 static STABILISERS_FROM_ENV: std::sync::Once = std::sync::Once::new();
 
 fn stabilisers_from_env() {
     STABILISERS_FROM_ENV.call_once(|| {
-        use std::sync::atomic::Ordering;
-        SEED_HYSTERESIS.store(
-            std::env::var_os("FLYNNEL_SEED_HYSTERESIS").is_some(),
-            Ordering::Relaxed,
+        let off = matches!(
+            std::env::var_os("FLYNNEL_SEED_HYSTERESIS").as_deref(),
+            Some(v) if v == "0"
         );
-        ESTIMATE_SMOOTHING.store(
-            std::env::var_os("FLYNNEL_ESTIMATE_EWMA").is_some(),
-            Ordering::Relaxed,
-        );
+        SEED_HYSTERESIS.store(!off, std::sync::atomic::Ordering::Relaxed);
     });
 }
 
@@ -353,16 +346,9 @@ fn seed_hysteresis_enabled() -> bool {
     SEED_HYSTERESIS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether a caller's per-item estimate is smoothed against its call
-/// site's history before it reaches a bucketed decision.
-fn estimate_smoothing_enabled() -> bool {
-    stabilisers_from_env();
-    ESTIMATE_SMOOTHING.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Turn seed-depth hysteresis on or off, returning what it was.
 ///
-/// Settable rather than read once so a bench can put every arm in one
+/// Settable rather than read once so a bench can put both arms in one
 /// process and measure them back to back. Arms compared across
 /// processes carry whatever else differed between those processes,
 /// which for a decision driven by a measured estimate is the thing
@@ -370,12 +356,6 @@ fn estimate_smoothing_enabled() -> bool {
 pub fn set_seed_hysteresis(on: bool) -> bool {
     stabilisers_from_env();
     SEED_HYSTERESIS.swap(on, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Turn estimate smoothing on or off, returning what it was.
-pub fn set_estimate_smoothing(on: bool) -> bool {
-    stabilisers_from_env();
-    ESTIMATE_SMOOTHING.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Compute the eager seed-split depth for bisect_lazy_steal_driven.
@@ -410,14 +390,7 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
     let workers = workers.max(1);
     let items = items.max(1);
     let workers_log2 = (workers as u64).next_power_of_two().trailing_zeros() as usize;
-    // The estimate the boundary is compared against: the caller's as
-    // given, or this site's smoothed history of it.
-    let estimate_ns = match (plan.estimated_per_item_ns, plan.site) {
-        (Some(ns), Some(site)) if ns > 0 && estimate_smoothing_enabled() => {
-            Some(site.get().smooth_estimate_ns(ns))
-        }
-        (other, _) => other,
-    };
+    let estimate_ns = plan.estimated_per_item_ns;
     let target_leaf_count = match estimate_ns {
         Some(ns) if ns > 0 => {
             let total_work_ns = (ns as u64).saturating_mul(items as u64);

@@ -79,24 +79,21 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use flynnel::JobPlan;
 use flynnel::sched::call_site::{CallSiteState, SiteRef};
-use flynnel::sched::par_iter::{for_each_chunk, set_estimate_smoothing, set_seed_hysteresis};
+use flynnel::sched::par_iter::{for_each_chunk, set_seed_hysteresis};
 
 /// One site per arm per ordering, so nothing a site learns crosses
 /// between them.
 static SITES: [CallSiteState; 16] = [const { CallSiteState::new() }; 16];
 
-/// Which stabilisers an arm runs with.
+/// Whether an arm runs with seed-depth hysteresis.
 #[derive(Copy, Clone)]
 struct Arm {
     name: &'static str,
     hysteresis: bool,
-    smoothing: bool,
 }
 
-const NEITHER: Arm = Arm { name: "neither", hysteresis: false, smoothing: false };
-const HYSTERESIS: Arm = Arm { name: "hysteresis", hysteresis: true, smoothing: false };
-const SMOOTHING: Arm = Arm { name: "smoothing", hysteresis: false, smoothing: true };
-const BOTH: Arm = Arm { name: "both", hysteresis: true, smoothing: true };
+const OFF: Arm = Arm { name: "off", hysteresis: false };
+const ON: Arm = Arm { name: "on", hysteresis: true };
 
 /// Per-item work: a dependent chain, so the cost is the chain rather
 /// than anything the optimizer can vectorize away.
@@ -150,7 +147,6 @@ fn register(
         let site = SiteRef::new(state);
         group.bench_function(arm.name, |b| {
             set_seed_hysteresis(arm.hysteresis);
-            set_estimate_smoothing(arm.smoothing);
             b.iter(|| {
                 dispatch(site, &mut buf, estimates.0);
                 dispatch(site, &mut buf, estimates.1);
@@ -167,10 +163,9 @@ fn register(
         );
     }
 
-    // Leave the process as found, so a later group is not measured
-    // under whatever the last arm set.
-    set_seed_hysteresis(false);
-    set_estimate_smoothing(false);
+    // Leave the process at the shipped default, so a later group is not
+    // measured under whatever the last arm set.
+    set_seed_hysteresis(true);
     group.finish();
 }
 
@@ -178,29 +173,23 @@ fn register(
 /// 800 and 1200 straddle it. Their ratio is 1.5, inside the 1.71 one
 /// operation actually showed across runs.
 fn bench_straddle(c: &mut Criterion) {
-    let fwd = [NEITHER, HYSTERESIS, SMOOTHING, BOTH];
-    let rev = [BOTH, SMOOTHING, HYSTERESIS, NEITHER];
-    register(c, "straddle", 32_768, (800, 1_200), &fwd, 0);
-    register(c, "straddle_rev", 32_768, (800, 1_200), &rev, 4);
+    register(c, "straddle", 32_768, (800, 1_200), &[OFF, ON], 0);
+    register(c, "straddle_rev", 32_768, (800, 1_200), &[ON, OFF], 4);
 }
 
-/// The same dispatches with the estimate held still, where neither
-/// mechanism has anything to do.
+/// The same dispatches with the estimate held still, where the
+/// mechanism has nothing to do.
 fn bench_stable(c: &mut Criterion) {
-    let fwd = [NEITHER, BOTH];
-    let rev = [BOTH, NEITHER];
-    register(c, "stable", 32_768, (800, 800), &fwd, 8);
-    register(c, "stable_rev", 32_768, (800, 800), &rev, 10);
+    register(c, "stable", 32_768, (800, 800), &[OFF, ON], 8);
+    register(c, "stable_rev", 32_768, (800, 800), &[ON, OFF], 10);
 }
 
 /// 4096 items at 100 ns gives a target of 0.41, which the worker floor
 /// lifts to the worker count: the estimate reaches the decision not at
 /// all. A cost that appears only when the floor binds shows here.
 fn bench_pinned(c: &mut Criterion) {
-    let fwd = [NEITHER, BOTH];
-    let rev = [BOTH, NEITHER];
-    register(c, "pinned", 4_096, (100, 100), &fwd, 12);
-    register(c, "pinned_rev", 4_096, (100, 100), &rev, 14);
+    register(c, "pinned", 4_096, (100, 100), &[OFF, ON], 12);
+    register(c, "pinned_rev", 4_096, (100, 100), &[ON, OFF], 14);
 }
 
 criterion_group!(benches, bench_straddle, bench_stable, bench_pinned);

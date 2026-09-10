@@ -135,12 +135,37 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   band is empty here and the change is a no-op on it; whether mailbox
   beats tree in that band is unmeasured on any host.
 
-- `set_seed_hysteresis` and `set_estimate_smoothing` switch the two
-  seed-depth stabilizers at run time rather than once per process, so
-  every arm of a comparison fits in one process. Arms measured across
-  separate processes cannot be told apart from whatever else differed
-  between those processes, which on a shared host is most of what
-  matters.
+- Seed-depth hysteresis is on. A change of seeded leaf count now needs
+  two consecutive dispatches asking for it, so one estimate landing the
+  far side of a power-of-two boundary cannot halve or double the fan-out
+  by itself. `FLYNNEL_SEED_HYSTERESIS=0` turns it off, and
+  `set_seed_hysteresis` switches it at run time so both arms of a
+  comparison fit in one process; arms measured across separate processes
+  carry whatever else differed between them.
+
+  Measured against the defect rather than only against the clock. Over
+  one bench group of 32768 items whose estimate alternates across a
+  boundary every dispatch, the number of dispatches seeding a different
+  leaf count from the one before them:
+
+  | | flips | cost |
+  |---|---|---|
+  | off | 15013 | - |
+  | on | 0 | ~2.3% |
+
+  Zero in both registration orders. The cost appears only in that
+  straddling group; with the estimate held still, and with it so far
+  under the worker floor that it reaches the decision not at all, the
+  arm with hysteresis measured slightly faster than the arm without.
+  So it is charged to callers who are crossing a boundary and to nobody
+  else.
+
+  An estimate-smoothing arm was measured beside it and is not shipped.
+  It was free, and it removed 8 percent of the flips in one order and
+  none in the other - not distinguishable from no effect. Reading cost
+  alone would have kept it and dropped hysteresis, since one was free
+  and the other was not; the flip count is what separates a mechanism
+  that works from one that only looks affordable.
 
 - `cooperative_join_n_flat_mailbox` picks its mode and its mailbox
   targets from the worker count. Both read `ctx.stealers.len()`, which

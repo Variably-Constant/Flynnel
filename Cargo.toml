@@ -180,6 +180,9 @@ shared-memory-worker-reference = ["dep:memmap2"]
 name = "trace_dispatch"
 
 [[example]]
+name = "trace_mailbox_hang"
+
+[[example]]
 name = "adaptive_dispatcher_demo"
 
 [[example]]

@@ -215,8 +215,6 @@ pub struct CallSiteState {
     active_depth: AtomicU32,
     pending_depth: AtomicU32,
     depth_run: AtomicU32,
-    /// Per-item estimate smoothed across this site's calls.
-    estimate_ewma_ns: AtomicU64,
     /// What fraction of its interval the most recent dispatch at this
     /// site actually spent on a core, in hundredths. Starts at 100, so
     /// a site nothing has reported for classifies as it always did.
@@ -284,7 +282,6 @@ impl CallSiteState {
             active_depth: AtomicU32::new(DEPTH_UNSET),
             pending_depth: AtomicU32::new(DEPTH_UNSET),
             depth_run: AtomicU32::new(0),
-            estimate_ewma_ns: AtomicU64::new(0),
             recent_occupancy_pct: AtomicU32::new(100),
             last_seed_depth: AtomicU32::new(DEPTH_UNSET),
             seed_depth_flips: AtomicU32::new(0),
@@ -380,24 +377,6 @@ impl CallSiteState {
             return observed;
         }
         active as usize
-    }
-
-    /// The per-item estimate smoothed across this site's calls.
-    ///
-    /// The first estimate seeds the average and is returned as it
-    /// stands. Later ones move it at the rate the policy-arm timings
-    /// use, so a reading well off this site's own history moves the
-    /// decisions it drives by a fraction of the distance rather than
-    /// all of it.
-    pub fn smooth_estimate_ns(&self, observed: u32) -> u32 {
-        if observed == 0 {
-            return observed;
-        }
-        ewma_update(&self.estimate_ewma_ns, observed as u64);
-        match ewma_value(&self.estimate_ewma_ns) {
-            0 => observed,
-            v => v.min(u32::MAX as u64) as u32,
-        }
     }
 
     /// The seed depth in force, or `None` before this site's first
@@ -1085,27 +1064,6 @@ mod tests {
             "and it broke the run, so 6 needs two agreeing calls again"
         );
         assert_eq!(S.stabilise_seed_depth(6), 6);
-    }
-
-    #[test]
-    fn a_smoothed_estimate_moves_part_of_the_way() {
-        static S: CallSiteState = CallSiteState::new();
-        assert_eq!(
-            S.smooth_estimate_ns(240),
-            240,
-            "the first estimate seeds the average and stands as given"
-        );
-        let jumped = S.smooth_estimate_ns(400);
-        assert!(
-            jumped > 240 && jumped < 400,
-            "a reading well off this site's history moves the average part of \
-             the way rather than all of it, got {jumped}"
-        );
-        assert_eq!(
-            S.smooth_estimate_ns(0),
-            0,
-            "an absent estimate is passed through rather than folded in"
-        );
     }
 
     #[test]
