@@ -382,29 +382,29 @@ pub fn set_estimate_smoothing(on: bool) -> bool {
 /// Returns the number of initial split levels before lazy mode
 /// (steal-pressure-driven) kicks in.
 ///
-/// Two-rule trade-off:
-/// - Light items (per_item < TARGET_LEAF_WORK_NS / 16):
-///   log2(workers) levels. Targets workers initial leaves
-///   (one per core) and minimizes dispatch overhead. Matches
-///   rayon's LengthSplitter::default_count() behavior.
-/// - Heavy items (per_item >> TARGET_LEAF_WORK_NS / items.len()):
-///   log2(items) levels. Targets one leaf per item for fine-grained
-///   load balancing -- a slow worker only blocks one item's worth
-///   of work before its remaining items can be stolen.
+/// `leaf_count = max(workers, items * per_item / TARGET_LEAF_WORK_NS)`,
+/// capped at `items`; `seed_depth = ceil(log2(leaf_count))`, never
+/// below `log2(workers)`.
 ///
-/// Formula: leaf_count = max(workers, items * per_item / TARGET_LEAF_WORK_NS),
-/// capped at items.len(); seed_depth = ceil(log2(leaf_count)).
+/// The light and heavy regimes are the two ends of that one
+/// expression, not separate branches. Light items leave
+/// `items * per_item` under the target, so the worker floor supplies
+/// the whole count and the depth is `log2(workers)`: one leaf per core,
+/// fewest dispatches. Heavy items drive the quotient past `items`,
+/// where the cap binds and the depth is `log2(items)`: one leaf per
+/// item, so a slow worker holds up one item's work before the rest can
+/// be stolen.
+///
+/// The division is integer, so a quotient below one contributes
+/// nothing and the floor decides alone.
 ///
 /// Example workloads (workers=16):
-///   100us * 32 items: leaf_count = max(16, 32*100us/1ms) = max(16, 3.2) = 16
-///                     -> 5 levels eager -> 16 initial leaves (good for light)
-///   10ms * 128 items: leaf_count = max(16, 128*10ms/1ms) = max(16, 1280) = 128
-///                     (capped at items.len()=128) -> 7 levels eager
-///                     -> 128 initial leaves (good for heavy load-balance)
+///   100us * 32 items: max(16, 3) = 16 -> 4 levels -> 16 leaves
+///   10ms * 128 items: max(16, 1280) = 1280, capped at 128
+///                     -> 7 levels -> 128 leaves
 ///
-/// Without a per-item hint, fall back to log2(workers) (the
-/// conservative fewest-leaves choice; lazy-steal mode kicks in
-/// after to subdivide on demand).
+/// Without a per-item hint the count is `workers`, the fewest-leaves
+/// choice; lazy-steal mode subdivides on demand after.
 #[inline]
 fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
     let workers = workers.max(1);
