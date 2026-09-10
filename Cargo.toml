@@ -345,6 +345,10 @@ name = "seed_depth_stability"
 harness = false
 
 [[bench]]
+name = "seed_depth_smoothness"
+harness = false
+
+[[bench]]
 name = "simc_n12_bisect"
 harness = false
 
