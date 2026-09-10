@@ -422,25 +422,27 @@ where
         FanOutMode::Mailbox if n < n_workers => FanOutMode::Deque,
         other => other,
     };
-    // Wake-protocol selection per mode (the bench-audit found
-    // these two modes need OPPOSITE wake protocols):
+    // Wake protocol per mode. Both end in exactly one broadcast and
+    // they differ in which call issues it.
     //
-    // - Deque mode: keep the per-push wake. The first push hits
-    //   own deque empty -> non-empty (one broadcast); subsequent
-    //   pushes hit a non-empty deque (no broadcast). Workers wake
-    //   IMMEDIATELY when the first item lands and start probing
-    //   the parent's deque via peer-steal while the parent is
-    //   still pushing - pipeline parallelism. Measured 3.7x
-    //   regression on N=8 when we tried to defer this broadcast.
+    // - Deque mode: no scope. `push_burst` never wakes - it buffers
+    //   into the owner accumulator and counts - so `ctx.flush_all()`
+    //   below issues the one broadcast, covering every burst push
+    //   since the last flush. A deque fan-out's entire wake is that
+    //   call, and it is guarded by `DISPATCH_USE_JEC_WAKE`.
     //
-    // - Mailbox mode: disable per-push wake; issue ONE batched
-    //   broadcast at the end. Each push targets a DIFFERENT
-    //   mailbox, so each push would otherwise fire its own
-    //   empty -> non-empty broadcast (n-1 broadcasts, each
-    //   cascading through every worker's parker - waste, since
-    //   only the targeted worker can pop that specific mailbox).
-    //   The batched single broadcast wakes everyone once after
-    //   all targets are loaded. Measured 1.5x -> ~1.0x at N=16.
+    // - Mailbox mode: the scope holds `DISPATCH_USE_JEC_WAKE` false
+    //   across the pushes and the flush, so `push_to_mailbox` stays
+    //   silent and `flush_all` does not broadcast either; the one
+    //   broadcast is issued explicitly after the scope drops. Each
+    //   push targets a different mailbox and only the targeted worker
+    //   can pop it, so per-push wakes would be n-1 broadcasts each
+    //   cascading through every parker. Measured 1.5x -> ~1.0x at
+    //   N=16.
+    //
+    // The scope covers the flush and not the wait loop: it drops
+    // before the loop at the bottom so a job executed there pushes
+    // under the restored flag.
     let _wake_scope = match effective_mode {
         FanOutMode::Mailbox => {
             // Use new_if_change so we skip the TLS write+drop when
@@ -497,20 +499,21 @@ where
             }
         }
     }
-    // Deque-mode publishes accumulated bursts via flush_all so
-    // thieves see them as 3-per-slot batches. Mailbox-mode also
-    // calls flush_all so any self-push bursts (target == ctx.index
-    // case) become visible; mailbox pushes themselves are direct.
+    // Publishes accumulated bursts so thieves see them as 3-per-slot
+    // batches, and in Deque mode issues the fan-out's only wake.
+    // Mailbox mode reaches here inside the scope, so this publishes its
+    // self-push bursts (the target == ctx.index case) without waking;
+    // its mailbox pushes are direct and need no flush.
     ctx.flush_all();
     crate::sched::trace::emit(crate::sched::trace::TraceEvent::JoinPush, n as u32);
     // Drop the wake_scope (if any) so DISPATCH_USE_JEC_WAKE
     // returns to true for subsequent in-wait-loop pushes.
     let needs_batched_broadcast = _wake_scope.is_some();
     drop(_wake_scope);
-    // Mailbox-mode only: issue ONE batched broadcast covering all
-    // n_to_push items that were pushed silently. Deque mode skips
-    // this because its first push already broadcast immediately
-    // via the per-push wake path.
+    // Mailbox mode only: the one broadcast, covering every item pushed
+    // silently under the scope. Deque mode has already had its wake
+    // from `flush_all` above, whose broadcast was not suppressed
+    // because that mode holds no scope.
     if needs_batched_broadcast && n_to_push > 0 {
         ctx.sleep.new_internal_jobs(n_to_push as u32, true);
     }
