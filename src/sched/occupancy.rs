@@ -97,7 +97,7 @@ impl OccupancyWindow {
 
 /// This thread's on-core count and an elapsed count in the same unit.
 ///
-/// Windows reports thread time as CYCLES, so the elapsed side is the
+/// Windows reports thread time in cycles, so the elapsed side is the
 /// timestamp counter rather than a nanosecond clock; dividing cycles by
 /// nanoseconds yields achieved clock rate, not a fraction. The two
 /// counters advance for different reasons - the thread counter per

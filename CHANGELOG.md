@@ -319,6 +319,42 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   another's starting condition, and each prints its site's occupancy and
   suppressed-migration count so a degraded run marks itself.
 
+- `benches/seed_depth_smoothness.rs` measures what an input size costs
+  for crossing a fan-out boundary, at sizes close enough together that
+  only the leaf count differs. The leaf count is rounded up to a power
+  of two as the last step, so it is a step function of the input size:
+  two calls whose sizes differ by one percent can seed 32 leaves and 64.
+  Nothing is noisy and nothing flips - a consumer sweeping sizes reads
+  the discontinuity as its own kernel changing behavior.
+
+  It does not hunt for the boundary. The division is integer and the
+  floor is the pool width, so the count is 32 until the quotient reaches
+  33 - items at or above `33e6 / est`, which is 660_000 at 50 ns an item
+  on 24 workers. Six sizes bracket that with the closest pair five
+  thousand apart, and the per-item work is tuned to the same 50 ns the
+  plan is told. On a host of another width the boundary moves and the
+  reported leaf count per size says where it fell.
+
+  What it settles is whether the step clears the within-size spread. A
+  step buried under that spread is a fact about the code with no
+  consequence, which is a result rather than an absence of one.
+
+- `examples/pair_orders.py` pairs each arm's forward reading against its
+  reversed one across a whole log. It compares an arm's movement against
+  its GROUP's median movement rather than against a threshold: the raw
+  cross-order difference is unpaired, carrying whatever the machine did
+  between two readings at opposite ends of a group, while criterion's
+  interval is a within-arm estimate - so testing one against the other
+  rejects arms that merely drifted with everything around them.
+
+  It refuses rather than under-reports. A timing line it cannot
+  attribute ends the run, having once dropped sixteen arms while
+  reporting twenty as though that were all of them; an arm present in
+  only one order is named; an unrecognized time unit is an error rather
+  than a guess; and the per-arm figures are read as key-value pairs
+  rather than by position, so a field added or removed leaves the rest
+  readable instead of reporting the column as absent.
+
 - `benches/simc_cooperative.rs` registers every size twice, in opposite
   arm order. Criterion measures arms sequentially, so a load arriving
   partway through a group moves the arms it covers and not the others,
