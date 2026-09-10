@@ -7,6 +7,45 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ## Unreleased
 
+### Fixed
+
+- A deque-shape cooperative fan-out wider than one worker's ring could
+  hang, with the dispatching worker spinning and every other worker
+  parked. `cooperative_join_n_flat` at N = 1024 on a 24-worker host is
+  where it was caught; any caller reaching the deque shape with more
+  than `ADAPTIVE_SLOT_CAPACITY * 3` closures could reach it.
+
+  The fan-out pushed all N-1 closures onto one worker's tier before
+  waking anybody. Those pushes go through the burst path, which
+  publishes to a ring of 256 slots holding three jobs each, and
+  publishing to a full ring spins until a consumer frees a slot. The
+  only wake sat below the push loop. So past 768 jobs the producer
+  waited for a consumer nobody had woken and could not reach the line
+  that would have woken one.
+
+  ```text
+     N   jobs pushed   ring holds 768
+   512          511    fits
+   768          767    fits, just
+  1024         1023    over by 255
+  ```
+
+  Whether it hung was down to timing: if peers left awake by a previous
+  dispatch happened to drain the ring, the push completed. That is why
+  it presented as an intermittent hang at one width rather than a
+  reproducible failure at a threshold.
+
+  The first slot's worth still bursts and is then published and
+  broadcast, so peers drain while the rest is pushed - the deque path's
+  per-push wake is measured at 3.7x on N=8 and is kept. Past that the
+  push refuses instead of waiting, and the caller runs a refused
+  closure inline. That bound is the one `try_push_tier` already applied
+  to the single-push path after the 65,536-item hang; the burst path
+  had not taken it.
+
+  Below one slot's worth nothing changed, so narrow fan-outs take the
+  same path as before.
+
 ### Scheduler
 
 - The cooperative fan-out's mailbox gate moves from the worker count to
