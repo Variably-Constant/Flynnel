@@ -196,18 +196,21 @@ fn register(
     group.measurement_time(Duration::from_secs(8));
     group.sample_size(20);
 
-    let mut buf: Vec<u64> = (0..shape.items() as u64).collect();
+    let items = shape.items();
+    let mut buf: Vec<u64> = (0..items as u64).collect();
 
     for (i, (arm_name, profile)) in profiles.iter().enumerate() {
         let state = &SITES[site_base + i];
         let site = SiteRef::new(state);
+        // Built once, outside the timed loop. set_profile marks the
+        // profile explicit, which is what pins it: a site's own learning
+        // cannot override a profile the caller supplied. Constructing it
+        // per iteration would put the classifier's work inside the
+        // measurement, where it is not what the arm is comparing.
+        let plan = JobPlan::set_profile(0, items as u32, *profile).with_site(site);
+
         group.bench_function(*arm_name, |b| {
             b.iter(|| {
-                // set_profile marks the profile explicit, which is what
-                // pins it: a site's own learning cannot override a
-                // profile the caller supplied.
-                let plan = JobPlan::set_profile(0, buf.len() as u32, *profile)
-                    .with_site(site);
                 for_each_chunk(&plan, &mut buf, |slice| shape.apply(slice, table));
                 black_box(buf[0]);
             });
