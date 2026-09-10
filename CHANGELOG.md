@@ -331,6 +331,29 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   another's starting condition, and each prints its site's occupancy and
   suppressed-migration count so a degraded run marks itself.
 
+- `FLYNNEL_SEED_DEPTH` prints, per distinct workload shape, the leaf
+  count the cost model asked for beside the power of two it rounded to.
+  The two differ by up to a factor of two and only the second is
+  dispatched, so a caller reading its own fan-out had no way to see
+  which of the two it got. Deduplicated on the pair the result depends
+  on, so a sweep prints once per size rather than once per dispatch.
+
+- `CallSiteState::seed_depth_flips` counts dispatches at a site that
+  seeded a different leaf count from the one before them. Throughput
+  cannot express that: a flip between two adjacent depths costs little
+  either way, so an arm can be fast and unstable or slow and steady and
+  the timings rank them the same. It is what the seed-depth mechanisms
+  were finally measured against, and it reversed which of them shipped.
+
+- `examples/trace_mailbox_hang` runs a mailbox fan-out at a chosen width
+  with the caller's join push and wait recorded and every closure
+  emitting its own index on entry and exit, so a fan-out that does not
+  complete says which closures never ran rather than only that it
+  stopped. A worker that never dumps its buffer never woke, since a
+  parked worker flushes only when woken. It takes a repeat count,
+  because a single call is the one thing a standalone reproduction does
+  that a criterion sweep does not.
+
 - `benches/seed_depth_smoothness.rs` measures what an input size costs
   for crossing a fan-out boundary, at sizes close enough together that
   only the leaf count differs. The leaf count is rounded up to a power
