@@ -135,7 +135,7 @@ See [JobPlan Reference](JobPlan-Reference.md) for the full field list.
 | SISD | `.execute_streaming(op)` | `WorkloadShape::Streaming` | Direct closure call on caller thread |
 | MIMD | `.execute_for_each(items, op)` | `WorkloadShape::WorkSteal { n_consumers, batch_size }` | [`for_each_chunk`](../reference/Sched-Module-Reference.md#for_each_chunk) |
 | SIMC | `.execute_cooperative(closures)` | `WorkloadShape::Cooperative { n_cores }` | [`cooperative_join_n_flat`](../reference/Sched-Module-Reference.md#cooperative_join_n) |
-| SIMC (mailbox) | `.execute_cooperative_mailbox(closures)` | same as SIMC | `cooperative_join_n_flat_mailbox` (URD owner-directed) |
+| SIMC (mailbox) | `.execute_cooperative_mailbox(closures)` | same as SIMC | `cooperative_join_n_flat_mailbox`, which takes owner-directed placement at or above 32 times the worker count and the deque shape below it |
 | MIMC | `.execute_cooperative(closures)` with heterogeneous closures | `WorkloadShape::Cooperative { n_cores }` | Same as SIMC; heterogeneity is intrinsic to the closures |
 | SIMT | `.execute_indexed(count, work)` | `WorkloadShape::WorkSteal { .. }` | [`DispatchBackend::dispatch_parallel_for`](../reference/Backend-System.md) via active backend (CPU / CUDA / TPU / Metal / ROCm) |
 | MIMT single-pair | Direct [`join_hybrid(plan, cpu, gpu)`](../reference/Sched-Module-Reference.md#join_hybrid) call | (dispatcher does not carry a MIMT execute_ method) | `join_hybrid` |
