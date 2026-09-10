@@ -51,14 +51,27 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   broadcast had been measured at 3.7x on N = 8 and the early wake had
   to be shown not to undo it. Both trees at N = 8, 12, 16, 24 and 32,
   four passes alternating which tree ran first, every width in both
-  registration orders, on a 24-worker Zen 4 under a measurement lease:
-  no width moves further than the spread of one binary against itself,
-  and the direction reverses with registration order at three of the
-  five. The deque arm reads up to 7.7 percent faster on the fixed tree,
-  and the mailbox arm - which this change cannot reach, and which is
-  measured back to back with it in the same group - reads up to 7.1
-  percent faster beside it, so that figure is the host rather than the
-  change.
+  registration orders, on a 24-worker Zen 4 under a measurement lease.
+
+  No width regresses. Nine of the ten cells run faster on the fixed
+  tree, by 0.9 to 7.7 percent, and the tenth is 0.9 percent the other
+  way, which is inside the spread of one binary measured against itself
+  across two passes.
+
+  How much of that is the change is not separable on this host, and the
+  reason is worth stating rather than rounding away. Three of the four
+  arms in that sweep reach the same push loop at these widths: the
+  mailbox entry point gates at 32 times the worker count, which is 768
+  here, so below it that arm runs the deque branch too. They agree with
+  each other, which is a second reading rather than a control. The one
+  arm this change cannot reach is the rayon comparison, and across
+  these ten cells it moves between 7 percent faster and 32 percent
+  slower with no pattern, so it bounds nothing. The tree-shape arm is a
+  control at N = 8, 12 and 16, where it moves under half a percent in
+  one registration order and up to 4 percent in the other.
+
+  So the claim this entry makes is the one the measurement supports:
+  the fix does not cost the narrow widths anything.
 
 ### Scheduler
 
