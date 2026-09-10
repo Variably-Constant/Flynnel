@@ -161,6 +161,16 @@ pub struct JobPlan {
     /// nanoseconds drives the answer to one chunk at every size. Such a
     /// cost belongs in the caller's own serial-versus-parallel
     /// decision, alongside `inline_collapse_threshold_ns`.
+    ///
+    /// `None` and `Some(0)` are different answers, and the second is
+    /// not the one a caller usually means. `None` says the cost is
+    /// unknown and lets helpers fall back to the SLAW budget
+    /// heuristic. `Some(0)` says splitting is free, and
+    /// `optimal_chunk_count` answers it literally: with no cost to
+    /// balance against, the minimum runs away to the largest split
+    /// available and it returns the item count, one chunk per item. A
+    /// caller whose per-chunk cost is real but negligible wants `None`
+    /// or the scheduler's own share, never zero.
     pub task_overhead_ns: Option<u32>,
     /// Per-task critical-path span in nanoseconds (Tiny-Tasks model).
     /// The portion of a task that cannot be further parallelized
