@@ -138,13 +138,29 @@ pub struct JobPlan {
     /// enough that the wrong default would cost real wall-clock,
     /// the probe path measures actual per-element cost and overrides.
     pub estimated_per_item_ns_explicit: bool,
-    /// Per-task scheduler overhead in nanoseconds (Tiny-Tasks model
-    /// from Acar 2013): the fixed cost incurred each time a chunk is
-    /// dispatched (deque push, atomic, latch init). Used together
-    /// with `estimated_per_item_ns` to compute the optimal chunk
-    /// count via `optimal_chunk_count`. Typical: ~200-500ns for the
-    /// Flynnel join path with the adaptive splitter. Set
-    /// to `None` to let helpers fall back to the SLAW default.
+    /// Per-task overhead in nanoseconds (Tiny-Tasks model from Acar
+    /// 2013): the cost paid once for every chunk. The scheduler's own
+    /// share is the deque push, the atomic and the latch init, around
+    /// 200-500 ns for the join path with the adaptive splitter. Used
+    /// with `estimated_per_item_ns` to compute the optimal chunk count
+    /// via `optimal_chunk_count`. `None` lets helpers fall back to the
+    /// SLAW default.
+    ///
+    /// A caller whose own per-chunk work is larger than that adds it
+    /// here. `optimal_chunk_count` minimises `W/C + O*C`, so what it
+    /// asks of `O` is that the cost be paid once per chunk, not that
+    /// the scheduler be the one paying it: a merge across a chunk
+    /// boundary or a per-chunk setup pass belongs in this number.
+    ///
+    /// A cost paid once for the whole call does not belong here,
+    /// however large it is. A constant term cannot move the minimum of
+    /// that expression, so including it does not bias the chunk count
+    /// slightly - it inflates `O`, and `C = sqrt(W * P / O)` then comes
+    /// back too small by the square root of however far off it was. A
+    /// whole-input prescan against a per-chunk cost in the hundreds of
+    /// nanoseconds drives the answer to one chunk at every size. Such a
+    /// cost belongs in the caller's own serial-versus-parallel
+    /// decision, alongside `inline_collapse_threshold_ns`.
     pub task_overhead_ns: Option<u32>,
     /// Per-task critical-path span in nanoseconds (Tiny-Tasks model).
     /// The portion of a task that cannot be further parallelized
