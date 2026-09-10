@@ -322,6 +322,12 @@ impl CallSiteState {
     /// The figure the seed-depth stabilizers are measured against: a
     /// mechanism that costs throughput and does not lower this is
     /// paying for nothing.
+    ///
+    /// Counts only dispatches that reach the adaptive seed depth, which
+    /// a plan carrying an explicit `bisect_variant` does not - such a
+    /// dispatch names its own shape and has no depth to flip. So zero
+    /// at a site whose callers all name a variant means the question
+    /// was never asked there, not that the answer was steady.
     pub fn seed_depth_flips(&self) -> u32 {
         self.seed_depth_flips.load(Ordering::Relaxed)
     }
