@@ -323,20 +323,6 @@ const MIN_LEAF_ITEMS: usize = 256;
 /// still compute meaningfully.
 const LEAF_SAMPLE_STRIDE: u32 = 8;
 
-
-/// Compute the adaptive recursion floor for bisects based on the
-/// plan's per-item cost estimate. When the caller supplied an
-/// authoritative hint and each item is heavy enough that 1-item
-/// leaves still amortize dispatch overhead (~5us), return 1 so the
-/// bisect can split all the way down to one item per worker. For
-/// non-authoritative or fine-grain hints, fall back to MIN_LEAF_ITEMS
-/// (256) so chunked fine-grain workloads keep the existing per-leaf
-/// amortization.
-///
-/// `caller_floor` is the caller-supplied minimum (typically
-/// MIN_LEAF_ITEMS or 1). The returned value is `caller_floor.min(...)`
-/// so callers that explicitly pass `min_leaf=1` (heavy-per-item
-/// dispatch sites) always get that floor regardless of plan hints.
 /// Target per-leaf wall-clock work used by [`adaptive_seed_depth`].
 /// Smaller targets produce more leaves (better load balance, more
 /// dispatch overhead). Tuned empirically across VM Zen3 16-thread
@@ -477,6 +463,29 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
     depth
 }
 
+/// The recursion floor for a bisect: the smallest chunk it splits to,
+/// never above `caller_floor`.
+///
+/// Which of three regimes applies turns on whether the plan's per-item
+/// estimate is authoritative, not on how heavy the items are.
+///
+/// Without an authoritative estimate there is no figure to size
+/// against, so `use_smt` stands in for one: it is the static
+/// classifier's signal that items are heavy, and the floor drops to 1
+/// so a batch narrower than `caller_floor` still splits instead of
+/// running serially on the calling worker. Every other hintless plan
+/// takes `caller_floor` unchanged, leaving fine-grain chunked work its
+/// per-leaf amortization.
+///
+/// With an authoritative estimate a leaf carries about one dispatch's
+/// worth of work: `pool_dispatch_cost_ns() / per_item_ns`, floored at
+/// one item. The numerator is measured on the running host and cached,
+/// so this floor is only as steady as that measurement was; it is a
+/// figure this process holds, not a constant of the machine, and the
+/// spread across processes on one host reaches a factor of two.
+///
+/// The result is capped at `caller_floor` in every regime, so a site
+/// passing `min_leaf=1` gets one item per leaf whatever the plan says.
 #[inline]
 fn adaptive_min_leaf(plan: &JobPlan, caller_floor: usize) -> usize {
     if !plan.estimated_per_item_ns_explicit {
@@ -494,8 +503,8 @@ fn adaptive_min_leaf(plan: &JobPlan, caller_floor: usize) -> usize {
         if plan.use_smt {
             return 1;
         }
-        // For hint-less PortBound batches, the for_each_chunk
-        // probe path (lines 540+) already adaptively measures
+        // For hint-less PortBound batches, the probe-and-decide path
+        // in `for_each_chunk_min_leaf` already adaptively measures
         // per-item cost when n < workers*MIN_LEAF and feeds an
         // amended_plan with explicit ns into the bisect. Above
         // that threshold (n >= workers*MIN_LEAF, e.g. 16k items
