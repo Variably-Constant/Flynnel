@@ -525,6 +525,36 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   half minutes, which buys telling a contaminated run from a clean one
   without a second quiet window to compare against.
 
+- `FLYNNEL_BENCH_STALL_REPORT=1` makes every closure in
+  `benches/simc_cooperative.rs` record that it started and that it
+  finished, and arms a watchdog that prints what a dispatch reached
+  once it stops advancing. It is off by default because it puts two
+  atomic stores and one lock acquisition in each closure, which moves
+  the numbers that bench exists to take: a run with it on diagnoses and
+  does not measure.
+
+  It answers a stall with sets rather than an event log - the indices
+  that never started, the ones that started and never finished, and the
+  threads that ran anything. Those are bounded by the fan-out width
+  whatever the iteration count, where an event log is bounded by
+  iterations times width, which at this bench's counts is tens of
+  millions of records across forty-nine threads.
+
+  The three readings are distinct. Indices that never started with
+  workers missing from the thread list is work nothing was woken to
+  take; indices that never started with every worker present is work
+  routed where none of them looks; started-and-unfinished is a closure
+  still running or a thread that died inside one.
+
+  It is what located the deque fan-out hang recorded under Fixed. The
+  stalled dispatch reported all 1024 closures unstarted, every worker
+  present from earlier dispatches and none from this one, and nothing
+  started-and-unfinished. The last closure runs inline on the calling
+  thread before the wait loop, so its never having started placed the
+  hang in the push loop and ruled out the wait loop. The stall rates
+  measured before it could say how often the hang happened but never
+  where it was.
+
 - The GPU test binaries take one cross-process lock on the device.
   Each file declared its own `static Mutex`, which serializes the tests
   inside that binary and nothing else, and cargo runs the binaries
