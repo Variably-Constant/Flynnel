@@ -266,12 +266,12 @@ impl StallWatch {
         let threads = self.threads.lock().expect("stall watch threads");
         let ran: Vec<&String> = threads
             .iter()
-            .filter(|(_, &g)| g == generation)
+            .filter(|&(_, &g)| g == generation)
             .map(|(name, _)| name)
             .collect();
         let idle: Vec<&String> = threads
             .iter()
-            .filter(|(_, &g)| g != generation)
+            .filter(|&(_, &g)| g != generation)
             .map(|(name, _)| name)
             .collect();
 
