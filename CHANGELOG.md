@@ -9,6 +9,57 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Scheduler
 
+- The cooperative fan-out's mailbox gate moves from the worker count to
+  32 times it. Below the gate a fan-out takes the deque shape, which
+  distributes through the parent's own deque and random peer-steal;
+  at or above it, the mailbox shape, which pushes each closure to one
+  worker's mailbox.
+
+  A caller reaching `cooperative_join_n` at a width between the pool
+  count and 32 times it was previously routed to the mailbox shape and
+  is now routed to the deque one. Nothing about either shape changed and
+  both remain callable directly.
+
+  Measured on a 24-worker Zen 4, every width run in both registration
+  orders, comparing the deque fan-out against the routed entry point a
+  caller actually reaches:
+
+  ```text
+     N   xpool    deque   routed   faster
+    24      1     19.65    22.77   deque   by 13.0%
+    64      3     34.01    38.23   deque   by 13.3%
+   256     11    108.16   121.39   deque   by 12.1%
+   512     21    197.77   202.81   deque   by  2.5%
+   640     27    233.15   261.77   deque   by 12.3%
+   768     32    270.85   262.27   routed  by  3.2%
+   896     37    313.77   295.30   routed  by  5.9%
+  1024     43    384.93   322.43   routed  by 19.4%
+  ```
+
+  Microseconds, mean of both orders. The crossing lies between 640 and
+  768. Below the pool count both flynnel shapes run the same code and
+  agree to within 1.5 percent, which is the control the rest rests on.
+
+  The design's argument for owner-directed placement is that it beats
+  random peer-steal once a fan-out is deep enough to be worth directing.
+  That holds, and it holds much later than the pool width: mailbox mode
+  leaves the parent and every untargeted worker idle for the wait,
+  because peer-steal reads deques and cannot reach a closure sitting in
+  a mailbox. Until a fan-out is wide enough that nearly every worker
+  gets a target, that idleness costs more than the directed placement
+  saves.
+
+  The gate is a multiple of the pool rather than a constant, because the
+  crossing is a property of how many workers must be reached before
+  directed placement repays its cost. The multiple is measured on one
+  host and one workload shape; a host whose sync costs differ will put
+  the crossing elsewhere.
+
+  Applied where the fallback is the deque fan-out. The `Auto` arm of
+  `cooperative_join_n` still sends anything at or above the pool count
+  onward, because its own fallback is the tree shape and routing the
+  newly-excluded band there would be slower than either.
+
 - `sched::occupancy` reports what fraction of a measured interval the
   measuring thread was actually on a core. Nothing consumes it: no
   learner refuses a window on it and no dispatch is routed on it, so the
