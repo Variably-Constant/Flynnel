@@ -114,6 +114,23 @@ where
     }
 }
 
+/// How many jobs a deque fan-out buffers before it publishes, wakes,
+/// and switches to the refusing push.
+///
+/// One slot's worth, so the first publication carries a full
+/// cache-line batch rather than a single job.
+///
+/// Everything before this point sits in the owner's accumulator, so a
+/// fan-out that never reaches it is published by the flush below the
+/// push loop exactly as before. Everything after is pushed with a
+/// bounded push whose refusal the caller runs inline, because the ring
+/// holds `ADAPTIVE_SLOT_CAPACITY * 3` jobs and a wider fan-out than
+/// that would otherwise spin in `publish` waiting for a consumer that
+/// this loop has not yet woken - and cannot wake, because the wake is
+/// below it. At 256 slots that bound is 768 jobs, which a 1024-way
+/// fan-out exceeds by 255.
+const DEQUE_FIRST_BURST: usize = 3;
+
 /// How many times the worker count a fan-out must reach before
 /// owner-directed mailbox distribution beats random peer-steal.
 ///
@@ -516,8 +533,26 @@ where
         for (i, sj) in stack_jobs.iter().enumerate() {
             let r = sj.as_job_ref(plan.k_outer, numa_hint_byte, plan.variant);
             match effective_mode {
-                FanOutMode::Deque => {
+                FanOutMode::Deque if i < DEQUE_FIRST_BURST => {
                     ctx.push_burst(r);
+                }
+                FanOutMode::Deque => {
+                    if i == DEQUE_FIRST_BURST {
+                        // Publish and broadcast before the ring can
+                        // fill. Everything above is still buffered in
+                        // the accumulator, so without this the first
+                        // job a peer could see is the one flushed
+                        // after the whole loop.
+                        ctx.flush_all();
+                    }
+                    if let Err(refused) = ctx.try_push(r) {
+                        // The ring is full. Running it here is bounded;
+                        // waiting for a slot is not, because every
+                        // thief may be a producer in the same state and
+                        // the wake that would free one is below this
+                        // loop.
+                        refused.execute();
+                    }
                 }
                 FanOutMode::Mailbox => {
                     // Round-robin starting at (ctx.index + 1) so
@@ -898,6 +933,37 @@ mod tests {
             flat,
             vec![0, 1, 2, 100, 101, 102, 200, 201, 202, 300, 301, 302]
         );
+    }
+
+    #[test]
+    fn a_deque_fan_out_wider_than_the_ring_completes() {
+        // The ring holds ADAPTIVE_SLOT_CAPACITY * 3 jobs per tier per
+        // worker, 768 at 256 slots. A deque fan-out pushes N-1 onto one
+        // worker's tier, and the wake sits below the push loop, so a
+        // width past that once left the producer spinning in `publish`
+        // for a consumer nobody had woken. Observed at 1024: every one
+        // of the 1024 closures unstarted, all 24 workers parked, one
+        // thread at exactly one core.
+        //
+        // 2048 is well past the bound, so the refusing push and the
+        // inline run of what it refuses are both exercised.
+        //
+        // The join runs on its own thread so a failure is a timeout
+        // rather than a hung test binary.
+        let n = 2048usize;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let p = JobPlan::new(8, 1);
+            let closures: Vec<Box<dyn FnOnce() -> u32 + Send>> = (0..n)
+                .map(|i| Box::new(move || i as u32) as _)
+                .collect();
+            tx.send(cooperative_join_n_flat(&p, closures))
+                .expect("the test thread holds the receiver until it times out");
+        });
+        let results = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("a deque fan-out wider than the ring must complete");
+        assert_eq!(results, (0..n as u32).collect::<Vec<_>>());
     }
 
     #[test]
