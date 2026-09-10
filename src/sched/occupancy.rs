@@ -108,26 +108,33 @@ impl OccupancyWindow {
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub fn clock_pair() -> (u64, u64) {
     // SAFETY: `_rdtsc` reads a counter register and touches no memory.
-    (thread_cpu_ns(), unsafe { core::arch::x86_64::_rdtsc() })
+    (thread_on_core_ticks(), unsafe { core::arch::x86_64::_rdtsc() })
 }
 
 #[cfg(not(all(windows, target_arch = "x86_64")))]
 pub fn clock_pair() -> (u64, u64) {
-    let wall = std::time::SystemTime::UNIX_EPOCH
-        .elapsed()
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    (thread_cpu_ns(), wall)
+    // Nanoseconds since a fixed point in this process, from the
+    // monotonic clock. A wall clock is the wrong instrument here twice
+    // over: it can step backwards, which turns a subtraction into a
+    // zero-length interval, and it is the slower read on a path taken
+    // once per batch of leaves.
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let origin = ORIGIN.get_or_init(std::time::Instant::now);
+    (thread_on_core_ticks(), origin.elapsed().as_nanos() as u64)
 }
 
-/// Nanoseconds this thread has spent on a core, or zero where the
-/// platform offers no such clock.
+/// Ticks this thread has spent on a core, or zero where the platform
+/// offers no such clock.
+///
+/// The unit differs by platform - cycles on Windows, nanoseconds on
+/// Linux - so it is only ever divided by the elapsed count
+/// [`clock_pair`] returns beside it, which carries the same unit.
 ///
 /// Zero is the no-clock sentinel and produces full occupancy through
 /// the subtraction in [`OccupancyWindow::sample`], which is the
 /// behavior that leaves an unsupported platform where it was.
 #[cfg(windows)]
-pub fn thread_cpu_ns() -> u64 {
+pub fn thread_on_core_ticks() -> u64 {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentThread() -> isize;
@@ -149,7 +156,7 @@ pub fn thread_cpu_ns() -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-pub fn thread_cpu_ns() -> u64 {
+pub fn thread_on_core_ticks() -> u64 {
     let mut ts = libc_timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: an out parameter this stack frame owns; the clock id is
     // the per-thread CPU clock, defined on every Linux this targets.
@@ -177,7 +184,7 @@ unsafe extern "C" {
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-pub fn thread_cpu_ns() -> u64 {
+pub fn thread_on_core_ticks() -> u64 {
     0
 }
 
@@ -211,7 +218,7 @@ mod tests {
         let w = OccupancyWindow::start();
         std::thread::sleep(std::time::Duration::from_millis(40));
         let s = w.sample();
-        if thread_cpu_ns() == 0 {
+        if thread_on_core_ticks() == 0 {
             // No thread clock: the figure is inert and reports full
             // occupancy, so there is nothing to assert about sleeping.
             assert_eq!(s.percent(), 100);
