@@ -249,8 +249,10 @@ const DEPTH_UNSET: u32 = u32::MAX;
 /// No dispatch at a site has reported its pool's occupancy yet.
 ///
 /// Distinct from every occupancy a dispatch can report, which are
-/// hundredths and so at most 100.
-pub const OCCUPANCY_UNREPORTED: u32 = u32::MAX;
+/// hundredths and so at most 100. Not public: a caller reads
+/// [`CallSiteState::recent_occupancy`], whose `None` says the same
+/// thing without the caller having to know the encoding.
+const OCCUPANCY_UNREPORTED: u32 = u32::MAX;
 
 /// Consecutive calls that must agree on a different seed depth before
 /// it takes effect.
@@ -330,7 +332,7 @@ impl CallSiteState {
     /// Called from the worker that ran them, so the sum is over the
     /// threads that did the work rather than over the thread that
     /// waited for it.
-    pub fn add_pool_ticks(&self, thread_ticks: u64, wall_ticks: u64) {
+    pub(crate) fn add_pool_ticks(&self, thread_ticks: u64, wall_ticks: u64) {
         self.pool_thread_ticks
             .fetch_add(thread_ticks, Ordering::Relaxed);
         self.pool_wall_ticks.fetch_add(wall_ticks, Ordering::Relaxed);
@@ -338,7 +340,7 @@ impl CallSiteState {
 
     /// This site's running pool totals, for a caller taking a
     /// difference across a dispatch.
-    pub fn pool_ticks(&self) -> (u64, u64) {
+    pub(crate) fn pool_ticks(&self) -> (u64, u64) {
         (
             self.pool_thread_ticks.load(Ordering::Relaxed),
             self.pool_wall_ticks.load(Ordering::Relaxed),

@@ -106,13 +106,13 @@ impl OccupancyWindow {
 /// clamped. Linux reports thread time in nanoseconds, so both sides
 /// there are nanoseconds and the pairing is exact.
 #[cfg(all(windows, target_arch = "x86_64"))]
-pub fn clock_pair() -> (u64, u64) {
+pub(crate) fn clock_pair() -> (u64, u64) {
     // SAFETY: `_rdtsc` reads a counter register and touches no memory.
     (thread_on_core_ticks(), unsafe { core::arch::x86_64::_rdtsc() })
 }
 
 #[cfg(not(all(windows, target_arch = "x86_64")))]
-pub fn clock_pair() -> (u64, u64) {
+pub(crate) fn clock_pair() -> (u64, u64) {
     // Nanoseconds since a fixed point in this process, from the
     // monotonic clock. A wall clock is the wrong instrument here twice
     // over: it can step backwards, which turns a subtraction into a
