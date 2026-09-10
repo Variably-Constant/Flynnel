@@ -148,6 +148,12 @@ struct LocalLeafBuffer {
     site_sum_ns: u64,
     site_sumsq_scaled: u64,
     site_count: u64,
+    /// On-core and elapsed counts for this worker, spanning the leaves
+    /// buffered for the current site. Read once when the first sample
+    /// of a batch arrives and once at flush, so the pair costs two
+    /// clock reads per batch rather than two per leaf.
+    site_thread_at_start: u64,
+    site_wall_at_start: u64,
     /// Call site the buffered site-half samples belong to; null
     /// when the recent samples carried no site. Site changes are
     /// rare within one worker (only when it steals across
@@ -175,6 +181,8 @@ impl LocalLeafBuffer {
             site_sum_ns: 0,
             site_sumsq_scaled: 0,
             site_count: 0,
+            site_thread_at_start: 0,
+            site_wall_at_start: 0,
             site: core::ptr::null(),
         }
     }
@@ -196,6 +204,11 @@ impl LocalLeafBuffer {
             if !core::ptr::eq(site_ptr, self.site) {
                 self.flush_site();
                 self.site = site_ptr;
+            }
+            if self.site_count == 0 {
+                let (thread, wall) = crate::sched::occupancy::clock_pair();
+                self.site_thread_at_start = thread;
+                self.site_wall_at_start = wall;
             }
             self.site_sum_ns = self.site_sum_ns.saturating_add(nanos);
             self.site_sumsq_scaled = self.site_sumsq_scaled.saturating_add(sq);
@@ -232,6 +245,11 @@ impl LocalLeafBuffer {
         // the program's lifetime.
         let site: &'static crate::sched::call_site::CallSiteState =
             unsafe { &*self.site };
+        let (thread, wall) = crate::sched::occupancy::clock_pair();
+        site.add_pool_ticks(
+            thread.saturating_sub(self.site_thread_at_start),
+            wall.saturating_sub(self.site_wall_at_start),
+        );
         site.record_batch_site_only(
             self.site_sum_ns,
             self.site_sumsq_scaled,
@@ -836,15 +854,31 @@ fn parse_pinned_profile(text: &str) -> Option<HostDispatchProfile> {
 /// classifier derives from them is a variance, which preemption
 /// inflates by landing on some leaves and not others.
 struct ReportOccupancy {
-    window: crate::sched::occupancy::OccupancyWindow,
+    thread_at_start: u64,
+    wall_at_start: u64,
     site: crate::sched::call_site::SiteRef,
+}
+
+impl ReportOccupancy {
+    fn start(site: crate::sched::call_site::SiteRef) -> Self {
+        let (thread_at_start, wall_at_start) = site.get().pool_ticks();
+        Self { thread_at_start, wall_at_start, site }
+    }
 }
 
 impl Drop for ReportOccupancy {
     fn drop(&mut self) {
-        self.site
-            .get()
-            .record_occupancy(self.window.sample().percent());
+        let (thread, wall) = self.site.get().pool_ticks();
+        let elapsed = wall.saturating_sub(self.wall_at_start);
+        // No leaves reached the buffered path, so this dispatch says
+        // nothing about the pool. Reporting zero would read as total
+        // contention rather than as no reading.
+        if elapsed == 0 {
+            return;
+        }
+        let on_core = thread.saturating_sub(self.thread_at_start);
+        let pct = on_core.saturating_mul(100) / elapsed;
+        self.site.get().record_occupancy(pct.min(100) as u32);
     }
 }
 
@@ -1167,14 +1201,11 @@ where
         .with_site_if_none(crate::sched::call_site::caller_site())
         .apply_site_class();
     let plan = &plan_owned;
+    // Declared before the flush guard so it drops after it: the pool
+    // totals it differences are published by that flush, and a
+    // dispatch's last batch of leaves is in it.
+    let _occupancy = plan.site.map(ReportOccupancy::start);
     let _flush_on_exit = FlushLeafStatsOnExit;
-    // Declared after the flush guard so it drops before it: the
-    // classifier ticks on the flush, and it must read this dispatch's
-    // occupancy rather than the previous one's.
-    let _occupancy = plan.site.map(|site| ReportOccupancy {
-        window: crate::sched::occupancy::OccupancyWindow::start(),
-        site,
-    });
     // Wake path against polling: at small total work the sleep
     // counter's CAS and condvar wake cost more than they save, and
     // workers find pushed work by spinning (`ROUNDS_UNTIL_SLEEPING`

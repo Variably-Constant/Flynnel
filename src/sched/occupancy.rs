@@ -106,13 +106,13 @@ impl OccupancyWindow {
 /// clamped. Linux reports thread time in nanoseconds, so both sides
 /// there are nanoseconds and the pairing is exact.
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn clock_pair() -> (u64, u64) {
+pub fn clock_pair() -> (u64, u64) {
     // SAFETY: `_rdtsc` reads a counter register and touches no memory.
     (thread_cpu_ns(), unsafe { core::arch::x86_64::_rdtsc() })
 }
 
 #[cfg(not(all(windows, target_arch = "x86_64")))]
-fn clock_pair() -> (u64, u64) {
+pub fn clock_pair() -> (u64, u64) {
     let wall = std::time::SystemTime::UNIX_EPOCH
         .elapsed()
         .map(|d| d.as_nanos() as u64)

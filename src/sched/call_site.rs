@@ -217,8 +217,17 @@ pub struct CallSiteState {
     depth_run: AtomicU32,
     /// What fraction of its interval the most recent dispatch at this
     /// site actually spent on a core, in hundredths. Starts at 100, so
-    /// a site nothing has reported for classifies as it always did.
+    /// a site nothing has reported for reads as it always did.
     recent_occupancy_pct: AtomicU32,
+    /// On-core ticks and elapsed ticks summed across every worker that
+    /// has run a leaf for this site, in the same unit.
+    ///
+    /// Monotonic, so a dispatch takes the difference across itself: a
+    /// caller's own window covers its join wait, during which it is
+    /// deliberately not running, and reads low exactly when the work
+    /// spread well. These describe the threads that ran the leaves.
+    pool_thread_ticks: AtomicU64,
+    pool_wall_ticks: AtomicU64,
     /// The seed depth this site last dispatched with, and how many
     /// times a dispatch has used a different one from the dispatch
     /// before it.
@@ -276,6 +285,8 @@ impl CallSiteState {
             pending_depth: AtomicU32::new(DEPTH_UNSET),
             depth_run: AtomicU32::new(0),
             recent_occupancy_pct: AtomicU32::new(100),
+            pool_thread_ticks: AtomicU64::new(0),
+            pool_wall_ticks: AtomicU64::new(0),
             last_seed_depth: AtomicU32::new(DEPTH_UNSET),
             seed_depth_flips: AtomicU32::new(0),
         }
@@ -304,13 +315,33 @@ impl CallSiteState {
         self.seed_depth_flips.load(Ordering::Relaxed)
     }
 
-    /// Report what fraction of its interval the dispatch just finished
-    /// at this site spent on a core.
+    /// Add one worker's on-core and elapsed ticks for leaves it ran at
+    /// this site.
     ///
-    /// The classifier reads this before it migrates a site: leaf times
-    /// gathered while the pool was off its cores describe the machine's
-    /// other tenants, and a uniform workload measured that way looks
-    /// irregular.
+    /// Called from the worker that ran them, so the sum is over the
+    /// threads that did the work rather than over the thread that
+    /// waited for it.
+    pub fn add_pool_ticks(&self, thread_ticks: u64, wall_ticks: u64) {
+        self.pool_thread_ticks
+            .fetch_add(thread_ticks, Ordering::Relaxed);
+        self.pool_wall_ticks.fetch_add(wall_ticks, Ordering::Relaxed);
+    }
+
+    /// This site's running pool totals, for a caller taking a
+    /// difference across a dispatch.
+    pub fn pool_ticks(&self) -> (u64, u64) {
+        (
+            self.pool_thread_ticks.load(Ordering::Relaxed),
+            self.pool_wall_ticks.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Report what fraction of a dispatch's leaf time its workers spent
+    /// on a core.
+    ///
+    /// A dispatch that ran no leaves through the buffered path reports
+    /// nothing, leaving the previous figure rather than overwriting it
+    /// with a zero that would read as total contention.
     pub fn record_occupancy(&self, percent: u32) {
         self.recent_occupancy_pct
             .store(percent.min(100), Ordering::Relaxed);
