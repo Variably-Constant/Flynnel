@@ -361,6 +361,10 @@ name = "probe_gate_sweep"
 harness = false
 
 [[bench]]
+name = "workload_class_cost"
+harness = false
+
+[[bench]]
 name = "gpu_linalg"
 harness = false
 required-features = ["gpu-peer"]
