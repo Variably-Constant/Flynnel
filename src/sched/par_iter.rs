@@ -14,6 +14,15 @@
 //! - Cooperative work-stealing during waits (free from the Local
 //!   tier dispatch)
 //! - Linear speedup up to `worker_count()` cores
+//!
+//! # Sweeping input sizes
+//!
+//! The seeded leaf count is a power of two, so a throughput curve
+//! measured across many sizes has small steps in it at the sizes where
+//! that count doubles. Per element the larger size is the faster one
+//! across a step, which reads as the kernel speeding up as `n` grows.
+//! The steps belong to the fan-out, not to the caller's kernel; see
+//! `adaptive_seed_depth` for where they fall and how large they are.
 
 use crate::sched::arena::{global_local_arena, join_context};
 use crate::sched::plan::JobPlan;
@@ -403,6 +412,16 @@ pub fn set_seed_hysteresis(on: bool) -> bool {
 ///
 /// Without a per-item hint the count is `workers`, the fewest-leaves
 /// choice; lazy-steal mode subdivides on demand after.
+///
+/// The count rounds up to a power of two, so it is a step function of
+/// `items`: two sizes a percent apart can seed 32 leaves and 64, and
+/// the same size always gets the same count. Per element the larger
+/// size is the faster one across a boundary - 2.6 to 6.8 percent at
+/// 655_000 against 665_000, 24 workers, 50 ns an item - because 32
+/// leaves on 24 workers leaves eight workers holding two and a tail
+/// about twice one leaf, where 64 leaves is 2.67 each and averages the
+/// imbalance out. The step sits under the run-to-run spread on a quiet
+/// host.
 #[inline]
 fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
     let workers = workers.max(1);

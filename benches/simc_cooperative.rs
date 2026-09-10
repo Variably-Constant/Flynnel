@@ -211,6 +211,12 @@ fn bench_simc_cooperative(c: &mut Criterion) {
     // path was handed. If the crossing is anywhere it is here.
     bench_n(c, 512);
     bench_n(c, 1024);
+    // Between the tie at 512 and the 15 percent mailbox win at 1024.
+    // A gate wants the width where the two meet, and 512 and 1024 give
+    // only the bracket it lies in.
+    bench_n(c, 640);
+    bench_n(c, 768);
+    bench_n(c, 896);
 }
 
 criterion_group!(benches, bench_simc_cooperative);
