@@ -89,14 +89,21 @@ where
         CooperativeRouting::ForceDeque => cooperative_join_n_flat(plan, closures),
         CooperativeRouting::Auto => {
             // Population heuristic: a fan-out narrower than the pool
-            // routes to tree, a wider one to mailbox.
+            // routes to tree, a wider one to the flat path.
+            //
+            // The flat path is not the mailbox shape. It applies
+            // `mailbox_gate` itself and runs the deque shape below it,
+            // which is every width from the pool count to 32 times it -
+            // the band where the deque fan-out is 2 to 22 percent
+            // faster. Raising this comparison instead would send that
+            // band to the tree, which is slower than either.
             //
             // The count is the calling thread's own node, which is the
             // population the gate inside cooperative_join_n_flat_mailbox
             // compares against: a worker's `ctx.sleep` covers the
             // workers of the node it belongs to. Both read the same
-            // number, so a fan-out this arm routes to mailbox is one
-            // that path can populate.
+            // number, so a fan-out this arm routes onward is one that
+            // path can populate.
             let n_workers = global_local_arena().local_worker_count();
             if n < n_workers {
                 cooperative_join_n_tree(plan, closures)
@@ -105,6 +112,44 @@ where
             }
         }
     }
+}
+
+/// How many times the worker count a fan-out must reach before
+/// owner-directed mailbox distribution beats random peer-steal.
+///
+/// Measured on a 24-worker Zen 4, every width run in both registration
+/// orders, comparing the deque fan-out against the routed entry point a
+/// caller actually reaches:
+///
+/// ```text
+///    N   xpool   deque    routed   faster
+///  512     21   197.77   202.81   deque   by  2.5%
+///  640     27   233.15   261.77   deque   by 12.3%
+///  768     32   270.85   262.27   routed  by  3.2%
+///  896     37   313.77   295.30   routed  by  5.9%
+/// 1024     43   384.93   322.43   routed  by 19.4%
+/// ```
+///
+/// Microseconds, mean of both orders. The crossing lies between 640 and
+/// 768, so the gate is the first measured width past it. Below it the
+/// mailbox path costs 10 to 22 percent at every width from the pool
+/// count through 256.
+///
+/// A multiple of the pool rather than a constant: the crossing is a
+/// property of how many workers have to be reached before directed
+/// placement repays its cost, so it moves with the pool. The multiple
+/// itself is measured on one host and one workload shape, and a host
+/// whose sync costs differ will put it elsewhere.
+const MAILBOX_GATE_POOL_MULTIPLE: usize = 32;
+
+/// The fan-out width at or above which mailbox mode is chosen.
+///
+/// Saturating, so a pool count large enough to overflow the multiply
+/// yields a gate no fan-out can reach - which selects the deque path,
+/// the one that is faster everywhere below the crossing.
+#[inline]
+fn mailbox_gate(n_workers: usize) -> usize {
+    n_workers.saturating_mul(MAILBOX_GATE_POOL_MULTIPLE)
 }
 
 /// Tree-shape cooperative fork-join: balanced binary bisect of
@@ -286,14 +331,15 @@ where
         let ctx = unsafe { &*ctx_ptr };
         // Mailbox-distribute reaches only the workers it targets, and
         // peer-steal reads deques rather than mailboxes, so a fan-out
-        // narrower than the pool leaves the parent and the untargeted
-        // workers idle for the wait. Deque mode keeps them fed.
+        // that does not clear the gate leaves the parent and the
+        // untargeted workers idle for the wait. Deque mode keeps them
+        // fed, and is faster well past the pool width.
         //
-        // The comparison is against the worker count, which is what
+        // The base is the worker count, which is what
         // `fan_out_in_worker` also gates and round-robins on. The
         // stealer table is longer by `EXTERNAL_SLOT_COUNT`.
         let n_workers = ctx.sleep.worker_count();
-        let mode = if n >= n_workers {
+        let mode = if n >= mailbox_gate(n_workers) {
             FanOutMode::Mailbox
         } else {
             FanOutMode::Deque
@@ -301,9 +347,10 @@ where
         return fan_out_in_worker(ctx, plan, closures, mode);
     }
     // External path: no worker context yet, so the worker count is not
-    // reachable here. `fan_out_in_worker` applies the gate when the
-    // wrapper lands on a worker, and demotes this to Deque itself when
-    // the fan-out is narrower than the pool.
+    // reachable here. `fan_out_in_worker` applies `mailbox_gate` when
+    // the wrapper lands on a worker and demotes this to Deque itself
+    // below it, which is why asking for Mailbox unconditionally here is
+    // a request rather than a decision.
     fan_out_external(plan, closures, FanOutMode::Mailbox)
 }
 
@@ -415,11 +462,14 @@ where
     // Mailbox-distribute gate: mailbox mode leaves the parent and any
     // worker without a target idle for the wait, because peer-steal
     // reads deques rather than mailboxes. Deque mode keeps them fed,
-    // so it is the mode for a fan-out narrower than the pool. Mailbox
-    // at 8 closures on a 16-worker Ryzen 7 2700 runs 4.4x the deque
-    // variant.
+    // so it is the mode below the gate. Mailbox at 8 closures on a
+    // 16-worker Ryzen 7 2700 runs 4.4x the deque variant.
+    //
+    // This is the backstop for the external path, which cannot read a
+    // worker count before landing on a worker and so arrives asking for
+    // Mailbox at every width.
     let effective_mode = match mode {
-        FanOutMode::Mailbox if n < n_workers => FanOutMode::Deque,
+        FanOutMode::Mailbox if n < mailbox_gate(n_workers) => FanOutMode::Deque,
         other => other,
     };
     // Wake protocol per mode. Both end in exactly one broadcast and
@@ -851,19 +901,45 @@ mod tests {
     }
 
     #[test]
+    fn the_mailbox_gate_sits_where_the_crossing_was_measured() {
+        // The band between the pool count and the gate is the one the
+        // deque fan-out wins, by 2 to 22 percent across every width
+        // measured in it. A gate at the pool count hands that band to
+        // the mailbox path, which is what this pins against.
+        assert_eq!(mailbox_gate(24), 768, "24 workers, the measured host");
+        assert!(
+            mailbox_gate(24) > 640,
+            "640 is the widest fan-out measured with deque still ahead"
+        );
+
+        // Saturating rather than wrapping: an overflowing pool count
+        // must yield a gate no fan-out reaches, which selects deque -
+        // the mode that is faster everywhere below the crossing. A wrap
+        // would yield a small gate and select mailbox everywhere.
+        assert_eq!(mailbox_gate(usize::MAX), usize::MAX);
+    }
+
+    #[test]
     fn flat_mailbox_completes_once_its_gate_opens() {
-        // Mailbox mode engages at N >= the worker count and routes each
-        // closure to one worker's mailbox. `find_work` pops only the
-        // worker's own mailbox and peer-steal reads deques, so a closure
-        // routed to an index past the last worker is never executed and
-        // the join's CountLatch never reaches zero.
+        // Mailbox mode engages at `mailbox_gate` and routes each closure
+        // to one worker's mailbox. `find_work` pops only the worker's
+        // own mailbox and peer-steal reads deques, so a closure routed
+        // to an index past the last worker is never executed and the
+        // join's CountLatch never reaches zero.
         //
-        // N is the worker count plus EXTERNAL_SLOT_COUNT because that is
-        // the width at which a round-robin over the stealer table first
-        // covers every external slot. The join runs on its own thread so
-        // a failure is a timeout rather than a hung test binary.
-        let n = global_local_arena().total_workers()
-            + crate::sched::arena_local::EXTERNAL_SLOT_COUNT;
+        // N clears the gate and also clears the stealer table's width,
+        // which is where a round-robin first covers every external slot.
+        // Deriving it from `mailbox_gate` rather than from a width that
+        // happened to be above the gate keeps this exercising the
+        // mailbox path when the gate moves; a width below it takes the
+        // deque path and passes without testing any of the above.
+        //
+        // The join runs on its own thread so a failure is a timeout
+        // rather than a hung test binary.
+        let n = mailbox_gate(global_local_arena().local_worker_count()).max(
+            global_local_arena().total_workers()
+                + crate::sched::arena_local::EXTERNAL_SLOT_COUNT,
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let p = JobPlan::new(8, 1);
@@ -887,14 +963,12 @@ mod tests {
         // leaves the join's CountLatch permanently short.
         //
         // rayon::scope brings up its own pool sized to the machine,
-        // which competes with this arena's workers for cores. N sits
-        // above the mailbox gate and below the stealer table's width,
-        // which is the band the gate reaches only since it moved down
-        // to the worker count.
+        // which competes with this arena's workers for cores. N is the
+        // gate itself, the narrowest width that reaches mailbox mode.
         //
         // The join runs on its own thread so a failure to complete is a
         // timeout rather than a hung test binary.
-        let n = global_local_arena().local_worker_count() + 8;
+        let n = mailbox_gate(global_local_arena().local_worker_count());
 
         let mut warm: Vec<u64> = (0..n as u64).collect();
         rayon::scope(|s| {
