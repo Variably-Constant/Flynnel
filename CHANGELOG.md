@@ -13,7 +13,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   hang, with the dispatching worker spinning and every other worker
   parked. `cooperative_join_n_flat` at N = 1024 on a 24-worker host is
   where it was caught; any caller reaching the deque shape with more
-  than `ADAPTIVE_SLOT_CAPACITY * 3` closures could reach it.
+  than `ADAPTIVE_SLOT_CAPACITY * JOBS_PER_SLOT` closures could reach
+  it, which is 768 at the shipped values.
 
   The fan-out pushed all N-1 closures onto one worker's tier before
   waking anybody. Those pushes go through the burst path, which
