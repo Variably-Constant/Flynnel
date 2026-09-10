@@ -29,9 +29,9 @@
 //!   variance.
 //! - **Same N within a group**: every arm of a group fans out the same
 //!   number of closures, so a group compares shapes and nothing else.
-//!   The sweep runs nine widths - 8, 12, 16, 24, 32, 56, 64, 128, 256 -
-//!   which on a 24-worker host straddle the mailbox gate at 24 and
-//!   reach 10.7x the pool. Widths below the gate are the control: both
+//!   The sweep runs eleven widths - 8 through 1024 - which on a
+//!   24-worker host straddle the mailbox gate at 24 and reach 43x the
+//!   pool. Widths below the gate are the control: both
 //!   flynnel arms run the same code there, so a group that does not
 //!   show them agreeing is not measuring what it claims.
 //! - **Same result-collection**: both halves materialise a Vec<u64>
@@ -205,6 +205,12 @@ fn bench_simc_cooperative(c: &mut Criterion) {
     // worker count; these are what say whether there is one.
     bench_n(c, 128);
     bench_n(c, 256);
+    // 256 reached 10.7x the pool with the penalty no smaller than at
+    // 64. These are 21x and 43x, where a fan-out is deep enough that
+    // random peer-steal has to rediscover a distribution the mailbox
+    // path was handed. If the crossing is anywhere it is here.
+    bench_n(c, 512);
+    bench_n(c, 1024);
 }
 
 criterion_group!(benches, bench_simc_cooperative);
