@@ -43,10 +43,19 @@
 //! settles on and the average it learns never become another's starting
 //! condition.
 //!
-//! ## What the occupancy line says
+//! ## What the reported line says
 //!
-//! Each arm reports its site's last occupancy and how many classifier
-//! windows that site discarded for having been timed off-core. A
+//! `flips` counts dispatches at that arm's site which seeded a
+//! different leaf count from the dispatch before them. That is the
+//! quantity the two mechanisms exist to reduce, and the timings do not
+//! express it: a flip between two adjacent depths costs little either
+//! way, so an arm can be fast and unstable or slow and steady. Reading
+//! cost without it says what each mechanism charges and not what it
+//! buys.
+//!
+//! Each arm also reports its site's last occupancy and how many
+//! classifier windows that site discarded for having been timed
+//! off-core. A
 //! non-zero suppressed count means the arm ran on the class it held
 //! before the load arrived rather than one it learned during the
 //! measurement, which is a different quantity from the one the arm is
@@ -149,11 +158,12 @@ fn register(
             });
         });
         eprintln!(
-            "occupancy {}/{} pct={} suppressed={}",
+            "occupancy {}/{} pct={} suppressed={} flips={}",
             group_name,
             arm.name,
             state.recent_occupancy(),
             state.suppressed_migrations(),
+            state.seed_depth_flips(),
         );
     }
 

@@ -435,6 +435,11 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
         Some(site) if seed_hysteresis_enabled() => site.get().stabilise_seed_depth(depth),
         _ => depth,
     };
+    // Counted after both stabilizers, so it is the depth the dispatch
+    // actually seeds with rather than the one the cost model proposed.
+    if let Some(site) = plan.site {
+        site.get().record_seed_depth(depth);
+    }
     // The seeded leaf count is a power of two, so a target between two
     // of them is served by the next one up: a target of 33 seeds 64.
     // `FLYNNEL_SEED_DEPTH` reports the target beside what it rounded

@@ -221,6 +221,16 @@ pub struct CallSiteState {
     /// site actually spent on a core, in hundredths. Starts at 100, so
     /// a site nothing has reported for classifies as it always did.
     recent_occupancy_pct: AtomicU32,
+    /// The seed depth this site last dispatched with, and how many
+    /// times a dispatch has used a different one from the dispatch
+    /// before it.
+    ///
+    /// This is the quantity the seed-depth stabilizers exist to reduce:
+    /// the same workload seeding a different leaf count from one call
+    /// to the next. Throughput does not express it, because a flip
+    /// between two adjacent depths costs little either way.
+    last_seed_depth: AtomicU32,
+    seed_depth_flips: AtomicU32,
     /// Classifier windows this site discarded because the leaves in
     /// them were timed off-core.
     ///
@@ -276,6 +286,8 @@ impl CallSiteState {
             depth_run: AtomicU32::new(0),
             estimate_ewma_ns: AtomicU64::new(0),
             recent_occupancy_pct: AtomicU32::new(100),
+            last_seed_depth: AtomicU32::new(DEPTH_UNSET),
+            seed_depth_flips: AtomicU32::new(0),
             suppressed_migrations: AtomicU32::new(0),
         }
     }
@@ -290,6 +302,29 @@ impl CallSiteState {
     /// output.
     pub fn suppressed_migrations(&self) -> u32 {
         self.suppressed_migrations.load(Ordering::Relaxed)
+    }
+
+    /// Note the seed depth a dispatch at this site is about to use, and
+    /// count it when it differs from the one before.
+    ///
+    /// The first call at a site establishes the depth and counts
+    /// nothing: there is no previous dispatch for it to differ from.
+    pub fn record_seed_depth(&self, depth: usize) {
+        let d = depth as u32;
+        let previous = self.last_seed_depth.swap(d, Ordering::Relaxed);
+        if previous != DEPTH_UNSET && previous != d {
+            self.seed_depth_flips.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Dispatches at this site that seeded a different leaf count from
+    /// the dispatch before them.
+    ///
+    /// The figure the seed-depth stabilizers are measured against: a
+    /// mechanism that costs throughput and does not lower this is
+    /// paying for nothing.
+    pub fn seed_depth_flips(&self) -> u32 {
+        self.seed_depth_flips.load(Ordering::Relaxed)
     }
 
     /// Report what fraction of its interval the dispatch just finished
