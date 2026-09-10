@@ -10,8 +10,16 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 ### Scheduler
 
 - `sched::occupancy` reports what fraction of a measured interval the
-  measuring thread was actually on a core, and two learners refuse a
-  measurement taken below `TRUSTWORTHY_OCCUPANCY_PCT`, which is 85.
+  measuring thread was actually on a core. Nothing consumes it: no
+  learner refuses a window on it and no dispatch is routed on it, so the
+  scheduler behaves exactly as it did without it.
+
+  It is reported rather than acted on because what figure marks a
+  contended measurement is not known. A threshold chosen ahead of the
+  distribution describes whoever picked it, and this one would have been
+  picked against a scale that turned out to be wrong by the host's clock
+  rate. `FLYNNEL_OCCUPANCY` prints the host calibration's figure; the
+  seed-depth bench prints one per arm.
 
   Every adaptive input in the scheduler was derived from wall time: the
   calibrated dispatch cost and its two thresholds, a call site's
@@ -27,36 +35,26 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   `Gather` wakes them to interleave cache-miss loads. So a busy host
   moved the scheduler's choice rather than only its speed, and the
   choice outlived the load that caused it. What a wrong class costs is
-  not measured; the gate rests on the decision being wrong.
+  not measured.
 
-  `OccupancyWindow` reads the thread clock and the wall clock at
-  construction and again at `sample`, so the two cover the same interval
-  by construction rather than by a caller pairing them. The source is
-  `QueryThreadCycleTime` on Windows and `CLOCK_THREAD_CPUTIME_ID` on
-  Linux. The Windows figure is cycles rather than nanoseconds; both
-  sides of the ratio carry the same unknown frequency and the absolute
-  is never read alone. A platform with no thread clock reports full
-  occupancy, so it behaves as it did rather than refusing everything.
+  `OccupancyWindow` reads both counters at construction and again at
+  `sample`, so they cover the same interval by construction rather than
+  by a caller pairing them, and both come from the same clock so their
+  ratio is a fraction. On Windows that is `QueryThreadCycleTime` against
+  the timestamp counter, because the thread figure is CYCLES: divided by
+  a nanosecond clock it yields achieved GHz, which on a 4 GHz part reads
+  100 percent for anything above a quarter of one core. On Linux both
+  sides are nanoseconds through `CLOCK_THREAD_CPUTIME_ID`. The two
+  Windows counters advance for different reasons - one per executed
+  cycle, one at a fixed rate - so a boosted core reads over 1.0 and is
+  clamped. A platform with no thread clock reports full occupancy, so it
+  behaves as it did rather than reading every interval as idle.
 
-  The two gates refuse rather than adapt. A calibration taken below the
-  threshold still serves the process that measured it, which lives under
-  that same load, but does not enter the persisted table, which outlives
-  it. The classifier does not migrate a site's class on a window below
-  it; the window is spent rather than kept, because it describes the
-  machine and the site's class does not.
-
-  Nothing routes on occupancy. A dispatch's shape still depends only on
-  its workload, so identical code behaves identically whatever else is
-  running. Whether a loaded host wants a narrower fan-out is a separate
-  question with no measurement behind it.
-
-- `CallSiteState::suppressed_migrations` counts the classifier windows a
-  site discarded for having been timed off-core. The gate above refused
-  silently, and a site that never learned then reads exactly like a site
-  with nothing to learn: both sit on the class they started with. A
-  non-zero count says the site is running on what it learned before the
-  machine got busy, which is a different claim from having settled
-  there.
+  What it measures is the thread that opened the window, which for a
+  dispatch is the caller across its own join wait - so a well-spread
+  dispatch reads low because the caller is waiting, not because the
+  machine is busy. Measuring the pool instead is the next step and is
+  why nothing consumes the figure yet.
 
 - `sched::calibration_store` persists measured dispatch costs and device
   capabilities per host in a memory-mapped file, behind the new

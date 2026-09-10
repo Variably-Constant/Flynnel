@@ -229,13 +229,6 @@ pub struct CallSiteState {
     /// between two adjacent depths costs little either way.
     last_seed_depth: AtomicU32,
     seed_depth_flips: AtomicU32,
-    /// Classifier windows this site discarded because the leaves in
-    /// them were timed off-core.
-    ///
-    /// A gate that refuses silently leaves the next reader with a site
-    /// that never learned and no way to tell that from a site with
-    /// nothing to learn. This is what says which.
-    suppressed_migrations: AtomicU32,
 }
 
 /// No seed depth is in force for a site yet.
@@ -285,20 +278,7 @@ impl CallSiteState {
             recent_occupancy_pct: AtomicU32::new(100),
             last_seed_depth: AtomicU32::new(DEPTH_UNSET),
             seed_depth_flips: AtomicU32::new(0),
-            suppressed_migrations: AtomicU32::new(0),
         }
-    }
-
-    /// Classifier windows discarded at this site for having been timed
-    /// off-core.
-    ///
-    /// Non-zero means this site's class is older than its leaf history:
-    /// it is running on what it learned before the machine got busy. A
-    /// bench of this path on a shared host should print it, because
-    /// without it a suppressed run and a settled one produce the same
-    /// output.
-    pub fn suppressed_migrations(&self) -> u32 {
-        self.suppressed_migrations.load(Ordering::Relaxed)
     }
 
     /// Note the seed depth a dispatch at this site is about to use, and
@@ -498,21 +478,6 @@ impl CallSiteState {
         self.last_count.store(count, Ordering::Relaxed);
         self.last_sum_ns.store(sum, Ordering::Relaxed);
         self.last_sumsq.store(sumsq, Ordering::Relaxed);
-
-        // Leaves timed while the pool was off its cores carry the
-        // machine's other tenants in every figure derived from them,
-        // and the derived figure here is a variance: preemption lands
-        // on some leaves and not others, so a uniform workload reads as
-        // irregular and migrates to a shape that costs several times
-        // more on exactly that workload. The window is spent rather
-        // than kept - its snapshots have advanced - because it
-        // describes the machine and this site's class does not.
-        if self.recent_occupancy_pct.load(Ordering::Relaxed)
-            < crate::sched::occupancy::TRUSTWORTHY_OCCUPANCY_PCT
-        {
-            self.suppressed_migrations.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
 
         let mean_ns = dsum / dcount;
         let scaled_mean = (dsum >> 8) / dcount;

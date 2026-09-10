@@ -673,24 +673,20 @@ fn stored_or_measured() -> HostDispatchProfile {
             jec_wake_threshold_ns: cpu.jec_wake_threshold_ns,
         };
     }
+    // The sample spread already decides whether a record stands as the
+    // host's calibration, through `is_trustworthy` above and
+    // `PROVISIONAL_SPREAD_PER_MILLE`. Occupancy is reported beside it
+    // and gates nothing: what figure marks a contended measurement is
+    // not known, and a threshold picked ahead of the distribution
+    // describes whoever picked it.
     let occupancy_window = crate::sched::occupancy::OccupancyWindow::start();
     let (profile, spread) = measure_host_dispatch();
-    let occupancy = occupancy_window.sample();
-    if !occupancy.is_trustworthy() {
-        // The calibration did not get the cores it was timing against,
-        // so its figures describe this host's other tenants as much as
-        // this host. They serve the process that measured them, because
-        // that process is living under the same load; they do not go
-        // into the table, which outlives it and is read by starts that
-        // will not be.
+    if std::env::var_os("FLYNNEL_OCCUPANCY").is_some() {
         eprintln!(
-            "flynnel: calibrated at {} percent occupancy, under the {} the table \
-             accepts; keeping these figures for this process and leaving the \
-             table to a quieter start",
-            occupancy.percent(),
-            crate::sched::occupancy::TRUSTWORTHY_OCCUPANCY_PCT,
+            "flynnel: host calibration ran at {} percent occupancy, spread {} per mille",
+            occupancy_window.sample().percent(),
+            spread,
         );
-        return profile;
     }
     match store.try_acquire_writer() {
         Ok(writer) => {

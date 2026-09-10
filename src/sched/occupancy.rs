@@ -24,89 +24,100 @@
 //!
 //! # What this is for, and what it is not for
 //!
-//! It gates learning, and nothing else. A measurement taken at low
-//! occupancy is refused rather than installed, and a classifier is not
-//! allowed to migrate a site on evidence gathered while preempted.
-//! Dispatch decisions are never routed on it: making the shape of a
-//! dispatch depend on what else is running would mean identical code
-//! behaving differently run to run, which is the property the gate
-//! exists to protect.
+//! It reports, and nothing consumes it. No learner refuses a window on
+//! it and no dispatch is routed on it, so the scheduler behaves exactly
+//! as it did without it. What a trustworthy figure is cannot be named
+//! until the distribution across quiet and loaded hosts is known, and a
+//! threshold chosen ahead of that describes the person who picked it.
 //!
-//! Whether a loaded host wants a narrower fan-out is a separate
-//! question with no measurement behind it yet.
+//! Routing on it is a further step and a different one: making a
+//! dispatch's shape depend on what else is running would mean identical
+//! code behaving differently run to run.
 
-/// Occupancy at or above this, in hundredths, is a thread that owned
-/// its core closely enough for its timings to describe the work.
-///
-/// Below it a measurement describes the machine's other tenants as much
-/// as the workload, and the learner that would have consumed it keeps
-/// what it had.
-pub const TRUSTWORTHY_OCCUPANCY_PCT: u32 = 85;
-
-/// A thread's CPU time and the wall time it was read against.
+/// A thread's on-core ticks and the elapsed ticks they were read
+/// against, both from the same clock so their ratio is a fraction.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct OccupancySample {
-    /// Nanoseconds this thread spent on a core.
-    pub thread_ns: u64,
-    /// Nanoseconds of wall clock over the same interval.
-    pub wall_ns: u64,
+    /// Ticks this thread spent on a core.
+    pub thread_ticks: u64,
+    /// Ticks of elapsed time over the same interval.
+    pub wall_ticks: u64,
 }
 
 impl OccupancySample {
     /// Occupancy in hundredths: 100 is a thread that ran for the whole
     /// interval, 30 is a thread that got under a third of it.
     ///
-    /// Saturates at 100. A thread cannot use more core time than wall
-    /// time elapsed, but the two clocks have different resolutions and
-    /// a short interval can read slightly over.
+    /// Saturates at 100. A thread cannot be on a core for more of an
+    /// interval than the interval, but the two counters advance for
+    /// different reasons - one per executed cycle, one at a fixed rate -
+    /// so a boosted core reads slightly over.
     pub fn percent(&self) -> u32 {
-        if self.wall_ns == 0 {
+        if self.wall_ticks == 0 {
             return 100;
         }
-        let pct = self.thread_ns.saturating_mul(100) / self.wall_ns;
+        let pct = self.thread_ticks.saturating_mul(100) / self.wall_ticks;
         pct.min(100) as u32
-    }
-
-    /// Whether a measurement taken over this interval describes the
-    /// work rather than the machine's other tenants.
-    pub fn is_trustworthy(&self) -> bool {
-        self.percent() >= TRUSTWORTHY_OCCUPANCY_PCT
     }
 }
 
 /// Spans a measured interval, reporting what fraction of it this thread
 /// was actually on a core.
 ///
-/// The wall clock and the thread clock are both read at construction
-/// and again at [`sample`](Self::sample), so the two cover the same
-/// interval by construction rather than by the caller pairing them
-/// correctly.
+/// Both counters are read at construction and again at
+/// [`sample`](Self::sample), so the two cover the same interval by
+/// construction rather than by the caller pairing them correctly, and
+/// both come from [`clock_pair`] so they carry the same unit.
 #[derive(Debug)]
 pub struct OccupancyWindow {
-    thread_ns_at_start: u64,
-    wall_at_start: std::time::Instant,
+    thread_at_start: u64,
+    wall_at_start: u64,
 }
 
 impl OccupancyWindow {
     /// Open a window over whatever the caller measures next.
     pub fn start() -> Self {
-        Self {
-            thread_ns_at_start: thread_cpu_ns(),
-            wall_at_start: std::time::Instant::now(),
-        }
+        let (thread, wall) = clock_pair();
+        Self { thread_at_start: thread, wall_at_start: wall }
     }
 
     /// Close the window and report the interval.
     ///
     /// On a platform with no thread clock this reports full occupancy,
-    /// so a learner behaves exactly as it did before the gate existed
-    /// rather than refusing every measurement.
+    /// so a consumer behaves exactly as it did before this existed
+    /// rather than reading every interval as idle.
     pub fn sample(&self) -> OccupancySample {
+        let (thread, wall) = clock_pair();
         OccupancySample {
-            thread_ns: thread_cpu_ns().saturating_sub(self.thread_ns_at_start),
-            wall_ns: self.wall_at_start.elapsed().as_nanos() as u64,
+            thread_ticks: thread.saturating_sub(self.thread_at_start),
+            wall_ticks: wall.saturating_sub(self.wall_at_start),
         }
     }
+}
+
+/// This thread's on-core count and an elapsed count in the same unit.
+///
+/// Windows reports thread time as CYCLES, so the elapsed side is the
+/// timestamp counter rather than a nanosecond clock; dividing cycles by
+/// nanoseconds yields achieved clock rate, not a fraction. The two
+/// counters advance for different reasons - the thread counter per
+/// cycle actually executed, the timestamp counter at a fixed rate - so
+/// a core running above its base frequency reads over 1.0 and is
+/// clamped. Linux reports thread time in nanoseconds, so both sides
+/// there are nanoseconds and the pairing is exact.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn clock_pair() -> (u64, u64) {
+    // SAFETY: `_rdtsc` reads a counter register and touches no memory.
+    (thread_cpu_ns(), unsafe { core::arch::x86_64::_rdtsc() })
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+fn clock_pair() -> (u64, u64) {
+    let wall = std::time::SystemTime::UNIX_EPOCH
+        .elapsed()
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    (thread_cpu_ns(), wall)
 }
 
 /// Nanoseconds this thread has spent on a core, or zero where the

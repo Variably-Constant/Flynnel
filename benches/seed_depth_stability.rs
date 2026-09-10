@@ -53,22 +53,17 @@
 //! cost without it says what each mechanism charges and not what it
 //! buys.
 //!
-//! Each arm also reports its site's last occupancy and how many
-//! classifier windows that site discarded for having been timed
-//! off-core. A
-//! non-zero suppressed count means the arm ran on the class it held
-//! before the load arrived rather than one it learned during the
-//! measurement, which is a different quantity from the one the arm is
-//! named for. Without the line a suppressed run and a settled one
-//! produce identical output.
+//! `pct` is the fraction of the arm's last dispatch that its measuring
+//! thread spent on a core. Nothing consumes it; it is reported so the
+//! distribution across quiet and loaded runs can be read off real runs
+//! rather than assumed.
 //!
 //! It answers a different question from the two orders, and neither
 //! subsumes the other. Alternation catches load that arrives or departs
-//! during a group, because that lands on some arms and not others;
-//! load present across both orders degrades them equally and they
-//! agree. So a pair of orders can agree while every arm in them ran on
-//! a class it was never allowed to revise. The occupancy figure is what
-//! distinguishes that from a quiet measurement.
+//! during a group, because that lands on some arms and not others; load
+//! present across both orders moves them equally and they agree. So a
+//! pair of orders can agree while both were measured under the same
+//! contention, and the occupancy figure is what would say so.
 
 #![allow(clippy::missing_docs_in_private_items)]
 
@@ -154,11 +149,10 @@ fn register(
             });
         });
         eprintln!(
-            "occupancy {}/{} pct={} suppressed={} flips={}",
+            "occupancy {}/{} pct={} flips={}",
             group_name,
             arm.name,
             state.recent_occupancy(),
-            state.suppressed_migrations(),
             state.seed_depth_flips(),
         );
     }
