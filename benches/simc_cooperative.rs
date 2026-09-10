@@ -27,9 +27,13 @@
 //!   pure CPU work (a 1000-iteration u64 xorshift mixer) so the
 //!   comparison measures dispatch + steal latency, not workload
 //!   variance.
-//! - **Same N**: 8 closures for the canonical "one per physical
-//!   core" SIMC case on the development host (Zen+ R7 2700:
-//!   8 physical / 16 logical).
+//! - **Same N within a group**: every arm of a group fans out the same
+//!   number of closures, so a group compares shapes and nothing else.
+//!   The sweep runs nine widths - 8, 12, 16, 24, 32, 56, 64, 128, 256 -
+//!   which on a 24-worker host straddle the mailbox gate at 24 and
+//!   reach 10.7x the pool. Widths below the gate are the control: both
+//!   flynnel arms run the same code there, so a group that does not
+//!   show them agreeing is not measuring what it claims.
 //! - **Same result-collection**: both halves materialise a Vec<u64>
 //!   in caller order so the bench measures equivalent total work
 //!   including the result-gather phase.
