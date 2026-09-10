@@ -97,6 +97,15 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   the spread costs nothing to compute and is the sharpest available
   signal for whether the host was quiet.
 
+  It is scheduler surface rather than a reference backend, which matters
+  for a consumer that turns the default set off. `--no-default-features`
+  is the way to drop the CUDA, JAX, WASM and GPU-peer backends, and it
+  takes this with them unless it is named back:
+  `features = ["persisted-calibration"]`. Nothing reports the loss,
+  because a process that measures its own calibration behaves exactly
+  like one that read a table - it is simply the only process the
+  measurement ever serves.
+
   The directory is `FLYNNEL_CALIBRATION_DIR` when set, otherwise
   `%LOCALAPPDATA%\flynnel\calibration` on Windows and
   `$XDG_CACHE_HOME/flynnel/calibration` or `~/.cache/flynnel/calibration`

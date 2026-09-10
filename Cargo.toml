@@ -130,6 +130,14 @@ default = [
 # measuring. Pulls in memmap2 for the mapping. Without it every process
 # measures for itself, and two processes on one host can disagree by
 # more than the decisions those numbers drive.
+#
+# Scheduler surface, not a reference backend. A build that turns the
+# default set off to drop the CUDA, JAX, WASM and GPU-peer backends
+# wants this one back:
+#   flynnel = { default-features = false,
+#               features = ["persisted-calibration"] }
+# A process that measures its own calibration is indistinguishable from
+# one that read a table, so leaving it off has no visible symptom.
 persisted-calibration = ["dep:memmap2"]
 # Enable the BLAKE3-rooted verification-chain helper (VerifyChain).
 verify-chain = ["dep:blake3"]
