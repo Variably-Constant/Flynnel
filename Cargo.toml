@@ -38,6 +38,7 @@ exclude = [
     "/examples/probe_k_gating.rs",
     "/examples/migrate_observability.rs",
     "/examples/analyze_trace.py",
+    "/examples/pair_orders.py",
     "/examples/trace_real_grep.rs",
     "/kaggle/**",
     "/tpu/**",
