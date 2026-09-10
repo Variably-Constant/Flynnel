@@ -1120,7 +1120,7 @@ What each site learns, all atomically and lock-free:
 Process-global `WorkloadClass` / `DispatchProfile` migration via a single `AtomicU8` tag, plus the calibrated classification thresholds. Defined in [`src/sched/adaptive_profile.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/adaptive_profile.rs).
 
 ```rust
-pub enum WorkloadClass { Light, Compute, Heavy, Memory }
+pub enum WorkloadClass { FineGrain, PortBound, LatencyBound, MemoryBound, Streaming }
 
 pub fn active_dispatch_profile()   -> DispatchProfile;   // Acquire-load
 pub fn migrate_dispatch_profile(p: DispatchProfile);     // Release-store
