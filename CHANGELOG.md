@@ -41,7 +41,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   `sample`, so they cover the same interval by construction rather than
   by a caller pairing them, and both come from the same clock so their
   ratio is a fraction. On Windows that is `QueryThreadCycleTime` against
-  the timestamp counter, because the thread figure is CYCLES: divided by
+  the timestamp counter, because the thread figure counts cycles rather
+  than time: divided by
   a nanosecond clock it yields achieved GHz, which on a 4 GHz part reads
   100 percent for anything above a quarter of one core. On Linux both
   sides are nanoseconds through `CLOCK_THREAD_CPUTIME_ID`. The two
@@ -50,7 +51,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   clamped. A platform with no thread clock reports full occupancy, so it
   behaves as it did rather than reading every interval as idle.
 
-  What a dispatch reports is its POOL's: each worker contributes its own
+  What a dispatch reports is its pool's occupancy, not its caller's:
+  each worker contributes its own
   on-core and elapsed counts for the leaves it ran, summed per call
   site, and a dispatch takes the difference across itself. Measuring the
   calling thread instead gave the opposite of the intended reading,
@@ -373,6 +375,25 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   What it settles is whether the step clears the within-size spread. A
   step buried under that spread is a fact about the code with no
   consequence, which is a result rather than an absence of one.
+
+  Measured, 24 workers at 50 ns an item, every size run forward and
+  reversed: crossing 655_000 to 665_000 the larger input is faster per
+  element, by 2.6 percent in one order and 6.8 in the other. Both orders
+  agree on the direction, which is the counter-intuitive one - the
+  sawtooth costs the smaller input, so a consumer's throughput curve
+  gets faster as `n` grows past a boundary. The reason is load balance:
+  32 leaves on 24 workers leaves eight workers holding two and a tail
+  about twice one leaf, where 64 leaves is 2.67 each and averages the
+  imbalance out.
+
+  It does not clear the spread. The same size measured in the two orders
+  differed by 3.5 percent at 655_000, so the step is present and is not
+  a number a consumer can rely on measuring. It is documented beside
+  `adaptive_seed_depth` and where the fan-out helpers are described, as
+  the reason a reader's curve has a step in it rather than as a figure
+  to depend on. Nothing in the fan-out changed: interpolating between
+  boundaries or seeding a ragged split would give up the power-of-two
+  bisect for an effect this size.
 
 - `examples/pair_orders.py` pairs each arm's forward reading against its
   reversed one across a whole log. It compares an arm's movement against
