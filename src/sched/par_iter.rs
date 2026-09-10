@@ -598,6 +598,14 @@ pub fn host_dispatch_profile() -> HostDispatchProfile {
 /// another. The `FLYNNEL_HOST_PROFILE_NS` environment variable pins
 /// all three figures and skips the measurement, which is what an
 /// experiment comparing arms across processes needs.
+///
+/// It prices this pool's dispatch and nothing else. A caller whose
+/// parallel route has setup of its own - a prescan, a chunking pass, a
+/// merge across chunk boundaries - is not described by this number,
+/// and a serial-versus-parallel threshold derived from it alone will
+/// sit far below where that caller's own route starts winning. Declare
+/// that cost with [`JobPlan::with_task_overhead_ns`], which is what
+/// [`JobPlan::optimal_chunk_count`] divides the work against.
 pub fn inline_collapse_threshold_ns() -> u64 {
     host_dispatch_profile().collapse_threshold_ns
 }
