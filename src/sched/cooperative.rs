@@ -875,4 +875,46 @@ mod tests {
             .expect("mailbox fan-out at N >= worker count must complete");
         assert_eq!(results, (0..n as u32).collect::<Vec<_>>());
     }
+
+    #[test]
+    fn flat_mailbox_completes_after_a_foreign_pool_has_run() {
+        // A mailbox fan-out completes only when every targeted worker
+        // drains its own mailbox: peer-steal reads deques and cannot
+        // reach a closure sitting in one, so a worker that does not run
+        // leaves the join's CountLatch permanently short.
+        //
+        // rayon::scope brings up its own pool sized to the machine,
+        // which competes with this arena's workers for cores. N sits
+        // above the mailbox gate and below the stealer table's width,
+        // which is the band the gate reaches only since it moved down
+        // to the worker count.
+        //
+        // The join runs on its own thread so a failure to complete is a
+        // timeout rather than a hung test binary.
+        let n = global_local_arena().local_worker_count() + 8;
+
+        let mut warm: Vec<u64> = (0..n as u64).collect();
+        rayon::scope(|s| {
+            for slot in warm.iter_mut() {
+                s.spawn(move |_| {
+                    *slot = slot.wrapping_mul(0x100000001B3);
+                });
+            }
+        });
+        std::hint::black_box(&warm);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let p = JobPlan::new(8, 1);
+            let closures: Vec<Box<dyn FnOnce() -> u32 + Send>> = (0..n)
+                .map(|i| Box::new(move || i as u32) as _)
+                .collect();
+            tx.send(cooperative_join_n_flat_mailbox(&p, closures))
+                .expect("the test thread holds the receiver until it times out");
+        });
+        let results = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("mailbox fan-out must complete after a foreign pool has run");
+        assert_eq!(results, (0..n as u32).collect::<Vec<_>>());
+    }
 }
