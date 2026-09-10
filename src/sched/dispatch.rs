@@ -144,7 +144,7 @@ impl AdaptiveDispatcher {
         // Build a profile-derived base plan so use_smt +
         // oversubscription_log2 + estimated_per_item_ns are set
         // according to the active class. The explicit flag mirrors
-        // whether the CALLER supplied a workload class: a
+        // whether the caller supplied a workload class: a
         // with_workload_class dispatcher is pinned; one consulting
         // the global default stays overridable by per-site learning.
         let mut plan = JobPlan::set_profile_with(

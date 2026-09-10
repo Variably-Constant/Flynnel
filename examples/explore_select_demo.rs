@@ -61,7 +61,7 @@ fn run_episode(i: usize) -> Episode {
             pos = 0;
         }
     }
-    // Make the BEST (fewest-actions) explorer the SLOWEST to finish:
+    // Make the best (fewest-actions) explorer the slowest to finish:
     // sleep inversely to action count. First-past-the-post would
     // therefore discard exactly the explorer we want to keep.
     let sleep_us = (240_000u64 / actions.max(1) as u64).min(20_000);

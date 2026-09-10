@@ -217,7 +217,7 @@ fn assert_observer_drives_migration_to_latency_bound() {
     //   mean_ns >= 500 and cv2_per_mille >= 500 -> LatencyBound
     //   mean_ns >= 500 and cv2_per_mille <  500 -> MemoryBound/Streaming
     // Uniform high-cost samples (all 1500 ns) -> cv2=0 -> Streaming.
-    // Long-dep-chain workloads have HIGH per-leaf variance
+    // Long-dep-chain workloads have high per-leaf variance
     // (some leaves chase faster than others), so the simulated
     // signal mixes 500 ns and 2500 ns samples (mean 1500, var huge).
     for i in 0..128 {

@@ -5,7 +5,7 @@
 //! scheduler owns by index.
 //!
 //! The comparison is symmetric by construction: both paths use four
-//! lanes and the same pipelined submission window; the ONLY
+//! lanes and the same pipelined submission window; the only
 //! difference is whether the 64 KB payload rides the bus every task
 //! or stays resident.
 //!

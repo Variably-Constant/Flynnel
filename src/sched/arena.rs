@@ -453,7 +453,7 @@ where
     crate::sched::trace::emit(crate::sched::trace::TraceEvent::JoinWaitBegin, 0);
 
     // Wait loop. The most likely outcome (LIFO, no thief): the
-    // first ctx.find_work() returns OUR job_b. We special-case
+    // first ctx.find_work() returns our own job_b. We special-case
     // that via `id()` match and run it inline (stolen=false). If a
     // thief stole job_b first, we keep finding work until either
     // we observe job_b.latch set (the thief ran it) or we find

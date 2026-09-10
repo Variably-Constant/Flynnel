@@ -110,7 +110,7 @@ impl KhlBody {
     /// Crate-internal accessor for the underlying compact-ref
     /// array. Used by the [`super::khl_worker::KhlStash`]
     /// adapter to drain stash items without going through the
-    /// LIFO-execute path. Returns the FULL backing array including
+    /// LIFO-execute path. Returns the whole backing array including
     /// any padding slots beyond `n_items`; callers must respect
     /// `n_items` to avoid touching null padding slots.
     #[inline]

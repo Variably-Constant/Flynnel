@@ -14,7 +14,7 @@
 //! - Batched task submission (loop-body parallelism)
 //! - Burst-y push from a single-thread driver
 //!
-//! ## When Fcl does NOT win (and falls back gracefully)
+//! ## When Fcl does not win (and falls back gracefully)
 //!
 //! Single-push call sites (classic `join(a, b)` where the parent
 //! pushes a single right-half then runs the left half inline) get no

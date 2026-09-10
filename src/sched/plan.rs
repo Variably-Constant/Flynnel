@@ -468,7 +468,7 @@ impl JobPlan {
     /// `JobPlan::set_profile(K, batch, DispatchProfile::Unspecified)`.
     pub fn new(k_outer: u8, batch_size: u32) -> Self {
         // Static initial classifier: pick a WorkloadClass from
-        // (k_outer, batch_size) at construction time so the FIRST
+        // (k_outer, batch_size) at construction time so the first
         // dispatch already uses the right routing. The observer
         // refines via atomic migration if the classifier guessed
         // wrong; static gets us call-1 correctness, observer

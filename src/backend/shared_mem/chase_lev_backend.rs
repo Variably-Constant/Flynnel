@@ -223,7 +223,7 @@ impl SharedMemoryChaseLevBackend {
     }
 
     /// Same as [`Self::drain_one`] but issues a `prefetch_for_steal`
-    /// at the END of the call so the NEXT call's steal CAS hits a
+    /// at the end of the call so the following call's steal CAS hits a
     /// warm slot line. Each iteration of a tight drain loop
     /// (`while running { be.drain_one_prefetched(); }`) sees the
     /// slot bytes already in flight by the time it issues the steal,
@@ -251,7 +251,7 @@ impl SharedMemoryChaseLevBackend {
         // steal() does its slot load, the fill has had several
         // hundred cycles to make progress.
         //
-        // ONLY issue the prefetch when we just successfully stole.
+        // Issue the prefetch only when we just successfully stole.
         // If the prior drain returned None (empty), there is no
         // "next slot" to warm yet - prefetching slot[top] against
         // an empty deque burns a Line Fill Buffer entry on memory

@@ -136,7 +136,7 @@ pub(crate) fn record_leaf_span_ns(
 }
 
 /// Per-thread accumulator that batches leaf-time samples before
-/// flushing them onward. Two INDEPENDENT accumulations run side by
+/// flushing them onward. Two independent accumulations run side by
 /// side:
 ///
 /// - The **global half** feeds the process-wide observer counters
@@ -1547,7 +1547,7 @@ where
 
     // Default path: continuation-steal-lazy bisect. First level
     // always splits to seed initial fanout (workers eager leaves);
-    // subsequent levels run serially inline UNLESS the per-deque
+    // subsequent levels run serially inline unless the per-deque
     // steal counter on the dispatching worker has incremented since
     // the last check. Wins +12.7% Xeon Heavy/10k, +10.4% Xeon
     // Compute/100k, +5.1% Zen3 Compute/100k, never regresses across
@@ -3252,7 +3252,7 @@ fn record_reduce_chunks_path(p: ReduceChunksPath) {
 }
 
 /// Read the dispatch path that [`reduce_chunks`] selected on its
-/// most recent call on the CURRENT thread. Returns `None` if
+/// most recent call on the calling thread. Returns `None` if
 /// reduce_chunks has not been called on this thread yet.
 ///
 /// Bench-audit hook: a test that calls reduce_chunks with a

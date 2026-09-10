@@ -179,7 +179,7 @@ impl DualDeque {
 
     /// Borrow the MMF deque so peer in-process threads can call
     /// [`MmfChaseLevDeque::steal`] on it. Cross-process thieves do
-    /// NOT use this method - they open the deque file by path.
+    /// not use this method - they open the deque file by path.
     pub fn mmf_deque(&self) -> &MmfChaseLevDeque {
         &self.mmf
     }

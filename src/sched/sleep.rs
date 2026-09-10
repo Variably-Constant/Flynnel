@@ -193,8 +193,9 @@ impl Parker {
     /// trades a no-op syscall on the empty case for not having to
     /// track an explicit "is this worker parked" flag.
     ///
-    /// Increments [`Self::wake_counter`] FIRST so the WAITPKG
-    /// observer's monitor fires; then calls `thread::unpark()` so
+    /// Increments [`Self::wake_counter`] before anything else, so the
+    /// WAITPKG observer's monitor fires; then calls
+    /// `thread::unpark()` so
     /// the [`WaitStrategy::StdPark`] path also wakes. Both are
     /// needed because the Parker is constructed knowing its
     /// strategy but the caller does not need to: this method works

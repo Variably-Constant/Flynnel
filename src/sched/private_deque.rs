@@ -83,7 +83,7 @@ impl PrivateLifoDeque {
     }
 
     /// Try to pop without blocking. Returns `Ok(None)` if the deque
-    /// is empty AND was lockable; `Err(())` if a migration is in
+    /// is empty and was lockable; `Err(())` if a migration is in
     /// flight.
     #[cfg(test)]
     #[inline]

@@ -337,7 +337,7 @@ pub enum Settled<P, R> {
 /// another hunts a proof of unsatisfiability, and the first to land
 /// ends the search. The same shape drives a capability probe, where
 /// one side tries to certify a property absent while the other tries
-/// to witness it present. The two sides return DIFFERENT types (a
+/// to witness it present. The two sides return different types (a
 /// model is not a refutation), so the verdict carries both.
 ///
 /// Each side returns `Some(_)` when it settles the question and

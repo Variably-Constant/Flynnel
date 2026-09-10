@@ -1,7 +1,7 @@
 //! Adaptive DispatchProfile + WorkloadClass migration.
 //!
 //! The K_gating adaptive pattern proven in
-//! [`crate::sched::adaptive_worker`] generalizes to ANY routing
+//! [`crate::sched::adaptive_worker`] generalizes to any routing
 //! decision that's consulted once per dispatch (not per push/pop).
 //! DispatchProfile is the canonical example: it drives `use_smt`,
 //! `oversubscription_log2`, `estimated_per_item_ns`,
@@ -743,7 +743,7 @@ pub(crate) fn class_bucket_distance(a: WorkloadClass, b: WorkloadClass) -> u8 {
     bucket_distance(a, b)
 }
 
-/// Tag of the WorkloadClass that the LAST auto-classifier tick
+/// Tag of the WorkloadClass that the most recent auto-classifier tick
 /// produced. When this matches for [`AUTO_MIGRATION_HYSTERESIS`]
 /// consecutive ticks and differs from the active class, the
 /// observer fires [`migrate_workload_class`].
@@ -1078,8 +1078,8 @@ mod tests {
         for _ in 0..AUTO_MIGRATION_HYSTERESIS {
             record_leaf_batch(sample_ns * count, sumsq, count);
         }
-        // After HYSTERESIS consecutive Streaming classifications,
-        // active class should have migrated.
+        // After `AUTO_MIGRATION_HYSTERESIS` consecutive Streaming
+        // classifications, active class should have migrated.
         assert_eq!(
             active_workload_class(),
             WorkloadClass::Streaming,

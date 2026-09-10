@@ -476,7 +476,7 @@ where
     let hub_ab_for_gpu = hub_ab.clone();
     let hub_bc_for_post = hub_bc.clone();
 
-    // Clone an extra handle per stage so each stage holds its OWN
+    // Clone an extra handle per stage so each stage holds its own
     // shutdown-on-drop guard for its output hub. RAII drop runs
     // on the unwind path, so a panic in any stage closure
     // signals end-of-stream to its downstream consumer without

@@ -209,7 +209,7 @@ pub fn snapshot_leaf_stats() -> LeafStats {
 /// per-item ns hint. Observer-driven: the first dispatch on a
 /// fresh process pays the classifier-default min_leaf, but
 /// subsequent dispatches (criterion iter loops, multi-call
-/// batches, NMFD repeated calls) use the OBSERVED mean to pick
+/// batches, NMFD repeated calls) use the observed mean to pick
 /// a sharper granularity.
 ///
 /// Returns the leaf-level mean rather than the per-item mean: observer

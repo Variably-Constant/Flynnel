@@ -91,7 +91,7 @@ pub(crate) fn steal_retry(stealer: &Stealer<JobRef>) -> Option<JobRef> {
 }
 
 /// Batch steal-with-retry helper: tries to steal up to ~half of the
-/// victim's deque into `dest_worker` AND returns one job for the
+/// victim's deque into `dest_worker` and returns one job for the
 /// thief to execute immediately. One atomic CAS per call instead of
 /// N CASes for single-item steals.
 ///

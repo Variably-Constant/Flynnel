@@ -1,6 +1,6 @@
 //! Coherence-distance tier for per-worker deques.
 //!
-//! The cross-process KHPD architecture maps ONE publication line
+//! The cross-process KHPD architecture maps one publication line
 //! per topology distance: SMT-sibling, intra-CCX, cross-CCX,
 //! cross-NUMA. The in-process scheduler mirrors that shape:
 //! each worker carries N deques, one per [`DequeTier`]. The push site

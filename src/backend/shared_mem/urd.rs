@@ -461,7 +461,7 @@ impl UrdDeque {
 ///
 /// # Safety
 ///
-/// The caller MUST have confirmed WAITPKG is available via
+/// The caller must have confirmed WAITPKG is available via
 /// [`crate::cpu_info::has_waitpkg`] - executing `UMONITOR` /
 /// `UMWAIT` on hardware without WAITPKG raises an illegal-
 /// instruction trap (`#UD`).

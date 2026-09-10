@@ -577,7 +577,7 @@ impl WorkerCtx {
         //     (defaults false per the empirical regression noted in
         //     plan.rs). When no caller has ever opted in, skip the
         //     FlynnelRing::pop call entirely via one Acquire-load.
-        //     Saves ~0.5% SELF cycles measured on VM Zen3 v5 flame.
+        //     Saves ~0.5% self cycles measured on VM Zen3 v5 flame.
         if MAILBOX_EVER_USED.load(Ordering::Acquire)
             && let PopResult::Ok(job) = self.mailbox.pop()
         {
@@ -812,7 +812,7 @@ fn pin_disabled_env() -> bool {
                     true // any other value disables pinning
                 }
             }
-            // Default: pinning DISABLED. See doc comment.
+            // Default: pinning disabled. See doc comment.
             Err(_) => true,
         }
     })
@@ -944,7 +944,7 @@ thread_local! {
 /// [`WorkerCtx::push_to_mailbox`]. When `false`, every worker's
 /// [`WorkerCtx::find_work`] skips the `self.mailbox.pop()` call --
 /// the FlynnelRing pop has a fast-empty path but still costs a
-/// function call + ring-state check (~0.5% SELF measured on VM
+/// function call + ring-state check (~0.5% self measured on VM
 /// Zen3 v5 flame). Replacing it with one Acquire-load on the
 /// hot path saves those cycles on the >99% of dispatches that
 /// never opt into mailbox routing (`plan.use_mailbox_routing`

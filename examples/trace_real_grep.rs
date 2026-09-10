@@ -1,4 +1,5 @@
-//! Run a real-workload grep dispatch ONCE with FLYNNEL_TRACE=1 set and
+//! Run a real-workload grep dispatch a single time with
+//! FLYNNEL_TRACE=1 set and
 //! dump the per-worker trace buffers to stderr as CSV. Useful for
 //! localizing where per-fork wait-loop time goes architecturally.
 //!

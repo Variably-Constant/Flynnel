@@ -1,7 +1,7 @@
 //! Shared-region byte layout for the GPU-peer substrate.
 //!
 //! The GPU side of this contract lives in `kernels/gpu_peer.cu` as
-//! `#define` offsets; the values here MUST stay in lockstep with that
+//! `#define` offsets; the values here have to stay in lockstep with that
 //! file (the unit tests at the bottom pin every one of them). All
 //! cross-device state is addressed by byte offset from the region
 //! base - never by raw pointer - because the CPU and GPU observe the

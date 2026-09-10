@@ -1,7 +1,7 @@
 //! Bench: isolate pure scheduler overhead from leaf-body work.
 //!
 //! Runs `for_each_chunk` and `par_iter_mut().for_each` with bodies of
-//! varying weight at fixed N, AND at varying N with fixed body weight.
+//! varying weight at fixed N, and at varying N with fixed body weight.
 //! The "no-op body" rows give pure scheduler+dispatch cost. The
 //! difference between flynnel and rayon at the no-op body is the
 //! pure scheduling gap.

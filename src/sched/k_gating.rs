@@ -5,7 +5,7 @@
 //!
 //! - **`CounterOnly`** (Chase-Lev family, Fcl): all thieves load
 //!   the same `bottom` counter to learn what is publishable.
-//!   Publication signal concentrates on ONE cache line. Wins on
+//!   Publication signal concentrates on a single cache line. Wins on
 //!   smaller-store-buffer cores (in-order ARM, embedded) where
 //!   distributed-atomics CAS contention costs more than counter
 //!   contention.

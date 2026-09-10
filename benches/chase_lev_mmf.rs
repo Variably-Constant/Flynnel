@@ -230,7 +230,7 @@ fn bench_substrate_only(c: &mut Criterion) {
     });
     group.bench_function("chase_lev_push_steal_same_thread", |b| {
         b.iter(|| {
-            // Single-thread round-trip via STEAL path (CAS on top).
+            // Single-thread round-trip via the steal path (CAS on top).
             // This is the cost a cross-thread / cross-process thief
             // pays; the gap vs the LIFO-pop bench is the cost of the
             // owner-side asymmetric pop optimization.

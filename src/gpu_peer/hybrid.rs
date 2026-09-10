@@ -105,7 +105,7 @@ impl MirrorBuf {
 /// in place; `op` is the equivalent resident opcode (built-in `_V`
 /// or user op). Returns the placement taken.
 ///
-/// Race placements run BOTH sides on equal inputs and keep the CPU
+/// Race placements run both sides on equal inputs and keep the CPU
 /// result (matching the crate-level learned hybrid), recording both
 /// measured costs - transfers included - into the site's EWMAs.
 #[track_caller]

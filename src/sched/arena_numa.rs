@@ -233,7 +233,7 @@ impl NumaArena {
 
     /// Acquire one SMT request across every sub-arena, returning
     /// a `Vec<SmtGuard>` whose drop releases each per-node
-    /// request. Workers on EACH node's LocalArena that are
+    /// request. Workers on every node's LocalArena that are
     /// SMT-siblings will unpark and join the work-stealing loop
     /// while the guards are held.
     ///
