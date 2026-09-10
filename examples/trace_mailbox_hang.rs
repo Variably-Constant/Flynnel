@@ -5,15 +5,29 @@
 //! Run with the trace switch on:
 //!
 //! ```text
-//! cargo run --release --example trace_mailbox_hang -- 8 rayon 2> hang.csv
-//! cargo run --release --example trace_mailbox_hang -- 8 alone 2> alone.csv
+//! cargo run --release --example trace_mailbox_hang -- 8 rayon 1 2> hang.csv
+//! cargo run --release --example trace_mailbox_hang -- 8 alone 4000 2> alone.csv
 //! ```
 //!
 //! Arguments: how far above the local worker count to fan out
-//! (default 8), and whether a `rayon` scope fan-out runs first or the
-//! mailbox fan-out runs `alone`. The two arms differ in nothing else,
-//! so a completion in one and a stall in the other attributes the
-//! difference to the foreign pool.
+//! (default 8); whether a `rayon` scope fan-out runs first or the
+//! mailbox fan-out runs `alone`; and how many times to repeat the
+//! fan-out (default 1). The first two arms differ in nothing else, so a
+//! completion in one and a stall in the other attributes the difference
+//! to the foreign pool.
+//!
+//! The repeat count exists because a single call is the one thing this
+//! does that a criterion sweep does not: criterion calls the same
+//! fan-out thousands of times inside a warm-up and a sampling loop, and
+//! a stall seen there and not here may need the repetition rather than
+//! the shape. A run that stalls at some iteration reports which one, so
+//! a rare event is distinguishable from one that needs a particular
+//! predecessor.
+//!
+//! Every closure emits two rows, so a large repeat count with the trace
+//! switch on buffers `2 * n * repeats` of them before anything is
+//! written. Find whether it stalls with the switch off, then re-run
+//! with tracing at a count near the iteration it reached.
 //!
 //! # What the rows say
 //!
@@ -44,7 +58,19 @@ use flynnel::sched::cooperative::cooperative_join_n_flat_mailbox;
 use flynnel::sched::trace::{self, TraceEvent};
 use flynnel::{JobPlan, for_each_chunk};
 
-/// How long to let the fan-out run before calling it stalled.
+/// What the fan-out thread reports back.
+///
+/// `Entering` is sent before each call rather than after, so a silence
+/// names the iteration that stalled instead of the last that finished.
+enum Progress {
+    Entering(usize),
+    Finished(usize, Duration),
+}
+
+/// How long to wait for the next report before calling it stalled.
+///
+/// This bounds one iteration, not the whole run: a repeat count that
+/// makes progress keeps resetting it.
 const STALL_AFTER: Duration = Duration::from_secs(20);
 
 /// How long to keep waking workers so they can dump.
@@ -96,13 +122,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let over: usize = argument(&args, 1, 8, "over");
     let arm = args.get(2).map(String::as_str).unwrap_or("rayon");
+    let repeats: usize = argument(&args, 3, 1, "repeats").max(1);
     if !trace::is_enabled() {
         eprintln!("the trace switch is not set; the run will report completion but record nothing");
     }
 
     let workers = global_local_arena().local_worker_count();
     let n = workers + over;
-    println!("workers {workers}, fan-out {n}, arm {arm}");
+    println!("workers {workers}, fan-out {n}, arm {arm}, repeats {repeats}");
 
     if arm == "rayon" {
         let mut warm: Vec<u64> = (0..n as u64).collect();
@@ -120,20 +147,30 @@ fn main() {
     trace::reset_current_thread();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let plan = JobPlan::new(8, 1);
-        let closures: Vec<Box<dyn FnOnce() -> u32 + Send>> = (0..n)
-            .map(|i| {
-                Box::new(move || {
-                    trace::emit(TraceEvent::LeafStart, i as u32);
-                    let out = i as u32;
-                    trace::emit(TraceEvent::LeafEnd, i as u32);
-                    out
-                }) as _
-            })
-            .collect();
         let started = Instant::now();
-        let results = cooperative_join_n_flat_mailbox(&plan, closures);
-        if let Err(e) = tx.send((results, started.elapsed())) {
+        let mut last = 0usize;
+        for iteration in 0..repeats {
+            let plan = JobPlan::new(8, 1);
+            let closures: Vec<Box<dyn FnOnce() -> u32 + Send>> = (0..n)
+                .map(|i| {
+                    Box::new(move || {
+                        trace::emit(TraceEvent::LeafStart, i as u32);
+                        let out = i as u32;
+                        trace::emit(TraceEvent::LeafEnd, i as u32);
+                        out
+                    }) as _
+                })
+                .collect();
+            // Reported before the call rather than after, so a stall
+            // says which iteration it stalled on rather than which one
+            // last finished.
+            if let Err(e) = tx.send(Progress::Entering(iteration)) {
+                eprintln!("the harness stopped listening at iteration {iteration}: {e}");
+                return;
+            }
+            last = cooperative_join_n_flat_mailbox(&plan, closures).len();
+        }
+        if let Err(e) = tx.send(Progress::Finished(last, started.elapsed())) {
             // Finished, but after the main thread had already reported
             // a stall. A slow fan-out and a stuck one must not read the
             // same, so this says which it was.
@@ -141,18 +178,33 @@ fn main() {
         }
     });
 
-    match rx.recv_timeout(STALL_AFTER) {
-        Ok((results, wall)) => {
-            println!("completed {} closures in {wall:?}", results.len());
+    let mut reached = 0usize;
+    let outcome = loop {
+        match rx.recv_timeout(STALL_AFTER) {
+            Ok(Progress::Entering(i)) => reached = i,
+            other => break other,
+        }
+    };
+
+    match outcome {
+        Ok(Progress::Entering(_)) => unreachable!("the loop breaks on anything else"),
+        Ok(Progress::Finished(count, wall)) => {
+            println!("completed {repeats} x {count} closures in {wall:?}");
         }
         Err(RecvTimeoutError::Timeout) => {
-            println!("STALLED: no completion in {STALL_AFTER:?} at fan-out {n}");
+            println!(
+                "STALLED: no progress in {STALL_AFTER:?} at fan-out {n}, \
+                 on iteration {reached} of {repeats}"
+            );
         }
         Err(RecvTimeoutError::Disconnected) => {
             // The fan-out thread ended without sending, so a closure or
             // the join itself panicked. That is a different failure from
             // a stall and the trace below means something different too.
-            println!("the fan-out thread ended without sending: it panicked rather than stalled");
+            println!(
+                "the fan-out thread ended without sending on iteration {reached}: \
+                 it panicked rather than stalled"
+            );
         }
     }
 
