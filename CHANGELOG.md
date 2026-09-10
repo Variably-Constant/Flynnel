@@ -457,6 +457,22 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   which of the two it got. Deduplicated on the pair the result depends
   on, so a sweep prints once per size rather than once per dispatch.
 
+  It also reports the recursion floor beside the seeded count, as a
+  `leaf floor:` line carrying the caller's floor and the effective one.
+  They are two separate decisions taken from two separate inputs, and
+  only the second was observable: with an authoritative per-item
+  estimate the floor is `pool_dispatch_cost_ns()` divided by that
+  estimate, and that numerator is measured once per process. On the
+  bench host the sweep reports a caller floor of 256 against an
+  effective floor of 92, so the figure a caller gets is neither the
+  default nor a constant of the machine, and it could move under them
+  with every printed number staying still.
+
+  Both reports read the environment once rather than per dispatch.
+  `env::var_os` takes the process environment lock and allocates on
+  each call, and the seed-depth report sat on a per-dispatch path
+  paying that to answer a question whose answer cannot change.
+
 - `CallSiteState::seed_depth_flips` counts dispatches at a site that
   seeded a different leaf count from the one before them. Throughput
   cannot express that: a flip between two adjacent depths costs little
