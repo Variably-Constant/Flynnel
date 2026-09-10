@@ -359,6 +359,16 @@ fn seed_hysteresis_enabled() -> bool {
     SEED_HYSTERESIS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether `FLYNNEL_SEED_DEPTH` reporting is on, read once.
+///
+/// Every dispatch reaches this, and `env::var_os` takes the process
+/// environment lock and allocates a string on each read, so reading it
+/// per call would charge the hot path for a switch that is off.
+fn seed_depth_reporting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLYNNEL_SEED_DEPTH").is_some())
+}
+
 /// Turn seed-depth hysteresis on or off, returning what it was.
 ///
 /// Settable rather than read once so a bench can put both arms in one
@@ -444,7 +454,7 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
     // One line per distinct shape rather than per dispatch. The key is
     // the pair the result depends on, so a bench sweeping sizes prints
     // once per size and a caller repeating one shape prints once.
-    if std::env::var_os("FLYNNEL_SEED_DEPTH").is_some() {
+    if seed_depth_reporting() {
         static LAST_SHAPE: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(u64::MAX);
         let ns = plan.estimated_per_item_ns.unwrap_or(0);
@@ -1270,30 +1280,51 @@ where
 
     let workers = plan.effective_workers(global_local_arena().total_workers());
 
-    // Adaptive min_leaf. The default MIN_LEAF_ITEMS=256 floor caps
-    // chunk count for fine-grain ops (~10ns/elem) where per-leaf
-    // dispatch overhead dominates below 256-item chunks. For heavy
-    // per-element work (BigFloat mul, sqrt-chains, FMA-heavy
-    // kernels), a 256-item floor SERIALIZES the small-N case:
-    // N=4 items each taking 10ms can fully saturate 4 cores at
-    // 1-item leaves, but the 256-floor would force inline.
+    // The recursion floor. A fine-grain op at around 10ns an element
+    // wants a floor in the hundreds, because per-leaf dispatch
+    // dominates below that; heavy per-element work wants a floor of
+    // one, since four items at 10ms each saturate four cores as four
+    // leaves where a 256-item floor runs them on the calling thread.
     //
-    // Formula: effective_min_leaf = max(1, target_per_leaf_ns / per_item_ns),
-    // capped at MIN_LEAF_ITEMS. When per-item-cost is unknown,
-    // fall back to the conservative default.
+    // With an authoritative per-item estimate `adaptive_min_leaf`
+    // sizes a leaf to carry about one dispatch's worth of work,
+    // `pool_dispatch_cost_ns() / per_item_ns`, floored at one item;
+    // without one it takes the floor passed in here. Either way the
+    // result is capped at that floor, so a caller passing 1 gets 1.
     //
-    // Examples (target_per_leaf_overhead_ns = 5us):
-    //   per_item =     10ns -> floor = max(1, 500)   capped to 256
-    //   per_item =     50ns -> floor = max(1, 100)   = 100
-    //   per_item =    500ns -> floor = max(1, 10)    = 10
-    //   per_item =  10000ns -> floor = max(1, 0)     = 1
-    //
-    // The cap-at-MIN_LEAF_ITEMS preserves the fine-grain-default
-    // behavior; the lower-bound-at-1 unlocks the small-N + heavy
-    // case where rayon already parallelizes and flynnel was
-    // serializing.
+    // The numerator is measured once per process, so the floor is a
+    // figure this process holds rather than a constant of the machine.
     let effective_min_leaf = adaptive_min_leaf(plan, min_leaf.max(1));
 
+    // `FLYNNEL_SEED_DEPTH` reports the floor beside the seeded leaf
+    // count that `adaptive_seed_depth` prints. They are two separate
+    // decisions and only the second was observable, so a floor moving
+    // with a per-process measurement changed the fan-out while every
+    // printed figure stayed still.
+    //
+    // Reads nothing that would start the calibration: a print that
+    // measured the host would change what it reports on.
+    //
+    // One line per distinct shape, keyed on what the floor depends on,
+    // so a sweep prints once per size rather than once per dispatch.
+    if seed_depth_reporting() {
+        static LAST_FLOOR_SHAPE: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(u64::MAX);
+        let ns = plan.estimated_per_item_ns.unwrap_or(0);
+        let key = ((n as u64) << 32)
+            ^ ((ns as u64) << 8)
+            ^ effective_min_leaf as u64;
+        if LAST_FLOOR_SHAPE.swap(key, core::sync::atomic::Ordering::Relaxed) != key {
+            eprintln!(
+                "leaf floor: items {n} per_item_ns {:?} explicit {} \
+                 use_smt {} caller_floor {} effective_floor {effective_min_leaf}",
+                plan.estimated_per_item_ns,
+                plan.estimated_per_item_ns_explicit,
+                plan.use_smt,
+                min_leaf.max(1)
+            );
+        }
+    }
 
     // Probe-and-decide path: when the caller hasn't given us a cost
     // estimate and the workload is small relative to the worker
@@ -1304,10 +1335,14 @@ where
     //
     // Probe a tiny leaf inline, measure actual per-element cost,
     // then decide:
-    //   * estimated_tail_work < workers * 5us  -> finish inline
-    //     serially (skip the pool entirely).
-    //   * otherwise                            -> bisect the tail
-    //     with the observed cost as the leaves_per_worker driver.
+    //   * the tail's measured work is below this host's collapse
+    //     crossover -> finish inline serially, skipping the pool.
+    //   * otherwise -> bisect the tail with the observed cost as the
+    //     leaves_per_worker driver.
+    //
+    // That crossover is `inline_collapse_threshold_ns()`, measured on
+    // the running host and cached for the process, and the comparison
+    // is against the whole tail rather than a per-worker share.
     //
     // Gated on `plan.oversubscription_log2.is_none()` too: if the
     // caller explicitly set an oversub override they opted in to
