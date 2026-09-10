@@ -194,6 +194,13 @@ fn bench_simc_cooperative(c: &mut Criterion) {
     bench_n(c, 32);
     bench_n(c, 56);
     bench_n(c, 64);
+    // Past the widths where mailbox has been measured losing to deque
+    // by 10 to 22 percent. The design's own argument is that
+    // owner-directed placement eventually beats random peer-steal, so
+    // the gate belongs wherever that crossing is rather than at the
+    // worker count; these are what say whether there is one.
+    bench_n(c, 128);
+    bench_n(c, 256);
 }
 
 criterion_group!(benches, bench_simc_cooperative);
