@@ -140,8 +140,20 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   shape where the population heuristic intended mailbox.
   `NumaArena::local_worker_count` is the new accessor, resolving through
   the node lookup that already existed. This host is single-node, so the
-  band is empty here and the change is a no-op on it; whether mailbox
-  beats tree in that band is unmeasured on any host.
+  band is empty here and the change is a no-op on it.
+
+  Whether mailbox beats deque at the widths where it engages has since
+  been measured, and it does not. Against the deque fan-out on the same
+  closures, mailbox costs 13 percent more at N=24, 22 at 32, 9.7 at 56
+  and 14 at 64 - four widths, one direction. Below the gate the two arms
+  run the same code and match to within 1.5 percent, which is the
+  control that makes the rest readable.
+
+  So the fan-out a caller gets through `cooperative_join_n` is not the
+  fastest one the crate has at those widths, and where rayon has been
+  seen to win it is winning against the routed shape rather than against
+  the deque fan-out, which beats it at every width measured. Where the
+  gate belongs instead waits on the sweep reaching past 64.
 
 - Seed-depth hysteresis is on. A change of seeded leaf count now needs
   two consecutive dispatches asking for it, so one estimate landing the
