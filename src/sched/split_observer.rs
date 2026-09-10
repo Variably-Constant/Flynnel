@@ -1,21 +1,30 @@
 //! Background steal-rate observer that tunes the `par_iter`
 //! split-budget multiplier at runtime.
 //!
-//! The static split budget (`workers * 2` in
-//! [`crate::sched::par_iter::for_each_chunk`]) is a heuristic. When
-//! the pool is under heavy contention - lots
-//! of cross-worker stealing - workers benefit from a HIGHER split
-//! budget (more leaves spawned = better steal granularity). When
-//! the pool is mostly running owner-local work (no contention),
-//! a HIGHER budget creates extra dispatch overhead with no
-//! distribution benefit, so a LOWER budget wins.
+//! A split budget of `workers * multiplier` is a heuristic, and this
+//! multiplier is the one it scales by. When the pool is under heavy
+//! contention, with a lot of cross-worker stealing, workers benefit
+//! from a higher budget: more leaves spawned means finer steal
+//! granularity. When the pool is mostly running owner-local work, a
+//! higher budget only adds dispatch overhead with no distribution
+//! benefit, so a lower one wins.
 //!
 //! The observer thread (hosted on the
 //! [`crate::sched::io_pool::IoPool`]) samples per-worker stats
-//! every 200ms, computes a global steal rate, and writes a
-//! multiplier into a process-wide AtomicU32 that
-//! `par_iter::for_each_chunk` reads to scale its initial split
-//! budget.
+//! every 200ms, computes a global steal rate, and writes the
+//! multiplier into a process-wide AtomicU32.
+//!
+//! What reads it is [`crate::sched::plan::JobPlan::effective_leaves_per_worker`],
+//! and only for a plan whose caller did not pin a factor of their own.
+//! That covers the budget-shaped dispatch entries: the triple, indexed
+//! and collect helpers, the token-bucket and reduce paths, and
+//! `for_each_chunk`'s probe and pinned-variant routes.
+//!
+//! It does not cover every dispatch. `for_each_chunk` and
+//! `for_each_chunk_indexed` seed from `adaptive_seed_depth` when the
+//! plan carries an authoritative per-item estimate, and that route
+//! derives its leaf count from the estimate and from observed steals
+//! without consulting this multiplier at all.
 //!
 //! ## Steal rate definition
 //!

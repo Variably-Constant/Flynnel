@@ -1191,15 +1191,35 @@ fn run_on_caller<R>(plan: &JobPlan, body: impl FnOnce() -> R) -> R {
 /// recursively bisecting the slice. Each leaf chunk is processed
 /// serially by `op`, which is the right granule for SIMD loops.
 ///
-/// The number of leaves is bounded by `worker_count() * 2`:
-/// log2-depth recursion of `sched::join` until either the chunk
-/// is at most `n / target_leaves` items, or below
-/// [`MIN_LEAF_ITEMS`]. Each level halves the remaining `splits`
-/// budget; when the budget hits zero the recursion bottoms out
-/// even if larger chunks would have been split further. This is
-/// the simplified rayon `bridge` pattern: hand out roughly
-/// `2 * worker_count` chunks so steals have headroom without
-/// over-splitting.
+/// The leaf count is derived per dispatch and this entry does not
+/// expose it. Which mechanism derives it depends on what the plan
+/// carries.
+///
+/// With an authoritative per-item estimate the recursion seeds
+/// `2^adaptive_seed_depth` leaves, where the target is
+/// `max(workers, items * per_item_ns / TARGET_LEAF_WORK_NS)` capped
+/// at `items.len()`, rounded up to a power of two, and floored at
+/// `workers` rounded the same way. Past that seed
+/// `bisect_lazy_steal_driven` splits further only on observed steal
+/// pressure, down to the recursion floor.
+///
+/// Without one, a probe measures a prefix and the tail runs under a
+/// split budget of `workers * effective_leaves_per_worker()`, halved
+/// per level and replenished to the full budget when a subtree is
+/// stolen. That multiplier belongs to the split observer, which
+/// retunes it from the pool's steal rate within `[1, 8]` unless the
+/// caller pinned one with `with_oversubscription_log2`, so the budget
+/// is a figure this process holds at that moment rather than a
+/// constant. A pinned [`crate::sched::plan::BisectVariant`] takes the
+/// same budget shape with a multiplier of one.
+///
+/// So no route carries a fixed ceiling of the form
+/// `worker_count() * k`. The bound that holds on all of them is
+/// `items.len() / floor`.
+///
+/// A caller cannot ask these entries for a leaf count.
+/// [`for_each_chunk_min_leaf`] sets the floor, which bounds the count
+/// from above through that quotient rather than choosing it.
 ///
 /// `op` must be `Sync` because the same closure body is invoked
 /// in parallel from multiple workers (each on its own chunk).
@@ -1215,11 +1235,16 @@ where
 /// Same as [`for_each_chunk`] but the recursion floor is
 /// caller-supplied.
 ///
-/// The floor is a ceiling on the leaf size the cost model may pick,
-/// so a smaller value lets the SLAW budget cap the chunk count
-/// instead of the floor doing it. Heavy per-element ops pass 1 and
-/// get a leaf per item, where the default 256 caps the leaf count at
-/// `n / 256` and runs a small batch serially.
+/// The floor is a ceiling on the leaf size `adaptive_min_leaf` may
+/// pick, so a smaller value lets the seed depth and steal pressure
+/// decide the count instead of the floor deciding it. Heavy
+/// per-element ops pass 1 and get a leaf per item, where the default
+/// [`MIN_LEAF_ITEMS`] bounds the count at `n / MIN_LEAF_ITEMS` and
+/// runs a small batch serially.
+///
+/// Passing a floor does not request a leaf count. It sets the point
+/// the recursion stops, and the count that results depends on the
+/// per-item estimate and on how much the pool steals.
 #[track_caller]
 pub fn for_each_chunk_min_leaf<T, F>(
     plan: &JobPlan,
