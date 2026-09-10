@@ -11,10 +11,16 @@
 //!
 //! Arguments: how far above the local worker count to fan out
 //! (default 8); whether a `rayon` scope fan-out runs first or the
-//! mailbox fan-out runs `alone`; and how many times to repeat the
-//! fan-out (default 1). The first two arms differ in nothing else, so a
-//! completion in one and a stall in the other attributes the difference
-//! to the foreign pool.
+//! fan-out runs `alone`; how many times to repeat it (default 1); and
+//! `deque` to take the plain fan-out rather than the mailbox one. The
+//! first two arms differ in nothing else, so a completion in one and a
+//! stall in the other attributes the difference to the foreign pool.
+//!
+//! The shape argument exists because the stall reproduced on the DEQUE
+//! arm at 1024 while the mailbox arm at the same width completed. Both
+//! shapes reach the same wait path, so the question is which of them
+//! the defect needs, and running one binary both ways is what answers
+//! it without a second harness to differ in other respects.
 //!
 //! The repeat count exists because a single call is the one thing this
 //! does that a criterion sweep does not: criterion calls the same
@@ -54,7 +60,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use flynnel::sched::arena::global_local_arena;
-use flynnel::sched::cooperative::cooperative_join_n_flat_mailbox;
+use flynnel::sched::cooperative::{cooperative_join_n_flat, cooperative_join_n_flat_mailbox};
 use flynnel::sched::trace::{self, TraceEvent};
 use flynnel::{JobPlan, for_each_chunk};
 
@@ -123,13 +129,18 @@ fn main() {
     let over: usize = argument(&args, 1, 8, "over");
     let arm = args.get(2).map(String::as_str).unwrap_or("rayon");
     let repeats: usize = argument(&args, 3, 1, "repeats").max(1);
+    // Which fan-out shape stalls is the open question: the observed
+    // stall at 1024 was the deque arm, and the mailbox arm at the same
+    // width completed. Both reach the same wait path.
+    let deque = args.get(4).map(String::as_str) == Some("deque");
     if !trace::is_enabled() {
         eprintln!("the trace switch is not set; the run will report completion but record nothing");
     }
 
     let workers = global_local_arena().local_worker_count();
     let n = workers + over;
-    println!("workers {workers}, fan-out {n}, arm {arm}, repeats {repeats}");
+    let shape = if deque { "deque" } else { "mailbox" };
+    println!("workers {workers}, fan-out {n}, arm {arm}, repeats {repeats}, shape {shape}");
 
     if arm == "rayon" {
         let mut warm: Vec<u64> = (0..n as u64).collect();
@@ -168,7 +179,11 @@ fn main() {
                 eprintln!("the harness stopped listening at iteration {iteration}: {e}");
                 return;
             }
-            last = cooperative_join_n_flat_mailbox(&plan, closures).len();
+            last = if deque {
+                cooperative_join_n_flat(&plan, closures).len()
+            } else {
+                cooperative_join_n_flat_mailbox(&plan, closures).len()
+            };
         }
         if let Err(e) = tx.send(Progress::Finished(last, started.elapsed())) {
             // Finished, but after the main thread had already reported
