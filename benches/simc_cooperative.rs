@@ -183,7 +183,7 @@ impl StallWatch {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
-    fn started(&self, i: usize) {
+    fn record_start(&self, i: usize) {
         if i < WIDEST_FAN_OUT {
             // Recorded before the thread name so an index that appears
             // with no thread is a closure that began and whose runner
@@ -197,7 +197,7 @@ impl StallWatch {
         self.threads.lock().expect("stall watch threads").insert(name);
     }
 
-    fn finished(&self, i: usize) {
+    fn record_finish(&self, i: usize) {
         if i < WIDEST_FAN_OUT {
             self.finished[i].store(true, Ordering::Relaxed);
         }
@@ -325,9 +325,9 @@ fn closures(n: usize) -> Vec<Box<dyn FnOnce() -> u64 + Send>> {
         .map(|i| {
             let b: Box<dyn FnOnce() -> u64 + Send> = if armed {
                 Box::new(move || {
-                    stall_watch().started(i);
+                    stall_watch().record_start(i);
                     let out = fixed_cost_work(i as u64);
-                    stall_watch().finished(i);
+                    stall_watch().record_finish(i);
                     out
                 })
             } else {
