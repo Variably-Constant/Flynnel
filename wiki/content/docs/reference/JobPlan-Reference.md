@@ -164,7 +164,13 @@ Pairs with the SIMT and MIMT axes of the [extended Flynn taxonomy](Extended-Flyn
 
 Per-call leaf-count multiplier expressed as a log2, capping the bisect leaves at `workers * 2^log2` for this dispatch only.
 
-It caps the routes that take a split budget: the triple, indexed and collect helpers, the token-bucket and reduce paths, and `for_each_chunk`'s probe and pinned-variant routes. It does not reach the seed-depth route. When a plan carries an authoritative per-item estimate, `for_each_chunk` and `for_each_chunk_indexed` derive the leaf count from `adaptive_seed_depth` and from observed steals, and this field is not read on that path. A caller setting it there changes nothing.
+It reaches every route, but by two different mechanisms.
+
+On the routes that take a split budget, the triple, indexed and collect helpers, the token-bucket and reduce paths, and `for_each_chunk`'s probe and pinned-variant routes, it caps the leaves at `workers * 2^log2`.
+
+On the seed-depth route, which is what `for_each_chunk` and `for_each_chunk_indexed` take when the plan carries an authoritative per-item estimate, it shifts the depth: `adaptive_seed_depth` derives a depth from the estimate, applies the worker floor and the hysteresis stabiliser, then adds this log2, capped at one leaf per item. A factor of 2 on a depth of 6 seeds 256 leaves rather than 64.
+
+The distinction between the two sources matters more here than elsewhere. Only a factor the caller set through [`with_oversubscription_log2`](#builder-methods) shifts the seed depth. A profile-derived or learned factor does not, and neither does the process-global split multiplier, so on that route the only oversubscription applied is one the caller asked for.
 
 What resolves it at a dispatch entry is `effective_leaves_per_worker()`, and which of two sources it reads depends on who set the field. A factor the caller set through [`with_oversubscription_log2`](#builder-methods) wins outright and the process-global observer is not consulted: that is the whole point of the override. A factor that arrived from a profile or a learned class leaves `oversubscription_log2_explicit` false, and the entry reads the observer-tuned `split_multiplier` instead, so the adaptive default stays in charge whenever the caller expressed no opinion.
 

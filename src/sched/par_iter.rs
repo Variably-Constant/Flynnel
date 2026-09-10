@@ -409,6 +409,13 @@ pub fn set_seed_hysteresis(on: bool) -> bool {
 /// Without a per-item hint the count is `workers`, the fewest-leaves
 /// choice; lazy-steal mode subdivides on demand after.
 ///
+/// A caller who set an oversubscription factor with
+/// [`crate::sched::plan::JobPlan::with_oversubscription_log2`] shifts
+/// the resulting depth by that log2, capped at one leaf per item. A
+/// factor that arrived from a profile or a learned class does not,
+/// and neither does the process-global split multiplier: on this route
+/// the only oversubscription applied is one the caller asked for.
+///
 /// The count rounds up to a power of two, so it is a step function of
 /// `items`: two sizes a percent apart can seed 32 leaves and 64, and
 /// the same size always gets the same count. Per element the larger
@@ -440,6 +447,24 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
     let depth = match plan.site {
         Some(site) if seed_hysteresis_enabled() => site.get().stabilise_seed_depth(depth),
         _ => depth,
+    };
+    // A factor the caller set is them describing their own workload,
+    // which a profile-derived or learned one is not, so it shifts the
+    // depth the cost model settled on. It is applied after the worker
+    // floor and the stabilizer because both of those work in depth, and
+    // capped at one leaf per item, which is the same ceiling the target
+    // carries.
+    //
+    // The process-global split multiplier is not consulted here at any
+    // point. On this route the only oversubscription that applies is one
+    // the caller asked for.
+    let depth = if plan.oversubscription_log2_explicit {
+        let items_log2 = (items as u64).next_power_of_two().trailing_zeros() as usize;
+        depth
+            .saturating_add(plan.effective_oversubscription_log2() as usize)
+            .min(items_log2)
+    } else {
+        depth
     };
     // Counted after both stabilizers, so it is the depth the dispatch
     // actually seeds with rather than the one the cost model proposed.
@@ -1201,7 +1226,9 @@ fn run_on_caller<R>(plan: &JobPlan, body: impl FnOnce() -> R) -> R {
 /// at `items.len()`, rounded up to a power of two, and floored at
 /// `workers` rounded the same way. Past that seed
 /// `bisect_lazy_steal_driven` splits further only on observed steal
-/// pressure, down to the recursion floor.
+/// pressure, down to the recursion floor. A factor the caller set with
+/// `with_oversubscription_log2` shifts that depth; one from a profile
+/// or a learned class does not.
 ///
 /// Without one, a probe measures a prefix and the tail runs under a
 /// split budget of `workers * effective_leaves_per_worker()`, halved
@@ -4262,6 +4289,46 @@ mod tests {
 
     /// The caller's own oversubscription factor decides the split
     /// budget, in place of the process-global observer multiplier.
+    /// The seed-depth route takes the caller's factor and nobody
+    /// else's, so a plan carrying one seeds that many more leaves and a
+    /// plan whose factor came from a profile seeds what the cost model
+    /// chose.
+    #[test]
+    fn an_explicit_oversubscription_factor_shifts_the_seed_depth() {
+        const ITEMS: usize = 65_536;
+        const ITEMS_LOG2: usize = 16;
+        const WORKERS: usize = 24;
+
+        // No site, so the hysteresis stabilizer is out of the way and
+        // the depth is a function of the plan alone.
+        let bare = JobPlan::new(6, ITEMS as u32).with_estimated_per_item_ns(500);
+        assert!(!bare.oversubscription_log2_explicit);
+        let plain = adaptive_seed_depth(&bare, ITEMS, WORKERS);
+
+        for log2 in 0..=3u8 {
+            let pinned = JobPlan::new(6, ITEMS as u32)
+                .with_estimated_per_item_ns(500)
+                .with_oversubscription_log2(log2);
+            assert!(pinned.oversubscription_log2_explicit);
+            assert_eq!(
+                adaptive_seed_depth(&pinned, ITEMS, WORKERS),
+                (plain + log2 as usize).min(ITEMS_LOG2),
+                "a factor of {log2} shifts the depth by {log2}",
+            );
+        }
+
+        // A profile carries a factor as a routing default rather than as
+        // the caller's opinion, so it leaves the depth where it was.
+        let profiled = JobPlan::set_profile(
+            6,
+            ITEMS as u32,
+            crate::dispatch_profile::DispatchProfile::LatencyBound,
+        )
+        .with_estimated_per_item_ns(500);
+        assert!(profiled.oversubscription_log2.is_some());
+        assert_eq!(adaptive_seed_depth(&profiled, ITEMS, WORKERS), plain);
+    }
+
     #[test]
     fn an_explicit_oversubscription_factor_sets_the_split_budget() {
         let plan = JobPlan::new(6, 1024);

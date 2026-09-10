@@ -7,6 +7,33 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ## Unreleased
 
+### Changed
+
+- An oversubscription factor the caller set with
+  `with_oversubscription_log2` now reaches the seed-depth route, which
+  is what `for_each_chunk` and `for_each_chunk_indexed` take when the
+  plan carries an authoritative per-item estimate. It was read only on
+  the routes that take a split budget, so the override did nothing
+  exactly when the caller had supplied the per-item cost the docs ask
+  for.
+
+  It shifts the depth rather than scaling the target.
+  `adaptive_seed_depth` derives a depth from the estimate, applies the
+  worker floor and the hysteresis stabiliser, then adds the log2, capped
+  at one leaf per item. Both of those stabilisers already work in depth,
+  and the two orders agree only when the target is already a power of
+  two: on a target of 51 with a factor of 2, scaling the target gives
+  102 and seeds 128, while shifting the depth rounds 51 to 64 and then
+  doubles it.
+
+  Only a factor the caller set applies. One that arrived from a profile
+  or a learned class does not, and neither does the process-global split
+  multiplier, so on this route the only oversubscription is one the
+  caller asked for. `oversubscription_log2_explicit` is what separates
+  the two.
+
+  A plan that sets no factor seeds what it seeded before.
+
 ### Fixed
 
 - A deque-shape cooperative fan-out wider than one worker's ring could
