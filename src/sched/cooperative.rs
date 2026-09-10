@@ -525,10 +525,15 @@ where
     // is owned by `stack_jobs` which outlives the latch-wait loop
     // below. Each `as_job_ref` returns a JobRef pointing at the
     // StackJob's stable heap address.
-    // Producer-fast fan-out: use push_burst so 3 consecutive jobs
-    // pack into one cache-line slot (K_inner=3 amortization). The
-    // explicit flush_all below publishes all buffered slots and
-    // broadcasts a single JEC wake covering them.
+    // Producer-fast fan-out: the first `DEQUE_FIRST_BURST` pushes are
+    // burst pushes, so they pack into one cache-line slot (K_inner=3
+    // amortization), and the flush at that boundary publishes them and
+    // broadcasts. Past it the deque arm pushes with the refusing call
+    // and runs what it refuses inline, because the burst path spins
+    // when the ring is full and the ring holds fewer jobs than a wide
+    // fan-out pushes. Mailbox mode bursts throughout; its pushes go to
+    // n different mailboxes rather than one ring, so no single buffer
+    // fills.
     unsafe {
         for (i, sj) in stack_jobs.iter().enumerate() {
             let r = sj.as_job_ref(plan.k_outer, numa_hint_byte, plan.variant);
