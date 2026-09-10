@@ -36,12 +36,23 @@ use crate::sched::plan::JobPlan;
 /// [`crate::sched::adaptive_cooperative`] precedence: per-plan
 /// `cooperative_routing` (non-`Auto`) wins, else the process-global
 /// tag, else the population heuristic - `N < n_workers` routes to
-/// [`cooperative_join_n_tree`], `N >= n_workers` to
-/// [`cooperative_join_n_flat_mailbox`] (each closure pushed to a
-/// specific peer's mailbox, drained mailbox-first, zero shared-deque
-/// CAS contention). The explicit variants and
+/// [`cooperative_join_n_tree`] and `N >= n_workers` to
+/// [`cooperative_join_n_flat_mailbox`]. The explicit variants and
 /// [`crate::sched::JobPlan::with_cooperative_routing`] bypass the
 /// heuristic.
+///
+/// Being routed to `cooperative_join_n_flat_mailbox` is not the same
+/// as taking the mailbox shape. That function applies its own gate at
+/// 32 times the worker count: below it every closure goes onto the
+/// calling worker's own deque for random peer-steal to distribute, and
+/// at or above it each closure is pushed to one specific peer's
+/// mailbox, drained mailbox-first with no shared-deque CAS contention.
+/// A fan-out at or a little above the pool width therefore takes the
+/// deque shape, which is the common case and is measured 2 to 22
+/// percent faster than the mailbox shape across that band.
+///
+/// No shape places a closure on a worker the caller can name, so a
+/// closure must not depend on which worker runs it.
 ///
 /// # Determinism contract
 ///
