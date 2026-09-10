@@ -198,7 +198,7 @@ let results: Vec<u64> = AdaptiveDispatcher::new()
     .execute_cooperative(closures);
 ```
 
-The `Cooperative` shape hint switches to the flat fan-out variant of `cooperative_join_n`. For the mailbox-routed variant use `.execute_cooperative_mailbox(closures)` instead; the internal gating demotes to deque mode when N is below the worker count.
+The `Cooperative` shape hint switches to the flat fan-out variant of `cooperative_join_n`. For the mailbox-routed variant use `.execute_cooperative_mailbox(closures)` instead; the internal gating demotes to deque mode when N is below 32 times the worker count, which is where owner-directed distribution was measured to overtake random peer-steal. Below that the deque shape is 2 to 22 percent faster, because mailbox mode leaves the parent and every untargeted worker idle for the wait.
 
 #### MIMC via dispatcher (heterogeneous closures)
 

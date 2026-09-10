@@ -230,7 +230,16 @@ pub fn cooperative_join_n<R>(
 
 N-way fork-join. Returns results in caller-supplied order, invariant of which thread executed which closure.
 
-Implementation: at `N = 1` runs inline; at `N = 2` invokes [`arena::join`](#join); at `N >= 3` splits the list in half (left-biased on odd N) and recurses via `arena::join` on the two subtrees. The shape is deterministic given N; it does not depend on available worker count.
+Implementation: at `N = 1` runs inline and at `N = 2` invokes [`arena::join`](#join), both inside the tree variant. At `N >= 3` the shape comes from `plan.cooperative_routing`: `ForceTree`, `ForceMailbox` and `ForceDeque` select one outright, and `Auto`, the default, compares N against the calling thread's node worker count.
+
+Under `Auto`, a fan-out narrower than the pool takes the tree shape: a balanced binary bisect, splitting the list in half (left-biased on odd N) and recursing via `arena::join`. One at or above the pool count takes the flat shape, which then applies its own gate:
+
+- below 32 times the worker count, the **deque** fan-out, putting every closure onto the parent worker's own deque for random peer-steal to distribute;
+- at or above it, the **mailbox** fan-out, pushing each closure to one specific worker's mailbox.
+
+The 32x gate is measured rather than chosen. Mailbox mode leaves the parent and every untargeted worker idle for the wait, because peer-steal reads deques and cannot reach a closure sitting in a mailbox. On a 24-worker Zen 4 the deque shape is 2 to 22 percent faster at every width from the pool count to 640, and the mailbox shape wins from 768 upward, reaching 19 percent by 1024. The CHANGELOG carries the table.
+
+Results are in caller-supplied order under every shape. The **result order** is deterministic given N; the **execution shape** is not, because it depends on the worker count of the node the call lands on, so the same N can take different shapes on different hosts.
 
 #### SIMC vs MIMC usage
 
