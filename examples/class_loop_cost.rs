@@ -102,6 +102,192 @@ where
     }
 }
 
+/// The box's CPU accounting, so a timed window carries what else the host
+/// was doing while it ran.
+#[cfg(target_os = "linux")]
+mod host {
+    use std::fs;
+
+    /// Summed ticks across every CPU, the busy share of them, and the share
+    /// the hypervisor took from this guest.
+    pub struct Sample {
+        total: u64,
+        busy: u64,
+        steal: u64,
+        cpus: f64,
+    }
+
+    fn parse(field: Option<&str>, what: &str) -> Result<u64, String> {
+        match field {
+            Some(text) => text
+                .parse::<u64>()
+                .map_err(|err| format!("{what} is not a count: {text:?} ({err})")),
+            None => Err(format!("{what} is missing")),
+        }
+    }
+
+    pub fn read() -> Result<Sample, String> {
+        let stat =
+            fs::read_to_string("/proc/stat").map_err(|err| format!("reading /proc/stat: {err}"))?;
+        let Some(line) = stat.lines().next() else {
+            return Err("/proc/stat is empty".to_string());
+        };
+        let mut fields = line.split_whitespace().skip(1);
+        let mut ticks = [0u64; 8];
+        for (i, name) in ["user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal"]
+            .into_iter()
+            .enumerate()
+        {
+            ticks[i] = parse(fields.next(), name)?;
+        }
+        let cpus = stat
+            .lines()
+            .filter(|l| l.starts_with("cpu") && l.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
+            .count();
+        if cpus == 0 {
+            return Err("/proc/stat lists no CPUs".to_string());
+        }
+        let total: u64 = ticks.iter().sum();
+        Ok(Sample {
+            total,
+            busy: total - ticks[3] - ticks[4],
+            steal: ticks[7],
+            cpus: cpus as f64,
+        })
+    }
+
+    /// Cores the box was busy, and cores the hypervisor took, between two
+    /// samples.
+    pub fn cores_between(earlier: &Sample, later: &Sample) -> Result<(f64, f64), String> {
+        let total = later
+            .total
+            .checked_sub(earlier.total)
+            .ok_or_else(|| "the summed CPU ticks went backwards".to_string())?
+            as f64;
+        if total <= 0.0 {
+            return Err("no CPU ticks passed between the two samples".to_string());
+        }
+        let busy = later
+            .busy
+            .checked_sub(earlier.busy)
+            .ok_or_else(|| "the busy ticks went backwards".to_string())? as f64;
+        let steal = later
+            .steal
+            .checked_sub(earlier.steal)
+            .ok_or_else(|| "the stolen ticks went backwards".to_string())? as f64;
+        Ok((busy / total * later.cpus, steal / total * later.cpus))
+    }
+}
+
+/// The box's CPU accounting on Windows. A physical host takes nothing from
+/// itself, so the stolen figure is zero there by construction.
+#[cfg(windows)]
+mod host {
+    use std::time::Instant;
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    impl FileTime {
+        fn units(self) -> u64 {
+            (u64::from(self.high) << 32) | u64::from(self.low)
+        }
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemTimes(idle: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+    }
+
+    /// Busy 100 ns units summed over every logical CPU, and when they were
+    /// read.
+    pub struct Sample {
+        at: Instant,
+        busy: u64,
+    }
+
+    pub fn read() -> Result<Sample, String> {
+        let mut idle = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        // SAFETY: every pointer is to a live local FileTime, and the call
+        // writes only through them.
+        let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+        let at = Instant::now();
+        if ok == 0 {
+            return Err(format!(
+                "GetSystemTimes failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // The kernel time GetSystemTimes reports includes idle time.
+        let total = kernel.units() + user.units();
+        match total.checked_sub(idle.units()) {
+            Some(busy) => Ok(Sample { at, busy }),
+            None => Err(format!(
+                "GetSystemTimes reported idle time {} above kernel plus user time {total}",
+                idle.units()
+            )),
+        }
+    }
+
+    /// Cores the box was busy between two samples, and zero stolen cores.
+    pub fn cores_between(earlier: &Sample, later: &Sample) -> Result<(f64, f64), String> {
+        let wall = later.at.duration_since(earlier.at).as_nanos() as f64 / 100.0;
+        if wall <= 0.0 {
+            return Err("the two samples were taken at the same instant".to_string());
+        }
+        let busy = later
+            .busy
+            .checked_sub(earlier.busy)
+            .ok_or_else(|| "the busy time went backwards".to_string())? as f64;
+        Ok((busy / wall, 0.0))
+    }
+}
+
+/// No box-wide CPU accounting on other platforms: a window says so rather
+/// than reporting a number that reads as a quiet host.
+#[cfg(not(any(target_os = "linux", windows)))]
+mod host {
+    pub struct Sample;
+
+    pub fn read() -> Result<Sample, String> {
+        Err("the box's CPU accounting is read on Linux and Windows only".to_string())
+    }
+
+    pub fn cores_between(_earlier: &Sample, _later: &Sample) -> Result<(f64, f64), String> {
+        Err("the box's CPU accounting is read on Linux and Windows only".to_string())
+    }
+}
+
+/// The cores the box was busy and the cores the hypervisor took over a
+/// window, as `busy/steal`, or why they could not be read.
+fn tenancy(earlier: &Result<host::Sample, String>, later: &Result<host::Sample, String>) -> String {
+    match earlier {
+        Ok(first) => match later {
+            Ok(last) => match host::cores_between(first, last) {
+                Ok((busy, steal)) => format!("{busy:.2}/{steal:.2}"),
+                Err(reason) => {
+                    eprintln!("a window has no tenant record: {reason}");
+                    "unavailable".to_string()
+                }
+            },
+            Err(reason) => {
+                eprintln!("a window has no tenant record at its end: {reason}");
+                "unavailable".to_string()
+            }
+        },
+        Err(reason) => {
+            eprintln!("a window has no tenant record at its start: {reason}");
+            "unavailable".to_string()
+        }
+    }
+}
+
 /// Dependent xorshift chain. The cost is the dependency chain rather than
 /// anything the optimizer can vectorize away, and `rounds` is what moves an
 /// item between the classifier's per-item bands.
@@ -293,8 +479,9 @@ fn window(
     buf: &mut [u64],
     table: &[u64],
     duration: Duration,
-) -> (f64, u64, f64, String) {
+) -> (f64, u64, f64, String, String) {
     leaf_stats_reset();
+    let host_at_start = host::read();
     let items = buf.len();
     let start = Instant::now();
     let mut times = Vec::new();
@@ -308,9 +495,16 @@ fn window(
         black_box(buf[0]);
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
+    let host_at_end = host::read();
     let dispatches = times.len() as u64;
     let (per_dispatch, span) = leaf_stats(dispatches);
-    (median(&mut times), dispatches, per_dispatch, span)
+    (
+        median(&mut times),
+        dispatches,
+        per_dispatch,
+        span,
+        tenancy(&host_at_start, &host_at_end),
+    )
 }
 
 /// Dispatch without timing for `duration`, with `threads` burners loading
@@ -401,7 +595,7 @@ fn main() {
     let site = SiteRef::new(&SITE);
     let measured = Duration::from_secs(window_s);
 
-    let (pre_ms, pre_n, pre_leaves, pre_sizes) =
+    let (pre_ms, pre_n, pre_leaves, pre_sizes, pre_host) =
         window(shape, routing, site, &mut buf, &table, measured);
     let class_pre = SITE.learned_class();
     let global_pre = active_workload_class();
@@ -419,14 +613,14 @@ fn main() {
     // host settle before the second window is timed.
     std::thread::sleep(Duration::from_millis(250));
 
-    let (post_ms, post_n, post_leaves, post_sizes) =
+    let (post_ms, post_n, post_leaves, post_sizes, post_host) =
         window(shape, routing, site, &mut buf, &table, measured);
     let class_post = SITE.learned_class();
     let global_post = active_workload_class();
 
     let ratio = if pre_ms > 0.0 { post_ms / pre_ms } else { f64::NAN };
     println!(
-        "{} {} {:.4} {:.4} {:.4} {} {} {:?} {:?} {:.1} {:.1} {} {} {} {}",
+        "{} {} {:.4} {:.4} {:.4} {} {} {:?} {:?} {:.1} {:.1} {} {} {} {} {} {}",
         shape.name(),
         routing.name(),
         pre_ms,
@@ -442,6 +636,8 @@ fn main() {
         post_sizes,
         pre_n,
         post_n,
+        pre_host,
+        post_host,
     );
     if pre_n == 0 || post_n == 0 {
         eprintln!("the windows ran {pre_n} dispatches before and {post_n} after; raise the window");
