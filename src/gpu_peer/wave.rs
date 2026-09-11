@@ -653,6 +653,9 @@ pub struct WaveCosts {
     pub segment_ps: u64,
     /// Rebalance cost of moving one pending id, ps.
     pub copy_ps_per_id: u64,
+    /// First-barrier wait of a coupled slice as its blocks pick up the
+    /// slot, ns; paid once per slice.
+    pub start_skew_ns: u64,
     /// Longest generation of the calibration waves, ns.
     pub generation_ns: u64,
 }
@@ -711,6 +714,7 @@ struct CalibrationRun {
     wall_ns: u64,
     elapsed_ns: u64,
     moved_ids: u64,
+    skew_ns: u64,
     longest_ns: u64,
 }
 
@@ -807,6 +811,7 @@ impl GpuPeer {
     /// - `copy_ps_per_id`: the rebalancing partition's device time above the
     ///   non-rebalancing one, less its two barriers per generation, per id
     ///   moved;
+    /// - `start_skew_ns`: the global frontier's first-barrier wait;
     /// - `generation_ns`: the longest generation any run measured.
     ///
     /// A difference that comes out negative is kept as zero. The costs stay
@@ -827,6 +832,7 @@ impl GpuPeer {
         let mut wall_points = Vec::with_capacity(CALIBRATION_DEPTHS.len());
         let mut barrier_per_generation = Vec::with_capacity(CALIBRATION_DEPTHS.len());
         let mut copy_per_id = Vec::with_capacity(CALIBRATION_DEPTHS.len());
+        let mut skew_per_depth = Vec::with_capacity(CALIBRATION_DEPTHS.len());
         let mut longest = 0u64;
         for depth in CALIBRATION_DEPTHS {
             let segments = u64::from(CALIBRATION_ROOTS) * ((1u64 << (depth + 1)) - 1);
@@ -837,6 +843,7 @@ impl GpuPeer {
             let every =
                 self.calibration_run(Frontier::Partition { rebalance_every: NonZeroU32::new(1) }, depth, partitioned)?;
             wall_points.push((segments as f64, global.wall_ns as f64));
+            skew_per_depth.push(global.skew_ns);
             let barrier = global.elapsed_ns.saturating_sub(never.elapsed_ns) / generations;
             barrier_per_generation.push(barrier);
             if every.moved_ids > 0 {
@@ -855,6 +862,7 @@ impl GpuPeer {
             fixed_ns: fixed.max(0.0) as u64,
             segment_ps: (slope * 1000.0).max(0.0) as u64,
             copy_ps_per_id: median(&copy_per_id),
+            start_skew_ns: median(&skew_per_depth),
             generation_ns: longest,
         };
         self.wave_costs = Some(costs);
@@ -879,6 +887,7 @@ impl GpuPeer {
         let mut walls = Vec::with_capacity(CALIBRATION_REPEATS);
         let mut elapsed = Vec::with_capacity(CALIBRATION_REPEATS);
         let mut moved = Vec::with_capacity(CALIBRATION_REPEATS);
+        let mut skews = Vec::with_capacity(CALIBRATION_REPEATS);
         let mut longest = 0u64;
         for _ in 0..CALIBRATION_REPEATS {
             let wave = self.create_wave(&spec)?;
@@ -900,12 +909,14 @@ impl GpuPeer {
             walls.push(if wall_ns > u128::from(u64::MAX) { u64::MAX } else { wall_ns as u64 });
             elapsed.push(stats.elapsed_ns);
             moved.push(u64::from(stats.moved_ids));
+            skews.push(u64::from(stats.start_skew_max_ns));
             longest = longest.max(u64::from(stats.longest_generation_ns));
         }
         Ok(CalibrationRun {
             wall_ns: median(&walls),
             elapsed_ns: median(&elapsed),
             moved_ids: median(&moved),
+            skew_ns: median(&skews),
             longest_ns: longest,
         })
     }
@@ -940,6 +951,7 @@ pub(crate) fn stored_wave_costs(ordinal: usize, width: u32) -> Option<WaveCosts>
         fixed_ns: record.fixed_ns,
         segment_ps: record.segment_ps,
         copy_ps_per_id: record.copy_ps_per_id,
+        start_skew_ns: u64::from(record.skew_ns),
         generation_ns: record.generation_ns,
     })
 }
@@ -1007,6 +1019,11 @@ fn persist_wave_costs(ordinal: usize, costs: WaveCosts) {
         fixed_ns: costs.fixed_ns,
         segment_ps: costs.segment_ps,
         copy_ps_per_id: costs.copy_ps_per_id,
+        skew_ns: if costs.start_skew_ns > u64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            costs.start_skew_ns as u32
+        },
         generation_ns: costs.generation_ns,
     });
     writer.publish(&cpu, &devices);
@@ -1267,6 +1284,7 @@ mod tests {
             fixed_ns: 100_000,
             segment_ps: 500,
             copy_ps_per_id: 3_000,
+            start_skew_ns: 0,
             generation_ns: 1_000,
         };
         let s = spec(Frontier::Global, 2, 10);

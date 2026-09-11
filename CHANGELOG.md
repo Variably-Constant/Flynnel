@@ -45,9 +45,9 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   and the rebalance interval, from the barrier cost and an observed
   imbalance.
 - `GpuPeer::calibrate_waves` measures a device's wave costs at its team
-  size: the barrier, the copy per pending id at a rebalance, the fixed
-  and per-segment cost of a slice round trip, and the longest
-  generation. It runs Flynnel's own tree op
+  size: the barrier, the start skew, the copy per pending id at a
+  rebalance, the fixed and per-segment cost of a slice round trip, and
+  the longest generation. It runs Flynnel's own tree op
   (`layout::OP_WAVE_CALIBRATE`), which composing any user source brings
   into the poller module. The costs stay on the peer and are stored on
   the device record, and `GpuPeer::wave_costs` returns them. A later
