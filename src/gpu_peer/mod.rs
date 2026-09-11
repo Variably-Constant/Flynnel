@@ -382,6 +382,12 @@ pub struct GpuPeerConfig {
     /// device. Rank 0 owns the ring and retires the slot once the
     /// whole team has finished; the user op receives its rank and the
     /// team size and strides its work over them.
+    ///
+    /// [`GpuPeer::init`] clamps this to the device's streaming
+    /// multiprocessor count when the driver reports one, because a team
+    /// wider than the device loses ranks at its barrier, and says so on
+    /// stderr when it does. [`GpuPeer::team_size`] is the size in use,
+    /// and it is the `team_size` the user op receives.
     pub blocks_per_lane: u32,
     /// User opcode implementations as CUDA C source defining
     /// `extern "C" __device__ unsigned flynnel_user_op(unsigned op,
@@ -492,6 +498,8 @@ pub struct GpuPeer {
     poller: poller::Poller,
     pool: Option<VramPool>,
     calibration: PeerCalibration,
+    /// Blocks serving each lane after the clamp to the SM count.
+    team_size: u32,
     _module: Arc<CudaModule>,
     _stream: Arc<CudaStream>,
     // Wide ops run on their own stream so they neither serialize behind
@@ -515,6 +523,12 @@ fn current_context() -> Option<cu::CUcontext> {
     // touching the pointer.
     let rc: cu::CUresult = unsafe { cu::cuCtxGetCurrent(&mut ctx) };
     if rc == cu::CUresult::CUDA_SUCCESS && !ctx.is_null() { Some(ctx) } else { None }
+}
+
+/// The team size a lane runs: the requested blocks per lane, no wider
+/// than the device's streaming multiprocessor count when that is known.
+fn clamp_team_size(requested: u32, sm_count: Option<u32>) -> u32 {
+    sm_count.map_or(requested, |sm| requested.min(sm))
 }
 
 /// Report a context this peer displaced on the calling thread.
@@ -676,6 +690,17 @@ impl GpuPeer {
                     .map_err(|e| GpuPeerError::Driver(format!("lane {lane} stream: {e:?}")))?,
             );
         }
+        let sm_count = crate::backend::detect::cuda_sm_count(config.device_ordinal);
+        let requested_team = config.blocks_per_lane.max(1);
+        let team_size = clamp_team_size(requested_team, sm_count);
+        if team_size != requested_team {
+            eprintln!(
+                "flynnel gpu_peer: blocks_per_lane {requested_team} exceeds device \
+                 {}'s {team_size} streaming multiprocessors; each lane runs a team \
+                 of {team_size}",
+                config.device_ordinal
+            );
+        }
         let poller = poller::Poller::new(
             lane_streams,
             f_poller,
@@ -684,7 +709,7 @@ impl GpuPeer {
             vbase,
             vbytes,
             vblocks,
-            config.blocks_per_lane,
+            team_size,
             config.barrier_deadline_ns,
         );
         let wide_stream = ctx
@@ -696,6 +721,7 @@ impl GpuPeer {
             poller,
             pool,
             calibration,
+            team_size,
             _module: module,
             _stream: stream,
             wide_stream,
@@ -728,6 +754,14 @@ impl GpuPeer {
     #[inline]
     pub fn geometry(&self) -> Geometry {
         self.region.geometry()
+    }
+
+    /// Blocks serving each lane: [`GpuPeerConfig::blocks_per_lane`],
+    /// clamped to the device's streaming multiprocessor count when the
+    /// driver reports one. This is the `team_size` a user op receives.
+    #[inline]
+    pub fn team_size(&self) -> u32 {
+        self.team_size
     }
 
     /// The shared region (attachment path, offset accessors).

@@ -97,6 +97,10 @@ fn every_rank_of_a_team_contributes_to_the_result() {
     let _device = common::device();
     for team in [1u32, 2, 4, 8, 64] {
         let mut peer = team_peer(team);
+        // A request wider than the device runs at its SM count, so the
+        // marks expected are those of the team size the peer reports.
+        let used = peer.team_size();
+        assert!(used >= 1 && used <= team, "team {team}: reported team size {used}");
         // One byte per rank past the resident prefix, with room for the
         // widest team here and a margin above it that must stay zero.
         let mut payload = vec![0u8; RESIDENT_PREFIX + MARKS];
@@ -117,20 +121,20 @@ fn every_rank_of_a_team_contributes_to_the_result() {
         // 8-byte resident-parameter block, so a rank writing its own
         // index 0 lands at byte 8 of what the host reads back.
         let marks = &payload[RESIDENT_PREFIX..RESIDENT_PREFIX + MARKS];
-        for rank in 0..team as usize {
+        for rank in 0..used as usize {
             assert_eq!(
                 marks[rank],
                 (rank + 1) as u8,
-                "team {team}: rank {rank} left no mark, so the slot retired \
-                 without its contribution. Marks seen: {:?}",
-                &marks[..team as usize]
+                "team {team} running {used}: rank {rank} left no mark, so the slot \
+                 retired without its contribution. Marks seen: {:?}",
+                &marks[..used as usize]
             );
         }
         // Nothing beyond the team wrote, so a mark cannot come from a
         // rank that does not exist.
         assert!(
-            marks[team as usize..].iter().all(|&b| b == 0),
-            "team {team}: a byte past the last rank was written: {marks:?}"
+            marks[used as usize..].iter().all(|&b| b == 0),
+            "team {team} running {used}: a byte past the last rank was written: {marks:?}"
         );
     }
 }
@@ -438,5 +442,47 @@ fn a_team_submission_does_not_approach_its_barrier_deadline() {
         (waited as u64) < 5_000_000 / 10,
         "a team that assembles must sit far below the default barrier \
          deadline; rank 0 waited {waited} ns"
+    );
+}
+
+/// A team requested wider than the device runs at the device's SM count,
+/// and every rank of the team it runs still contributes.
+#[test]
+fn a_team_wider_than_the_device_runs_at_its_sm_count() {
+    let _device = common::device();
+    let Some(sm) = flynnel::backend::detect::cuda_sm_count(0) else {
+        panic!("this test needs the device's SM count, and the driver reported none");
+    };
+    let mut peer = team_peer(sm * 2);
+    assert_eq!(
+        peer.team_size(),
+        sm,
+        "a request of {} blocks on a device with {sm} SMs",
+        sm * 2
+    );
+
+    let marks_len = (sm as usize + 1).max(MARKS);
+    let mut payload = vec![0u8; RESIDENT_PREFIX + marks_len];
+    let t = peer
+        .submit_user(layout::OP_USER_BASE + 100, None, &payload)
+        .expect("submit the team op");
+    assert_eq!(
+        peer.wait_status(t, Duration::from_secs(10)).expect("completes"),
+        STATUS_DONE
+    );
+    peer.read_result(t, &mut payload).expect("the result fits the slot");
+    peer.reap(t).expect("reap");
+
+    let marks = &payload[RESIDENT_PREFIX..];
+    for rank in 0..sm as usize {
+        assert_eq!(
+            marks[rank],
+            (rank + 1) as u8,
+            "rank {rank} of the clamped team left no mark"
+        );
+    }
+    assert!(
+        marks[sm as usize..].iter().all(|&b| b == 0),
+        "a byte past the clamped team's last rank was written"
     );
 }
