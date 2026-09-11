@@ -34,6 +34,28 @@
 //! `PortBound`, so confusing those two changes nothing the scheduler
 //! does, and that is a result rather than an omission.
 //!
+//! ## The arms are only comparable because the route is pinned
+//!
+//! `pin_one_route` runs before any arm is timed. Without it, on an AMD
+//! host the `PortBound` arm alone is handed a `bisect_variant` at
+//! construction and runs a different bisect from the other four, whose
+//! leaf count then follows a process-global multiplier the other arms
+//! retune as they go. Measured that way the five arms spread by 1.6x;
+//! one process per arm, with no pinning, they agree within 3 percent.
+//!
+//! Pinning removes the carrier that was identified. It is not proof
+//! that no other exists, and the check for that is to run one arm per
+//! process and see whether the numbers move. A spread that appears here
+//! and vanishes under that check is the harness, not the profile.
+//!
+//! ## Read each arm's interval, not only its estimate
+//!
+//! A neighbour arriving mid-run reaches arms unequally, and criterion's
+//! confidence interval shows it before any process table does: two arms
+//! once came back varying by more than a factor of two internally while
+//! their neighbours held within one percent. A wide interval is a
+//! tenant report.
+//!
 //! ## Why every shape is registered twice, in opposite order
 //!
 //! Criterion runs arms sequentially, so a load arriving or departing
@@ -67,8 +89,28 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use flynnel::JobPlan;
 use flynnel::dispatch_profile::DispatchProfile;
 use flynnel::sched::adaptive_profile::active_workload_class;
+use flynnel::sched::adaptive_variant_routing::{VariantRouting, migrate_variant_routing};
 use flynnel::sched::call_site::{CallSiteState, SiteRef};
 use flynnel::sched::par_iter::for_each_chunk;
+
+/// Put every arm on one dispatch route before any of them is timed.
+///
+/// On a host whose vendor resolves to `ComputeBatchAdaptive`, the CPUID
+/// default on AMD, a `PortBound` plan is given a `bisect_variant` at
+/// construction and every other profile is not. The arm carrying that
+/// variant runs a split-budget bisect while the rest run the seed-depth
+/// one, so a comparison between them measures the route as much as the
+/// profile, and the budget route's leaf count reads a process-global
+/// multiplier that the other arms retune as they run.
+///
+/// Pinning the routing to `Default` returns `None` for every profile, so
+/// all five arms take the seed-depth route and none of them reads that
+/// multiplier. The oversubscription factor is deliberately left
+/// unpinned: setting it explicitly would shift the seed depth instead,
+/// which changes the thing being measured rather than isolating it.
+fn pin_one_route() {
+    migrate_variant_routing(VariantRouting::Default);
+}
 
 /// One site per arm per ordering, so nothing a site learns crosses
 /// between them. Three shapes, five profiles, two orders.
@@ -242,16 +284,19 @@ fn both_orders(c: &mut Criterion, shape: Shape, site_base: usize, table: &[u64])
 }
 
 fn bench_fine(c: &mut Criterion) {
+    pin_one_route();
     let table = build_table();
     both_orders(c, Shape::Fine, 0, &table);
 }
 
 fn bench_heavy(c: &mut Criterion) {
+    pin_one_route();
     let table = build_table();
     both_orders(c, Shape::Heavy, 10, &table);
 }
 
 fn bench_gather(c: &mut Criterion) {
+    pin_one_route();
     let table = build_table();
     both_orders(c, Shape::Gather, 20, &table);
 }
