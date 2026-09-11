@@ -349,9 +349,19 @@ fn verdict(name: &str, yes: &str, no: &str, answers: &[(f64, bool)]) {
     if answers.is_empty() {
         println!("{name}: no level had the rows to answer it");
     } else if fails.is_empty() {
-        println!("{name}: {yes} at every level ({} levels)", answers.len());
+        println!(
+            "{name}: {yes} at every level with rows, foreign <= {:.1} to {:.1} cores ({} levels)",
+            answers[0].0,
+            answers[answers.len() - 1].0,
+            answers.len()
+        );
     } else if holds.is_empty() {
-        println!("{name}: {no} at every level ({} levels)", answers.len());
+        println!(
+            "{name}: {no} at every level with rows, foreign <= {:.1} to {:.1} cores ({} levels)",
+            answers[0].0,
+            answers[answers.len() - 1].0,
+            answers.len()
+        );
     } else {
         println!("{name}: {yes} at foreign <= {holds:?}; {no} at foreign <= {fails:?}");
     }
@@ -379,10 +389,16 @@ fn report(rows: &[Row]) {
         println!("no row carried CPU context, so no level can be reported");
         return;
     }
-    let mut highest = 0.0f64;
+    let mut highest = f64::MIN;
+    let mut lowest = f64::MAX;
     for entry in &measured {
         highest = highest.max(entry.1);
+        lowest = lowest.min(entry.1);
     }
+    println!(
+        "foreign load across the {} rows with CPU context: {lowest:.2} to {highest:.2} cores; levels below {lowest:.2} hold no rows",
+        measured.len()
+    );
     println!("foreign_le  before_rows  before_left  load_rows  load_left  after_rows  after_last_class");
     let left = |row: &Row| matches!(row.learned, Some(class) if class != WorkloadClass::Streaming);
     let mut attribution = Vec::new();
