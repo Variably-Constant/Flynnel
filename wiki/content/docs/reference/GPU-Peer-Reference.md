@@ -469,7 +469,7 @@ rebalances every generation. The medians are kept.
 | `fixed_ns`, `segment_ps` | least-squares line through the global frontier's host round trip against its segment count |
 | `barrier_ns` | global frontier's device time above the non-rebalancing partition's, summed over every depth, per generation |
 | `start_skew_ns` | median first-barrier wait of the global frontier, as its blocks pick up the slot |
-| `copy_ps_per_id` | rebalancing partition's device time above the non-rebalancing one, summed over every depth, less two barriers per generation, per id moved |
+| `rebalance_fixed_ns`, `copy_ps_per_id` | non-negative least-squares fit of block 0's time in rebalances against the rebalances run and the ids they moved, over every depth of the partition that rebalances every generation |
 | `generation_ns` | longest generation any run measured |
 
 Device time is the slice time block 0 sums in the span. A difference

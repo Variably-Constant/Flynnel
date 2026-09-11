@@ -86,6 +86,7 @@
 #define FLW_REBALANCES_OFF        0x90u   // rebalances run
 #define FLW_MOVED_OFF             0x94u   // pending ids moved through staging by rebalances
 #define FLW_ELAPSED_NS_OFF        0x98u   // u64: slice time summed on block 0, ns
+#define FLW_REBALANCE_NS_OFF      0xA0u   // u64: block 0's time in rebalances that moved ids, ns
 #define FLW_HEADER_BYTES          0x100u
 
 // Per-block table, one FLW_TABLE_STRIDE entry per block.
@@ -426,9 +427,11 @@ __device__ __forceinline__ void flw_rebalance(flw_slice* s)
     unsigned char* b = s->base;
     u32 me = s->rank;
     u32 w = s->width;
+    u64 rebalance_t0 = 0ull;
 
     if (threadIdx.x == 0) {
         u64 now = gtimer();
+        rebalance_t0 = now;
         atomicMax(flw_u32(b, FLW_LONGEST_GEN_OFF), flw_sat(now - s->gen_t0));
         u32 pend_start = s->end;
         u32 pend_end = flw_pushed(s, me);
@@ -508,10 +511,14 @@ __device__ __forceinline__ void flw_rebalance(flw_slice* s)
                   && flw_get(b, FLW_STOP_OFF) == 0u
                   && flw_get(b, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
         flw_tset(s, me, FLW_T_DECISION, go);
+        s->gen_t0 = gtimer();
         if (me == 0u) {
             flw_set(b, FLW_GENERATIONS_OFF, flw_get(b, FLW_GENERATIONS_OFF) + 1u);
+            if (flw_tget(s, me, FLW_T_TOTAL) > 0u) {
+                flw_set64(b, FLW_REBALANCE_NS_OFF,
+                          flw_get64(b, FLW_REBALANCE_NS_OFF) + (s->gen_t0 - rebalance_t0));
+            }
         }
-        s->gen_t0 = gtimer();
         __threadfence_system();
     }
     __syncthreads();

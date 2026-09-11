@@ -51,6 +51,8 @@ pub struct PlanInputs {
     pub width: u32,
     /// Cost of one cross-block barrier at this width, ns.
     pub barrier_ns: f64,
+    /// Fixed cost of one rebalance apart from the ids it moves, ns.
+    pub rebalance_fixed_ns: f64,
     /// Cost of moving one pending id through staging at a rebalance, ns.
     pub copy_ns_per_id: f64,
     /// Ids typically pending at a rebalance.
@@ -82,7 +84,7 @@ fn growth(imbalance: Imbalance) -> f64 {
 /// Modeled cost per generation of a partition rebalancing every `n`
 /// generations.
 fn partition_cost(inputs: &PlanInputs, g: f64, n: f64) -> f64 {
-    let rebalance = 2.0 * inputs.barrier_ns + inputs.copy_ns_per_id * inputs.pending_ids;
+    let rebalance = inputs.rebalance_fixed_ns + inputs.copy_ns_per_id * inputs.pending_ids;
     let r = g.powf(n).min(f64::from(inputs.width.max(1)));
     rebalance / n + inputs.generation_ns * (1.0 - 1.0 / r) / 2.0
 }
@@ -162,6 +164,7 @@ mod tests {
         PlanInputs {
             width: 32,
             barrier_ns,
+            rebalance_fixed_ns: 2.0 * barrier_ns,
             copy_ns_per_id: 2.0,
             pending_ids: 10_000.0,
             generation_ns,

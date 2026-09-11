@@ -476,12 +476,8 @@ fn a_team_wider_than_the_device_runs_at_its_sm_count() {
     peer.reap(t).expect("reap");
 
     let marks = &payload[RESIDENT_PREFIX..];
-    for rank in 0..sm as usize {
-        assert_eq!(
-            marks[rank],
-            (rank + 1) as u8,
-            "rank {rank} of the clamped team left no mark"
-        );
+    for (rank, &mark) in marks.iter().enumerate().take(sm as usize) {
+        assert_eq!(mark, (rank + 1) as u8, "rank {rank} of the clamped team left no mark");
     }
     assert!(
         marks[sm as usize..].iter().all(|&b| b == 0),

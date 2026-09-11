@@ -59,7 +59,7 @@ pub const CALIBRATION_MAGIC: u64 = 0x464C_4342_0000_0001;
 
 /// Raising this changes every host stamp, so the next start on any host
 /// measures again. Raise it whenever a stored field changes meaning.
-pub const LAYOUT_VERSION: u32 = 3;
+pub const LAYOUT_VERSION: u32 = 4;
 
 /// Devices a table records. A host with more reports the first
 /// [`MAX_ACCEL`] and the rest go unrecorded rather than overflowing.
@@ -262,6 +262,8 @@ pub struct WaveCostRecord {
     pub fixed_ns: u64,
     /// Substrate cost of one segment, ps.
     pub segment_ps: u64,
+    /// Fixed cost of one rebalance apart from the ids it moves, ns.
+    pub rebalance_fixed_ns: u64,
     /// Rebalance cost of moving one pending id, ps.
     pub copy_ps_per_id: u64,
     /// First-barrier wait of a coupled slice, ns.
@@ -332,7 +334,10 @@ pub struct AccelCalibration {
     pub wave_copy_ps_per_id: u64,
     /// Longest generation of the calibration waves, ns.
     pub wave_generation_ns: u64,
-    _pad: [u8; 56],
+    /// Fixed cost of one rebalance at `wave_width` apart from the ids it
+    /// moves, ns.
+    pub wave_rebalance_fixed_ns: u64,
+    _pad: [u8; 48],
 }
 
 impl Default for AccelCalibration {
@@ -360,7 +365,8 @@ impl Default for AccelCalibration {
             wave_segment_ps: 0,
             wave_copy_ps_per_id: 0,
             wave_generation_ns: 0,
-            _pad: [0; 56],
+            wave_rebalance_fixed_ns: 0,
+            _pad: [0; 48],
         }
     }
 }
@@ -419,7 +425,8 @@ impl AccelCalibration {
             wave_segment_ps: 0,
             wave_copy_ps_per_id: 0,
             wave_generation_ns: 0,
-            _pad: [0; 56],
+            wave_rebalance_fixed_ns: 0,
+            _pad: [0; 48],
         }
     }
 
@@ -447,6 +454,7 @@ impl AccelCalibration {
         self.wave_segment_ps = wave.segment_ps;
         self.wave_copy_ps_per_id = wave.copy_ps_per_id;
         self.wave_skew_ns = wave.skew_ns;
+        self.wave_rebalance_fixed_ns = wave.rebalance_fixed_ns;
         self.wave_generation_ns = wave.generation_ns;
         self
     }
@@ -463,6 +471,7 @@ impl AccelCalibration {
             segment_ps: self.wave_segment_ps,
             copy_ps_per_id: self.wave_copy_ps_per_id,
             skew_ns: self.wave_skew_ns,
+            rebalance_fixed_ns: self.wave_rebalance_fixed_ns,
             generation_ns: self.wave_generation_ns,
         })
     }
@@ -978,6 +987,7 @@ mod tests {
             segment_ps: 450,
             copy_ps_per_id: 1_900,
             skew_ns: 490_000,
+            rebalance_fixed_ns: 5_200,
             generation_ns: 1_800,
         };
         let device = AccelCalibration::new(

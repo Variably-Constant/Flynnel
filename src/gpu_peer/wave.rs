@@ -105,6 +105,8 @@ pub const REBALANCES_OFF: usize = 0x90;
 pub const MOVED_OFF: usize = 0x94;
 /// Slice time summed on block 0, ns (u64).
 pub const ELAPSED_NS_OFF: usize = 0x98;
+/// Block 0's time in rebalances that moved ids, ns (u64).
+pub const REBALANCE_NS_OFF: usize = 0xA0;
 /// Header size.
 pub const HEADER_BYTES: usize = 0x100;
 
@@ -525,6 +527,8 @@ pub struct WaveStats {
     pub moved_ids: u32,
     /// Slice time summed on block 0, ns.
     pub elapsed_ns: u64,
+    /// Block 0's time in rebalances that moved ids, ns.
+    pub rebalance_ns: u64,
     /// Arena bytes reserved.
     pub arena_used_bytes: u32,
     /// Global frontier: ids pushed.
@@ -601,6 +605,7 @@ impl WaveStats {
             rebalances: get_u32(bytes, REBALANCES_OFF),
             moved_ids: get_u32(bytes, MOVED_OFF),
             elapsed_ns: get_u64(bytes, ELAPSED_NS_OFF),
+            rebalance_ns: get_u64(bytes, REBALANCE_NS_OFF),
             arena_used_bytes: get_u32(bytes, ARENA_BUMP_OFF),
             pushed: get_u32(bytes, PUSH_OFF),
             failure,
@@ -651,6 +656,9 @@ pub struct WaveCosts {
     pub fixed_ns: u64,
     /// Substrate cost of one segment, ps.
     pub segment_ps: u64,
+    /// Fixed cost of one rebalance apart from the ids it moves, ns: its
+    /// two barriers and its synchronization.
+    pub rebalance_fixed_ns: u64,
     /// Rebalance cost of moving one pending id, ps.
     pub copy_ps_per_id: u64,
     /// First-barrier wait of a coupled slice as its blocks pick up the
@@ -694,6 +702,7 @@ impl WaveCosts {
         plan::PlanInputs {
             width: self.width,
             barrier_ns: self.barrier_ns as f64,
+            rebalance_fixed_ns: self.rebalance_fixed_ns as f64,
             copy_ns_per_id: self.copy_ps_per_id as f64 / 1000.0,
             pending_ids,
             generation_ns: f64::from(stats.longest_generation_ns),
@@ -714,6 +723,8 @@ struct CalibrationRun {
     wall_ns: u64,
     elapsed_ns: u64,
     moved_ids: u64,
+    rebalances: u64,
+    rebalance_ns: u64,
     skew_ns: u64,
     longest_ns: u64,
 }
@@ -741,6 +752,43 @@ fn least_squares(points: &[(f64, f64)]) -> (f64, f64) {
     let sxx: f64 = points.iter().map(|p| (p.0 - mean_x) * (p.0 - mean_x)).sum();
     let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
     (mean_y - slope * mean_x, slope)
+}
+
+/// The non-negative least-squares fit of `y = fixed * r + per_id * m`
+/// through `(r, m, y)` points, returned as `(fixed, per_id)`. When the joint
+/// fit would make a term negative, that term is zero and the other is fit
+/// alone; of the two single-term fits, the one with the smaller residual is
+/// returned.
+fn rebalance_fit(points: &[(f64, f64, f64)]) -> (f64, f64) {
+    let srr: f64 = points.iter().map(|p| p.0 * p.0).sum();
+    let srm: f64 = points.iter().map(|p| p.0 * p.1).sum();
+    let smm: f64 = points.iter().map(|p| p.1 * p.1).sum();
+    let sry: f64 = points.iter().map(|p| p.0 * p.2).sum();
+    let smy: f64 = points.iter().map(|p| p.1 * p.2).sum();
+    let det = srr * smm - srm * srm;
+    if det > f64::EPSILON * srr * smm {
+        let fixed = (sry * smm - smy * srm) / det;
+        let per_id = (smy * srr - sry * srm) / det;
+        if fixed >= 0.0 && per_id >= 0.0 {
+            return (fixed, per_id);
+        }
+    }
+    let fixed_only = if srr > 0.0 { (sry / srr).max(0.0) } else { 0.0 };
+    let per_id_only = if smm > 0.0 { (smy / smm).max(0.0) } else { 0.0 };
+    let residual = |fixed: f64, per_id: f64| -> f64 {
+        points
+            .iter()
+            .map(|p| {
+                let e = p.2 - fixed * p.0 - per_id * p.1;
+                e * e
+            })
+            .sum()
+    };
+    if residual(fixed_only, 0.0) <= residual(0.0, per_id_only) {
+        (fixed_only, 0.0)
+    } else {
+        (0.0, per_id_only)
+    }
 }
 
 impl GpuPeer {
@@ -809,9 +857,10 @@ impl GpuPeer {
     /// - `barrier_ns`: the global frontier's device time above the
     ///   non-rebalancing partition's, summed over every depth, per
     ///   generation;
-    /// - `copy_ps_per_id`: the rebalancing partition's device time above the
-    ///   non-rebalancing one, summed over every depth, less two barriers per
-    ///   generation, per id moved;
+    /// - `rebalance_fixed_ns` and `copy_ps_per_id`: the non-negative
+    ///   least-squares fit of block 0's time in rebalances against the
+    ///   rebalances run and the ids they moved, over every depth of the
+    ///   partition that rebalances every generation;
     /// - `start_skew_ns`: the global frontier's first-barrier wait;
     /// - `generation_ns`: the longest generation any run measured.
     ///
@@ -833,10 +882,8 @@ impl GpuPeer {
         let mut wall_points = Vec::with_capacity(CALIBRATION_DEPTHS.len());
         let mut skew_per_depth = Vec::with_capacity(CALIBRATION_DEPTHS.len());
         let mut global_extra_ns = 0u64;
-        let mut rebalance_extra_ns = 0u64;
         let mut generations = 0u64;
-        let mut rebalanced_generations = 0u64;
-        let mut moved_ids = 0u64;
+        let mut rebalance_points = Vec::with_capacity(CALIBRATION_DEPTHS.len());
         let mut longest = 0u64;
         for depth in CALIBRATION_DEPTHS {
             let segments = u64::from(CALIBRATION_ROOTS) * ((1u64 << (depth + 1)) - 1);
@@ -850,27 +897,19 @@ impl GpuPeer {
             skew_per_depth.push(global.skew_ns);
             global_extra_ns = global_extra_ns.saturating_add(global.elapsed_ns.saturating_sub(never.elapsed_ns));
             generations += depth_generations;
-            if every.moved_ids > 0 {
-                rebalance_extra_ns =
-                    rebalance_extra_ns.saturating_add(every.elapsed_ns.saturating_sub(never.elapsed_ns));
-                rebalanced_generations += depth_generations;
-                moved_ids += every.moved_ids;
-            }
+            rebalance_points.push((every.rebalances as f64, every.moved_ids as f64, every.rebalance_ns as f64));
             longest = longest.max(global.longest_ns).max(never.longest_ns).max(every.longest_ns);
         }
         let barrier_ns = global_extra_ns / generations.max(1);
-        // With no ids moved, the rebalancing time is zero as well.
-        let copy_ps_per_id = rebalance_extra_ns
-            .saturating_sub(barrier_ns.saturating_mul(2 * rebalanced_generations))
-            .saturating_mul(1000)
-            / moved_ids.max(1);
+        let (rebalance_fixed, copy_per_id) = rebalance_fit(&rebalance_points);
         let (fixed, slope) = least_squares(&wall_points);
         let costs = WaveCosts {
             width,
             barrier_ns,
             fixed_ns: fixed.max(0.0) as u64,
             segment_ps: (slope * 1000.0).max(0.0) as u64,
-            copy_ps_per_id,
+            rebalance_fixed_ns: rebalance_fixed as u64,
+            copy_ps_per_id: (copy_per_id * 1000.0) as u64,
             start_skew_ns: median(&skew_per_depth),
             generation_ns: longest,
         };
@@ -897,6 +936,8 @@ impl GpuPeer {
         let mut elapsed = Vec::with_capacity(CALIBRATION_REPEATS);
         let mut moved = Vec::with_capacity(CALIBRATION_REPEATS);
         let mut skews = Vec::with_capacity(CALIBRATION_REPEATS);
+        let mut rebalances = Vec::with_capacity(CALIBRATION_REPEATS);
+        let mut rebalance_times = Vec::with_capacity(CALIBRATION_REPEATS);
         let mut longest = 0u64;
         for _ in 0..CALIBRATION_REPEATS {
             let wave = self.create_wave(&spec)?;
@@ -919,12 +960,16 @@ impl GpuPeer {
             elapsed.push(stats.elapsed_ns);
             moved.push(u64::from(stats.moved_ids));
             skews.push(u64::from(stats.start_skew_max_ns));
+            rebalances.push(u64::from(stats.rebalances));
+            rebalance_times.push(stats.rebalance_ns);
             longest = longest.max(u64::from(stats.longest_generation_ns));
         }
         Ok(CalibrationRun {
             wall_ns: median(&walls),
             elapsed_ns: median(&elapsed),
             moved_ids: median(&moved),
+            rebalances: median(&rebalances),
+            rebalance_ns: median(&rebalance_times),
             skew_ns: median(&skews),
             longest_ns: longest,
         })
@@ -959,6 +1004,7 @@ pub(crate) fn stored_wave_costs(ordinal: usize, width: u32) -> Option<WaveCosts>
         barrier_ns: record.barrier_ns,
         fixed_ns: record.fixed_ns,
         segment_ps: record.segment_ps,
+        rebalance_fixed_ns: record.rebalance_fixed_ns,
         copy_ps_per_id: record.copy_ps_per_id,
         start_skew_ns: u64::from(record.skew_ns),
         generation_ns: record.generation_ns,
@@ -1027,6 +1073,7 @@ fn persist_wave_costs(ordinal: usize, costs: WaveCosts) {
         barrier_ns: costs.barrier_ns,
         fixed_ns: costs.fixed_ns,
         segment_ps: costs.segment_ps,
+        rebalance_fixed_ns: costs.rebalance_fixed_ns,
         copy_ps_per_id: costs.copy_ps_per_id,
         skew_ns: if costs.start_skew_ns > u64::from(u32::MAX) {
             u32::MAX
@@ -1110,6 +1157,7 @@ mod tests {
             ("FLW_REBALANCES_OFF", REBALANCES_OFF as u64),
             ("FLW_MOVED_OFF", MOVED_OFF as u64),
             ("FLW_ELAPSED_NS_OFF", ELAPSED_NS_OFF as u64),
+            ("FLW_REBALANCE_NS_OFF", REBALANCE_NS_OFF as u64),
             ("FLW_HEADER_BYTES", HEADER_BYTES as u64),
             ("FLW_TABLE_STRIDE", TABLE_STRIDE as u64),
             ("FLW_T_PUSH", T_PUSH as u64),
@@ -1254,6 +1302,7 @@ mod tests {
         put_u32(&mut span, WAIT_SUM_KNS_OFF, 3);
         put_u32(&mut span, MOVED_OFF, 11);
         put_u64(&mut span, ELAPSED_NS_OFF, 123_456);
+        put_u64(&mut span, REBALANCE_NS_OFF, 7_890);
         let entry = layout.table_off as usize + TABLE_STRIDE;
         put_u32(&mut span, entry + T_GENERATION, 5);
         let stats = WaveStats::decode(&span, 2).expect("decodes");
@@ -1262,6 +1311,7 @@ mod tests {
         assert_eq!(stats.barrier_wait_sum_ns, 3 << 10);
         assert_eq!(stats.moved_ids, 11);
         assert_eq!(stats.elapsed_ns, 123_456);
+        assert_eq!(stats.rebalance_ns, 7_890);
         assert_eq!(stats.blocks[1].generations, 5);
 
         put_u32(&mut span, FAIL_COMP_OFF, u32::MAX - NO_SEGMENT);
@@ -1286,12 +1336,30 @@ mod tests {
     }
 
     #[test]
+    fn the_rebalance_fit_recovers_a_fixed_and_a_per_id_cost_and_never_goes_negative() {
+        let points: Vec<(f64, f64, f64)> = [(3.0, 20.0), (5.0, 300.0), (7.0, 2_000.0), (9.0, 9_000.0)]
+            .iter()
+            .map(|&(r, m)| (r, m, 500.0 * r + 3.0 * m))
+            .collect();
+        let (fixed, per_id) = rebalance_fit(&points);
+        assert!((fixed - 500.0).abs() < 1e-6, "{fixed}");
+        assert!((per_id - 3.0).abs() < 1e-9, "{per_id}");
+
+        // Time that falls as more ids move cannot be a per-id cost.
+        let falling: Vec<(f64, f64, f64)> = [(3.0, 20.0, 9_000.0), (5.0, 300.0, 8_000.0), (7.0, 2_000.0, 7_000.0)].to_vec();
+        let (fixed, per_id) = rebalance_fit(&falling);
+        assert!(fixed >= 0.0 && per_id >= 0.0, "{fixed} {per_id}");
+        assert_eq!(rebalance_fit(&[]), (0.0, 0.0));
+    }
+
+    #[test]
     fn plan_inputs_take_the_imbalance_over_the_interval_the_wave_ran() {
         let costs = WaveCosts {
             width: 4,
             barrier_ns: 2_000,
             fixed_ns: 100_000,
             segment_ps: 500,
+            rebalance_fixed_ns: 4_000,
             copy_ps_per_id: 3_000,
             start_skew_ns: 0,
             generation_ns: 1_000,
@@ -1309,6 +1377,7 @@ mod tests {
         assert_eq!(global.imbalance, Some(plan::Imbalance { per_mille: 1_500, over_generations: 1 }));
         assert_eq!(global.pending_ids, 100.0, "1000 pushed over 10 generations");
         assert_eq!(global.copy_ns_per_id, 3.0);
+        assert_eq!(global.rebalance_fixed_ns, 4_000.0);
         assert_eq!(global.generation_ns, 9_000.0);
 
         let every = costs.plan_inputs(&stats, Frontier::Partition { rebalance_every: NonZeroU32::new(4) });
