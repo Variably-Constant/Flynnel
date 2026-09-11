@@ -174,6 +174,16 @@ pub const RESIDENT_PARAMS_BYTES: usize = 8;
 pub const OP_USER_BASE: u32 = 100;
 /// Param value naming "no resident block" for a user opcode.
 pub const NO_BLOCK: u32 = u32::MAX;
+/// Return value from `flynnel_user_op` that keeps the slot in the ring
+/// instead of retiring it (`FLYNNEL_USER_YIELD` in the kernel).
+///
+/// The poller runs the same slot again on its next pass, after its stop,
+/// generation and quantum checks, so an op can pace itself across passes
+/// and quanta while its state stays in VRAM. Only rank 0's thread 0
+/// decides. A yielded slot reports [`STATUS_SUBMITTED`] until an op run
+/// retires it, and runs only while its lane has a resident quantum;
+/// [`super::GpuPeer::wait_status`] relaunches the lane as it waits.
+pub const USER_OP_YIELD: u32 = 0x5949_4C44;
 
 /// Status: slot published, not yet consumed.
 pub const STATUS_SUBMITTED: u32 = 0;
@@ -265,6 +275,10 @@ mod tests {
         assert_eq!(STATUS_DONE, 1);
         assert_eq!(STATUS_ERR, 2);
         assert_eq!(STATUS_TEAM_INCOMPLETE, 3);
+        // FLYNNEL_USER_YIELD in the kernel. It is a return value, not a
+        // status, and must differ from 0 (success) and from the small
+        // codes consumers already return for failure.
+        assert_eq!(USER_OP_YIELD, 0x5949_4C44);
 
         // Each outcome must be its own word: a caller distinguishing a
         // lost rank from a failed op can only do so while these differ.

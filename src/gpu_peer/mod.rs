@@ -82,7 +82,7 @@ pub use calibration::PeerCalibration;
 pub use lanes::{LaneSet, RegionWords, Ticket};
 pub use layout::{
     Geometry, OP_ADD1_F32, OP_ADD1_F32_V, OP_H2V, OP_NOP, OP_SUM_U32, OP_SUM_U32_V, OP_V2H,
-    RESIDENT_PARAMS_BYTES, STATUS_DONE, STATUS_ERR, STATUS_TEAM_INCOMPLETE,
+    RESIDENT_PARAMS_BYTES, STATUS_DONE, STATUS_ERR, STATUS_TEAM_INCOMPLETE, USER_OP_YIELD,
 };
 pub use group::{GroupHandle, PeerGroup};
 pub use l2_persist::{L2BenchReport, L2Capability, L2Persist};
@@ -394,6 +394,16 @@ pub struct GpuPeerConfig {
     /// dispatch through it (called block-cooperatively by all 256
     /// threads). Requires the NVRTC runtime library on the host;
     /// `None` uses the pre-generated PTX and needs only the driver.
+    ///
+    /// The op's return value decides the slot. `0` retires it
+    /// [`STATUS_DONE`]; [`USER_OP_YIELD`] (`FLYNNEL_USER_YIELD` in the
+    /// source) keeps it in the ring so the same op runs again on the
+    /// poller's next pass; anything else retires it [`STATUS_ERR`]. Only
+    /// the value returned by thread 0 of rank 0 is read.
+    ///
+    /// A handle passed to [`GpuPeer::submit_user`] may name a span from
+    /// [`GpuPeer::pin_bulk`]: the op's `count` may run to the end of the
+    /// pool, not only to the end of its first block.
     pub user_ops_cuda: Option<String>,
 }
 

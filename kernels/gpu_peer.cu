@@ -104,6 +104,14 @@ typedef unsigned long long u64;
 // Return 0 for success, nonzero to mark the slot STATUS_ERR.
 #define OP_USER_BASE 100u
 
+// A user op returning this leaves its slot in the ring instead of
+// retiring it. The poller runs the same slot again on its next pass,
+// after the stop, generation and quantum checks at the top of its loop,
+// so an op can pace itself across passes and across quanta while its
+// state stays in VRAM. Rank 0's thread 0 decides for the whole team; an
+// op that fails, or a team that does not assemble, retires as before.
+#define FLYNNEL_USER_YIELD 0x59494C44u
+
 #ifdef FLYNNEL_USER_OPS
 extern "C" __device__ unsigned flynnel_user_op(
     unsigned op, unsigned char* block, unsigned count,
@@ -217,6 +225,7 @@ extern "C" __global__ void flynnel_peer_poller(
         u32 len = ld_vol(d_len);
         u32 payload_max = slot_bytes - (u32)SLOT_PAYLOAD_OFF;
         if (len > payload_max) { op = ~0u; }
+        u32 yielded = 0u;
 
         // The builtin ops are single-block bodies; only user ops are
         // written to spread across a team, so ranks above 0 skip
@@ -299,7 +308,11 @@ extern "C" __global__ void flynnel_peer_poller(
             u32 count = params[1];
             unsigned char* blk = (unsigned char*)0;
             if (bidx != ~0u) {
-                if (vram_base == 0 || bidx >= vram_blocks || count > vram_block_bytes) {
+                // A user op may address a contiguous span that starts at
+                // its block, so its byte count is bounded by the end of
+                // the pool rather than by one block.
+                if (vram_base == 0 || bidx >= vram_blocks
+                    || (u64)count > (u64)(vram_blocks - bidx) * (u64)vram_block_bytes) {
                     op = ~0u;
                 } else {
                     blk = vram_base + (u64)bidx * vram_block_bytes;
@@ -307,14 +320,19 @@ extern "C" __global__ void flynnel_peer_poller(
             }
             if (op != ~0u) {
                 __shared__ u32 s_user_err;
-                if (threadIdx.x == 0) s_user_err = 0u;
+                __shared__ u32 s_user_yield;
+                if (threadIdx.x == 0) { s_user_err = 0u; s_user_yield = 0u; }
                 __syncthreads();
                 u32 e = flynnel_user_op(op, blk, count,
                                         (volatile unsigned char*)(slot + SLOT_PAYLOAD_OFF + 8),
                                         team_rank, blocks_per_lane);
-                if (threadIdx.x == 0 && e != 0u) s_user_err = 1u;
+                if (threadIdx.x == 0) {
+                    if (e == FLYNNEL_USER_YIELD) s_user_yield = 1u;
+                    else if (e != 0u) s_user_err = 1u;
+                }
                 __syncthreads();
                 if (s_user_err) op = ~0u;
+                if (s_user_yield) yielded = 1u;
             }
         }
         else if (op != OP_NOP) {
@@ -372,13 +390,19 @@ extern "C" __global__ void flynnel_peer_poller(
                     }
                     // A failing op outranks an incomplete team: the op
                     // ran and reported, which is the more specific fact.
-                    st_vol(d_status,
-                           (op == ~0u)   ? STATUS_ERR :
-                           (!whole_team) ? STATUS_TEAM_INCOMPLETE :
-                                           STATUS_DONE);
-                    __threadfence_system();
-                    st_vol(tail, ld_vol(tail) + 1u);
-                    __threadfence_system();
+                    // A yielding op keeps its slot: no status and no tail
+                    // advance, so the team takes the same slot on its
+                    // next pass. The generation below still advances,
+                    // which is what releases the followers.
+                    if (!(yielded && op != ~0u && whole_team)) {
+                        st_vol(d_status,
+                               (op == ~0u)   ? STATUS_ERR :
+                               (!whole_team) ? STATUS_TEAM_INCOMPLETE :
+                                               STATUS_DONE);
+                        __threadfence_system();
+                        st_vol(tail, ld_vol(tail) + 1u);
+                        __threadfence_system();
+                    }
                     // The ring moved: the team may take the next slot.
                     st_vol(team_gen, ld_vol(team_gen) + 1u);
                     __threadfence_system();
@@ -399,7 +423,7 @@ extern "C" __global__ void flynnel_peer_poller(
             if (threadIdx.x == 0) my_gen_local += 1u;
             __syncthreads();
         } else {
-            if (threadIdx.x == 0) {
+            if (threadIdx.x == 0 && !(yielded && op != ~0u)) {
                 st_vol(d_status, op == ~0u ? STATUS_ERR : STATUS_DONE);
                 __threadfence_system();
                 st_vol(tail, ld_vol(tail) + 1u);
