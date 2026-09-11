@@ -68,6 +68,7 @@ pub mod region;
 pub mod timed_lock;
 pub mod vram;
 pub mod watchdog;
+pub mod wave;
 
 mod poller;
 
@@ -501,6 +502,12 @@ pub struct GpuPeer {
     calibration: PeerCalibration,
     /// Blocks serving each lane after the clamp to the SM count.
     team_size: u32,
+    /// The poller quantum and the kernel's team barrier deadline, which a
+    /// wave's slice budget is derived after.
+    quantum_ns: u64,
+    barrier_deadline_ns: u64,
+    /// The device this peer runs on, which watchdog detection reads.
+    device_ordinal: usize,
     _module: Arc<CudaModule>,
     _stream: Arc<CudaStream>,
     // Wide ops run on their own stream so they neither serialize behind
@@ -605,9 +612,12 @@ impl GpuPeer {
                 }
             },
             Some(user_src) => {
-                // Compose poller + user ops into a single compilation unit
-                // so the device-function call links, then JIT.
-                let src = format!("#define FLYNNEL_USER_OPS 1\n{PEER_CU}\n{user_src}\n");
+                // Compose poller, wave helpers and user ops into a single
+                // compilation unit so the device-function calls link, then JIT.
+                let src = format!(
+                    "#define FLYNNEL_USER_OPS 1\n{PEER_CU}\n{}\n{user_src}\n",
+                    wave::WAVE_CU
+                );
                 let ptx = cudarc::nvrtc::compile_ptx(src).map_err(|e| {
                     GpuPeerError::Driver(format!("user-ops NVRTC compile: {e:?}"))
                 })?;
@@ -723,6 +733,9 @@ impl GpuPeer {
             pool,
             calibration,
             team_size,
+            quantum_ns: config.quantum_ns,
+            barrier_deadline_ns: config.barrier_deadline_ns.max(1),
+            device_ordinal: config.device_ordinal,
             _module: module,
             _stream: stream,
             wide_stream,
