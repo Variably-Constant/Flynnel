@@ -859,14 +859,11 @@ impl GpuPeer {
             longest = longest.max(global.longest_ns).max(never.longest_ns).max(every.longest_ns);
         }
         let barrier_ns = global_extra_ns / generations.max(1);
-        let copy_ps_per_id = if moved_ids == 0 {
-            0
-        } else {
-            rebalance_extra_ns
-                .saturating_sub(barrier_ns.saturating_mul(2 * rebalanced_generations))
-                .saturating_mul(1000)
-                / moved_ids
-        };
+        // With no ids moved, the rebalancing time is zero as well.
+        let copy_ps_per_id = rebalance_extra_ns
+            .saturating_sub(barrier_ns.saturating_mul(2 * rebalanced_generations))
+            .saturating_mul(1000)
+            / moved_ids.max(1);
         let (fixed, slope) = least_squares(&wall_points);
         let costs = WaveCosts {
             width,
