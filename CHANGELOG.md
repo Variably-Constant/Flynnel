@@ -44,6 +44,18 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   `wave::plan::plan` chooses between a global frontier and a partition,
   and the rebalance interval, from the barrier cost and an observed
   imbalance.
+- `GpuPeer::calibrate_waves` measures a device's wave costs at its team
+  size: the barrier, the copy per pending id at a rebalance, the fixed
+  and per-segment cost of a slice round trip, and the longest
+  generation. It runs Flynnel's own tree op
+  (`layout::OP_WAVE_CALIBRATE`), which composing any user source brings
+  into the poller module. The costs stay on the peer and are stored on
+  the device record, and `GpuPeer::wave_costs` returns them. A later
+  peer on the same device at the same team size starts with them.
+  `WaveCosts::plan_inputs` turns the costs and a wave's stats into the
+  planner's inputs. A global frontier records its per-generation
+  imbalance. `WaveStats` also reports the ids moved by rebalances and
+  the summed slice time.
 - `GpuPeer::team_size`, the blocks each lane actually runs.
 
 ### Changed

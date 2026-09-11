@@ -81,20 +81,22 @@
 #define FLW_ARENA_OFF_OFF         0x78u   // byte offset of the arena
 #define FLW_TABLE_OFF_OFF         0x7Cu   // byte offset of the per-block table
 #define FLW_BARRIER_DEADLINE_OFF  0x80u   // ns a block waits at a barrier; must be nonzero
-#define FLW_IMBALANCE_OFF         0x84u   // largest pending run over the mean at a rebalance, per mille
+#define FLW_IMBALANCE_OFF         0x84u   // largest block's share over the mean, per mille (see wave.rs)
 #define FLW_DONE_DEADLINE_NS_OFF  0x88u   // u64: ns block 0 waits at slice end; 0 = no limit
 #define FLW_REBALANCES_OFF        0x90u   // rebalances run
+#define FLW_MOVED_OFF             0x94u   // pending ids moved through staging by rebalances
+#define FLW_ELAPSED_NS_OFF        0x98u   // u64: slice time summed on block 0, ns
 #define FLW_HEADER_BYTES          0x100u
 
 // Per-block table, one FLW_TABLE_STRIDE entry per block.
 #define FLW_TABLE_STRIDE          0x40u
-#define FLW_T_PUSH                0x00u   // partition: ids pushed into the block's region
+#define FLW_T_PUSH                0x00u   // ids the block pushed: into its region, or to the global array
 #define FLW_T_START               0x04u   // current generation start
 #define FLW_T_END                 0x08u   // current generation end
 #define FLW_T_DECISION            0x0Cu   // 1 while the block's threads run another generation
 #define FLW_T_EMPTY               0x10u   // 1 when the block's current range is empty
 #define FLW_T_PENDING             0x14u   // rebalance: pending ids
-#define FLW_T_PREFIX              0x18u   // rebalance: staging offset of the block's run
+#define FLW_T_PREFIX              0x18u   // rebalance: staging offset; global: pushes seen at the last barrier
 #define FLW_T_GENERATION          0x1Cu   // generations the block completed
 #define FLW_T_TOTAL               0x20u   // rebalance: pending ids over every block
 #define FLW_T_DEAL_LO             0x24u   // rebalance: staging start dealt to the block
@@ -171,6 +173,11 @@ __device__ __forceinline__ u64 flw_get64(unsigned char* base, u32 off)
     return *(volatile u64*)(base + off);
 }
 
+__device__ __forceinline__ void flw_set64(unsigned char* base, u32 off, u64 v)
+{
+    *(volatile u64*)(base + off) = v;
+}
+
 __device__ __forceinline__ u32* flw_table(flw_slice* s, u32 blk, u32 field)
 {
     return (u32*)(s->base + flw_get(s->base, FLW_TABLE_OFF_OFF) + blk * FLW_TABLE_STRIDE + field);
@@ -234,6 +241,11 @@ __device__ __forceinline__ u32 flw_push(flw_slice* s, u32 id)
         ? flw_u32(s->base, FLW_PUSH_OFF)
         : flw_table(s, s->rank, FLW_T_PUSH);
     u32 p = atomicAdd(counter, 1u);
+    if (s->mode == FLW_MODE_GLOBAL) {
+        // Children counted per block, which block 0 turns into the
+        // frontier's per-generation imbalance at each barrier.
+        atomicAdd(flw_table(s, s->rank, FLW_T_PUSH), 1u);
+    }
     if (p >= s->cap) {
         flw_fail(s, id, FLW_FAIL_IDS);
         return 0xFFFFFFFFu;
@@ -443,6 +455,7 @@ __device__ __forceinline__ void flw_rebalance(flw_slice* s)
             atomicMax(flw_u32(b, FLW_IMBALANCE_OFF),
                       flw_sat((u64)largest * 1000ull * (u64)w / (u64)total));
             atomicAdd(flw_u32(b, FLW_REBALANCES_OFF), 1u);
+            atomicAdd(flw_u32(b, FLW_MOVED_OFF), total);
         }
         __threadfence_system();
     }
@@ -530,6 +543,23 @@ __device__ __forceinline__ void flw_generation_end(flw_slice* s)
                     flw_set(b, FLW_STOP_OFF, flw_should_stop(s, now, 1u));
                 }
                 u32 whole = flw_barrier(s, 0u);
+                if (me == 0u) {
+                    // Each block's share of this generation's children,
+                    // readable now that every block has arrived.
+                    u32 largest = 0u;
+                    u32 sum = 0u;
+                    for (u32 k = 0u; k < s->width; k++) {
+                        u32 pushed = atomicAdd(flw_table(s, k, FLW_T_PUSH), 0u);
+                        u32 delta = pushed - flw_tget(s, k, FLW_T_PREFIX);
+                        flw_tset(s, k, FLW_T_PREFIX, pushed);
+                        sum += delta;
+                        if (delta > largest) largest = delta;
+                    }
+                    if (sum > 0u) {
+                        atomicMax(flw_u32(b, FLW_IMBALANCE_OFF),
+                                  flw_sat((u64)largest * 1000ull * (u64)s->width / (u64)sum));
+                    }
+                }
                 next_end = flw_pushed(s, me);
                 go = (whole != 0u && next_start < next_end
                       && flw_get(b, FLW_STOP_OFF) == 0u
@@ -594,6 +624,8 @@ __device__ __forceinline__ u32 flw_slice_end(flw_slice* s)
                 if (flw_tget(s, k, FLW_T_EMPTY) == 0u) finished = 0u;
             }
             flw_set(b, FLW_SLICES_OFF, flw_get(b, FLW_SLICES_OFF) + 1u);
+            flw_set64(b, FLW_ELAPSED_NS_OFF,
+                      flw_get64(b, FLW_ELAPSED_NS_OFF) + (gtimer() - s->slice_t0));
             flw_set(b, FLW_STOP_OFF, 0u);
             u32 state;
             if (flw_get(b, FLW_FAIL_COMP_OFF) != 0u) {
@@ -614,4 +646,33 @@ __device__ __forceinline__ u32 flw_slice_end(flw_slice* s)
     }
     __syncthreads();
     return result;
+}
+
+// ------------------------------------------------------------ calibration
+
+// Flynnel's wave calibration op, which the poller dispatches for
+// FLW_OP_CALIBRATE. It walks a binary segment tree to the depth in payload
+// word 0. Its segments do nothing but push their children, so a slice's
+// time is the helpers' own.
+__device__ unsigned flw_calibration_op(unsigned char* block, unsigned count,
+                                       volatile unsigned char* payload,
+                                       unsigned team_rank, unsigned team_size)
+{
+    u32 limit = *(volatile u32*)payload;
+    flw_slice s;
+    u32 bad = flw_slice_begin(&s, block, count, team_rank, team_size);
+    if (bad != 0u) return bad;
+    while (s.running) {
+        for (u32 k = flw_first(&s); k < s.end; k += flw_stride(&s)) {
+            u32 id = flw_id(&s, k);
+            u32 depth = id >> 24;
+            if (depth < limit) {
+                u32 serial = (id & 0xFFFFFFu) << 1;
+                flw_push(&s, ((depth + 1u) << 24) | (serial & 0xFFFFFFu));
+                flw_push(&s, ((depth + 1u) << 24) | ((serial | 1u) & 0xFFFFFFu));
+            }
+        }
+        flw_generation_end(&s);
+    }
+    return flw_slice_end(&s);
 }

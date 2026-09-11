@@ -532,6 +532,12 @@ pub struct GpuPeer {
     barrier_deadline_ns: u64,
     /// The device this peer runs on, which watchdog detection reads.
     device_ordinal: usize,
+    /// Whether user ops, and with them the wave helpers and Flynnel's
+    /// calibration op, are composed into the poller module.
+    user_ops: bool,
+    /// Wave costs for this device at this team size, measured by this
+    /// peer or read from the device's stored record.
+    wave_costs: Option<wave::WaveCosts>,
     _module: Arc<CudaModule>,
     _stream: Arc<CudaStream>,
     // Wide ops run on their own stream so they neither serialize behind
@@ -760,6 +766,8 @@ impl GpuPeer {
             quantum_ns: config.quantum_ns,
             barrier_deadline_ns: config.barrier_deadline_ns.max(1),
             device_ordinal: config.device_ordinal,
+            user_ops: config.user_ops_cuda.is_some(),
+            wave_costs: wave::stored_wave_costs(config.device_ordinal, team_size),
             _module: module,
             _stream: stream,
             wide_stream,

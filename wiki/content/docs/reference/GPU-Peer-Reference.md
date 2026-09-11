@@ -454,6 +454,39 @@ What the measurements show:
 - **Counters belong in VRAM.** In the host-mapped slot payload they cost
   about 2.5 us per block per generation (81 us at 32 blocks).
 
+#### Calibrating the costs
+
+`GpuPeer::calibrate_waves()` measures the planner's device costs at
+`team_size()` and keeps them. It runs Flynnel's calibration op
+(`layout::OP_WAVE_CALIBRATE`). The op walks a binary segment tree whose
+segments do nothing but push their children, from 64 roots to depths 2,
+4, 6 and 8. Each depth runs five times as each of three frontiers:
+global, a partition that never rebalances, and a partition that
+rebalances every generation. The medians are kept.
+
+| cost | from |
+|---|---|
+| `fixed_ns`, `segment_ps` | least-squares line through the global frontier's host round trip against its segment count |
+| `barrier_ns` | global frontier's device time per generation above the non-rebalancing partition's |
+| `copy_ps_per_id` | rebalancing partition's device time above the non-rebalancing one, less two barriers per generation, per id moved |
+| `generation_ns` | longest generation any run measured |
+
+Device time is the slice time block 0 sums in the span. A difference
+that comes out negative is kept as zero. The op is composed with the
+wave helpers, so calibration needs `user_ops_cuda` set, and it returns
+an error without it.
+
+The costs are written to the device's record in the calibration table,
+next to the doorbell timings. A peer started later on the same device
+reads them into `wave_costs()` when the team size matches.
+`wave_costs.plan_inputs(&stats, frontier)` builds the planner's inputs
+from a program's last wave:
+- **Imbalance:** the one that wave recorded. A global frontier records
+  each block's share of the children pushed in one generation, and a
+  partition records its pending ids at each rebalance.
+- **Pending ids:** the ids moved per rebalance, or the ids pushed per
+  generation when the wave never rebalanced.
+
 ### Watchdog detection (`gpu_peer::watchdog`)
 
 `watchdog::detect(ordinal)` reports which watchdog can reset a device

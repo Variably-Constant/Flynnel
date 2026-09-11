@@ -117,6 +117,14 @@ extern "C" __device__ unsigned flynnel_user_op(
     unsigned op, unsigned char* block, unsigned count,
     volatile unsigned char* payload,
     unsigned team_rank, unsigned team_size);
+// Flynnel's own wave calibration op, defined in gpu_peer_wave.cu and
+// dispatched ahead of the user hook. The opcode lies in the user range so
+// every rank of a team runs it, and a user op must not take this value.
+#define FLW_OP_CALIBRATE 0xFFFFFF00u
+__device__ unsigned flw_calibration_op(
+    unsigned char* block, unsigned count,
+    volatile unsigned char* payload,
+    unsigned team_rank, unsigned team_size);
 #else
 // Precompiled-PTX default: user ops are not linked; reject them.
 extern "C" __device__ unsigned flynnel_user_op(
@@ -323,9 +331,19 @@ extern "C" __global__ void flynnel_peer_poller(
                 __shared__ u32 s_user_yield;
                 if (threadIdx.x == 0) { s_user_err = 0u; s_user_yield = 0u; }
                 __syncthreads();
+#ifdef FLYNNEL_USER_OPS
+                u32 e = op == FLW_OP_CALIBRATE
+                    ? flw_calibration_op(blk, count,
+                                         (volatile unsigned char*)(slot + SLOT_PAYLOAD_OFF + 8),
+                                         team_rank, blocks_per_lane)
+                    : flynnel_user_op(op, blk, count,
+                                      (volatile unsigned char*)(slot + SLOT_PAYLOAD_OFF + 8),
+                                      team_rank, blocks_per_lane);
+#else
                 u32 e = flynnel_user_op(op, blk, count,
                                         (volatile unsigned char*)(slot + SLOT_PAYLOAD_OFF + 8),
                                         team_rank, blocks_per_lane);
+#endif
                 if (threadIdx.x == 0) {
                     if (e == FLYNNEL_USER_YIELD) s_user_yield = 1u;
                     else if (e != 0u) s_user_err = 1u;

@@ -184,6 +184,11 @@ pub const NO_BLOCK: u32 = u32::MAX;
 /// retires it, and runs only while its lane has a resident quantum;
 /// [`super::GpuPeer::wait_status`] relaunches the lane as it waits.
 pub const USER_OP_YIELD: u32 = 0x5949_4C44;
+/// Opcode of Flynnel's own wave calibration op (`FLW_OP_CALIBRATE` in the
+/// kernel), dispatched ahead of the user hook when user ops are composed.
+/// It lies in the user range so every rank of a team runs it; a user op
+/// must not use this value.
+pub const OP_WAVE_CALIBRATE: u32 = 0xFFFF_FF00;
 
 /// Status: slot published, not yet consumed.
 pub const STATUS_SUBMITTED: u32 = 0;
@@ -279,6 +284,14 @@ mod tests {
         // status, and must differ from 0 (success) and from the small
         // codes consumers already return for failure.
         assert_eq!(USER_OP_YIELD, 0x5949_4C44);
+        // FLW_OP_CALIBRATE in the kernel: inside the user range, so every
+        // rank runs it, and distinct from the ~0 the kernel uses for a
+        // refused op.
+        assert_eq!(OP_WAVE_CALIBRATE, 0xFFFF_FF00);
+        #[expect(clippy::assertions_on_constants, reason = "guard over const opcodes")]
+        {
+            assert!(OP_WAVE_CALIBRATE >= OP_USER_BASE && OP_WAVE_CALIBRATE != u32::MAX);
+        }
 
         // Each outcome must be its own word: a caller distinguishing a
         // lost rank from a failed op can only do so while these differ.

@@ -8,14 +8,16 @@
 //! device. [`WaveSpec`] describes a wave, [`GpuPeer::create_wave`] lays out
 //! and pins its span, [`GpuPeer::submit_wave`] runs a slice of it through
 //! the consumer's user op, and [`GpuPeer::wave_stats`] reads its state back.
+//! [`GpuPeer::calibrate_waves`] measures what waves cost on the device, and
+//! [`plan`] turns those costs and a wave's stats into a frontier choice.
 //!
 //! The consumer's op follows the loop shown at the top of the kernel file.
 //! Every offset here mirrors a define there, and a test compares the two.
 
 use std::num::NonZeroU32;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::{GpuPeer, GpuPeerError, ResidentHandle, Ticket};
+use super::{GpuPeer, GpuPeerError, ResidentHandle, STATUS_DONE, Ticket, layout};
 
 pub mod plan;
 
@@ -91,18 +93,25 @@ pub const ARENA_OFF_OFF: usize = 0x78;
 pub const TABLE_OFF_OFF: usize = 0x7C;
 /// How long a block waits at a barrier, ns; never 0.
 pub const BARRIER_DEADLINE_OFF: usize = 0x80;
-/// Largest pending run over the mean at a rebalance, per mille.
+/// The largest block's share over the mean, per mille: of the pending ids
+/// at a partition rebalance, or of the children pushed in one generation on
+/// a global frontier.
 pub const IMBALANCE_OFF: usize = 0x84;
 /// How long block 0 waits at slice end, ns (u64); 0 is no limit.
 pub const DONE_DEADLINE_NS_OFF: usize = 0x88;
 /// Rebalances run.
 pub const REBALANCES_OFF: usize = 0x90;
+/// Pending ids moved through staging by rebalances.
+pub const MOVED_OFF: usize = 0x94;
+/// Slice time summed on block 0, ns (u64).
+pub const ELAPSED_NS_OFF: usize = 0x98;
 /// Header size.
 pub const HEADER_BYTES: usize = 0x100;
 
 /// Per-block table entry size.
 pub const TABLE_STRIDE: usize = 0x40;
-/// Partition: ids pushed into the block's region.
+/// Ids the block pushed: into its region for a partition, into the shared
+/// array for a global frontier.
 pub const T_PUSH: usize = 0x00;
 /// Current generation start.
 pub const T_START: usize = 0x04;
@@ -114,7 +123,8 @@ pub const T_DECISION: usize = 0x0C;
 pub const T_EMPTY: usize = 0x10;
 /// Rebalance: pending ids.
 pub const T_PENDING: usize = 0x14;
-/// Rebalance: staging offset of the block's run.
+/// Rebalance: staging offset of the block's run. Global frontier: the
+/// block's pushes counted at the last barrier.
 pub const T_PREFIX: usize = 0x18;
 /// Generations the block completed.
 pub const T_GENERATION: usize = 0x1C;
@@ -341,6 +351,12 @@ fn get_u32(span: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(w)
 }
 
+fn get_u64(span: &[u8], at: usize) -> u64 {
+    let mut w = [0u8; 8];
+    w.copy_from_slice(&span[at..at + 8]);
+    u64::from_le_bytes(w)
+}
+
 /// `d` in nanoseconds, or `too_long` when it does not fit in `limit`.
 fn nanos_within(d: Duration, limit: u64, too_long: &'static str) -> Result<u64, GpuPeerError> {
     let ns = d.as_nanos();
@@ -471,7 +487,8 @@ pub struct BlockState {
     pub start: u32,
     /// Current generation end.
     pub end: u32,
-    /// Partition: ids pushed into the block's region.
+    /// Ids the block pushed: into its region for a partition, into the
+    /// shared array for a global frontier.
     pub pushed: u32,
     /// Generations the block completed.
     pub generations: u32,
@@ -498,10 +515,16 @@ pub struct WaveStats {
     pub start_skew_max_ns: u32,
     /// Longest generation, ns.
     pub longest_generation_ns: u32,
-    /// Largest pending run over the mean at a rebalance, per mille.
+    /// The largest block's share over the mean, per mille: of the pending
+    /// ids at a partition rebalance, or of the children pushed in one
+    /// generation on a global frontier. 0 when nothing was measured.
     pub imbalance_per_mille: u32,
     /// Rebalances run.
     pub rebalances: u32,
+    /// Pending ids moved through staging by rebalances.
+    pub moved_ids: u32,
+    /// Slice time summed on block 0, ns.
+    pub elapsed_ns: u64,
     /// Arena bytes reserved.
     pub arena_used_bytes: u32,
     /// Global frontier: ids pushed.
@@ -576,6 +599,8 @@ impl WaveStats {
             longest_generation_ns: get_u32(bytes, LONGEST_GEN_OFF),
             imbalance_per_mille: get_u32(bytes, IMBALANCE_OFF),
             rebalances: get_u32(bytes, REBALANCES_OFF),
+            moved_ids: get_u32(bytes, MOVED_OFF),
+            elapsed_ns: get_u64(bytes, ELAPSED_NS_OFF),
             arena_used_bytes: get_u32(bytes, ARENA_BUMP_OFF),
             pushed: get_u32(bytes, PUSH_OFF),
             failure,
@@ -613,6 +638,105 @@ impl Wave {
     pub fn watchdog_basis(&self) -> Option<&str> {
         self.watchdog_basis.as_deref()
     }
+}
+
+/// Segmented-wave costs measured on one device at one team size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaveCosts {
+    /// Team size the costs were measured at.
+    pub width: u32,
+    /// Cost of one cross-block generation barrier, ns.
+    pub barrier_ns: u64,
+    /// Host round trip of a wave slice apart from its segments, ns.
+    pub fixed_ns: u64,
+    /// Substrate cost of one segment, ps.
+    pub segment_ps: u64,
+    /// Rebalance cost of moving one pending id, ps.
+    pub copy_ps_per_id: u64,
+    /// Longest generation of the calibration waves, ns.
+    pub generation_ns: u64,
+}
+
+impl WaveCosts {
+    /// Planner inputs for a program whose last wave ran with `frontier` and
+    /// produced `stats`.
+    ///
+    /// The imbalance is the one the wave recorded, over one generation for a
+    /// global frontier and over the rebalance interval for a partition; a
+    /// wave that recorded none gives none. Pending ids are the ids moved per
+    /// rebalance when the wave rebalanced, and otherwise the ids pushed per
+    /// generation.
+    pub fn plan_inputs(&self, stats: &WaveStats, frontier: Frontier) -> plan::PlanInputs {
+        let block_generations = stats.blocks.iter().map(|b| b.generations).fold(0, u32::max);
+        let generations = f64::from(stats.generations.max(block_generations).max(1));
+        let over_generations = match frontier {
+            Frontier::Global => 1,
+            Frontier::Partition { rebalance_every: Some(n) } => n.get(),
+            Frontier::Partition { rebalance_every: None } => generations as u32,
+        };
+        let pending_ids = if stats.rebalances > 0 {
+            f64::from(stats.moved_ids) / f64::from(stats.rebalances)
+        } else {
+            let pushed: u64 = match frontier {
+                Frontier::Global => u64::from(stats.pushed),
+                Frontier::Partition { .. } => stats.blocks.iter().map(|b| u64::from(b.pushed)).sum(),
+            };
+            pushed as f64 / generations
+        };
+        let imbalance = if stats.imbalance_per_mille == 0 {
+            None
+        } else {
+            Some(plan::Imbalance { per_mille: stats.imbalance_per_mille, over_generations })
+        };
+        plan::PlanInputs {
+            width: self.width,
+            barrier_ns: self.barrier_ns as f64,
+            copy_ns_per_id: self.copy_ps_per_id as f64 / 1000.0,
+            pending_ids,
+            generation_ns: f64::from(stats.longest_generation_ns),
+            imbalance,
+        }
+    }
+}
+
+/// Depths of the calibration tree. Each is run as three frontiers.
+const CALIBRATION_DEPTHS: [u32; 4] = [2, 4, 6, 8];
+/// Roots of the calibration tree.
+const CALIBRATION_ROOTS: u32 = 64;
+/// Runs of each depth and frontier; the medians are kept.
+const CALIBRATION_REPEATS: usize = 5;
+
+/// The medians of one calibration configuration's runs.
+struct CalibrationRun {
+    wall_ns: u64,
+    elapsed_ns: u64,
+    moved_ids: u64,
+    longest_ns: u64,
+}
+
+fn median(values: &[u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
+/// The intercept and slope of the least-squares line through `points`.
+fn least_squares(points: &[(f64, f64)]) -> (f64, f64) {
+    let n = points.len() as f64;
+    match points {
+        [] => return (0.0, 0.0),
+        [only] => return (only.1, 0.0),
+        _ => {}
+    }
+    let mean_x = points.iter().map(|p| p.0).sum::<f64>() / n;
+    let mean_y = points.iter().map(|p| p.1).sum::<f64>() / n;
+    let sxy: f64 = points.iter().map(|p| (p.0 - mean_x) * (p.1 - mean_y)).sum();
+    let sxx: f64 = points.iter().map(|p| (p.0 - mean_x) * (p.0 - mean_x)).sum();
+    let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+    (mean_y - slope * mean_x, slope)
 }
 
 impl GpuPeer {
@@ -660,7 +784,236 @@ impl GpuPeer {
     pub fn release_wave(&mut self, wave: Wave) -> Result<(), GpuPeerError> {
         self.unpin(wave.handle)
     }
+
+    /// The wave costs for this device at this team size, from
+    /// [`GpuPeer::calibrate_waves`] or the device's stored record.
+    pub fn wave_costs(&self) -> Option<WaveCosts> {
+        self.wave_costs
+    }
+
+    /// Measure this device's wave costs at [`GpuPeer::team_size`] and keep
+    /// them.
+    ///
+    /// Flynnel's calibration op ([`layout::OP_WAVE_CALIBRATE`]) walks a
+    /// binary segment tree whose segments only push their children, from 64
+    /// roots to depths 2, 4, 6 and 8. Each depth runs as a global frontier,
+    /// a partition that never rebalances and a partition that rebalances
+    /// every generation, five times each, and the medians are kept:
+    ///
+    /// - `fixed_ns` and `segment_ps`: the least-squares line through the
+    ///   global frontier's host round trip against its segment count;
+    /// - `barrier_ns`: the global frontier's device time per generation
+    ///   above the non-rebalancing partition's;
+    /// - `copy_ps_per_id`: the rebalancing partition's device time above the
+    ///   non-rebalancing one, less its two barriers per generation, per id
+    ///   moved;
+    /// - `generation_ns`: the longest generation any run measured.
+    ///
+    /// A difference that comes out negative is kept as zero. The costs stay
+    /// on this peer, and with the `persisted-calibration` feature they are
+    /// written to the device's stored record, where the next peer on the
+    /// device reads them.
+    ///
+    /// Needs user ops composed through [`super::GpuPeerConfig::user_ops_cuda`],
+    /// which is what brings the helpers and the calibration op into the
+    /// poller module.
+    pub fn calibrate_waves(&mut self) -> Result<WaveCosts, GpuPeerError> {
+        if !self.user_ops {
+            return Err(GpuPeerError::Unavailable(
+                "wave calibration needs user ops composed through GpuPeerConfig::user_ops_cuda",
+            ));
+        }
+        let width = self.team_size();
+        let mut wall_points = Vec::with_capacity(CALIBRATION_DEPTHS.len());
+        let mut barrier_per_generation = Vec::with_capacity(CALIBRATION_DEPTHS.len());
+        let mut copy_per_id = Vec::with_capacity(CALIBRATION_DEPTHS.len());
+        let mut longest = 0u64;
+        for depth in CALIBRATION_DEPTHS {
+            let segments = u64::from(CALIBRATION_ROOTS) * ((1u64 << (depth + 1)) - 1);
+            let generations = u64::from(depth + 1);
+            let global = self.calibration_run(Frontier::Global, depth, segments)?;
+            let partitioned = segments * u64::from(width);
+            let never = self.calibration_run(Frontier::Partition { rebalance_every: None }, depth, partitioned)?;
+            let every =
+                self.calibration_run(Frontier::Partition { rebalance_every: NonZeroU32::new(1) }, depth, partitioned)?;
+            wall_points.push((segments as f64, global.wall_ns as f64));
+            let barrier = global.elapsed_ns.saturating_sub(never.elapsed_ns) / generations;
+            barrier_per_generation.push(barrier);
+            if every.moved_ids > 0 {
+                let copying = every
+                    .elapsed_ns
+                    .saturating_sub(never.elapsed_ns)
+                    .saturating_sub(barrier.saturating_mul(2 * generations));
+                copy_per_id.push(copying.saturating_mul(1000) / every.moved_ids);
+            }
+            longest = longest.max(global.longest_ns).max(never.longest_ns).max(every.longest_ns);
+        }
+        let (fixed, slope) = least_squares(&wall_points);
+        let costs = WaveCosts {
+            width,
+            barrier_ns: median(&barrier_per_generation),
+            fixed_ns: fixed.max(0.0) as u64,
+            segment_ps: (slope * 1000.0).max(0.0) as u64,
+            copy_ps_per_id: median(&copy_per_id),
+            generation_ns: longest,
+        };
+        self.wave_costs = Some(costs);
+        persist_wave_costs(self.device_ordinal, costs);
+        Ok(costs)
+    }
+
+    /// Run one calibration configuration [`CALIBRATION_REPEATS`] times and
+    /// keep the medians.
+    fn calibration_run(&mut self, frontier: Frontier, depth: u32, id_capacity: u64) -> Result<CalibrationRun, GpuPeerError> {
+        let spec = WaveSpec {
+            roots: (0..CALIBRATION_ROOTS).collect(),
+            id_capacity: span_offset(id_capacity)?,
+            arena_bytes: 0,
+            frontier,
+            resume: Resume::Host,
+            slice_budget: SliceBudget::Unbounded,
+            barrier_deadline: Duration::from_millis(50),
+            done_deadline: Some(Duration::from_secs(2)),
+            longest_generation_seed: Duration::ZERO,
+        };
+        let mut walls = Vec::with_capacity(CALIBRATION_REPEATS);
+        let mut elapsed = Vec::with_capacity(CALIBRATION_REPEATS);
+        let mut moved = Vec::with_capacity(CALIBRATION_REPEATS);
+        let mut longest = 0u64;
+        for _ in 0..CALIBRATION_REPEATS {
+            let wave = self.create_wave(&spec)?;
+            let started = Instant::now();
+            let ticket = self.submit_wave(&wave, layout::OP_WAVE_CALIBRATE, &depth.to_le_bytes())?;
+            let status = self.wait_status(ticket, Duration::from_secs(30))?;
+            let wall = started.elapsed();
+            self.reap(ticket)?;
+            let stats = self.wave_stats(&wave)?;
+            self.release_wave(wave)?;
+            if status != STATUS_DONE || stats.slice_state != SliceState::Finished {
+                eprintln!(
+                    "flynnel gpu_peer: a wave calibration run ({frontier:?}, depth {depth}) \
+                     retired with status {status}: {stats:?}"
+                );
+                return Err(GpuPeerError::Unavailable("a wave calibration run did not finish"));
+            }
+            let wall_ns = wall.as_nanos();
+            walls.push(if wall_ns > u128::from(u64::MAX) { u64::MAX } else { wall_ns as u64 });
+            elapsed.push(stats.elapsed_ns);
+            moved.push(u64::from(stats.moved_ids));
+            longest = longest.max(u64::from(stats.longest_generation_ns));
+        }
+        Ok(CalibrationRun {
+            wall_ns: median(&walls),
+            elapsed_ns: median(&elapsed),
+            moved_ids: median(&moved),
+            longest_ns: longest,
+        })
+    }
 }
+
+/// The wave costs stored for device `ordinal`, when they were measured at
+/// `width`.
+#[cfg(feature = "persisted-calibration")]
+pub(crate) fn stored_wave_costs(ordinal: usize, width: u32) -> Option<WaveCosts> {
+    use crate::sched::calibration_store::{CalibrationStore, HostStamp, calibration_dir};
+
+    let dir = calibration_dir()?;
+    let store = match CalibrationStore::open_or_create(&dir, &HostStamp::detect()) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!(
+                "flynnel gpu_peer: the calibration table under {} is unusable ({err:?}), \
+                 so no stored wave costs are read",
+                dir.display()
+            );
+            return None;
+        }
+    };
+    let (_cpu, devices) = store.read()?;
+    let record = devices.into_iter().find(|d| d.ordinal as usize == ordinal)?.wave()?;
+    if record.width != width {
+        return None;
+    }
+    Some(WaveCosts {
+        width: record.width,
+        barrier_ns: record.barrier_ns,
+        fixed_ns: record.fixed_ns,
+        segment_ps: record.segment_ps,
+        copy_ps_per_id: record.copy_ps_per_id,
+        generation_ns: record.generation_ns,
+    })
+}
+
+#[cfg(not(feature = "persisted-calibration"))]
+pub(crate) fn stored_wave_costs(_ordinal: usize, _width: u32) -> Option<WaveCosts> {
+    None
+}
+
+/// Write `costs` to device `ordinal`'s stored record. A table that cannot be
+/// written leaves the costs on the peer only, and says so.
+#[cfg(feature = "persisted-calibration")]
+fn persist_wave_costs(ordinal: usize, costs: WaveCosts) {
+    use crate::sched::calibration_store::{
+        CalibrationStore, HostStamp, StoreError, WaveCostRecord, calibration_dir,
+    };
+
+    let Some(dir) = calibration_dir() else {
+        eprintln!("flynnel gpu_peer: no calibration directory, so the wave costs stay on this peer");
+        return;
+    };
+    let store = match CalibrationStore::open_or_create(&dir, &HostStamp::detect()) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!(
+                "flynnel gpu_peer: the calibration table under {} is unusable ({err:?}), \
+                 so the wave costs stay on this peer",
+                dir.display()
+            );
+            return;
+        }
+    };
+    let writer = match store.try_acquire_writer() {
+        Ok(writer) => writer,
+        Err(StoreError::WriterActive) => {
+            eprintln!(
+                "flynnel gpu_peer: another process is writing the calibration table, \
+                 so the wave costs stay on this peer"
+            );
+            return;
+        }
+        Err(err) => {
+            eprintln!("flynnel gpu_peer: the calibration lease failed ({err:?}), so the wave costs stay on this peer");
+            return;
+        }
+    };
+    writer.beat();
+    let Some((cpu, mut devices)) = store.read() else {
+        eprintln!(
+            "flynnel gpu_peer: the calibration table could not be read between writers, \
+             so the wave costs stay on this peer"
+        );
+        return;
+    };
+    let Some(i) = devices.iter().position(|d| d.ordinal as usize == ordinal) else {
+        eprintln!(
+            "flynnel gpu_peer: device {ordinal} has no stored record to carry the wave costs, \
+             so they stay on this peer"
+        );
+        return;
+    };
+    devices[i] = devices[i].with_wave(WaveCostRecord {
+        width: costs.width,
+        barrier_ns: costs.barrier_ns,
+        fixed_ns: costs.fixed_ns,
+        segment_ps: costs.segment_ps,
+        copy_ps_per_id: costs.copy_ps_per_id,
+        generation_ns: costs.generation_ns,
+    });
+    writer.publish(&cpu, &devices);
+}
+
+#[cfg(not(feature = "persisted-calibration"))]
+fn persist_wave_costs(_ordinal: usize, _costs: WaveCosts) {}
 
 #[cfg(test)]
 mod tests {
@@ -729,6 +1082,8 @@ mod tests {
             ("FLW_IMBALANCE_OFF", IMBALANCE_OFF as u64),
             ("FLW_DONE_DEADLINE_NS_OFF", DONE_DEADLINE_NS_OFF as u64),
             ("FLW_REBALANCES_OFF", REBALANCES_OFF as u64),
+            ("FLW_MOVED_OFF", MOVED_OFF as u64),
+            ("FLW_ELAPSED_NS_OFF", ELAPSED_NS_OFF as u64),
             ("FLW_HEADER_BYTES", HEADER_BYTES as u64),
             ("FLW_TABLE_STRIDE", TABLE_STRIDE as u64),
             ("FLW_T_PUSH", T_PUSH as u64),
@@ -763,6 +1118,12 @@ mod tests {
         for (name, rust) in pairs {
             assert_eq!(define(name), *rust, "{name} differs between the kernel and wave.rs");
         }
+        // The calibration opcode is defined in the poller kernel.
+        let kernel = super::super::PEER_CU;
+        assert!(
+            kernel.contains(&format!("#define FLW_OP_CALIBRATE 0x{:08X}u", layout::OP_WAVE_CALIBRATE)),
+            "FLW_OP_CALIBRATE in gpu_peer.cu differs from layout::OP_WAVE_CALIBRATE"
+        );
     }
 
     fn spec(frontier: Frontier, roots: usize, id_capacity: u32) -> WaveSpec {
@@ -818,9 +1179,7 @@ mod tests {
         assert_eq!(get_u32(&span, PUSH_OFF), 3);
         let ids = layout.ids_off as usize;
         assert_eq!((0..3).map(|i| get_u32(&span, ids + i * 4)).collect::<Vec<_>>(), vec![1000, 1001, 1002]);
-        let mut budget = [0u8; 8];
-        budget.copy_from_slice(&span[BUDGET_NS_OFF..BUDGET_NS_OFF + 8]);
-        assert_eq!(u64::from_le_bytes(budget), 7);
+        assert_eq!(get_u64(&span, BUDGET_NS_OFF), 7);
     }
 
     #[test]
@@ -867,12 +1226,16 @@ mod tests {
         put_u32(&mut span, FAIL_COMP_OFF, u32::MAX - 7);
         put_u32(&mut span, FAIL_CODE_OFF, 42);
         put_u32(&mut span, WAIT_SUM_KNS_OFF, 3);
+        put_u32(&mut span, MOVED_OFF, 11);
+        put_u64(&mut span, ELAPSED_NS_OFF, 123_456);
         let entry = layout.table_off as usize + TABLE_STRIDE;
         put_u32(&mut span, entry + T_GENERATION, 5);
         let stats = WaveStats::decode(&span, 2).expect("decodes");
         assert_eq!(stats.slice_state, SliceState::Failed);
         assert_eq!(stats.failure, Some(WaveFailure { segment: Some(7), code: 42 }));
         assert_eq!(stats.barrier_wait_sum_ns, 3 << 10);
+        assert_eq!(stats.moved_ids, 11);
+        assert_eq!(stats.elapsed_ns, 123_456);
         assert_eq!(stats.blocks[1].generations, 5);
 
         put_u32(&mut span, FAIL_COMP_OFF, u32::MAX - NO_SEGMENT);
@@ -881,5 +1244,47 @@ mod tests {
 
         put_u32(&mut span, SLICE_STATE_OFF, 99);
         assert!(WaveStats::decode(&span, 2).is_err(), "an unknown slice state is refused");
+    }
+
+    #[test]
+    fn the_least_squares_line_recovers_a_fixed_and_a_per_segment_cost() {
+        let points: Vec<(f64, f64)> = [100.0, 400.0, 1600.0, 6400.0]
+            .iter()
+            .map(|&x| (x, 5_000.0 + 2.5 * x))
+            .collect();
+        let (intercept, slope) = least_squares(&points);
+        assert!((intercept - 5_000.0).abs() < 1e-6, "{intercept}");
+        assert!((slope - 2.5).abs() < 1e-9, "{slope}");
+        assert_eq!(median(&[5, 1, 9, 3, 7]), 5);
+        assert_eq!(median(&[]), 0);
+    }
+
+    #[test]
+    fn plan_inputs_take_the_imbalance_over_the_interval_the_wave_ran() {
+        let costs = WaveCosts {
+            width: 4,
+            barrier_ns: 2_000,
+            fixed_ns: 100_000,
+            segment_ps: 500,
+            copy_ps_per_id: 3_000,
+            generation_ns: 1_000,
+        };
+        let s = spec(Frontier::Global, 2, 10);
+        let layout = WaveLayout::new(4, &s).expect("fits");
+        let mut span = initial_span(&s, &layout, 0).expect("encodes");
+        put_u32(&mut span, GENERATIONS_OFF, 10);
+        put_u32(&mut span, PUSH_OFF, 1_000);
+        put_u32(&mut span, IMBALANCE_OFF, 1_500);
+        put_u32(&mut span, LONGEST_GEN_OFF, 9_000);
+        let stats = WaveStats::decode(&span, 4).expect("decodes");
+
+        let global = costs.plan_inputs(&stats, Frontier::Global);
+        assert_eq!(global.imbalance, Some(plan::Imbalance { per_mille: 1_500, over_generations: 1 }));
+        assert_eq!(global.pending_ids, 100.0, "1000 pushed over 10 generations");
+        assert_eq!(global.copy_ns_per_id, 3.0);
+        assert_eq!(global.generation_ns, 9_000.0);
+
+        let every = costs.plan_inputs(&stats, Frontier::Partition { rebalance_every: NonZeroU32::new(4) });
+        assert_eq!(every.imbalance.map(|i| i.over_generations), Some(4));
     }
 }
