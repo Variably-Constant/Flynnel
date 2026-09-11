@@ -1,11 +1,14 @@
 //! The cost of a cross-block barrier written inside a user op and run once
 //! per generation, at team sizes up to the width of the card.
 //!
-//! - `gen_wait_max_ns`: the longest any block's thread 0 waited at a
-//!   generation barrier in the slot, which is the latency one generation
-//!   pays.
+//! - `gen_wait_max_ns`: the longest any block's thread 0 waited at any
+//!   generation barrier in the slot, generation 0 included.
 //! - `gen0_wait_max_ns`: the same for generation 0 alone, which also
 //!   absorbs any skew in when the blocks began the slot.
+//! - `steady_wait_max_ns`: the same over generations 1 onward, which is the
+//!   latency each generation after the first pays.
+//! - `period_ns`: rank 0's op time divided by the generation count. Blocks
+//!   advance in lockstep, so this is the team's time per generation.
 //! - `wait_sum_ns`: every block's wait over every generation, accumulated
 //!   on the device in units of 1024 ns.
 //! - `timeouts`: barriers a block left on its deadline. A nonzero count
@@ -65,6 +68,7 @@ const CELL_WAIT_MAX: usize = 1;
 const CELL_WAIT_SUM_KNS: usize = 2;
 const CELL_TIMEOUTS: usize = 3;
 const CELL_GEN0_WAIT_MAX: usize = 4;
+const CELL_STEADY_WAIT_MAX: usize = 5;
 
 /// How long a block waits at one generation barrier before leaving it.
 /// Forty times the 55 us the kernel's slot barrier measured for a
@@ -140,7 +144,7 @@ extern "C" __device__ unsigned flynnel_user_op(
             unsigned w = (unsigned)(waited > 0xFFFFFFFFull ? 0xFFFFFFFFull : waited);
             atomicMax(cells + 1, w);
             atomicAdd(cells + 2, (unsigned)(waited >> 10));
-            if (g == 0u) atomicMax(cells + 4, w);
+            if (g == 0u) atomicMax(cells + 4, w); else atomicMax(cells + 5, w);
             if (whole == 0u) atomicAdd(cells + 3, 1u);
         }
         __syncthreads();
@@ -209,6 +213,7 @@ struct Slot {
     status: u32,
     gen_wait_max_ns: u32,
     gen0_wait_max_ns: u32,
+    steady_wait_max_ns: u32,
     wait_sum_ns: u64,
     timeouts: u32,
     op_total_ns: u32,
@@ -467,6 +472,7 @@ fn run_slot(
         status,
         gen_wait_max_ns: get(&cells, CELL_WAIT_MAX << 2),
         gen0_wait_max_ns: get(&cells, CELL_GEN0_WAIT_MAX << 2),
+        steady_wait_max_ns: get(&cells, CELL_STEADY_WAIT_MAX << 2),
         wait_sum_ns: u64::from(get(&cells, CELL_WAIT_SUM_KNS << 2)) << 10,
         timeouts: get(&cells, CELL_TIMEOUTS << 2),
         op_total_ns: get(&result, RESIDENT_PREFIX + RESULT_TOTAL_NS),
@@ -563,7 +569,7 @@ fn main() {
     };
     let mut csv = BufWriter::new(file);
     let header = "pass,team,place,work_us,spread_permille,rep,warm,status,gen_wait_max_ns,\
-                  gen0_wait_max_ns,wait_sum_ns,timeouts,op_total_ns,host_rtt_us";
+                  gen0_wait_max_ns,steady_wait_max_ns,wait_sum_ns,timeouts,op_total_ns,host_rtt_us";
     if let Err(err) = writeln!(csv, "{header}") {
         eprintln!("cannot write {csv_path}: {err}");
         std::process::exit(2);
@@ -571,8 +577,8 @@ fn main() {
 
     println!(
         "pass     team  place   work_us  spread  gen_wait_max_ns(min/med/max)  \
-         gen0_wait_max_ns(min/med/max)  op_total_ns(med)  timeouts  not_done  errors  \
-         kernel_barrier_max_ns  kernel_stalls"
+         gen0_wait_max_ns(min/med/max)  steady_wait_max_ns(min/med/max)  period_ns(med)  \
+         op_total_ns(med)  timeouts  not_done  errors  kernel_barrier_max_ns  kernel_stalls"
     );
 
     let mut peers: Vec<Option<(GpuPeer, ResidentHandle)>> = teams.iter().map(|_| None).collect();
@@ -610,6 +616,8 @@ fn main() {
 
             let mut waits = Vec::new();
             let mut gen0_waits = Vec::new();
+            let mut steady_waits = Vec::new();
+            let mut periods = Vec::new();
             let mut totals = Vec::new();
             let mut timeouts = 0u32;
             let mut not_done = 0u32;
@@ -631,7 +639,7 @@ fn main() {
                 };
                 let row = writeln!(
                     csv,
-                    "{pass},{},{},{},{},{rep},{},{},{},{},{},{},{},{}",
+                    "{pass},{},{},{},{},{rep},{},{},{},{},{},{},{},{},{}",
                     arm.team,
                     arm.place.name(),
                     arm.work_us,
@@ -640,6 +648,7 @@ fn main() {
                     slot.status,
                     slot.gen_wait_max_ns,
                     slot.gen0_wait_max_ns,
+                    slot.steady_wait_max_ns,
                     slot.wait_sum_ns,
                     slot.timeouts,
                     slot.op_total_ns,
@@ -657,6 +666,8 @@ fn main() {
                 if !warm && slot.status == STATUS_DONE && slot.timeouts == 0 {
                     waits.push(u64::from(slot.gen_wait_max_ns));
                     gen0_waits.push(u64::from(slot.gen0_wait_max_ns));
+                    steady_waits.push(u64::from(slot.steady_wait_max_ns));
+                    periods.push(u64::from(slot.op_total_ns) / u64::from(generations));
                     totals.push(u64::from(slot.op_total_ns));
                 }
             }
@@ -664,11 +675,13 @@ fn main() {
             let (stalls, stall_depth) = peer.barrier_stalls();
             let wait_spread = spread_of(&waits).text;
             let gen0_spread = spread_of(&gen0_waits).text;
+            let steady_spread = spread_of(&steady_waits).text;
+            let period_median = spread_of(&periods).median;
             let total_median = spread_of(&totals).median;
             println!(
                 "{pass:<7}  {:>5}  {:<6}  {:>7}  {:>6}  {wait_spread:>28}  {gen0_spread:>29}  \
-                 {total_median:>16}  {timeouts:>8}  {not_done:>8}  {errors:>6}  {:>21}  \
-                 {stalls:>6} (depth {stall_depth})",
+                 {steady_spread:>31}  {period_median:>14}  {total_median:>16}  {timeouts:>8}  \
+                 {not_done:>8}  {errors:>6}  {:>21}  {stalls:>6} (depth {stall_depth})",
                 arm.team,
                 arm.place.name(),
                 arm.work_us,
