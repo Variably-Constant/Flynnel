@@ -3134,10 +3134,27 @@ where
 
 /// Parallel reduction: split `items` into chunks, fold each chunk
 /// with `fold`, then combine pairs with `reduce` until one value
-/// remains. The combine tree is binary and bit-exact for non-
-/// commutative `reduce` only when called with associative
-/// operations - the order of combination depends on the
-/// recursion shape.
+/// remains.
+///
+/// `reduce` must be associative. The combine tree is binary and the
+/// order of combination is not fixed, so an operator that is not
+/// associative returns a value that depends on the shape of the tree.
+/// Commutativity is not required.
+///
+/// The shape is chosen per call from state this call site has learned,
+/// so it is not a property of the input. Below four timed samples the
+/// reduce cost is unknown and the call takes the bisect tree; from the
+/// fourth call an average exists and the flat shape can be selected
+/// instead; the average goes on moving until sixteen. The flat shape
+/// then splits into `workers * split_multiplier()` chunks, and that
+/// multiplier is the process-global split observer's, retuned from the
+/// pool's steal rate every 200ms.
+///
+/// So for a non-associative `reduce`, the same call site over the same
+/// input on one host in one process can return one value early and
+/// another later. Floating-point addition is the usual case. A caller
+/// who needs a reproducible result needs an associative operator, not
+/// a quiet host.
 ///
 /// `init` is called once per chunk to seed its accumulator (so
 /// each chunk gets a fresh `init` value, allowing thread-local
