@@ -489,30 +489,35 @@ __device__ __forceinline__ u32 flw_pushed(flw_slice* s, u32 blk)
     return flw_min(pushed, s->cap);
 }
 
-// On a block's thread 0: arrive at a barrier and wait until every block of
-// the wave has arrived in the same round, or the deadline passes. Records
-// the wait. Returns 1 when the round completed; on the deadline the wave is
-// marked failed and 0 is returned. The block's stores are fenced first, so
-// a block that reads them after the round reads what this one wrote.
-//
-// With `walk` set, block 0 of a wave with a ROB first waits until every
-// other block has arrived in this round, walks the rows while those blocks
-// wait, and only then arrives. Their deadlines cover the walk.
-__device__ __forceinline__ u32 flw_barrier(flw_slice* s, u32 first_of_slice, u32 walk)
+// On block 0's thread 0, before it arrives at a barrier: waits until every
+// other block has arrived in the coming round, when their threads are synced
+// and their stores fenced, or until the barrier deadline passes. Returns 1
+// when every other block has arrived. The other blocks' deadlines cover
+// what block 0 does before it arrives.
+__device__ __forceinline__ u32 flw_await_others(flw_slice* s)
 {
     unsigned char* b = s->base;
     __threadfence_system();
     u64 t0 = gtimer();
     u64 deadline = (u64)flw_get(b, FLW_BARRIER_DEADLINE_OFF);
-    if (walk != 0u && s->rank == 0u && flw_rob_capacity(s) != 0u) {
-        u32 seen = atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u);
-        u32 last = (seen / s->width + 1u) * s->width - 1u;
-        while (atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u) < last && gtimer() - t0 <= deadline) {
-        }
-        if (atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u) == last) {
-            flw_rob_walk(s);
-        }
+    u32 seen = atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u);
+    u32 last = (seen / s->width + 1u) * s->width - 1u;
+    while (atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u) < last && gtimer() - t0 <= deadline) {
     }
+    return atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u) == last ? 1u : 0u;
+}
+
+// On a block's thread 0: arrive at a barrier and wait until every block of
+// the wave has arrived in the same round, or the deadline passes. Records
+// the wait. Returns 1 when the round completed; on the deadline the wave is
+// marked failed and 0 is returned. The block's stores are fenced first, so
+// a block that reads them after the round reads what this one wrote.
+__device__ __forceinline__ u32 flw_barrier(flw_slice* s, u32 first_of_slice)
+{
+    unsigned char* b = s->base;
+    __threadfence_system();
+    u64 t0 = gtimer();
+    u64 deadline = (u64)flw_get(b, FLW_BARRIER_DEADLINE_OFF);
     u32 mine = atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 1u) + 1u;
     u32 goal = ((mine + s->width - 1u) / s->width) * s->width;
     u32 whole = 1u;
@@ -595,7 +600,7 @@ __device__ __forceinline__ u32 flw_slice_begin(flw_slice* s, unsigned char* base
 
         u32 go;
         if (s->coupled != 0u) {
-            u32 whole = flw_barrier(s, 1u, 0u);
+            u32 whole = flw_barrier(s, 1u);
             u32 any = 0u;
             for (u32 k = 0u; k < team_size; k++) {
                 if (flw_tget(s, k, FLW_T_EMPTY) == 0u) any = 1u;
@@ -638,8 +643,9 @@ __device__ __forceinline__ void flw_rebalance(flw_slice* s)
         flw_tset(s, me, FLW_T_PENDING, pend_end > pend_start ? pend_end - pend_start : 0u);
         if (me == 0u) {
             flw_set(b, FLW_STOP_OFF, flw_should_stop(s, now, s->rebalance));
+            if (flw_await_others(s) != 0u) flw_rob_walk(s);
         }
-        u32 whole = flw_barrier(s, 0u, 1u);
+        u32 whole = flw_barrier(s, 0u);
         u32 prefix = 0u;
         u32 total = 0u;
         u32 largest = 0u;
@@ -676,7 +682,7 @@ __device__ __forceinline__ void flw_rebalance(flw_slice* s)
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        u32 whole = flw_barrier(s, 0u, 0u);
+        u32 whole = flw_barrier(s, 0u);
         u32 total = flw_tget(s, me, FLW_T_TOTAL);
         flw_tset(s, me, FLW_T_DEAL_LO, (u32)((u64)me * (u64)total / (u64)w));
         flw_tset(s, me, FLW_T_DEAL_HI, (u32)((u64)(me + 1u) * (u64)total / (u64)w));
@@ -747,32 +753,37 @@ __device__ __forceinline__ void flw_generation_end(flw_slice* s)
             if (s->mode == FLW_MODE_GLOBAL) {
                 if (me == 0u) {
                     flw_set(b, FLW_STOP_OFF, flw_should_stop(s, now, 1u));
-                }
-                u32 whole = flw_barrier(s, 0u, 1u);
-                if (me == 0u) {
-                    // Each block's share of this generation's children,
-                    // readable now that every block has arrived.
-                    u32 largest = 0u;
-                    u32 sum = 0u;
-                    for (u32 k = 0u; k < s->width; k++) {
-                        u32 pushed = atomicAdd(flw_table(s, k, FLW_T_PUSH), 0u);
-                        u32 delta = pushed - flw_tget(s, k, FLW_T_PREFIX);
-                        flw_tset(s, k, FLW_T_PREFIX, pushed);
-                        sum += delta;
-                        if (delta > largest) largest = delta;
+                    if (flw_await_others(s) != 0u) {
+                        // Every other block has arrived with its threads
+                        // synced, so this generation's push counts are
+                        // final: take each block's share of the children,
+                        // walk the ROB, and publish the next range.
+                        u32 largest = 0u;
+                        u32 sum = 0u;
+                        for (u32 k = 0u; k < s->width; k++) {
+                            u32 pushed = atomicAdd(flw_table(s, k, FLW_T_PUSH), 0u);
+                            u32 delta = pushed - flw_tget(s, k, FLW_T_PREFIX);
+                            flw_tset(s, k, FLW_T_PREFIX, pushed);
+                            sum += delta;
+                            if (delta > largest) largest = delta;
+                        }
+                        if (sum > 0u) {
+                            atomicMax(flw_u32(b, FLW_IMBALANCE_OFF),
+                                      flw_sat((u64)largest * 1000ull * (u64)s->width / (u64)sum));
+                        }
+                        flw_rob_walk(s);
+                        flw_set(b, FLW_START_OFF, next_start);
+                        flw_set(b, FLW_END_OFF, flw_pushed(s, 0u));
+                    } else {
+                        flw_fail(s, FLW_NO_SEGMENT, FLW_FAIL_BARRIER);
                     }
-                    if (sum > 0u) {
-                        atomicMax(flw_u32(b, FLW_IMBALANCE_OFF),
-                                  flw_sat((u64)largest * 1000ull * (u64)s->width / (u64)sum));
-                    }
                 }
-                next_end = flw_pushed(s, me);
+                u32 whole = flw_barrier(s, 0u);
+                next_end = flw_get(b, FLW_END_OFF);
                 go = (whole != 0u && next_start < next_end
                       && flw_get(b, FLW_STOP_OFF) == 0u
                       && flw_get(b, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
                 if (me == 0u) {
-                    flw_set(b, FLW_START_OFF, next_start);
-                    flw_set(b, FLW_END_OFF, next_end);
                     flw_set(b, FLW_GENERATIONS_OFF, flw_get(b, FLW_GENERATIONS_OFF) + 1u);
                 }
             } else {

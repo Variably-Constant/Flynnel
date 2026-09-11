@@ -72,8 +72,10 @@ pub mod wave;
 
 mod poller;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use cudarc::driver::sys as cu;
@@ -437,6 +439,15 @@ pub struct GpuPeerConfig {
     /// [`GpuPeer::pin_bulk`]: the op's `count` may run to the end of the
     /// pool, not only to the end of its first block.
     pub user_ops_cuda: Option<String>,
+    /// NVRTC options for the composed user-op module, passed verbatim: for
+    /// example `"--fmad=false"`, which keeps a kernel's arithmetic
+    /// bit-exact with a host that does not fuse multiply-adds. Empty
+    /// compiles with NVRTC's defaults. Unused without
+    /// [`Self::user_ops_cuda`].
+    ///
+    /// A module is compiled once per process for each source and set of
+    /// options, and a later init with the same pair loads it again.
+    pub user_ops_nvrtc_options: Vec<String>,
 }
 
 impl Default for GpuPeerConfig {
@@ -454,6 +465,7 @@ impl Default for GpuPeerConfig {
             vram_blocks: 1024,
             blocks_per_lane: 1,
             user_ops_cuda: None,
+            user_ops_nvrtc_options: Vec::new(),
         }
     }
 }
@@ -601,6 +613,41 @@ fn warn_on_foreign_context(prior: Option<cu::CUcontext>) -> bool {
     }
 }
 
+/// Composed user-op modules, keyed by their source and NVRTC options.
+type ComposedModules = HashMap<(String, Vec<String>), Ptx>;
+
+/// Composed user-op modules compiled in this process.
+static COMPOSED_PTX: OnceLock<Mutex<ComposedModules>> = OnceLock::new();
+
+/// NVRTC compilations of a composed user-op module in this process.
+static COMPOSED_COMPILES: AtomicU64 = AtomicU64::new(0);
+
+/// The module for `src` under `options`: the one compiled earlier in this
+/// process for the same pair, or a fresh NVRTC compilation that is kept.
+fn composed_ptx(src: String, options: &[String]) -> Result<Ptx, GpuPeerError> {
+    let cache = COMPOSED_PTX.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (src, options.to_vec());
+    if let Some(ptx) = lock_composed(cache).get(&key) {
+        return Ok(ptx.clone());
+    }
+    let opts = cudarc::nvrtc::CompileOptions { options: key.1.clone(), ..Default::default() };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(&key.0, opts)
+        .map_err(|e| GpuPeerError::Driver(format!("user-ops NVRTC compile: {e:?}")))?;
+    COMPOSED_COMPILES.fetch_add(1, Ordering::Relaxed);
+    lock_composed(cache).insert(key, ptx.clone());
+    Ok(ptx)
+}
+
+/// The composed-module cache, locked. Every use holds the lock for a single
+/// map call, so a panic under it cannot leave the map part-written, and a
+/// poisoned lock still guards a whole map.
+fn lock_composed(cache: &Mutex<ComposedModules>) -> MutexGuard<'_, ComposedModules> {
+    match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 impl GpuPeer {
     /// Initialize the substrate: CUDA context, region creation +
     /// registration, kernel load, and the full host calibration
@@ -648,9 +695,7 @@ impl GpuPeer {
                     "#define FLYNNEL_USER_OPS 1\n{PEER_CU}\n{}\n{user_src}\n",
                     wave::WAVE_CU
                 );
-                let ptx = cudarc::nvrtc::compile_ptx(src).map_err(|e| {
-                    GpuPeerError::Driver(format!("user-ops NVRTC compile: {e:?}"))
-                })?;
+                let ptx = composed_ptx(src, &config.user_ops_nvrtc_options)?;
                 ctx.load_module(ptx)
                     .map_err(|e| GpuPeerError::Driver(format!("user-ops PTX load: {e:?}")))?
             }
@@ -808,6 +853,13 @@ impl GpuPeer {
     #[inline]
     pub fn team_size(&self) -> u32 {
         self.team_size
+    }
+
+    /// NVRTC compilations of a composed user-op module so far in this
+    /// process. An init whose source and options were compiled before
+    /// loads that module and adds nothing.
+    pub fn user_ops_compiles() -> u64 {
+        COMPOSED_COMPILES.load(Ordering::Relaxed)
     }
 
     /// The shared region (attachment path, offset accessors).

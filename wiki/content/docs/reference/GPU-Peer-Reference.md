@@ -313,6 +313,12 @@ the lane's team. What the kernel requires of it:
 - **Pinning limits.** `pin` rides a slot, so it takes at most one pool
   block and at most `payload_max() - 8` bytes. `pin_bulk` is the route
   for anything larger.
+- **Compile options.** `GpuPeerConfig::user_ops_nvrtc_options` passes
+  NVRTC options to the composed module verbatim. For example,
+  `--fmad=false` keeps multiply-adds unfused, as a host computes them. A
+  module is compiled once per process for each source and set of options,
+  and a later init with the same pair loads it.
+  `GpuPeer::user_ops_compiles()` counts the compilations.
 
 #### Yielding a slot
 

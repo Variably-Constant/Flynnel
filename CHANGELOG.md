@@ -30,7 +30,9 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   with the user source and provides:
   - a push index and an arena over `atomicAdd`;
   - a per-generation cross-block barrier with its own deadline and
-    instrumentation;
+    instrumentation. On a global frontier, block 0 reads the push count
+    once every other block has arrived and publishes the next range, and
+    every block takes its range from that;
   - a global frontier, or per-block frontiers that deal pending
     segments out evenly every N generations;
   - a slice end at which block 0 waits for every block;
@@ -69,6 +71,11 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
     host-run segments to the same span.
 - `GpuPeer::fetch_bulk_at` and `write_resident_bulk_at` read and write a
   resident span at an offset.
+- `GpuPeerConfig::user_ops_nvrtc_options` passes NVRTC options to the
+  composed user-op module, such as `--fmad=false` for a kernel that must
+  match the host bit for bit. A composed module is compiled once per
+  process for each source and set of options, and
+  `GpuPeer::user_ops_compiles` counts the compilations.
 - `GpuPeer::team_size`, the blocks each lane actually runs.
 
 ### Changed
