@@ -806,11 +806,12 @@ impl GpuPeer {
     ///
     /// - `fixed_ns` and `segment_ps`: the least-squares line through the
     ///   global frontier's host round trip against its segment count;
-    /// - `barrier_ns`: the global frontier's device time per generation
-    ///   above the non-rebalancing partition's;
+    /// - `barrier_ns`: the global frontier's device time above the
+    ///   non-rebalancing partition's, summed over every depth, per
+    ///   generation;
     /// - `copy_ps_per_id`: the rebalancing partition's device time above the
-    ///   non-rebalancing one, less its two barriers per generation, per id
-    ///   moved;
+    ///   non-rebalancing one, summed over every depth, less two barriers per
+    ///   generation, per id moved;
     /// - `start_skew_ns`: the global frontier's first-barrier wait;
     /// - `generation_ns`: the longest generation any run measured.
     ///
@@ -830,13 +831,16 @@ impl GpuPeer {
         }
         let width = self.team_size();
         let mut wall_points = Vec::with_capacity(CALIBRATION_DEPTHS.len());
-        let mut barrier_per_generation = Vec::with_capacity(CALIBRATION_DEPTHS.len());
-        let mut copy_per_id = Vec::with_capacity(CALIBRATION_DEPTHS.len());
         let mut skew_per_depth = Vec::with_capacity(CALIBRATION_DEPTHS.len());
+        let mut global_extra_ns = 0u64;
+        let mut rebalance_extra_ns = 0u64;
+        let mut generations = 0u64;
+        let mut rebalanced_generations = 0u64;
+        let mut moved_ids = 0u64;
         let mut longest = 0u64;
         for depth in CALIBRATION_DEPTHS {
             let segments = u64::from(CALIBRATION_ROOTS) * ((1u64 << (depth + 1)) - 1);
-            let generations = u64::from(depth + 1);
+            let depth_generations = u64::from(depth + 1);
             let global = self.calibration_run(Frontier::Global, depth, segments)?;
             let partitioned = segments * u64::from(width);
             let never = self.calibration_run(Frontier::Partition { rebalance_every: None }, depth, partitioned)?;
@@ -844,24 +848,32 @@ impl GpuPeer {
                 self.calibration_run(Frontier::Partition { rebalance_every: NonZeroU32::new(1) }, depth, partitioned)?;
             wall_points.push((segments as f64, global.wall_ns as f64));
             skew_per_depth.push(global.skew_ns);
-            let barrier = global.elapsed_ns.saturating_sub(never.elapsed_ns) / generations;
-            barrier_per_generation.push(barrier);
+            global_extra_ns = global_extra_ns.saturating_add(global.elapsed_ns.saturating_sub(never.elapsed_ns));
+            generations += depth_generations;
             if every.moved_ids > 0 {
-                let copying = every
-                    .elapsed_ns
-                    .saturating_sub(never.elapsed_ns)
-                    .saturating_sub(barrier.saturating_mul(2 * generations));
-                copy_per_id.push(copying.saturating_mul(1000) / every.moved_ids);
+                rebalance_extra_ns =
+                    rebalance_extra_ns.saturating_add(every.elapsed_ns.saturating_sub(never.elapsed_ns));
+                rebalanced_generations += depth_generations;
+                moved_ids += every.moved_ids;
             }
             longest = longest.max(global.longest_ns).max(never.longest_ns).max(every.longest_ns);
         }
+        let barrier_ns = global_extra_ns / generations.max(1);
+        let copy_ps_per_id = if moved_ids == 0 {
+            0
+        } else {
+            rebalance_extra_ns
+                .saturating_sub(barrier_ns.saturating_mul(2 * rebalanced_generations))
+                .saturating_mul(1000)
+                / moved_ids
+        };
         let (fixed, slope) = least_squares(&wall_points);
         let costs = WaveCosts {
             width,
-            barrier_ns: median(&barrier_per_generation),
+            barrier_ns,
             fixed_ns: fixed.max(0.0) as u64,
             segment_ps: (slope * 1000.0).max(0.0) as u64,
-            copy_ps_per_id: median(&copy_per_id),
+            copy_ps_per_id,
             start_skew_ns: median(&skew_per_depth),
             generation_ns: longest,
         };
