@@ -108,11 +108,13 @@ where
 mod host {
     use std::fs;
 
-    /// Summed ticks across every CPU, the busy share of them, and the share
-    /// the hypervisor took from this guest.
+    /// Summed ticks across every CPU, the busy share of them, the share
+    /// this process used, and the share the hypervisor took from this
+    /// guest.
     pub struct Sample {
         total: u64,
         busy: u64,
+        own: u64,
         steal: u64,
         cpus: f64,
     }
@@ -147,18 +149,31 @@ mod host {
         if cpus == 0 {
             return Err("/proc/stat lists no CPUs".to_string());
         }
+        let own_stat = fs::read_to_string("/proc/self/stat")
+            .map_err(|err| format!("reading /proc/self/stat: {err}"))?;
+        // The command name is parenthesised and may hold spaces, so fields
+        // are counted from its closing parenthesis: utime and stime are the
+        // 12th and 13th after it.
+        let Some(close) = own_stat.rfind(')') else {
+            return Err("/proc/self/stat has no command name".to_string());
+        };
+        let mut rest = own_stat[close + 1..].split_whitespace().skip(11);
+        let utime = parse(rest.next(), "utime")?;
+        let stime = parse(rest.next(), "stime")?;
+
         let total: u64 = ticks.iter().sum();
         Ok(Sample {
             total,
             busy: total - ticks[3] - ticks[4],
+            own: utime + stime,
             steal: ticks[7],
             cpus: cpus as f64,
         })
     }
 
-    /// Cores the box was busy, and cores the hypervisor took, between two
-    /// samples.
-    pub fn cores_between(earlier: &Sample, later: &Sample) -> Result<(f64, f64), String> {
+    /// Cores the box was busy, cores this process used, and cores the
+    /// hypervisor took, between two samples.
+    pub fn cores_between(earlier: &Sample, later: &Sample) -> Result<(f64, f64, f64), String> {
         let total = later
             .total
             .checked_sub(earlier.total)
@@ -171,11 +186,19 @@ mod host {
             .busy
             .checked_sub(earlier.busy)
             .ok_or_else(|| "the busy ticks went backwards".to_string())? as f64;
+        let own = later
+            .own
+            .checked_sub(earlier.own)
+            .ok_or_else(|| "this process's ticks went backwards".to_string())? as f64;
         let steal = later
             .steal
             .checked_sub(earlier.steal)
             .ok_or_else(|| "the stolen ticks went backwards".to_string())? as f64;
-        Ok((busy / total * later.cpus, steal / total * later.cpus))
+        Ok((
+            busy / total * later.cpus,
+            own / total * later.cpus,
+            steal / total * later.cpus,
+        ))
     }
 }
 
@@ -201,33 +224,68 @@ mod host {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetSystemTimes(idle: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetProcessTimes(
+            process: *mut std::ffi::c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
     }
 
-    /// Busy 100 ns units summed over every logical CPU, and when they were
-    /// read.
+    /// Busy and own 100 ns units summed over every logical CPU, and when
+    /// they were read.
     pub struct Sample {
         at: Instant,
         busy: u64,
+        own: u64,
     }
 
     pub fn read() -> Result<Sample, String> {
         let mut idle = FileTime::default();
         let mut kernel = FileTime::default();
         let mut user = FileTime::default();
-        // SAFETY: every pointer is to a live local FileTime, and the call
-        // writes only through them.
-        let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+        let mut created = FileTime::default();
+        let mut exited = FileTime::default();
+        let mut own_kernel = FileTime::default();
+        let mut own_user = FileTime::default();
+        // SAFETY: every pointer is to a live local FileTime, the handle
+        // GetCurrentProcess returns needs no closing, and both calls write
+        // only through those pointers.
+        let (system_ok, process_ok) = unsafe {
+            (
+                GetSystemTimes(&mut idle, &mut kernel, &mut user),
+                GetProcessTimes(
+                    GetCurrentProcess(),
+                    &mut created,
+                    &mut exited,
+                    &mut own_kernel,
+                    &mut own_user,
+                ),
+            )
+        };
         let at = Instant::now();
-        if ok == 0 {
+        if system_ok == 0 {
             return Err(format!(
                 "GetSystemTimes failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if process_ok == 0 {
+            return Err(format!(
+                "GetProcessTimes failed: {}",
                 std::io::Error::last_os_error()
             ));
         }
         // The kernel time GetSystemTimes reports includes idle time.
         let total = kernel.units() + user.units();
         match total.checked_sub(idle.units()) {
-            Some(busy) => Ok(Sample { at, busy }),
+            Some(busy) => Ok(Sample {
+                at,
+                busy,
+                own: own_kernel.units() + own_user.units(),
+            }),
             None => Err(format!(
                 "GetSystemTimes reported idle time {} above kernel plus user time {total}",
                 idle.units()
@@ -235,8 +293,10 @@ mod host {
         }
     }
 
-    /// Cores the box was busy between two samples, and zero stolen cores.
-    pub fn cores_between(earlier: &Sample, later: &Sample) -> Result<(f64, f64), String> {
+    /// Cores the box was busy and cores this process used between two
+    /// samples, with zero stolen: a physical host takes nothing from
+    /// itself.
+    pub fn cores_between(earlier: &Sample, later: &Sample) -> Result<(f64, f64, f64), String> {
         let wall = later.at.duration_since(earlier.at).as_nanos() as f64 / 100.0;
         if wall <= 0.0 {
             return Err("the two samples were taken at the same instant".to_string());
@@ -245,7 +305,11 @@ mod host {
             .busy
             .checked_sub(earlier.busy)
             .ok_or_else(|| "the busy time went backwards".to_string())? as f64;
-        Ok((busy / wall, 0.0))
+        let own = later
+            .own
+            .checked_sub(earlier.own)
+            .ok_or_else(|| "this process's time went backwards".to_string())? as f64;
+        Ok((busy / wall, own / wall, 0.0))
     }
 }
 
@@ -259,18 +323,20 @@ mod host {
         Err("the box's CPU accounting is read on Linux and Windows only".to_string())
     }
 
-    pub fn cores_between(_earlier: &Sample, _later: &Sample) -> Result<(f64, f64), String> {
+    pub fn cores_between(_earlier: &Sample, _later: &Sample) -> Result<(f64, f64, f64), String> {
         Err("the box's CPU accounting is read on Linux and Windows only".to_string())
     }
 }
 
-/// The cores the box was busy and the cores the hypervisor took over a
-/// window, as `busy/steal`, or why they could not be read.
+/// Over a window: the cores the box was busy, the cores this process used
+/// and the cores the hypervisor took, as `busy/own/steal`, or why they
+/// could not be read. The difference between the first two is load this run
+/// did not produce.
 fn tenancy(earlier: &Result<host::Sample, String>, later: &Result<host::Sample, String>) -> String {
     match earlier {
         Ok(first) => match later {
             Ok(last) => match host::cores_between(first, last) {
-                Ok((busy, steal)) => format!("{busy:.2}/{steal:.2}"),
+                Ok((busy, own, steal)) => format!("{busy:.2}/{own:.2}/{steal:.2}"),
                 Err(reason) => {
                     eprintln!("a window has no tenant record: {reason}");
                     "unavailable".to_string()
