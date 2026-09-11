@@ -6,7 +6,18 @@
 //! quantity here is what the routing costs once the load is gone, so the
 //! burst runs between the two measured windows and in neither of them.
 //!
-//! Three routings run the same sequence:
+//! # One arm per process
+//!
+//! This runs exactly one arm and prints one row. The observer counters, the
+//! split multiplier and the process-wide class are process-global, so arms
+//! sharing a process hand each other a starting condition: five profile
+//! arms in one process spread 1.6x and agreed within 3 percent one arm per
+//! process. The driver runs this once per shape, routing and trial, and
+//! each row carries the process-wide class at both window ends, so a reader
+//! can see whether it moved rather than assume it did not.
+//!
+//! # The arms
+//!
 //! - `adaptive` builds each plan with `JobPlan::new`, so the site's learned
 //!   class re-derives the routing of every later dispatch;
 //! - `streaming` pins the Streaming profile, so the site still classifies
@@ -14,18 +25,11 @@
 //! - `latency` pins LatencyBound, the routing an adaptive site lands on,
 //!   for every window including the first.
 //!
-//! Each row carries both windows' median dispatch time, their ratio, the
-//! class at the end of each window, and the leaf shape the op was handed.
-//! A ratio that the pinned routings do not show is what the class having
-//! moved costs. Each shape runs its routings in one order on even trials
-//! and the reverse on odd ones, so an effect that depends on the order is
-//! visible as one.
-//!
-//! Every arm owns its own site, so nothing one arm learns is another's
-//! starting condition.
+//! A ratio the pinned arms do not show is what the class having moved
+//! costs.
 //!
 //! ```sh
-//! cargo run --release --example class_loop_cost -- 8 6 3 12
+//! cargo run --release --example class_loop_cost -- heavy adaptive 8 6 12
 //! ```
 
 use std::env;
@@ -34,7 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use flynnel::sched::adaptive_profile::WorkloadClass;
+use flynnel::sched::adaptive_profile::{WorkloadClass, active_workload_class};
 use flynnel::sched::par_iter::for_each_chunk_min_leaf;
 use flynnel::{CallSiteState, DispatchProfile, JobPlan, SiteRef};
 
@@ -42,12 +46,8 @@ use flynnel::{CallSiteState, DispatchProfile, JobPlan, SiteRef};
 /// floor below it is doing so on its own account.
 const MIN_LEAF: usize = 1_024;
 
-/// Trials one run can take. The site array is sized for it.
-const MAX_TRIALS: usize = 4;
-
-/// One site per shape, routing and trial.
-static SITES: [CallSiteState; SHAPES.len() * ROUTINGS.len() * MAX_TRIALS] =
-    [const { CallSiteState::new() }; SHAPES.len() * ROUTINGS.len() * MAX_TRIALS];
+/// The one site this process dispatches through.
+static SITE: CallSiteState = CallSiteState::new();
 
 /// Leaves the op ran in the current window: how many, their summed items,
 /// and the smallest and largest it was handed.
@@ -156,9 +156,18 @@ enum Shape {
     Gather,
 }
 
-const SHAPES: [Shape; 5] = [Shape::Fine, Shape::Medium, Shape::Heavy, Shape::Huge, Shape::Gather];
-
 impl Shape {
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "fine" => Some(Shape::Fine),
+            "medium" => Some(Shape::Medium),
+            "heavy" => Some(Shape::Heavy),
+            "huge" => Some(Shape::Huge),
+            "gather" => Some(Shape::Gather),
+            _ => None,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Shape::Fine => "fine",
@@ -166,16 +175,6 @@ impl Shape {
             Shape::Heavy => "heavy",
             Shape::Huge => "huge",
             Shape::Gather => "gather",
-        }
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Shape::Fine => 0,
-            Shape::Medium => 1,
-            Shape::Heavy => 2,
-            Shape::Huge => 3,
-            Shape::Gather => 4,
         }
     }
 
@@ -230,23 +229,21 @@ enum Routing {
     PinnedLatency,
 }
 
-const ROUTINGS: [Routing; 3] =
-    [Routing::Adaptive, Routing::PinnedStreaming, Routing::PinnedLatency];
-
 impl Routing {
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "adaptive" => Some(Routing::Adaptive),
+            "streaming" => Some(Routing::PinnedStreaming),
+            "latency" => Some(Routing::PinnedLatency),
+            _ => None,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Routing::Adaptive => "adaptive",
             Routing::PinnedStreaming => "streaming",
             Routing::PinnedLatency => "latency",
-        }
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Routing::Adaptive => 0,
-            Routing::PinnedStreaming => 1,
-            Routing::PinnedLatency => 2,
         }
     }
 
@@ -359,115 +356,94 @@ fn load_window(
     }
 }
 
-/// One trial's outcome, kept for the closing table.
-struct Row {
-    shape: Shape,
-    routing: Routing,
-    ratio: f64,
-    class_after: Option<WorkloadClass>,
+fn usage() -> ! {
+    eprintln!("usage: class_loop_cost <shape> <routing> [window_s] [load_s] [load_threads]");
+    eprintln!("  shape:   fine, medium, heavy, huge, gather");
+    eprintln!("  routing: adaptive, streaming, latency");
+    std::process::exit(2);
 }
 
 fn main() {
-    let window_s: u64 = arg(1, 8);
-    let load_s: u64 = arg(2, 6);
-    let trials: usize = arg(3, 3);
-    let load_threads: usize = arg(4, 12);
-    if trials == 0 || trials > MAX_TRIALS {
-        eprintln!("argument 3 is the trial count, 1 to {MAX_TRIALS}, not {trials}");
-        std::process::exit(2);
-    }
-    println!(
-        "window {window_s}s  load {load_s}s  trials {trials}  load_threads {load_threads}  \
-         min_leaf {MIN_LEAF}"
-    );
-    println!(
-        "shape    routing    trial  pre_ms     post_ms    ratio   class_pre     class_post    \
-         leaves_pre  leaves_post  sizes_pre  sizes_post"
+    let shape = match env::args().nth(1) {
+        Some(text) => match Shape::parse(&text) {
+            Some(shape) => shape,
+            None => {
+                eprintln!("argument 1 is the shape, not {text:?}");
+                usage();
+            }
+        },
+        None => usage(),
+    };
+    let routing = match env::args().nth(2) {
+        Some(text) => match Routing::parse(&text) {
+            Some(routing) => routing,
+            None => {
+                eprintln!("argument 2 is the routing, not {text:?}");
+                usage();
+            }
+        },
+        None => usage(),
+    };
+    let window_s: u64 = arg(3, 8);
+    let load_s: u64 = arg(4, 6);
+    let load_threads: usize = arg(5, 12);
+
+    eprintln!(
+        "shape {}  routing {}  window {window_s}s  load {load_s}s  \
+         load_threads {load_threads}  min_leaf {MIN_LEAF}  items {}",
+        shape.name(),
+        routing.name(),
+        shape.items()
     );
 
     let table = build_table();
+    let mut buf: Vec<u64> = (0..shape.items() as u64).collect();
+    let site = SiteRef::new(&SITE);
     let measured = Duration::from_secs(window_s);
-    let loaded = Duration::from_secs(load_s);
-    let mut rows = Vec::new();
 
-    for shape in SHAPES {
-        let mut buf: Vec<u64> = (0..shape.items() as u64).collect();
-        for trial in 0..trials {
-            let mut order = ROUTINGS;
-            if trial % 2 == 1 {
-                order.reverse();
-            }
-            for routing in order {
-                let index = (shape.index() * ROUTINGS.len() + routing.index()) * MAX_TRIALS + trial;
-                let state = &SITES[index];
-                let site = SiteRef::new(state);
+    let (pre_ms, pre_n, pre_leaves, pre_sizes) =
+        window(shape, routing, site, &mut buf, &table, measured);
+    let class_pre = SITE.learned_class();
+    let global_pre = active_workload_class();
 
-                let (pre_ms, pre_n, pre_leaves, pre_sizes) =
-                    window(shape, routing, site, &mut buf, &table, measured);
-                let class_pre = state.learned_class();
+    load_window(
+        shape,
+        routing,
+        site,
+        &mut buf,
+        &table,
+        Duration::from_secs(load_s),
+        load_threads,
+    );
+    // The burners are joined; this lets the pool's workers park and the
+    // host settle before the second window is timed.
+    std::thread::sleep(Duration::from_millis(250));
 
-                load_window(shape, routing, site, &mut buf, &table, loaded, load_threads);
-                // The burners are joined; this lets the pool's workers park
-                // and the host settle before the second window is timed.
-                std::thread::sleep(Duration::from_millis(250));
+    let (post_ms, post_n, post_leaves, post_sizes) =
+        window(shape, routing, site, &mut buf, &table, measured);
+    let class_post = SITE.learned_class();
+    let global_post = active_workload_class();
 
-                let (post_ms, post_n, post_leaves, post_sizes) =
-                    window(shape, routing, site, &mut buf, &table, measured);
-                let class_post = state.learned_class();
-
-                let ratio = if pre_ms > 0.0 { post_ms / pre_ms } else { f64::NAN };
-                println!(
-                    "{:7}  {:9}  {:5}  {:9.3}  {:9.3}  {:6.3}  {:>12}  {:>12}  {:10.1}  {:11.1}  \
-                     {:>9}  {:>10}",
-                    shape.name(),
-                    routing.name(),
-                    trial,
-                    pre_ms,
-                    post_ms,
-                    ratio,
-                    class_name(class_pre),
-                    class_name(class_post),
-                    pre_leaves,
-                    post_leaves,
-                    pre_sizes,
-                    post_sizes,
-                );
-                if pre_n == 0 || post_n == 0 {
-                    eprintln!(
-                        "{} {} trial {trial} ran {pre_n} dispatches before and {post_n} after; \
-                         raise the window",
-                        shape.name(),
-                        routing.name()
-                    );
-                }
-                rows.push(Row { shape, routing, ratio, class_after: class_post });
-            }
-        }
-    }
-
-    println!();
-    println!("shape    routing    median_ratio  trials  class_after");
-    for shape in SHAPES {
-        for routing in ROUTINGS {
-            let mut ratios: Vec<f64> = rows
-                .iter()
-                .filter(|r| r.shape == shape && r.routing == routing)
-                .map(|r| r.ratio)
-                .collect();
-            let classes: Vec<String> = rows
-                .iter()
-                .filter(|r| r.shape == shape && r.routing == routing)
-                .map(|r| class_name(r.class_after))
-                .collect();
-            let count = ratios.len();
-            println!(
-                "{:7}  {:9}  {:12.3}  {:6}  {}",
-                shape.name(),
-                routing.name(),
-                median(&mut ratios),
-                count,
-                classes.join(","),
-            );
-        }
+    let ratio = if pre_ms > 0.0 { post_ms / pre_ms } else { f64::NAN };
+    println!(
+        "{} {} {:.4} {:.4} {:.4} {} {} {:?} {:?} {:.1} {:.1} {} {} {} {}",
+        shape.name(),
+        routing.name(),
+        pre_ms,
+        post_ms,
+        ratio,
+        class_name(class_pre),
+        class_name(class_post),
+        global_pre,
+        global_post,
+        pre_leaves,
+        post_leaves,
+        pre_sizes,
+        post_sizes,
+        pre_n,
+        post_n,
+    );
+    if pre_n == 0 || post_n == 0 {
+        eprintln!("the windows ran {pre_n} dispatches before and {post_n} after; raise the window");
     }
 }
