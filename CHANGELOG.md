@@ -9,6 +9,15 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- `CallSiteState::window_mean_ticks`, `window_cv2_per_mille` and
+  `window_ticks` report the delta window the latest classifier tick
+  classified: its mean leaf time, in rdtsc ticks on x86_64, and its cv^2
+  per mille, which are what the site's learned class is decided from, and
+  how many windows have been classified. `cv2_per_mille` stays the site's
+  lifetime figure. `examples/class_migration_under_load` prints them
+  beside the class, with the sizes, counts, mean times and cv^2 of the
+  leaves each row's interval ran, and takes `adaptive` or `pinned`
+  routing so a class's effect on the split can be told from the load's.
 - A user op can keep its slot. Returning `USER_OP_YIELD`
   (`FLYNNEL_USER_YIELD` in the CUDA source) leaves the slot in the ring
   with no status written, and the poller runs the same op again on its

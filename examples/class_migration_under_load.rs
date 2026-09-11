@@ -20,7 +20,10 @@
 //! A migration needs at least 64 leaves in one delta window to take the
 //! fast path, and otherwise needs the same observation repeated across
 //! consecutive windows, so the leaf count is reported and is what to
-//! raise if nothing ever moves.
+//! raise if nothing ever moves. That count is the leaves the site's
+//! recorder timed, which on this dispatch's lazy bisect is one leaf in
+//! every `LEAF_SAMPLE_STRIDE` (`src/sched/par_iter.rs`), and the window
+//! mean is in the recorder's unit, rdtsc ticks on x86_64.
 //!
 //! The site times whole leaves and records no item counts, so leaves of
 //! different sizes read as variance even when every item costs the same.
@@ -239,18 +242,18 @@ where
 /// The three site readings taken together, so a row reports one moment
 /// rather than three moments a few microseconds apart.
 struct SiteView {
-    leaves: u64,
+    sampled_leaves: u64,
     cv2: Option<u64>,
-    window_mean_ns: Option<u64>,
+    window_mean_ticks: Option<u64>,
     window_cv2: Option<u64>,
     learned: Option<WorkloadClass>,
 }
 
 fn read_site(state: &CallSiteState) -> SiteView {
     SiteView {
-        leaves: state.leaf_count(),
+        sampled_leaves: state.leaf_count(),
         cv2: state.cv2_per_mille(),
-        window_mean_ns: state.window_mean_ns(),
+        window_mean_ticks: state.window_mean_ticks(),
         window_cv2: state.window_cv2_per_mille(),
         learned: state.learned_class(),
     }
@@ -649,13 +652,13 @@ fn main() {
          min_leaf {min_leaf}  load_at {load_at}s  load_for {load_for}s  load_threads {load_threads}  routing {}",
         routing.name()
     );
-    // leaves_per_dispatch and items_per_leaf are the precondition: this
-    // experiment needs leaves whose own variance is near zero, and a run
-    // whose leaves came out at a few items each cannot answer it however
-    // clean the class column looks.
+    // leaf_sizes is the precondition: this experiment needs leaves whose
+    // own variance is near zero, and a run whose leaves came out at mixed
+    // or few-item sizes cannot answer it however clean the class column
+    // looks.
     println!(
-        "elapsed_s  phase   dispatches  leaves  per_disp  items_per_leaf  \
-         cv2_per_mille  window_mean_ns  window_cv2  site_class  global_class  last_ms  box_cores  own_cores  foreign_cores  leaf_sizes"
+        "elapsed_s  phase   dispatches  sampled_leaves  cv2_per_mille  window_mean_ticks  window_cv2  \
+         site_class  global_class  last_ms  box_cores  own_cores  foreign_cores  leaf_sizes"
     );
 
     let site = SiteRef::new(&SITE);
@@ -740,7 +743,7 @@ fn main() {
                 Some(v) => v.to_string(),
                 None => "none".to_string(),
             };
-            let window_mean = match view.window_mean_ns {
+            let window_mean = match view.window_mean_ticks {
                 Some(v) => v.to_string(),
                 None => "none".to_string(),
             };
@@ -752,16 +755,6 @@ fn main() {
                 Some(c) => format!("{c:?}"),
                 None => "none".to_string(),
             };
-            let per_disp = if dispatches > 0 {
-                view.leaves as f64 / dispatches as f64
-            } else {
-                0.0
-            };
-            let items_per_leaf = if per_disp > 0.0 {
-                items as f64 / per_disp
-            } else {
-                0.0
-            };
             let (box_text, own_text, foreign_text) = match &context {
                 CpuContext::Measured { busy, own } => {
                     (format!("{busy:.2}"), format!("{own:.2}"), format!("{:.2}", busy - own))
@@ -772,13 +765,11 @@ fn main() {
                 }
             };
             println!(
-                "{:9.1}  {:6}  {:10}  {:8}  {:8.1}  {:14.1}  {:>13}  {:>14}  {:>10}  {:>12}  {:>12}  {:7.2}  {:>11}  {:>11}  {:>13}  {}",
+                "{:9.1}  {:6}  {:10}  {:>14}  {:>13}  {:>17}  {:>10}  {:>12}  {:>12}  {:7.2}  {:>11}  {:>11}  {:>13}  {}",
                 elapsed_s,
                 phase.name(),
                 dispatches,
-                view.leaves,
-                per_disp,
-                items_per_leaf,
+                view.sampled_leaves,
                 cv2,
                 window_mean,
                 window_cv2,
