@@ -7,7 +7,55 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ## Unreleased
 
+### Added
+
+- A user op can keep its slot. Returning `USER_OP_YIELD`
+  (`FLYNNEL_USER_YIELD` in the CUDA source) leaves the slot in the ring
+  with no status written, and the poller runs the same op again on its
+  next pass, after its stop, generation and quantum checks. So an op can
+  pace itself across passes and quanta while its state stays in VRAM.
+  Only thread 0 of rank 0 decides. A failing op, or a team that does not
+  assemble, still retires as before. The pre-generated PTX is rebuilt
+  from the new source.
+- A user op may address a `pin_bulk` span. Its byte count is now bounded
+  by the end of the resident pool rather than by one pool block.
+- `gpu_peer::watchdog` reads which GPU watchdog can reset a device. On
+  Windows it reads the TDR level and delay from the registry and the
+  driver model from NVML, both loaded at run time with no new
+  dependency. TCC devices are outside TDR and level 0 disables it, and
+  every failed read is named in the result.
+- `gpu_peer::wave`: segmented waves across a lane's team. A wave runs a
+  set of segments in generations on every block of the team, with its
+  state in one resident span. `kernels/gpu_peer_wave.cu` is composed
+  with the user source and provides:
+  - a push index and an arena over `atomicAdd`;
+  - a per-generation cross-block barrier with its own deadline and
+    instrumentation;
+  - a global frontier, or per-block frontiers that deal pending
+    segments out evenly every N generations;
+  - a slice end at which block 0 waits for every block;
+  - failure carry that names the lowest failing segment;
+  - a self-timed stop from the measured longest generation against a
+    budget derived from the detected watchdog.
+
+  A slice that stops early yields to run again on the device, or retires
+  for the host to continue. `GpuPeer::create_wave`, `submit_wave`,
+  `wave_stats` and `release_wave` drive it from the host.
+  `wave::plan::plan` chooses between a global frontier and a partition,
+  and the rebalance interval, from the barrier cost and an observed
+  imbalance.
+- `GpuPeer::team_size`, the blocks each lane actually runs.
+
 ### Changed
+
+- `GpuPeer::init` clamps `blocks_per_lane` to the device's streaming
+  multiprocessor count whenever the driver reports one, and says so on
+  stderr. A team wider than the device loses ranks at its barrier.
+  Measured on an RTX 5070 with 48 SMs, 64-block teams expired generation
+  barriers in both passes of the barrier probe (2,496 and 704), retired
+  slots incomplete and stalled the kernel, while teams of up to 32
+  blocks ran clean. `team_size` returns the size in use, and it is the
+  `team_size` a user op receives.
 
 - An oversubscription factor the caller set with
   `with_oversubscription_log2` now reaches the seed-depth route, which

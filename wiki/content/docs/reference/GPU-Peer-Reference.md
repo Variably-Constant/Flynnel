@@ -58,6 +58,7 @@ impl GpuPeer {
     pub fn reap(&mut self, ticket: Ticket) -> Result<(), GpuPeerError>;
     pub fn barrier_stalls(&self) -> (u32, u32);
     pub fn barrier_wait_max_ns(&self) -> u32;
+    pub fn team_size(&self) -> u32;
     pub fn displaced_foreign_context(&self) -> bool;
     pub fn timed_lock_acquire(&self, timeout: Duration) -> Result<(), GpuPeerError>;
     pub fn timed_lock_release(&self);
@@ -82,6 +83,11 @@ impl GpuPeer {
     pub fn resume_poller(&mut self) -> Result<(), GpuPeerError>;
     pub fn context(&self) -> &Arc<CudaContext>;
     pub fn wide_stream(&self) -> &Arc<CudaStream>;
+    // Segmented waves (see "Segmented waves" below):
+    pub fn create_wave(&mut self, spec: &WaveSpec) -> Result<Wave, GpuPeerError>;
+    pub fn submit_wave(&mut self, wave: &Wave, op: u32, args: &[u8]) -> Result<Ticket, GpuPeerError>;
+    pub fn wave_stats(&mut self, wave: &Wave) -> Result<WaveStats, GpuPeerError>;
+    pub fn release_wave(&mut self, wave: Wave) -> Result<(), GpuPeerError>;
 }
 ```
 
@@ -238,6 +244,17 @@ quotient to whatever team size the user op supports: a hook that opens
 with `if (team_rank != 0u) return 0u;` serves one rank and stays on one
 SM whatever the config says.
 
+`GpuPeer::init` clamps `blocks_per_lane` to the multiprocessor count
+whenever the driver reports one, says so on stderr, and `team_size()`
+returns the size each lane actually runs, which is the `team_size` the
+user op receives. A team wider than the device does not hold together at
+its barrier. On an RTX 5070 with 48 SMs, the barrier probe
+(`examples/gpu_peer_generation_barrier.rs`) measured:
+- 64-block teams: 2,496 and 704 expired generation barriers across its
+  two passes, slots retired incomplete, and the kernel stalled.
+- Teams of up to 32 blocks: no expiry, incomplete slot or stall in
+  either pass.
+
 #### When a team does not assemble
 
 Rank 0 does not wait forever. `GpuPeerConfig::barrier_deadline_ns`
@@ -269,6 +286,193 @@ queries is the 125th slowest, which a handful of events cannot reach,
 and recall moved 0.0005 across arms whose counts went 0, 3, 6. A tail
 exposes these only when the window is short enough for a few events to
 be most of it.
+
+### Writing a user op
+
+`GpuPeerConfig::user_ops_cuda` is composed into one NVRTC module after
+the poller kernel and the wave helpers (`kernels/gpu_peer_wave.cu`), so
+the op can call `gtimer()`, return `FLYNNEL_USER_YIELD`, and use the
+`flw_` helpers. The poller calls it on every thread of every block of
+the lane's team. What the kernel requires of it:
+
+- **Sync scope.** `__syncthreads` synchronizes the 256 threads of one
+  block. The blocks of a team meet only at atomic barriers: the kernel's
+  after the op, or ones the op writes itself, such as the wave helpers'.
+- **Sync count.** Every thread of a block reaches the same number of
+  `__syncthreads` in one op. A thread that skips one leaves the rest of
+  its block waiting at the next barrier.
+- **Return value.** Only thread 0 of rank 0's return is read. `0` retires
+  the slot `STATUS_DONE`, `USER_OP_YIELD` keeps it, and anything else
+  retires it `STATUS_ERR`. A failure on another thread, or in another
+  block, must be carried to that thread through shared device memory.
+- **`atomicAdd`.** `atomicAdd(p, v)` returns `*p` from before the addition,
+  like `fetch_add`. A multi-producer position is the returned value, and
+  an arrival that counts itself adds one to it.
+- **Span handles.** A handle from `pin_bulk` may be passed to
+  `submit_user`, and the op's `count` may run to the end of the pool.
+- **Pinning limits.** `pin` rides a slot, so it takes at most one pool
+  block and at most `payload_max() - 8` bytes. `pin_bulk` is the route
+  for anything larger.
+
+#### Yielding a slot
+
+A user op that returns `USER_OP_YIELD` leaves its slot in the ring:
+- Rank 0 writes no status and does not advance the tail.
+- A team still advances its generation, so every rank takes the same
+  slot again.
+- The next pass runs after the poller's stop, generation and quantum
+  checks, so a long op paces itself across passes and across quanta,
+  with its state in VRAM.
+- A yielded slot runs only while its lane has a resident quantum.
+  `wait_status` relaunches the lane as it waits.
+- A slot published behind a yielding one waits its turn, since lane
+  order is unchanged.
+
+`tests/gpu_peer_yield.rs` covers:
+- yielding on one block and on a team;
+- yielding across quantum exits;
+- failure after yields;
+- lane order behind a yielding slot;
+- a write to the last byte of a three-block span.
+
+### Segmented waves (`gpu_peer::wave`)
+
+A wave runs a set of segments in generations on every block of a lane's
+team. A segment may push children into the next generation. The wave's
+state lives in one resident span: a header, a table with one entry per
+block, an id array, a staging array for rebalancing, and an arena for
+state created on the device.
+
+```rust
+use flynnel::gpu_peer::wave::{Frontier, Resume, SliceBudget, WaveSpec};
+
+let wave = peer.create_wave(&WaveSpec {
+    roots,                                   // first generation's segment ids
+    id_capacity: 1 << 20,                    // ids over the whole run, roots included
+    arena_bytes: 1 << 20,                    // device-born segment state
+    frontier: Frontier::Global,              // or Partition { rebalance_every }
+    resume: Resume::Device,                  // or Host
+    slice_budget: SliceBudget::Detected,     // from the watchdog, or Unbounded / Fixed
+    barrier_deadline: Duration::from_millis(50),
+    done_deadline: Some(Duration::from_millis(500)),
+    longest_generation_seed: Duration::ZERO,
+})?;
+let t = peer.submit_wave(&wave, MY_WAVE_OP, &args)?;
+let status = peer.wait_status(t, Duration::from_secs(60))?;
+let stats = peer.wave_stats(&wave)?;         // slice state, failure, barrier figures, per block
+```
+
+The op runs this loop on every thread of every block:
+
+```c
+flw_slice s;
+u32 bad = flw_slice_begin(&s, block, count, team_rank, team_size);
+if (bad != 0u) return bad;
+while (s.running) {
+    for (u32 k = flw_first(&s); k < s.end; k += flw_stride(&s)) {
+        u32 id = flw_id(&s, k);
+        // run segment id: flw_push(&s, child), flw_alloc(&s, bytes), flw_fail(&s, id, code)
+    }
+    flw_generation_end(&s);
+}
+return flw_slice_end(&s);
+```
+
+- **`Frontier::Global`.** One frontier across the team, whose range is
+  fixed by a barrier at every generation. Threads stride the whole team,
+  so load stays even. Each generation waits for its slowest block.
+- **`Frontier::Partition { rebalance_every }`.**
+  - Each block owns a region of ids, and a child stays in its parent's
+    block.
+  - With an interval N, the blocks meet every N generations, and every
+    block's pending ids are gathered through staging and dealt out
+    evenly, which also reclaims each region.
+  - With `None` the blocks never meet, and each decides its own stop.
+- **`Resume::Device`.** A slice that stops early returns `USER_OP_YIELD`
+  and runs again without a host round trip.
+- **`Resume::Host`.** A slice that stops early retires `STATUS_DONE`
+  with `SliceState::Continue`, and the host submits the next slice.
+- **Slice end.** Block 0 waits for every block, then returns the result.
+  A failure names the lowest failing segment and the largest code:
+  `FAIL_IDS`, `FAIL_ARENA`, `FAIL_BARRIER`, `FAIL_DONE` or
+  `FAIL_BUDGET` for the substrate's own.
+
+A slice stops when the time it has run, plus the longest generation
+measured times the generations to the next decision point, reaches the
+budget. `SliceBudget::Detected` derives the budget from the device's
+watchdog delay less the poller quantum and the kernel barrier deadline,
+and gives no budget when no watchdog applies.
+
+Every thread of a block reaches the same number of `__syncthreads`, and
+a thread acts only on words its block's thread 0 wrote before the last
+sync. A barrier's arrival count is never reset: a block waits for the
+round its own arrival fell in, so rounds stay aligned from one slice to
+the next.
+
+`tests/gpu_peer_wave.rs` walks a binary segment tree and checks the
+count and checksum of the ids run against the same walk on the host. It
+covers:
+- a global frontier on one block and on a team;
+- a partition with and without rebalancing;
+- device yields and host continuation;
+- failure carry;
+- id and arena exhaustion.
+
+#### Choosing the frontier
+
+`wave::plan::plan` prices three frontiers per generation:
+- **Global:** one barrier.
+- **Partition rebalancing every N:** a rebalance (two barriers and a copy
+  of every pending id) spread over N, plus the capacity idled as block
+  frontiers diverge.
+- **Partition that never rebalances:** the idling alone.
+
+How the model works:
+- **Divergence.** An observed imbalance `r` over `n` generations
+  compounds at `r^(1/n)` per generation, capped at the team width.
+- **Idling.** A team whose largest frontier is `r` times the mean idles
+  `1 - 1/r`, averaged to half across an interval.
+- **No observation.** The plan is a global frontier.
+
+Measured with the barrier probe on an RTX 5070 with 48 SMs (medians,
+forward and reverse passes, counters in VRAM, 64 generations):
+
+| team | steady wait, no work | steady wait, 250 us work | period, 250 us work | generation-0 wait |
+|---|---|---|---|---|
+| 2 | 0.35 us | 0.35 us | 250.7 / 255.7 us | 17 us |
+| 8 | 0.38 us | 0.38 / 1.25 us | 251.2 / 253.2 us | 88 / 101 us |
+| 16 | 0.35 us | 0.51 / 2.59 us | 251.6 / 257.0 us | 233 / 240 us |
+| 32 | 0.48 us | 2.11 / 2.72 us | 251.6 / 252.3 us | 489 / 493 us |
+
+What the measurements show:
+- **Imbalance dominates.** With the slowest rank at 500 us the period is
+  500 to 510 us at every width, so the team's time follows its slowest
+  block.
+- **The barrier itself is small.**
+- **Start skew is once per wave.** The generation-0 wait is paid once per
+  wave, as the blocks pick up the slot.
+- **Counters belong in VRAM.** In the host-mapped slot payload they cost
+  about 2.5 us per block per generation (81 us at 32 blocks).
+
+### Watchdog detection (`gpu_peer::watchdog`)
+
+`watchdog::detect(ordinal)` reports which watchdog can reset a device
+whose work runs too long, and what it read to decide. On Windows, TDR
+covers WDDM and MCDM devices, and its level and delay come from
+`HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`, with the
+documented defaults (level 3, 2 s) when a value is absent. The driver
+model comes from NVML, loaded at run time and matched to the CUDA
+ordinal by PCI bus id.
+
+How it decides:
+- **TCC devices:** outside TDR.
+- **Level 0:** disables detection.
+- **Unreadable TDR settings:** the documented delay is taken.
+- **Unreadable driver model:** treated as covered.
+
+Both fallbacks are named in the basis string. `watchdog::decide` holds
+the rules apart from the reads, so every case is tested without a
+device.
 
 ### Batching wide ops and quiescing the poller
 

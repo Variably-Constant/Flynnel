@@ -407,7 +407,24 @@ pub struct GpuPeerConfig {
     /// [`STATUS_DONE`]; [`USER_OP_YIELD`] (`FLYNNEL_USER_YIELD` in the
     /// source) keeps it in the ring so the same op runs again on the
     /// poller's next pass; anything else retires it [`STATUS_ERR`]. Only
-    /// the value returned by thread 0 of rank 0 is read.
+    /// the value returned by thread 0 of rank 0 is read, so a failure on
+    /// any other thread, or in another block of a team, reaches the slot
+    /// only when the op carries it to that thread through shared device
+    /// memory. A yielded slot runs again only while its lane has a
+    /// resident quantum; [`GpuPeer::wait_status`] relaunches the lane as
+    /// it waits.
+    ///
+    /// `__syncthreads` synchronizes the threads of one block. The blocks
+    /// of a team meet only at atomic barriers, the kernel's or the wave
+    /// helpers', and every thread of a block must reach the same number
+    /// of `__syncthreads` in one op or the block deadlocks at its next
+    /// barrier. Device `atomicAdd` returns the word's value from before
+    /// the addition.
+    ///
+    /// The source is composed after the poller kernel and the wave
+    /// helpers in `kernels/gpu_peer_wave.cu`, so an op may call
+    /// `gtimer()`, return `FLYNNEL_USER_YIELD`, and run a segmented wave
+    /// through the `flw_` helpers (see [`wave`]).
     ///
     /// A handle passed to [`GpuPeer::submit_user`] may name a span from
     /// [`GpuPeer::pin_bulk`]: the op's `count` may run to the end of the
@@ -950,6 +967,14 @@ impl GpuPeer {
     /// Pin `data` into a device-resident block. Synchronous (waits
     /// for the upload); requires the assigned lane to have no
     /// unreaped tickets outstanding.
+    ///
+    /// The upload rides a lane slot, so `data` may be at most one pool
+    /// block and at most the slot's payload capacity less the
+    /// [`RESIDENT_PARAMS_BYTES`] header, `geometry().payload_max() - 8`.
+    /// Anything longer is refused with [`GpuPeerError::PayloadTooLarge`].
+    /// Resident state larger than that goes through [`Self::pin_bulk`],
+    /// which copies straight to the device across as many consecutive
+    /// blocks as it needs.
     pub fn pin(&mut self, data: &[u8]) -> Result<ResidentHandle, GpuPeerError> {
         let pool = self
             .pool
