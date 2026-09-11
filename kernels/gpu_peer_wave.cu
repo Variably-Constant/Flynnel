@@ -13,6 +13,12 @@
 // the word's value from before the addition, so a push takes the position
 // it returns and an arrival counts itself by adding one to it.
 //
+// Every other word that more than one thread touches is read and written
+// through flw_ld / flw_st, which go through volatile pointers, and a thread
+// fences its stores before an arrival or a sync that lets another thread
+// read them. Without that a compiler may move a load of such a word ahead
+// of a barrier's wait and read it before the block that writes it arrives.
+//
 // Synchronization contract, which every helper keeps:
 //  - Every thread of a block reaches the same number of __syncthreads.
 //    Segment work runs between syncs, and decisions are read after them.
@@ -134,29 +140,60 @@ typedef struct {
     u64 gen_t0;      // thread 0 only
 } flw_slice;
 
+// Load and store of a word more than one thread touches.
+__device__ __forceinline__ u32 flw_ld(u32* p)
+{
+    return *(volatile u32*)p;
+}
+
+__device__ __forceinline__ void flw_st(u32* p, u32 v)
+{
+    *(volatile u32*)p = v;
+}
+
 __device__ __forceinline__ u32* flw_u32(unsigned char* base, u32 off)
 {
     return (u32*)(base + off);
 }
 
-__device__ __forceinline__ u64* flw_u64(unsigned char* base, u32 off)
+__device__ __forceinline__ u32 flw_get(unsigned char* base, u32 off)
 {
-    return (u64*)(base + off);
+    return flw_ld(flw_u32(base, off));
+}
+
+__device__ __forceinline__ void flw_set(unsigned char* base, u32 off, u32 v)
+{
+    flw_st(flw_u32(base, off), v);
+}
+
+__device__ __forceinline__ u64 flw_get64(unsigned char* base, u32 off)
+{
+    return *(volatile u64*)(base + off);
 }
 
 __device__ __forceinline__ u32* flw_table(flw_slice* s, u32 blk, u32 field)
 {
-    return (u32*)(s->base + *flw_u32(s->base, FLW_TABLE_OFF_OFF) + blk * FLW_TABLE_STRIDE + field);
+    return (u32*)(s->base + flw_get(s->base, FLW_TABLE_OFF_OFF) + blk * FLW_TABLE_STRIDE + field);
+}
+
+__device__ __forceinline__ u32 flw_tget(flw_slice* s, u32 blk, u32 field)
+{
+    return flw_ld(flw_table(s, blk, field));
+}
+
+__device__ __forceinline__ void flw_tset(flw_slice* s, u32 blk, u32 field, u32 v)
+{
+    flw_st(flw_table(s, blk, field), v);
 }
 
 __device__ __forceinline__ u32* flw_ids(flw_slice* s)
 {
-    return (u32*)(s->base + *flw_u32(s->base, FLW_IDS_OFF_OFF));
+    return (u32*)(s->base + flw_get(s->base, FLW_IDS_OFF_OFF));
 }
 
 __device__ __forceinline__ u32* flw_staging(flw_slice* s)
 {
-    return (u32*)(s->base + *flw_u32(s->base, FLW_STAGING_OFF_OFF));
+    return (u32*)(s->base + flw_get(s->base, FLW_STAGING_OFF_OFF));
 }
 
 __device__ __forceinline__ u32 flw_min(u32 a, u32 b)
@@ -201,7 +238,7 @@ __device__ __forceinline__ u32 flw_push(flw_slice* s, u32 id)
         flw_fail(s, id, FLW_FAIL_IDS);
         return 0xFFFFFFFFu;
     }
-    flw_ids(s)[flw_region(s, s->rank) + p] = id;
+    flw_st(flw_ids(s) + flw_region(s, s->rank) + p, id);
     return p;
 }
 
@@ -214,17 +251,17 @@ __device__ __forceinline__ u32 flw_alloc(flw_slice* s, u32 bytes)
     u32 size = (bytes + 7u) & ~7u;
     u32 at = atomicAdd(flw_u32(s->base, FLW_ARENA_BUMP_OFF), size);
     u32 top = at + size;
-    if (size < bytes || top < at || top > *flw_u32(s->base, FLW_ARENA_CAPACITY_OFF)) {
+    if (size < bytes || top < at || top > flw_get(s->base, FLW_ARENA_CAPACITY_OFF)) {
         flw_fail(s, FLW_NO_SEGMENT, FLW_FAIL_ARENA);
         return 0xFFFFFFFFu;
     }
-    return *flw_u32(s->base, FLW_ARENA_OFF_OFF) + at;
+    return flw_get(s->base, FLW_ARENA_OFF_OFF) + at;
 }
 
 // The segment id at position `k` of the current generation.
 __device__ __forceinline__ u32 flw_id(flw_slice* s, u32 k)
 {
-    return flw_ids(s)[flw_region(s, s->rank) + k];
+    return flw_ld(flw_ids(s) + flw_region(s, s->rank) + k);
 }
 
 // The first position this thread takes in the current generation. A global
@@ -257,14 +294,16 @@ __device__ __forceinline__ u32 flw_pushed(flw_slice* s, u32 blk)
 // On a block's thread 0: arrive at a barrier and wait until every block of
 // the wave has arrived in the same round, or the deadline passes. Records
 // the wait. Returns 1 when the round completed; on the deadline the wave is
-// marked failed and 0 is returned.
+// marked failed and 0 is returned. The block's stores are fenced first, so
+// a block that reads them after the round reads what this one wrote.
 __device__ __forceinline__ u32 flw_barrier(flw_slice* s, u32 first_of_slice)
 {
     unsigned char* b = s->base;
+    __threadfence_system();
     u64 t0 = gtimer();
     u32 mine = atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 1u) + 1u;
     u32 goal = ((mine + s->width - 1u) / s->width) * s->width;
-    u64 deadline = (u64)*flw_u32(b, FLW_BARRIER_DEADLINE_OFF);
+    u64 deadline = (u64)flw_get(b, FLW_BARRIER_DEADLINE_OFF);
     u32 whole = 1u;
     while (atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u) < goal) {
         if (gtimer() - t0 > deadline) {
@@ -290,9 +329,9 @@ __device__ __forceinline__ u32 flw_barrier(flw_slice* s, u32 first_of_slice)
 // against the watchdog budget. A zero budget never ends a slice.
 __device__ __forceinline__ u32 flw_should_stop(flw_slice* s, u64 now, u32 ahead)
 {
-    u64 budget = *flw_u64(s->base, FLW_BUDGET_NS_OFF);
+    u64 budget = flw_get64(s->base, FLW_BUDGET_NS_OFF);
     if (budget == 0ull) return 0u;
-    u64 longest = (u64)*flw_u32(s->base, FLW_LONGEST_GEN_OFF);
+    u64 longest = (u64)flw_get(s->base, FLW_LONGEST_GEN_OFF);
     return (now - s->slice_t0) + longest * (u64)ahead >= budget ? 1u : 0u;
 }
 
@@ -310,36 +349,36 @@ __device__ __forceinline__ u32 flw_slice_begin(flw_slice* s, unsigned char* base
     s->start = 0u;
     s->end = 0u;
     if (base == (unsigned char*)0 || count < FLW_HEADER_BYTES
-        || *flw_u32(base, FLW_MAGIC_OFF) != FLW_MAGIC
-        || *flw_u32(base, FLW_VERSION_OFF) != FLW_VERSION
-        || *flw_u32(base, FLW_WIDTH_OFF) != team_size) {
+        || flw_get(base, FLW_MAGIC_OFF) != FLW_MAGIC
+        || flw_get(base, FLW_VERSION_OFF) != FLW_VERSION
+        || flw_get(base, FLW_WIDTH_OFF) != team_size) {
         return FLW_STATUS_BAD_SPAN;
     }
-    s->mode = *flw_u32(base, FLW_MODE_OFF);
-    s->rebalance = *flw_u32(base, FLW_REBALANCE_OFF);
+    s->mode = flw_get(base, FLW_MODE_OFF);
+    s->rebalance = flw_get(base, FLW_REBALANCE_OFF);
     s->coupled = (s->mode == FLW_MODE_GLOBAL || s->rebalance != 0u) ? 1u : 0u;
     s->cap = s->mode == FLW_MODE_GLOBAL
-        ? *flw_u32(base, FLW_ID_CAPACITY_OFF)
-        : *flw_u32(base, FLW_ID_CAPACITY_OFF) / team_size;
+        ? flw_get(base, FLW_ID_CAPACITY_OFF)
+        : flw_get(base, FLW_ID_CAPACITY_OFF) / team_size;
 
     if (threadIdx.x == 0) {
         s->slice_t0 = gtimer();
         u32 start = s->mode == FLW_MODE_GLOBAL
-            ? *flw_u32(base, FLW_START_OFF)
-            : *flw_table(s, team_rank, FLW_T_START);
+            ? flw_get(base, FLW_START_OFF)
+            : flw_tget(s, team_rank, FLW_T_START);
         u32 end = s->mode == FLW_MODE_GLOBAL
-            ? *flw_u32(base, FLW_END_OFF)
-            : *flw_table(s, team_rank, FLW_T_END);
-        *flw_table(s, team_rank, FLW_T_START) = start;
-        *flw_table(s, team_rank, FLW_T_END) = end;
-        *flw_table(s, team_rank, FLW_T_EMPTY) = start < end ? 0u : 1u;
+            ? flw_get(base, FLW_END_OFF)
+            : flw_tget(s, team_rank, FLW_T_END);
+        flw_tset(s, team_rank, FLW_T_START, start);
+        flw_tset(s, team_rank, FLW_T_END, end);
+        flw_tset(s, team_rank, FLW_T_EMPTY, start < end ? 0u : 1u);
 
         // A slice that cannot fit the generations before its first
         // decision point would yield forever without progress.
         u32 ahead = s->mode == FLW_MODE_PARTITION && s->rebalance != 0u ? s->rebalance : 1u;
-        u64 budget = *flw_u64(base, FLW_BUDGET_NS_OFF);
+        u64 budget = flw_get64(base, FLW_BUDGET_NS_OFF);
         if (budget != 0ull
-            && (u64)*flw_u32(base, FLW_LONGEST_GEN_OFF) * (u64)ahead >= budget) {
+            && (u64)flw_get(base, FLW_LONGEST_GEN_OFF) * (u64)ahead >= budget) {
             flw_fail(s, FLW_NO_SEGMENT, FLW_FAIL_BUDGET);
         }
 
@@ -348,19 +387,20 @@ __device__ __forceinline__ u32 flw_slice_begin(flw_slice* s, unsigned char* base
             u32 whole = flw_barrier(s, 1u);
             u32 any = 0u;
             for (u32 k = 0u; k < team_size; k++) {
-                if (*flw_table(s, k, FLW_T_EMPTY) == 0u) any = 1u;
+                if (flw_tget(s, k, FLW_T_EMPTY) == 0u) any = 1u;
             }
-            go = (whole != 0u && any != 0u && *flw_u32(base, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
+            go = (whole != 0u && any != 0u && flw_get(base, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
         } else {
-            go = (start < end && *flw_u32(base, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
+            go = (start < end && flw_get(base, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
         }
-        *flw_table(s, team_rank, FLW_T_DECISION) = go;
+        flw_tset(s, team_rank, FLW_T_DECISION, go);
         s->gen_t0 = gtimer();
+        __threadfence_system();
     }
     __syncthreads();
-    s->start = *flw_table(s, team_rank, FLW_T_START);
-    s->end = *flw_table(s, team_rank, FLW_T_END);
-    s->running = *flw_table(s, team_rank, FLW_T_DECISION);
+    s->start = flw_tget(s, team_rank, FLW_T_START);
+    s->end = flw_tget(s, team_rank, FLW_T_END);
+    s->running = flw_tget(s, team_rank, FLW_T_DECISION);
     return 0u;
 }
 
@@ -380,83 +420,86 @@ __device__ __forceinline__ void flw_rebalance(flw_slice* s)
         atomicMax(flw_u32(b, FLW_LONGEST_GEN_OFF), flw_sat(now - s->gen_t0));
         u32 pend_start = s->end;
         u32 pend_end = flw_pushed(s, me);
-        *flw_table(s, me, FLW_T_START) = pend_start;
-        *flw_table(s, me, FLW_T_END) = pend_end;
-        *flw_table(s, me, FLW_T_PENDING) = pend_end > pend_start ? pend_end - pend_start : 0u;
+        flw_tset(s, me, FLW_T_START, pend_start);
+        flw_tset(s, me, FLW_T_END, pend_end);
+        flw_tset(s, me, FLW_T_PENDING, pend_end > pend_start ? pend_end - pend_start : 0u);
         if (me == 0u) {
-            *flw_u32(b, FLW_STOP_OFF) = flw_should_stop(s, now, s->rebalance);
+            flw_set(b, FLW_STOP_OFF, flw_should_stop(s, now, s->rebalance));
         }
         u32 whole = flw_barrier(s, 0u);
         u32 prefix = 0u;
         u32 total = 0u;
         u32 largest = 0u;
         for (u32 k = 0u; k < w; k++) {
-            u32 len = *flw_table(s, k, FLW_T_PENDING);
+            u32 len = flw_tget(s, k, FLW_T_PENDING);
             if (k < me) prefix += len;
             total += len;
             if (len > largest) largest = len;
         }
-        *flw_table(s, me, FLW_T_PREFIX) = prefix;
-        *flw_table(s, me, FLW_T_TOTAL) = total;
-        *flw_table(s, me, FLW_T_DECISION) = whole;
+        flw_tset(s, me, FLW_T_PREFIX, prefix);
+        flw_tset(s, me, FLW_T_TOTAL, total);
+        flw_tset(s, me, FLW_T_DECISION, whole);
         if (me == 0u && total > 0u) {
             atomicMax(flw_u32(b, FLW_IMBALANCE_OFF),
                       flw_sat((u64)largest * 1000ull * (u64)w / (u64)total));
             atomicAdd(flw_u32(b, FLW_REBALANCES_OFF), 1u);
         }
+        __threadfence_system();
     }
     __syncthreads();
 
     {
-        u32 src0 = *flw_table(s, me, FLW_T_START);
-        u32 src1 = *flw_table(s, me, FLW_T_END);
-        u32 prefix = *flw_table(s, me, FLW_T_PREFIX);
+        u32 src0 = flw_tget(s, me, FLW_T_START);
+        u32 src1 = flw_tget(s, me, FLW_T_END);
+        u32 prefix = flw_tget(s, me, FLW_T_PREFIX);
         u32* ids = flw_ids(s);
         u32* staging = flw_staging(s);
         u32 region = flw_region(s, me);
         for (u32 k = src0 + threadIdx.x; k < src1; k += blockDim.x) {
-            staging[prefix + (k - src0)] = ids[region + k];
+            flw_st(staging + prefix + (k - src0), flw_ld(ids + region + k));
         }
     }
     __syncthreads();
 
     if (threadIdx.x == 0) {
         u32 whole = flw_barrier(s, 0u);
-        u32 total = *flw_table(s, me, FLW_T_TOTAL);
-        *flw_table(s, me, FLW_T_DEAL_LO) = (u32)((u64)me * (u64)total / (u64)w);
-        *flw_table(s, me, FLW_T_DEAL_HI) = (u32)((u64)(me + 1u) * (u64)total / (u64)w);
-        if (whole == 0u) *flw_table(s, me, FLW_T_DECISION) = 0u;
+        u32 total = flw_tget(s, me, FLW_T_TOTAL);
+        flw_tset(s, me, FLW_T_DEAL_LO, (u32)((u64)me * (u64)total / (u64)w));
+        flw_tset(s, me, FLW_T_DEAL_HI, (u32)((u64)(me + 1u) * (u64)total / (u64)w));
+        if (whole == 0u) flw_tset(s, me, FLW_T_DECISION, 0u);
+        __threadfence_system();
     }
     __syncthreads();
 
     {
-        u32 lo = *flw_table(s, me, FLW_T_DEAL_LO);
-        u32 hi = *flw_table(s, me, FLW_T_DEAL_HI);
+        u32 lo = flw_tget(s, me, FLW_T_DEAL_LO);
+        u32 hi = flw_tget(s, me, FLW_T_DEAL_HI);
         u32* ids = flw_ids(s);
         u32* staging = flw_staging(s);
         u32 region = flw_region(s, me);
         for (u32 k = threadIdx.x; k < hi - lo; k += blockDim.x) {
-            ids[region + k] = staging[lo + k];
+            flw_st(ids + region + k, flw_ld(staging + lo + k));
         }
     }
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        u32 len = *flw_table(s, me, FLW_T_DEAL_HI) - *flw_table(s, me, FLW_T_DEAL_LO);
-        *flw_table(s, me, FLW_T_PUSH) = len;
-        *flw_table(s, me, FLW_T_START) = 0u;
-        *flw_table(s, me, FLW_T_END) = len;
-        *flw_table(s, me, FLW_T_EMPTY) = len == 0u ? 1u : 0u;
-        *flw_table(s, me, FLW_T_GENERATION) = *flw_table(s, me, FLW_T_GENERATION) + 1u;
-        u32 go = (*flw_table(s, me, FLW_T_DECISION) != 0u
-                  && *flw_table(s, me, FLW_T_TOTAL) > 0u
-                  && *flw_u32(b, FLW_STOP_OFF) == 0u
-                  && *flw_u32(b, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
-        *flw_table(s, me, FLW_T_DECISION) = go;
+        u32 len = flw_tget(s, me, FLW_T_DEAL_HI) - flw_tget(s, me, FLW_T_DEAL_LO);
+        flw_tset(s, me, FLW_T_PUSH, len);
+        flw_tset(s, me, FLW_T_START, 0u);
+        flw_tset(s, me, FLW_T_END, len);
+        flw_tset(s, me, FLW_T_EMPTY, len == 0u ? 1u : 0u);
+        flw_tset(s, me, FLW_T_GENERATION, flw_tget(s, me, FLW_T_GENERATION) + 1u);
+        u32 go = (flw_tget(s, me, FLW_T_DECISION) != 0u
+                  && flw_tget(s, me, FLW_T_TOTAL) > 0u
+                  && flw_get(b, FLW_STOP_OFF) == 0u
+                  && flw_get(b, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
+        flw_tset(s, me, FLW_T_DECISION, go);
         if (me == 0u) {
-            *flw_u32(b, FLW_GENERATIONS_OFF) = *flw_u32(b, FLW_GENERATIONS_OFF) + 1u;
+            flw_set(b, FLW_GENERATIONS_OFF, flw_get(b, FLW_GENERATIONS_OFF) + 1u);
         }
         s->gen_t0 = gtimer();
+        __threadfence_system();
     }
     __syncthreads();
 }
@@ -484,17 +527,17 @@ __device__ __forceinline__ void flw_generation_end(flw_slice* s)
             u32 go;
             if (s->mode == FLW_MODE_GLOBAL) {
                 if (me == 0u) {
-                    *flw_u32(b, FLW_STOP_OFF) = flw_should_stop(s, now, 1u);
+                    flw_set(b, FLW_STOP_OFF, flw_should_stop(s, now, 1u));
                 }
                 u32 whole = flw_barrier(s, 0u);
                 next_end = flw_pushed(s, me);
                 go = (whole != 0u && next_start < next_end
-                      && *flw_u32(b, FLW_STOP_OFF) == 0u
-                      && *flw_u32(b, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
+                      && flw_get(b, FLW_STOP_OFF) == 0u
+                      && flw_get(b, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
                 if (me == 0u) {
-                    *flw_u32(b, FLW_START_OFF) = next_start;
-                    *flw_u32(b, FLW_END_OFF) = next_end;
-                    *flw_u32(b, FLW_GENERATIONS_OFF) = *flw_u32(b, FLW_GENERATIONS_OFF) + 1u;
+                    flw_set(b, FLW_START_OFF, next_start);
+                    flw_set(b, FLW_END_OFF, next_end);
+                    flw_set(b, FLW_GENERATIONS_OFF, flw_get(b, FLW_GENERATIONS_OFF) + 1u);
                 }
             } else {
                 next_end = flw_pushed(s, me);
@@ -503,21 +546,22 @@ __device__ __forceinline__ void flw_generation_end(flw_slice* s)
                 } else {
                     go = (next_start < next_end
                           && flw_should_stop(s, now, 1u) == 0u
-                          && *flw_u32(b, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
+                          && flw_get(b, FLW_FAIL_COMP_OFF) == 0u) ? 1u : 0u;
                 }
-                *flw_table(s, me, FLW_T_GENERATION) = *flw_table(s, me, FLW_T_GENERATION) + 1u;
+                flw_tset(s, me, FLW_T_GENERATION, flw_tget(s, me, FLW_T_GENERATION) + 1u);
             }
-            *flw_table(s, me, FLW_T_START) = next_start;
-            *flw_table(s, me, FLW_T_END) = next_end;
-            *flw_table(s, me, FLW_T_EMPTY) = next_start < next_end ? 0u : 1u;
-            *flw_table(s, me, FLW_T_DECISION) = go;
+            flw_tset(s, me, FLW_T_START, next_start);
+            flw_tset(s, me, FLW_T_END, next_end);
+            flw_tset(s, me, FLW_T_EMPTY, next_start < next_end ? 0u : 1u);
+            flw_tset(s, me, FLW_T_DECISION, go);
             s->gen_t0 = gtimer();
+            __threadfence_system();
         }
         __syncthreads();
     }
-    s->start = *flw_table(s, me, FLW_T_START);
-    s->end = *flw_table(s, me, FLW_T_END);
-    s->running = *flw_table(s, me, FLW_T_DECISION);
+    s->start = flw_tget(s, me, FLW_T_START);
+    s->end = flw_tget(s, me, FLW_T_END);
+    s->running = flw_tget(s, me, FLW_T_DECISION);
     s->local_gen = next_gen;
 }
 
@@ -533,11 +577,12 @@ __device__ __forceinline__ u32 flw_slice_end(flw_slice* s)
     u32 result = 0u;
     __syncthreads();
     if (threadIdx.x == 0) {
+        __threadfence_system();
         u64 t0 = gtimer();
         u32 mine = atomicAdd(flw_u32(b, FLW_DONE_OFF), 1u) + 1u;
         if (s->rank == 0u) {
             u32 goal = ((mine + s->width - 1u) / s->width) * s->width;
-            u64 deadline = *flw_u64(b, FLW_DONE_DEADLINE_NS_OFF);
+            u64 deadline = flw_get64(b, FLW_DONE_DEADLINE_NS_OFF);
             while (atomicAdd(flw_u32(b, FLW_DONE_OFF), 0u) < goal) {
                 if (deadline != 0ull && gtimer() - t0 > deadline) {
                     flw_fail(s, FLW_NO_SEGMENT, FLW_FAIL_DONE);
@@ -546,24 +591,25 @@ __device__ __forceinline__ u32 flw_slice_end(flw_slice* s)
             }
             u32 finished = 1u;
             for (u32 k = 0u; k < s->width; k++) {
-                if (*flw_table(s, k, FLW_T_EMPTY) == 0u) finished = 0u;
+                if (flw_tget(s, k, FLW_T_EMPTY) == 0u) finished = 0u;
             }
-            *flw_u32(b, FLW_SLICES_OFF) = *flw_u32(b, FLW_SLICES_OFF) + 1u;
-            *flw_u32(b, FLW_STOP_OFF) = 0u;
+            flw_set(b, FLW_SLICES_OFF, flw_get(b, FLW_SLICES_OFF) + 1u);
+            flw_set(b, FLW_STOP_OFF, 0u);
             u32 state;
-            if (*flw_u32(b, FLW_FAIL_COMP_OFF) != 0u) {
+            if (flw_get(b, FLW_FAIL_COMP_OFF) != 0u) {
                 state = FLW_SLICE_FAILED;
                 result = FLW_STATUS_FAILED;
             } else if (finished != 0u) {
                 state = FLW_SLICE_FINISHED;
-            } else if (*flw_u32(b, FLW_RESUME_MODE_OFF) == FLW_RESUME_DEVICE) {
+            } else if (flw_get(b, FLW_RESUME_MODE_OFF) == FLW_RESUME_DEVICE) {
                 state = FLW_SLICE_YIELDED;
-                *flw_u32(b, FLW_YIELDS_OFF) = *flw_u32(b, FLW_YIELDS_OFF) + 1u;
+                flw_set(b, FLW_YIELDS_OFF, flw_get(b, FLW_YIELDS_OFF) + 1u);
                 result = FLYNNEL_USER_YIELD;
             } else {
                 state = FLW_SLICE_CONTINUE;
             }
-            *flw_u32(b, FLW_SLICE_STATE_OFF) = state;
+            flw_set(b, FLW_SLICE_STATE_OFF, state);
+            __threadfence_system();
         }
     }
     __syncthreads();
