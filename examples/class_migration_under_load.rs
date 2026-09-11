@@ -30,7 +30,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use flynnel::sched::adaptive_profile::{WorkloadClass, active_workload_class};
-use flynnel::sched::par_iter::for_each_chunk;
+use flynnel::sched::par_iter::for_each_chunk_min_leaf;
 use flynnel::{CallSiteState, JobPlan, SiteRef};
 
 /// One site, owned here rather than resolved from the call location, so
@@ -98,6 +98,14 @@ fn main() {
     let report_every: u64 = arg(2, 4);
     let items: usize = arg(3, 32_768);
     let rounds: u32 = arg(4, 64);
+    // The recursion floor, passed rather than derived. Leaf size is what
+    // the classifier's variance is computed over, and a caller who sets
+    // only the per-item cost does not thereby set it: `adaptive_min_leaf`
+    // is the dispatch cost divided by the per-item cost, so heavier items
+    // give a SMALLER floor and a finer split. Two runs that raised the
+    // item cost to make leaves coarse got 3.5 items per leaf and a cv2 of
+    // 16000 per mille instead.
+    let min_leaf: usize = arg(5, 1_024);
 
     let workers = match std::thread::available_parallelism() {
         Ok(n) => n.get().to_string(),
@@ -106,9 +114,18 @@ fn main() {
 
     println!(
         "seconds {seconds}  report_every {report_every}s  items {items}  \
-         rounds {rounds}  workers {workers}"
+         rounds {rounds}  min_leaf {min_leaf}  workers {workers}"
     );
-    println!("elapsed_s  dispatches  leaves  cv2_per_mille  site_class  global_class  last_ms");
+    // leaves_per_dispatch and items_per_leaf are the precondition, not
+    // decoration. This experiment needs leaves whose own variance is near
+    // zero, and a run whose leaves came out at a few items each cannot
+    // answer it however clean the class column looks. Reading that off
+    // two cumulative counters after the fact is how two runs were taken
+    // before anyone noticed.
+    println!(
+        "elapsed_s  dispatches  leaves  per_disp  items_per_leaf  \
+         cv2_per_mille  site_class  global_class  last_ms"
+    );
 
     let site = SiteRef::new(&SITE);
     let mut buf: Vec<u64> = (0..items as u64).collect();
@@ -121,7 +138,7 @@ fn main() {
     while start.elapsed() < Duration::from_secs(seconds) {
         let t0 = Instant::now();
         let plan = JobPlan::new(0, buf.len() as u32).with_site(site);
-        for_each_chunk(&plan, &mut buf, |slice| {
+        for_each_chunk_min_leaf(&plan, &mut buf, min_leaf, |slice| {
             for x in slice {
                 *x = item_work(*x, rounds);
             }
@@ -143,11 +160,23 @@ fn main() {
                 Some(c) => format!("{c:?}"),
                 None => "none".to_string(),
             };
+            let per_disp = if dispatches > 0 {
+                view.leaves as f64 / dispatches as f64
+            } else {
+                0.0
+            };
+            let items_per_leaf = if per_disp > 0.0 {
+                items as f64 / per_disp
+            } else {
+                0.0
+            };
             println!(
-                "{:9.1}  {:10}  {:6}  {:>13}  {:>10}  {:>12}  {:7.2}",
+                "{:9.1}  {:10}  {:8}  {:8.1}  {:14.1}  {:>13}  {:>12}  {:>12}  {:7.2}",
                 start.elapsed().as_secs_f64(),
                 dispatches,
                 view.leaves,
+                per_disp,
+                items_per_leaf,
                 cv2,
                 learned,
                 format!("{:?}", active_workload_class()),
