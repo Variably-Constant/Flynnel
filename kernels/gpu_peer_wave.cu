@@ -9,7 +9,9 @@
 // receives as `block` and `count`. The span starts with the header laid
 // out below, which src/gpu_peer/wave.rs mirrors; a test there reads these
 // defines and compares them. Every counter is a VRAM word touched only by
-// GPU threads, where atomicAdd and atomicMax are exact.
+// GPU threads, where atomicAdd and atomicMax are exact. atomicAdd returns
+// the word's value from before the addition, so a push takes the position
+// it returns and an arrival counts itself by adding one to it.
 //
 // Synchronization contract, which every helper keeps:
 //  - Every thread of a block reaches the same number of __syncthreads.
@@ -194,7 +196,7 @@ __device__ __forceinline__ u32 flw_push(flw_slice* s, u32 id)
     u32* counter = s->mode == FLW_MODE_GLOBAL
         ? flw_u32(s->base, FLW_PUSH_OFF)
         : flw_table(s, s->rank, FLW_T_PUSH);
-    u32 p = atomicAdd(counter, 1u) - 1u;
+    u32 p = atomicAdd(counter, 1u);
     if (p >= s->cap) {
         flw_fail(s, id, FLW_FAIL_IDS);
         return 0xFFFFFFFFu;
@@ -210,12 +212,13 @@ __device__ __forceinline__ u32 flw_push(flw_slice* s, u32 id)
 __device__ __forceinline__ u32 flw_alloc(flw_slice* s, u32 bytes)
 {
     u32 size = (bytes + 7u) & ~7u;
-    u32 top = atomicAdd(flw_u32(s->base, FLW_ARENA_BUMP_OFF), size);
-    if (size < bytes || top < size || top > *flw_u32(s->base, FLW_ARENA_CAPACITY_OFF)) {
+    u32 at = atomicAdd(flw_u32(s->base, FLW_ARENA_BUMP_OFF), size);
+    u32 top = at + size;
+    if (size < bytes || top < at || top > *flw_u32(s->base, FLW_ARENA_CAPACITY_OFF)) {
         flw_fail(s, FLW_NO_SEGMENT, FLW_FAIL_ARENA);
         return 0xFFFFFFFFu;
     }
-    return *flw_u32(s->base, FLW_ARENA_OFF_OFF) + (top - size);
+    return *flw_u32(s->base, FLW_ARENA_OFF_OFF) + at;
 }
 
 // The segment id at position `k` of the current generation.
@@ -259,7 +262,7 @@ __device__ __forceinline__ u32 flw_barrier(flw_slice* s, u32 first_of_slice)
 {
     unsigned char* b = s->base;
     u64 t0 = gtimer();
-    u32 mine = atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 1u);
+    u32 mine = atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 1u) + 1u;
     u32 goal = ((mine + s->width - 1u) / s->width) * s->width;
     u64 deadline = (u64)*flw_u32(b, FLW_BARRIER_DEADLINE_OFF);
     u32 whole = 1u;
@@ -531,7 +534,7 @@ __device__ __forceinline__ u32 flw_slice_end(flw_slice* s)
     __syncthreads();
     if (threadIdx.x == 0) {
         u64 t0 = gtimer();
-        u32 mine = atomicAdd(flw_u32(b, FLW_DONE_OFF), 1u);
+        u32 mine = atomicAdd(flw_u32(b, FLW_DONE_OFF), 1u) + 1u;
         if (s->rank == 0u) {
             u32 goal = ((mine + s->width - 1u) / s->width) * s->width;
             u64 deadline = *flw_u64(b, FLW_DONE_DEADLINE_NS_OFF);
