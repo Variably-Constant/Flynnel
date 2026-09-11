@@ -66,6 +66,9 @@ fn abandoned(path: &Path) -> bool {
         // Released between the failed create and this check, so there is
         // nothing to steal and the next create attempt will win it.
         Err(e) if e.kind() == ErrorKind::NotFound => return false,
+        // On Windows a file another holder is still deleting refuses its
+        // metadata with access denied; it is being released, not abandoned.
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => return false,
         Err(e) => panic!("gpu test lock: cannot read {}: {e}", path.display()),
     };
     match created.elapsed() {
