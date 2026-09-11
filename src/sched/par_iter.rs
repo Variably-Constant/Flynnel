@@ -1240,6 +1240,19 @@ fn run_on_caller<R>(plan: &JobPlan, body: impl FnOnce() -> R) -> R {
 /// constant. A pinned [`crate::sched::plan::BisectVariant`] takes the
 /// same budget shape with a multiplier of one.
 ///
+/// That variant is not pinned only by a caller. On a host whose vendor
+/// resolves to [`crate::sched::adaptive_variant_routing::VariantRouting::ComputeBatchAdaptive`],
+/// which is the CPUID default on AMD, a plan carrying
+/// [`crate::dispatch_profile::DispatchProfile::PortBound`] is given one
+/// at construction, chosen by the item count either side of
+/// [`crate::sched::adaptive_variant_routing::COMPUTE_BATCH_LARGE_N`].
+/// Every other profile is left on the seed-depth route.
+///
+/// So on such a host PortBound takes a different bisect from the other
+/// profiles, and a caller comparing profiles is comparing routes as
+/// well. PortBound is also what an unclassified site collapses to, so
+/// this is the common case rather than a corner of it.
+///
 /// So no route carries a fixed ceiling of the form
 /// `worker_count() * k`. The bound that holds on all of them is
 /// `items.len() / floor`.

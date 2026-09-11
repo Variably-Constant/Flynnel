@@ -172,6 +172,16 @@ On the seed-depth route, which is what `for_each_chunk` and `for_each_chunk_inde
 
 The distinction between the two sources matters more here than elsewhere. Only a factor the caller set through [`with_oversubscription_log2`](#builder-methods) shifts the seed depth. A profile-derived or learned factor does not, and neither does the process-global split multiplier, so on that route the only oversubscription applied is one the caller asked for.
 
+### A profile-derived plan follows the observer, not its own factor
+
+`set_profile` fills `oversubscription_log2` from the profile and leaves `oversubscription_log2_explicit` **false**. On the budget-shaped routes, `effective_leaves_per_worker()` reads that flag first, so the value it returns is the process-global split observer's multiplier rather than the profile's own.
+
+The observer retunes that multiplier from the pool's measured steal rate every 200 ms, within `[1, 8]`. So a plan built from a profile has a leaf count that moves with what else the process is dispatching, and two unrelated call sites in one process influence each other's fan-out through it.
+
+This reaches `PortBound` plans in particular. On a host whose vendor resolves to `ComputeBatchAdaptive`, the CPUID default on AMD, a `PortBound` plan is given a `bisect_variant` at construction and therefore takes a budget-shaped route; every other profile stays on the seed-depth route, where the multiplier is not read at all. `PortBound` is also what an unclassified site collapses to.
+
+To take the profile's factor rather than the observer's, set it explicitly with `with_oversubscription_log2`, which marks it as the caller's and stops the observer being consulted for that dispatch.
+
 What resolves it at a dispatch entry is `effective_leaves_per_worker()`, and which of two sources it reads depends on who set the field. A factor the caller set through [`with_oversubscription_log2`](#builder-methods) wins outright and the process-global observer is not consulted: that is the whole point of the override. A factor that arrived from a profile or a learned class leaves `oversubscription_log2_explicit` false, and the entry reads the observer-tuned `split_multiplier` instead, so the adaptive default stays in charge whenever the caller expressed no opinion.
 
 `effective_oversubscription_log2()` reports the field alone, defaulting to 1 (2x), and is the right accessor for reading back what a plan carries rather than what a dispatch will do with it.
