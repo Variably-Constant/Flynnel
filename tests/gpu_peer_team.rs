@@ -367,7 +367,8 @@ fn a_barrier_expiry_records_its_count_and_the_ring_depth() {
 ///
 /// The 64-block case is what the bound has to survive: 2, 4 and 8 clear
 /// any bound by hundreds of times, and 64 measures 55 us against the
-/// 5 ms deadline. It reached 412 us once, on a run where another test
+/// 5 ms deadline. A 64-block request runs at the device's SM count where
+/// that is smaller, so on a 48-SM card this is the 48-block team. It reached 412 us once, on a run where another test
 /// binary held the device at the same time, which put it at 82 percent
 /// of this bound and turned the assertion into a reading of the
 /// neighbour. The device lock in [`common`] is what makes 55 the figure
@@ -395,8 +396,9 @@ fn a_healthy_team_costs_far_less_at_the_barrier_than_its_deadline() {
         let waited = peer.barrier_wait_max_ns();
         let (stalls, _) = peer.barrier_stalls();
         println!(
-            "team {team}: worst healthy barrier wait {waited} ns against a \
-             {DEADLINE_NS} ns deadline; {stalls} expiries"
+            "team {team} running {}: worst healthy barrier wait {waited} ns against a \
+             {DEADLINE_NS} ns deadline; {stalls} expiries",
+            peer.team_size()
         );
 
         assert_eq!(stalls, 0, "team {team}: no team should have missed on an idle host");
