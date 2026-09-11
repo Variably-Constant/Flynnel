@@ -22,6 +22,20 @@
 //! consecutive windows, so the leaf count is reported and is what to
 //! raise if nothing ever moves.
 //!
+//! The site times whole leaves and records no item counts, so leaves of
+//! different sizes read as variance even when every item costs the same.
+//! Every row therefore lists the leaves each size ran over its interval,
+//! with their count, mean time and cv^2. When those per-size values are low
+//! and the site's window cv^2 is high, the variance came from the mix of
+//! sizes rather than from the time any one size took.
+//!
+//! The ninth argument picks the routing. `adaptive` builds each plan with
+//! `JobPlan::new`, so the site's learned class re-derives the routing of
+//! every later dispatch; `pinned` builds it with `JobPlan::set_profile` on
+//! Streaming, so the site still classifies but its class routes nothing.
+//! Running both separates what the load did to the leaves from what the
+//! class did to them once it moved.
+//!
 //! The load comes from burner threads inside this process, from `load_at`
 //! seconds for `load_for` seconds. Every row reports, over its interval,
 //! the cores the whole box was busy, the cores this process used, and the
@@ -33,23 +47,158 @@
 //! load, and what class it was in at the end.
 //!
 //! ```sh
-//! cargo run --release --example class_migration_under_load -- 220 4 24576 4000 1024 60 60 12
+//! cargo run --release --example class_migration_under_load -- 220 4 24576 4000 1024 60 60 12 adaptive
 //! ```
 
 use std::collections::BTreeMap;
 use std::env;
 use std::hint::black_box;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flynnel::sched::adaptive_profile::{WorkloadClass, active_workload_class};
 use flynnel::sched::par_iter::for_each_chunk_min_leaf;
-use flynnel::{CallSiteState, JobPlan, SiteRef};
+use flynnel::{CallSiteState, DispatchProfile, JobPlan, SiteRef};
 
 /// One site, owned here rather than resolved from the call location, so
 /// the statistics reported are this dispatch's and nothing else's.
 static SITE: CallSiteState = CallSiteState::new();
+
+/// The leaves one size bucket ran: bucket 0 holds empty slices and bucket
+/// `b + 1` holds slices whose item count has base-2 logarithm `b`. `items`
+/// is the item count of the latest leaf the bucket took. Times are summed
+/// as nanoseconds and their squares as `(ns >> 8)^2`, the scaled form the
+/// site's own statistics use. A leaf's sums are written before its count and
+/// a reading takes the count first, so a reading's sums cover at least the
+/// leaves its count does.
+struct LeafSize {
+    items: AtomicU64,
+    count: AtomicU64,
+    sum_ns: AtomicU64,
+    sumsq_scaled: AtomicU64,
+    square_overflows: AtomicU64,
+}
+
+impl LeafSize {
+    const fn new() -> Self {
+        Self {
+            items: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            sum_ns: AtomicU64::new(0),
+            sumsq_scaled: AtomicU64::new(0),
+            square_overflows: AtomicU64::new(0),
+        }
+    }
+}
+
+const LEAF_BUCKETS: usize = 65;
+
+static LEAF_SIZES: [LeafSize; LEAF_BUCKETS] = [const { LeafSize::new() }; LEAF_BUCKETS];
+
+/// Record one leaf of `items` items that took `nanos`. A scaled square that
+/// does not fit in 64 bits is counted in `square_overflows` instead of
+/// being added.
+fn record_leaf_size(items: usize, nanos: u64) {
+    let bucket = match items.checked_ilog2() {
+        Some(log2) => &LEAF_SIZES[log2 as usize + 1],
+        None => &LEAF_SIZES[0],
+    };
+    let scaled = nanos >> 8;
+    bucket.items.store(items as u64, Ordering::Relaxed);
+    bucket.sum_ns.fetch_add(nanos, Ordering::Relaxed);
+    match scaled.checked_mul(scaled) {
+        Some(square) => {
+            bucket.sumsq_scaled.fetch_add(square, Ordering::Relaxed);
+        }
+        None => {
+            bucket.square_overflows.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    bucket.count.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One bucket's counters as read at one moment.
+#[derive(Clone, Copy)]
+struct LeafSizeReading {
+    items: u64,
+    count: u64,
+    sum_ns: u64,
+    sumsq_scaled: u64,
+    square_overflows: u64,
+}
+
+fn read_leaf_sizes() -> [LeafSizeReading; LEAF_BUCKETS] {
+    std::array::from_fn(|b| {
+        let bucket = &LEAF_SIZES[b];
+        let count = bucket.count.load(Ordering::Relaxed);
+        LeafSizeReading {
+            items: bucket.items.load(Ordering::Relaxed),
+            count,
+            sum_ns: bucket.sum_ns.load(Ordering::Relaxed),
+            sumsq_scaled: bucket.sumsq_scaled.load(Ordering::Relaxed),
+            square_overflows: bucket.square_overflows.load(Ordering::Relaxed),
+        }
+    })
+}
+
+/// The leaves each size ran between two readings, smallest first, as
+/// `items:count:mean_ms:cv2_per_mille` joined by commas, or `none` when no
+/// leaf ran. A size whose window lost a square to overflow carries
+/// `:square_overflows=N` and its cv^2 is printed as `unknown`.
+fn leaf_sizes_between(
+    earlier: &[LeafSizeReading; LEAF_BUCKETS],
+    later: &[LeafSizeReading; LEAF_BUCKETS],
+) -> Result<String, String> {
+    let mut sizes = Vec::new();
+    for (before, after) in earlier.iter().zip(later) {
+        let count = advanced("a leaf-size count", before.count, after.count)?;
+        if count == 0 {
+            continue;
+        }
+        let sum = advanced("a leaf-size time sum", before.sum_ns, after.sum_ns)? as f64;
+        let sumsq = advanced("a leaf-size squared time sum", before.sumsq_scaled, after.sumsq_scaled)? as f64;
+        let overflows = advanced("a leaf-size square overflow count", before.square_overflows, after.square_overflows)?;
+        let n = count as f64;
+        let mean = sum / n;
+        if overflows == 0 {
+            let variance = sumsq * 65_536.0 / n - mean * mean;
+            let cv2 = variance / (mean * mean) * 1_000.0;
+            sizes.push(format!("{}:{count}:{:.2}:{cv2:.0}", after.items, mean / 1e6));
+        } else {
+            sizes.push(format!(
+                "{}:{count}:{:.2}:unknown:square_overflows={overflows}",
+                after.items,
+                mean / 1e6
+            ));
+        }
+    }
+    if sizes.is_empty() {
+        return Ok("none".to_string());
+    }
+    Ok(sizes.join(","))
+}
+
+/// How each dispatch's plan is built.
+#[derive(Clone, Copy)]
+enum Routing {
+    /// `JobPlan::new`: on every dispatch the site's learned class re-derives
+    /// the plan's SMT activation, oversubscription and per-item estimate.
+    Adaptive,
+    /// `JobPlan::set_profile` with Streaming: the caller named the profile,
+    /// so the site still classifies and its class is printed, but it routes
+    /// nothing.
+    Pinned,
+}
+
+impl Routing {
+    fn name(self) -> &'static str {
+        match self {
+            Routing::Adaptive => "adaptive",
+            Routing::Pinned => "pinned",
+        }
+    }
+}
 
 /// Per-item work: a dependent chain of fixed length, so every leaf costs
 /// the same and any spread in the measured leaf times came from the host
@@ -486,9 +635,19 @@ fn main() {
         }
     };
 
+    let routing = match env::args().nth(9).as_deref() {
+        None | Some("adaptive") => Routing::Adaptive,
+        Some("pinned") => Routing::Pinned,
+        Some(other) => {
+            eprintln!("argument 9 is the routing, adaptive or pinned, not {other:?}");
+            std::process::exit(2);
+        }
+    };
+
     println!(
         "seconds {seconds}  report_every {report_every}s  items {items}  rounds {rounds}  \
-         min_leaf {min_leaf}  load_at {load_at}s  load_for {load_for}s  load_threads {load_threads}"
+         min_leaf {min_leaf}  load_at {load_at}s  load_for {load_for}s  load_threads {load_threads}  routing {}",
+        routing.name()
     );
     // leaves_per_dispatch and items_per_leaf are the precondition: this
     // experiment needs leaves whose own variance is near zero, and a run
@@ -496,7 +655,7 @@ fn main() {
     // clean the class column looks.
     println!(
         "elapsed_s  phase   dispatches  leaves  per_disp  items_per_leaf  \
-         cv2_per_mille  window_mean_ns  window_cv2  site_class  global_class  last_ms  box_cores  own_cores  foreign_cores"
+         cv2_per_mille  window_mean_ns  window_cv2  site_class  global_class  last_ms  box_cores  own_cores  foreign_cores  leaf_sizes"
     );
 
     let site = SiteRef::new(&SITE);
@@ -525,6 +684,7 @@ fn main() {
         .collect();
 
     let mut previous_cpu = cpu::read();
+    let mut previous_leaf_sizes = read_leaf_sizes();
     let mut rows = Vec::new();
     let mut row_start = start;
     let mut next_report = Duration::from_secs(0);
@@ -533,11 +693,18 @@ fn main() {
 
     while start.elapsed() < Duration::from_secs(seconds) {
         let t0 = Instant::now();
-        let plan = JobPlan::new(0, buf.len() as u32).with_site(site);
+        let plan = match routing {
+            Routing::Adaptive => JobPlan::new(0, buf.len() as u32),
+            Routing::Pinned => JobPlan::set_profile(0, buf.len() as u32, DispatchProfile::Streaming),
+        }
+        .with_site(site);
         for_each_chunk_min_leaf(&plan, &mut buf, min_leaf, |slice| {
+            let leaf_items = slice.len();
+            let leaf_start = Instant::now();
             for x in slice {
                 *x = item_work(*x, rounds);
             }
+            record_leaf_size(leaf_items, leaf_start.elapsed().as_nanos() as u64);
         });
         black_box(buf[0]);
         last_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -550,6 +717,15 @@ fn main() {
             let later_cpu = cpu::read();
             let context = row_context(&previous_cpu, &later_cpu);
             previous_cpu = later_cpu;
+            let later_leaf_sizes = read_leaf_sizes();
+            let leaf_sizes = match leaf_sizes_between(&previous_leaf_sizes, &later_leaf_sizes) {
+                Ok(text) => text,
+                Err(reason) => {
+                    eprintln!("row at {elapsed_s:.1}s has no leaf sizes: {reason}");
+                    "unavailable".to_string()
+                }
+            };
+            previous_leaf_sizes = later_leaf_sizes;
             let phase = if now <= load_begin {
                 Phase::Before
             } else if row_start >= load_end {
@@ -596,7 +772,7 @@ fn main() {
                 }
             };
             println!(
-                "{:9.1}  {:6}  {:10}  {:8}  {:8.1}  {:14.1}  {:>13}  {:>14}  {:>10}  {:>12}  {:>12}  {:7.2}  {:>11}  {:>11}  {:>13}",
+                "{:9.1}  {:6}  {:10}  {:8}  {:8.1}  {:14.1}  {:>13}  {:>14}  {:>10}  {:>12}  {:>12}  {:7.2}  {:>11}  {:>11}  {:>13}  {}",
                 elapsed_s,
                 phase.name(),
                 dispatches,
@@ -612,6 +788,7 @@ fn main() {
                 box_text,
                 own_text,
                 foreign_text,
+                leaf_sizes,
             );
             rows.push(Row { phase, learned: view.learned, cpu: context });
             row_start = now;
