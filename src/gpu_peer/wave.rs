@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use super::{GpuPeer, GpuPeerError, ResidentHandle, Ticket};
 
+pub mod plan;
+
 /// The helper source, composed between the poller and the user source.
 pub(crate) const WAVE_CU: &str = include_str!("../../kernels/gpu_peer_wave.cu");
 
