@@ -96,6 +96,10 @@ pub fn device() -> DeviceLock {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(_) => return DeviceLock { path },
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            // On Windows, creating a file that another holder is still
+            // deleting fails with access denied until the delete completes,
+            // which is the same contention as a file that still exists.
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
             // A path that cannot be created at all is not contention.
             // Spinning on it would wait the full ten minutes and then
             // report a stuck holder that never existed.
