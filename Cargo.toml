@@ -299,6 +299,10 @@ required-features = ["gpu-peer"]
 name = "gpu_peer_multi_silicon"
 required-features = ["gpu-peer"]
 
+[[example]]
+name = "gpu_peer_generation_barrier"
+required-features = ["gpu-peer"]
+
 [[bench]]
 name = "flynn_axes"
 harness = false
