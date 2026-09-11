@@ -57,6 +57,18 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   planner's inputs. A global frontier records its per-generation
   imbalance. `WaveStats` also reports the ids moved by rebalances, the
   time block 0 spent in them, and the summed slice time.
+- A wave can keep a reorder buffer (`WaveSpec::rob`), with a record per
+  segment id and a row per root.
+  - Segments link their children with `flw_push_child` and report
+    themselves expanded, refused or retired.
+  - While the other blocks wait at a barrier, block 0 commits each row in
+    pre-order over (parent, ordinal). It stops at the first pending or
+    refused segment, and the row keeps its lowest refusing id.
+  - `GpuPeer::wave_rows` reads the rows.
+  - Between slices, `push_wave_segments` and `report_wave_segments` add
+    host-run segments to the same span.
+- `GpuPeer::fetch_bulk_at` and `write_resident_bulk_at` read and write a
+  resident span at an offset.
 - `GpuPeer::team_size`, the blocks each lane actually runs.
 
 ### Changed

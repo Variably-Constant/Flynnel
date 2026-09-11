@@ -1143,6 +1143,58 @@ impl GpuPeer {
             .map_err(|e| GpuPeerError::Driver(format!("fetch_bulk sync: {e:?}")))
     }
 
+    /// Read `out.len()` bytes of a [`Self::pin_bulk`] span, starting
+    /// `offset` bytes in, device-to-host.
+    pub fn fetch_bulk_at(
+        &mut self,
+        handle: &ResidentHandle,
+        offset: usize,
+        out: &mut [u8],
+    ) -> Result<(), GpuPeerError> {
+        let (base, len) = self.resident_ptr(handle)?;
+        if out.len() > len || offset > len - out.len() {
+            return Err(GpuPeerError::Unavailable("the read runs past the resident span"));
+        }
+        // SAFETY: the bytes lie inside the pool's own device span for this handle.
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_async(
+                out,
+                base + offset as u64,
+                self.wide_stream.cu_stream() as _,
+            )
+            .map_err(|e| GpuPeerError::Driver(format!("fetch_bulk_at: {e:?}")))?;
+        }
+        self.wide_stream
+            .synchronize()
+            .map_err(|e| GpuPeerError::Driver(format!("fetch_bulk_at sync: {e:?}")))
+    }
+
+    /// Overwrite `data.len()` bytes of a [`Self::pin_bulk`] span, starting
+    /// `offset` bytes in, host-to-device.
+    pub fn write_resident_bulk_at(
+        &mut self,
+        handle: &ResidentHandle,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), GpuPeerError> {
+        let (base, len) = self.resident_ptr(handle)?;
+        if data.len() > len || offset > len - data.len() {
+            return Err(GpuPeerError::Unavailable("the write runs past the resident span"));
+        }
+        // SAFETY: the bytes lie inside the pool's own device span for this handle.
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                base + offset as u64,
+                data,
+                self.wide_stream.cu_stream() as _,
+            )
+            .map_err(|e| GpuPeerError::Driver(format!("write_resident_bulk_at: {e:?}")))?;
+        }
+        self.wide_stream
+            .synchronize()
+            .map_err(|e| GpuPeerError::Driver(format!("write_resident_bulk_at sync: {e:?}")))
+    }
+
     /// [`Self::pin`] without waiting: zero-synchronization prefetch.
     /// The upload rides the handle's lane, and lane FIFO order IS the
     /// dependency order - any task submitted on this handle

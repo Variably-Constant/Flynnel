@@ -96,6 +96,7 @@ fn spec(frontier: Frontier, resume: Resume, budget: SliceBudget, roots: Vec<u32>
         barrier_deadline: Duration::from_millis(50),
         done_deadline: Some(Duration::from_millis(500)),
         longest_generation_seed: Duration::ZERO,
+        rob: None,
     }
 }
 

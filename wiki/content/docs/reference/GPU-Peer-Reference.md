@@ -356,6 +356,7 @@ let wave = peer.create_wave(&WaveSpec {
     barrier_deadline: Duration::from_millis(50),
     done_deadline: Some(Duration::from_millis(500)),
     longest_generation_seed: Duration::ZERO,
+    rob: None,                               // or Some(RobSpec { capacity }): see Reorder buffer
 })?;
 let t = peer.submit_wave(&wave, MY_WAVE_OP, &args)?;
 let status = peer.wait_status(t, Duration::from_secs(60))?;
@@ -417,6 +418,63 @@ covers:
 - device yields and host continuation;
 - failure carry;
 - id and arena exhaustion.
+
+#### Reorder buffer
+
+A wave created with `rob: Some(RobSpec { capacity })` keeps a record for
+every segment id below `capacity` and a row for each root. Segment ids are
+dense below the capacity, and roots are distinct.
+
+On the device:
+- `flw_push_child(&s, parent, id)` links `id` as the parent's next child,
+  in the parent's row, and pushes it. The one thread running the parent
+  links all of its children, in ordinal order, before
+  `flw_rob_expanded(&s, parent)`.
+- `flw_rob_expanded(&s, id)` marks the segment's own step done. A leaf is
+  expanded with no children.
+- `flw_rob_refuse(&s, id)` marks it refused. Its row commits nothing past
+  it in pre-order, and the row keeps its lowest refusing id.
+- `flw_rob_retired(&s, id)` marks its value retired. For a root, the row's
+  value is ready.
+- An id already linked can be pushed again with `flw_push`, for example to
+  run a parent's fold after its children.
+
+Block 0 commits each row in pre-order over (parent, ordinal), from its
+cursor up to the first segment still pending or refused. It walks while the
+other blocks wait: at every global generation barrier and at the first
+barrier of a rebalance it waits for every other block to arrive, walks, and
+then arrives itself, so the barrier deadline covers the walk. It also walks
+after the slice-end wait.
+
+`wave_rows` returns, for each row:
+- its root;
+- the first segment not yet committed;
+- whether the row is complete;
+- the refused segment its frontier stopped at, and its lowest refusing id;
+- whether the root retired, and how many segments committed.
+
+Between slices, the host can run segments too:
+- `push_wave_segments(&wave, &[(parent, id)])` links children and appends
+  them to the pending frontier.
+- `report_wave_segments(&wave, &[(id, SegmentReport::Expanded)])` records
+  an expansion, a refusal or a retirement.
+
+Both are refused while the wave's last slice has not retired. The rows move
+at the next walk, so a slice submitted with nothing pending walks them and
+returns.
+
+`FAIL_ROB` marks a broken ROB invariant, an id outside the ROB or a cycle in
+its links, never a program's verdict: a program refuses through
+`flw_rob_refuse`. Codes below `0xF000` passed to `flw_fail` are the op's
+own, and any `FAIL_*` code reported beside them wins.
+
+`tests/gpu_peer_wave_rob.rs` covers:
+- every row committing on each frontier;
+- a leaf never expanded holding its row;
+- a refusal stopping only its row;
+- rows committing across device yields;
+- host-run segments joining their rows;
+- host pushes and reports waiting for the slice in flight.
 
 #### Choosing the frontier
 

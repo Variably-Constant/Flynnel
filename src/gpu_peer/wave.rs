@@ -11,9 +11,19 @@
 //! [`GpuPeer::calibrate_waves`] measures what waves cost on the device, and
 //! [`plan`] turns those costs and a wave's stats into a frontier choice.
 //!
+//! A wave can keep a reorder buffer ([`RobSpec`]): a record per segment id
+//! and a row per root. Segments link their children and report themselves
+//! expanded, refused or retired, and block 0 commits each row in pre-order.
+//! [`GpuPeer::wave_rows`] reads the rows, and between slices
+//! [`GpuPeer::push_wave_segments`] and [`GpuPeer::report_wave_segments`] add
+//! what the host ran.
+//!
 //! The consumer's op follows the loop shown at the top of the kernel file.
 //! Every offset here mirrors a define there, and a test compares the two.
 
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
@@ -107,6 +117,16 @@ pub const MOVED_OFF: usize = 0x94;
 pub const ELAPSED_NS_OFF: usize = 0x98;
 /// Block 0's time in rebalances that moved ids, ns (u64).
 pub const REBALANCE_NS_OFF: usize = 0xA0;
+/// Byte offset of the ROB table; 0 when the wave keeps no ROB.
+pub const ROB_OFF_OFF: usize = 0xA8;
+/// Records in the ROB table; every segment id is below it.
+pub const ROB_CAPACITY_OFF: usize = 0xAC;
+/// Byte offset of the row table.
+pub const ROWS_OFF_OFF: usize = 0xB0;
+/// Rows, one per root.
+pub const ROW_COUNT_OFF: usize = 0xB4;
+/// Segments committed over every row.
+pub const ROB_COMMITTED_OFF: usize = 0xB8;
 /// Header size.
 pub const HEADER_BYTES: usize = 0x100;
 
@@ -136,6 +156,50 @@ pub const T_TOTAL: usize = 0x20;
 pub const T_DEAL_LO: usize = 0x24;
 /// Rebalance: staging end dealt to the block.
 pub const T_DEAL_HI: usize = 0x28;
+
+/// ROB record size, one per segment id.
+pub const ROB_STRIDE: usize = 0x28;
+/// Parent id; [`ROB_NONE`] for a root or an id never linked.
+pub const R_PARENT: usize = 0x00;
+/// Index among the parent's children.
+pub const R_ORDINAL: usize = 0x04;
+/// The row the segment belongs to.
+pub const R_ROW: usize = 0x08;
+/// Child with ordinal 0; [`ROB_NONE`] for none.
+pub const R_FIRST_CHILD: usize = 0x0C;
+/// The parent's next child; [`ROB_NONE`] after the last.
+pub const R_NEXT_SIBLING: usize = 0x10;
+/// Most recently linked child.
+pub const R_LAST_CHILD: usize = 0x14;
+/// 1 once the segment's own step is done and its children are linked.
+pub const R_EXPANDED: usize = 0x18;
+/// 1 once the segment refused.
+pub const R_REFUSED: usize = 0x1C;
+/// 1 once the segment's value retired.
+pub const R_RETIRED: usize = 0x20;
+/// Children linked.
+pub const R_CHILDREN: usize = 0x24;
+
+/// Row size, one per root.
+pub const ROW_STRIDE: usize = 0x18;
+/// Root id.
+pub const W_ROOT: usize = 0x00;
+/// First segment in pre-order not committed; [`ROB_NONE`] once complete.
+pub const W_CURSOR: usize = 0x04;
+/// [`ROW_COMPLETE`] and [`ROW_REFUSED`] bits, written by block 0's walk.
+pub const W_FLAGS: usize = 0x08;
+/// Complement of the lowest id that refused; 0 when none did.
+pub const W_REFUSED_COMP: usize = 0x0C;
+/// 1 once the root's value retired.
+pub const W_ROOT_RETIRED: usize = 0x10;
+/// Segments of the row committed.
+pub const W_COMMITTED: usize = 0x14;
+/// Row flag: every segment of the row committed.
+pub const ROW_COMPLETE: u32 = 1;
+/// Row flag: the row's frontier stopped at a refused segment.
+pub const ROW_REFUSED: u32 = 2;
+/// An absent segment in a ROB link.
+pub const ROB_NONE: u32 = 0xFFFF_FFFF;
 
 /// Frontier mode: one frontier across the team.
 pub const MODE_GLOBAL: u32 = 0;
@@ -169,6 +233,9 @@ pub const FAIL_BARRIER: u32 = 0xF003;
 pub const FAIL_DONE: u32 = 0xF004;
 /// Failure code: the longest generation leaves no room in the budget.
 pub const FAIL_BUDGET: u32 = 0xF005;
+/// Failure code: a segment id lies outside the ROB, or the ROB's links hold
+/// a cycle.
+pub const FAIL_ROB: u32 = 0xF006;
 
 /// Op return for a failed wave; the slot retires as an error.
 pub const STATUS_FAILED: u32 = 2;
@@ -213,6 +280,14 @@ pub enum SliceBudget {
     Fixed(Duration),
 }
 
+/// A wave's reorder buffer: a record per segment id and a row per root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RobSpec {
+    /// Records the ROB holds. Every segment id, roots included, is below
+    /// it, and it is below [`ROB_NONE`].
+    pub capacity: u32,
+}
+
 /// A wave to create.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveSpec {
@@ -236,6 +311,9 @@ pub struct WaveSpec {
     pub done_deadline: Option<Duration>,
     /// Longest generation to assume before one has been measured.
     pub longest_generation_seed: Duration,
+    /// The wave's reorder buffer, or `None` for a wave that keeps none.
+    /// Each root starts one row.
+    pub rob: Option<RobSpec>,
 }
 
 /// Where each part of a wave span sits, in bytes from the span start.
@@ -247,6 +325,10 @@ pub struct WaveLayout {
     pub id_capacity: u32,
     /// Start of the per-block table.
     pub table_off: u32,
+    /// Start of the row table, right after the per-block table.
+    pub rows_off: u32,
+    /// Rows: one per root when the wave keeps a ROB, and 0 otherwise.
+    pub row_count: u32,
     /// Start of the id array.
     pub ids_off: u32,
     /// Start of the staging array.
@@ -254,6 +336,10 @@ pub struct WaveLayout {
     /// Ids the staging array holds: the id capacity for a partition that
     /// rebalances, and 0 otherwise.
     pub staging_ids: u32,
+    /// Start of the ROB table.
+    pub rob_off: u32,
+    /// Records the ROB table holds; 0 when the wave keeps none.
+    pub rob_capacity: u32,
     /// Start of the arena.
     pub arena_off: u32,
     /// Arena bytes.
@@ -291,18 +377,35 @@ impl WaveLayout {
             Frontier::Partition { rebalance_every: Some(_) } => id_capacity,
             Frontier::Global | Frontier::Partition { rebalance_every: None } => 0,
         };
+        let (row_count, rob_capacity) = match spec.rob {
+            Some(rob) => {
+                if rob.capacity == 0 || rob.capacity == ROB_NONE {
+                    return Err(GpuPeerError::Unavailable(
+                        "a ROB's capacity must be at least 1 and below ROB_NONE",
+                    ));
+                }
+                (spec.roots.len() as u64, u64::from(rob.capacity))
+            }
+            None => (0, 0),
+        };
         let table_off = HEADER_BYTES as u64;
-        let ids_off = table_off + u64::from(width) * TABLE_STRIDE as u64;
+        let rows_off = table_off + u64::from(width) * TABLE_STRIDE as u64;
+        let ids_off = rows_off + row_count * ROW_STRIDE as u64;
         let staging_off = ids_off + id_capacity * 4;
-        let arena_off = (staging_off + staging_ids * 4).div_ceil(8) * 8;
+        let rob_off = (staging_off + staging_ids * 4).div_ceil(8) * 8;
+        let arena_off = (rob_off + rob_capacity * ROB_STRIDE as u64).div_ceil(8) * 8;
         let total = arena_off + u64::from(spec.arena_bytes);
         Ok(Self {
             width,
             id_capacity: span_offset(id_capacity)?,
             table_off: span_offset(table_off)?,
+            rows_off: span_offset(rows_off)?,
+            row_count: span_offset(row_count)?,
             ids_off: span_offset(ids_off)?,
             staging_off: span_offset(staging_off)?,
             staging_ids: span_offset(staging_ids)?,
+            rob_off: span_offset(rob_off)?,
+            rob_capacity: span_offset(rob_capacity)?,
             arena_off: span_offset(arena_off)?,
             arena_bytes: spec.arena_bytes,
             total_bytes: span_offset(total)?,
@@ -368,7 +471,8 @@ fn nanos_within(d: Duration, limit: u64, too_long: &'static str) -> Result<u64, 
     Ok(ns as u64)
 }
 
-/// The bytes of a new wave span: header, table and first generation.
+/// The bytes of a new wave span: header, table, first generation and, with
+/// a ROB, its rows and records.
 pub fn initial_span(spec: &WaveSpec, layout: &WaveLayout, budget_ns: u64) -> Result<Vec<u8>, GpuPeerError> {
     let width = layout.width;
     let barrier_ns = nanos_within(
@@ -419,6 +523,35 @@ pub fn initial_span(spec: &WaveSpec, layout: &WaveLayout, budget_ns: u64) -> Res
     put_u32(&mut span, TABLE_OFF_OFF, layout.table_off);
     put_u32(&mut span, BARRIER_DEADLINE_OFF, barrier_ns as u32);
     put_u64(&mut span, DONE_DEADLINE_NS_OFF, done_ns);
+
+    if let Some(rob) = spec.rob {
+        let mut sorted = spec.roots.clone();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(GpuPeerError::Unavailable("a ROB's roots must be distinct, one per row"));
+        }
+        if sorted.last().is_some_and(|&top| top >= rob.capacity) {
+            return Err(GpuPeerError::Unavailable("every root id must be below the ROB's capacity"));
+        }
+        put_u32(&mut span, ROB_OFF_OFF, layout.rob_off);
+        put_u32(&mut span, ROB_CAPACITY_OFF, rob.capacity);
+        put_u32(&mut span, ROWS_OFF_OFF, layout.rows_off);
+        put_u32(&mut span, ROW_COUNT_OFF, layout.row_count);
+        let records = layout.rob_off as usize;
+        for id in 0..rob.capacity as usize {
+            let r = records + id * ROB_STRIDE;
+            put_u32(&mut span, r + R_PARENT, ROB_NONE);
+            put_u32(&mut span, r + R_FIRST_CHILD, ROB_NONE);
+            put_u32(&mut span, r + R_NEXT_SIBLING, ROB_NONE);
+            put_u32(&mut span, r + R_LAST_CHILD, ROB_NONE);
+        }
+        for (row, &root) in spec.roots.iter().enumerate() {
+            put_u32(&mut span, records + root as usize * ROB_STRIDE + R_ROW, row as u32);
+            let w = layout.rows_off as usize + row * ROW_STRIDE;
+            put_u32(&mut span, w + W_ROOT, root);
+            put_u32(&mut span, w + W_CURSOR, root);
+        }
+    }
 
     let roots = spec.roots.len();
     let ids = layout.ids_off as usize;
@@ -478,7 +611,8 @@ pub struct WaveFailure {
     /// The lowest failing segment id, or `None` for a failure that belongs
     /// to no segment.
     pub segment: Option<u32>,
-    /// The largest failure code reported.
+    /// The largest failure code reported. Codes below 0xF000 are the op's
+    /// own; a `FAIL_*` code reported beside them wins.
     pub code: u32,
 }
 
@@ -533,6 +667,8 @@ pub struct WaveStats {
     pub arena_used_bytes: u32,
     /// Global frontier: ids pushed.
     pub pushed: u32,
+    /// Segments committed over every row of the wave's ROB.
+    pub rob_committed: u32,
     /// The failure, when the wave failed.
     pub failure: Option<WaveFailure>,
     /// Every block's frontier.
@@ -608,10 +744,61 @@ impl WaveStats {
             rebalance_ns: get_u64(bytes, REBALANCE_NS_OFF),
             arena_used_bytes: get_u32(bytes, ARENA_BUMP_OFF),
             pushed: get_u32(bytes, PUSH_OFF),
+            rob_committed: get_u32(bytes, ROB_COMMITTED_OFF),
             failure,
             blocks,
         })
     }
+}
+
+/// One row of a wave's ROB: a root and every segment descended from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowState {
+    /// The row's root id.
+    pub root: u32,
+    /// The first segment in the row's pre-order that has not committed;
+    /// every segment before it has. `None` once the row is complete.
+    pub committed_through: Option<u32>,
+    /// Every segment of the row has committed.
+    pub complete: bool,
+    /// The refused segment the row's commit frontier stopped at.
+    pub first_refused: Option<u32>,
+    /// The lowest id that refused anywhere in the row.
+    pub lowest_refused: Option<u32>,
+    /// The root's value has retired.
+    pub root_retired: bool,
+    /// Segments of the row committed.
+    pub committed: u32,
+}
+
+impl RowState {
+    /// Decode the row whose entry starts `at` bytes into `bytes`.
+    fn decode(bytes: &[u8], at: usize) -> Self {
+        let cursor = get_u32(bytes, at + W_CURSOR);
+        let flags = get_u32(bytes, at + W_FLAGS);
+        let comp = get_u32(bytes, at + W_REFUSED_COMP);
+        let refused = flags & ROW_REFUSED != 0;
+        Self {
+            root: get_u32(bytes, at + W_ROOT),
+            committed_through: if cursor == ROB_NONE { None } else { Some(cursor) },
+            complete: flags & ROW_COMPLETE != 0,
+            first_refused: if refused { Some(cursor) } else { None },
+            lowest_refused: if comp == 0 { None } else { Some(u32::MAX - comp) },
+            root_retired: get_u32(bytes, at + W_ROOT_RETIRED) != 0,
+            committed: get_u32(bytes, at + W_COMMITTED),
+        }
+    }
+}
+
+/// What a host-run segment reports into its wave's ROB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentReport {
+    /// Its own step is done, and every child it pushed is linked.
+    Expanded,
+    /// It refused, so its row commits nothing past it.
+    Refused,
+    /// Its value has retired.
+    Retired,
 }
 
 /// A wave pinned on a peer.
@@ -621,6 +808,8 @@ pub struct Wave {
     layout: WaveLayout,
     budget_ns: u64,
     watchdog_basis: Option<String>,
+    /// The last slice submitted against the wave.
+    in_flight: Cell<Option<Ticket>>,
 }
 
 impl Wave {
@@ -814,13 +1003,16 @@ impl GpuPeer {
         let layout = WaveLayout::new(width, spec)?;
         let bytes = initial_span(spec, &layout, budget_ns)?;
         let handle = self.pin_bulk(&bytes)?;
-        Ok(Wave { handle, layout, budget_ns, watchdog_basis })
+        Ok(Wave { handle, layout, budget_ns, watchdog_basis, in_flight: Cell::new(None) })
     }
 
     /// Run a slice of `wave` through the user opcode `op`, whose source
-    /// follows the `flw_` loop. `args` reach the op at its payload.
+    /// follows the `flw_` loop. `args` reach the op at its payload. The wave
+    /// keeps the ticket, so host pushes and reports wait until it retires.
     pub fn submit_wave(&mut self, wave: &Wave, op: u32, args: &[u8]) -> Result<Ticket, GpuPeerError> {
-        self.submit_user(op, Some(&wave.handle), args)
+        let ticket = self.submit_user(op, Some(&wave.handle), args)?;
+        wave.in_flight.set(Some(ticket));
+        Ok(ticket)
     }
 
     /// Read a wave's state from its span. Call it between slices: a slice in
@@ -835,6 +1027,227 @@ impl GpuPeer {
     /// flight.
     pub fn release_wave(&mut self, wave: Wave) -> Result<(), GpuPeerError> {
         self.unpin(wave.handle)
+    }
+
+    /// Every row of `wave`'s ROB, in root order. Call it between slices.
+    pub fn wave_rows(&mut self, wave: &Wave) -> Result<Vec<RowState>, GpuPeerError> {
+        let layout = wave.layout;
+        if layout.rob_capacity == 0 {
+            return Err(GpuPeerError::Unavailable("the wave keeps no ROB"));
+        }
+        let mut bytes = vec![0u8; layout.row_count as usize * ROW_STRIDE];
+        self.fetch_bulk_at(&wave.handle, layout.rows_off as usize, &mut bytes)?;
+        Ok((0..layout.row_count as usize)
+            .map(|row| RowState::decode(&bytes, row * ROW_STRIDE))
+            .collect())
+    }
+
+    /// Link host-run children into `wave`'s ROB and append them to its
+    /// pending frontier, as `flw_push_child` does on the device.
+    ///
+    /// Each `(parent, id)` links `id` as the next child of `parent`, so a
+    /// parent's children go in ordinal order, before the parent is reported
+    /// [`SegmentReport::Expanded`]. A global frontier takes the ids after its
+    /// pending range; a partition gives each to the block with the fewest
+    /// pending ids that has room. Refused while the wave's last submitted
+    /// slice has not retired.
+    pub fn push_wave_segments(&mut self, wave: &Wave, children: &[(u32, u32)]) -> Result<(), GpuPeerError> {
+        self.wave_idle(wave)?;
+        let layout = wave.layout;
+        if layout.rob_capacity == 0 {
+            return Err(GpuPeerError::Unavailable("the wave keeps no ROB"));
+        }
+        let mut prefix = vec![0u8; layout.rows_off as usize];
+        self.fetch_bulk(&wave.handle, &mut prefix)?;
+
+        let mut records = BTreeMap::new();
+        for &(parent, id) in children {
+            if parent == id {
+                return Err(GpuPeerError::Unavailable("a segment cannot be its own child"));
+            }
+            let (ordinal, row, last) = {
+                let p = self.rob_record(wave, &mut records, parent)?;
+                (get_u32(&p[..], R_CHILDREN), get_u32(&p[..], R_ROW), get_u32(&p[..], R_LAST_CHILD))
+            };
+            let child = self.rob_record(wave, &mut records, id)?;
+            put_u32(&mut child[..], R_PARENT, parent);
+            put_u32(&mut child[..], R_ORDINAL, ordinal);
+            put_u32(&mut child[..], R_ROW, row);
+            if ordinal == 0 {
+                let p = self.rob_record(wave, &mut records, parent)?;
+                put_u32(&mut p[..], R_FIRST_CHILD, id);
+            } else {
+                let previous = self.rob_record(wave, &mut records, last)?;
+                put_u32(&mut previous[..], R_NEXT_SIBLING, id);
+            }
+            let p = self.rob_record(wave, &mut records, parent)?;
+            put_u32(&mut p[..], R_LAST_CHILD, id);
+            put_u32(&mut p[..], R_CHILDREN, ordinal + 1);
+        }
+
+        // Runs of ids to write into the id array, each from its first index.
+        let mut runs: Vec<(usize, Vec<u32>)> = Vec::new();
+        if get_u32(&prefix, MODE_OFF) == MODE_GLOBAL {
+            let push = get_u32(&prefix, PUSH_OFF);
+            let end = get_u32(&prefix, END_OFF);
+            if push != end {
+                return Err(GpuPeerError::Unavailable(
+                    "the wave's frontier holds pushes past its range, so it is not between slices",
+                ));
+            }
+            if push as usize + children.len() > layout.id_capacity as usize {
+                return Err(GpuPeerError::Unavailable("the host push exceeds the wave's id capacity"));
+            }
+            let added = children.len() as u32;
+            put_u32(&mut prefix, PUSH_OFF, push + added);
+            put_u32(&mut prefix, END_OFF, end + added);
+            runs.push((push as usize, children.iter().map(|&(_, id)| id).collect()));
+        } else {
+            let width = layout.width as usize;
+            let per_block = (layout.id_capacity / layout.width) as usize;
+            let entry = |b: usize| layout.table_off as usize + b * TABLE_STRIDE;
+            if (0..width).any(|b| get_u32(&prefix, entry(b) + T_PUSH) != get_u32(&prefix, entry(b) + T_END)) {
+                return Err(GpuPeerError::Unavailable(
+                    "a block's frontier holds pushes past its range, so the wave is not between slices",
+                ));
+            }
+            let starts: Vec<usize> = (0..width).map(|b| get_u32(&prefix, entry(b) + T_END) as usize).collect();
+            let mut added: Vec<Vec<u32>> = vec![Vec::new(); width];
+            for &(_, id) in children {
+                let mut best: Option<(usize, u32)> = None;
+                for b in 0..width {
+                    let end = get_u32(&prefix, entry(b) + T_END);
+                    if end as usize >= per_block {
+                        continue;
+                    }
+                    let pending = end.saturating_sub(get_u32(&prefix, entry(b) + T_START));
+                    if best.is_none_or(|(_, least)| pending < least) {
+                        best = Some((b, pending));
+                    }
+                }
+                let Some((b, _)) = best else {
+                    return Err(GpuPeerError::Unavailable("every block's share of the wave's ids is full"));
+                };
+                let end = get_u32(&prefix, entry(b) + T_END);
+                put_u32(&mut prefix, entry(b) + T_END, end + 1);
+                put_u32(&mut prefix, entry(b) + T_PUSH, end + 1);
+                put_u32(&mut prefix, entry(b) + T_EMPTY, 0);
+                added[b].push(id);
+            }
+            for (b, ids) in added.into_iter().enumerate() {
+                if !ids.is_empty() {
+                    runs.push((b * per_block + starts[b], ids));
+                }
+            }
+        }
+
+        self.write_rob_records(wave, &records)?;
+        for (first, ids) in &runs {
+            let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            self.write_resident_bulk_at(&wave.handle, layout.ids_off as usize + first * 4, &bytes)?;
+        }
+        self.write_resident_bulk(&wave.handle, &prefix)
+    }
+
+    /// Record what host-run segments of `wave` did, as `flw_rob_expanded`,
+    /// `flw_rob_refuse` and `flw_rob_retired` do on the device. The rows move
+    /// at block 0's next walk, so a slice submitted with nothing pending
+    /// walks them and returns. Refused while the wave's last submitted slice
+    /// has not retired.
+    pub fn report_wave_segments(
+        &mut self,
+        wave: &Wave,
+        reports: &[(u32, SegmentReport)],
+    ) -> Result<(), GpuPeerError> {
+        self.wave_idle(wave)?;
+        let layout = wave.layout;
+        if layout.rob_capacity == 0 {
+            return Err(GpuPeerError::Unavailable("the wave keeps no ROB"));
+        }
+        let mut rows = vec![0u8; layout.row_count as usize * ROW_STRIDE];
+        self.fetch_bulk_at(&wave.handle, layout.rows_off as usize, &mut rows)?;
+        let mut records = BTreeMap::new();
+        for &(id, report) in reports {
+            let record = self.rob_record(wave, &mut records, id)?;
+            let row = get_u32(&record[..], R_ROW);
+            if row >= layout.row_count {
+                return Err(GpuPeerError::Unavailable("a segment's record names no row of the wave"));
+            }
+            let at = row as usize * ROW_STRIDE;
+            let root = get_u32(&rows, at + W_ROOT) == id;
+            if get_u32(&record[..], R_PARENT) == ROB_NONE && !root {
+                return Err(GpuPeerError::Unavailable("a reported segment was never linked into the wave's ROB"));
+            }
+            match report {
+                SegmentReport::Expanded => put_u32(&mut record[..], R_EXPANDED, 1),
+                SegmentReport::Refused => {
+                    put_u32(&mut record[..], R_REFUSED, 1);
+                    let comp = u32::MAX - id;
+                    if comp > get_u32(&rows, at + W_REFUSED_COMP) {
+                        put_u32(&mut rows, at + W_REFUSED_COMP, comp);
+                    }
+                }
+                SegmentReport::Retired => {
+                    put_u32(&mut record[..], R_RETIRED, 1);
+                    if root {
+                        put_u32(&mut rows, at + W_ROOT_RETIRED, 1);
+                    }
+                }
+            }
+        }
+        self.write_rob_records(wave, &records)?;
+        self.write_resident_bulk_at(&wave.handle, layout.rows_off as usize, &rows)
+    }
+
+    /// An error while the wave's last submitted slice has not retired.
+    fn wave_idle(&self, wave: &Wave) -> Result<(), GpuPeerError> {
+        match wave.in_flight.get() {
+            Some(ticket) if !self.is_done(ticket) => {
+                Err(GpuPeerError::Unavailable("a slice of this wave has not retired"))
+            }
+            Some(_) | None => Ok(()),
+        }
+    }
+
+    /// The ROB record for `id`, read from the span on first use and kept in
+    /// `records` for the host's edits.
+    fn rob_record<'a>(
+        &mut self,
+        wave: &Wave,
+        records: &'a mut BTreeMap<u32, [u8; ROB_STRIDE]>,
+        id: u32,
+    ) -> Result<&'a mut [u8; ROB_STRIDE], GpuPeerError> {
+        if id >= wave.layout.rob_capacity {
+            return Err(GpuPeerError::Unavailable("a segment id lies outside the wave's ROB"));
+        }
+        match records.entry(id) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                let mut record = [0u8; ROB_STRIDE];
+                self.fetch_bulk_at(
+                    &wave.handle,
+                    wave.layout.rob_off as usize + id as usize * ROB_STRIDE,
+                    &mut record,
+                )?;
+                Ok(entry.insert(record))
+            }
+        }
+    }
+
+    /// Write every record in `records` back to `wave`'s span.
+    fn write_rob_records(
+        &mut self,
+        wave: &Wave,
+        records: &BTreeMap<u32, [u8; ROB_STRIDE]>,
+    ) -> Result<(), GpuPeerError> {
+        for (&id, record) in records {
+            self.write_resident_bulk_at(
+                &wave.handle,
+                wave.layout.rob_off as usize + id as usize * ROB_STRIDE,
+                record,
+            )?;
+        }
+        Ok(())
     }
 
     /// The wave costs for this device at this team size, from
@@ -931,6 +1344,7 @@ impl GpuPeer {
             barrier_deadline: Duration::from_millis(50),
             done_deadline: Some(Duration::from_secs(2)),
             longest_generation_seed: Duration::ZERO,
+            rob: None,
         };
         let mut walls = Vec::with_capacity(CALIBRATION_REPEATS);
         let mut elapsed = Vec::with_capacity(CALIBRATION_REPEATS);
@@ -1158,6 +1572,11 @@ mod tests {
             ("FLW_MOVED_OFF", MOVED_OFF as u64),
             ("FLW_ELAPSED_NS_OFF", ELAPSED_NS_OFF as u64),
             ("FLW_REBALANCE_NS_OFF", REBALANCE_NS_OFF as u64),
+            ("FLW_ROB_OFF_OFF", ROB_OFF_OFF as u64),
+            ("FLW_ROB_CAPACITY_OFF", ROB_CAPACITY_OFF as u64),
+            ("FLW_ROWS_OFF_OFF", ROWS_OFF_OFF as u64),
+            ("FLW_ROW_COUNT_OFF", ROW_COUNT_OFF as u64),
+            ("FLW_ROB_COMMITTED_OFF", ROB_COMMITTED_OFF as u64),
             ("FLW_HEADER_BYTES", HEADER_BYTES as u64),
             ("FLW_TABLE_STRIDE", TABLE_STRIDE as u64),
             ("FLW_T_PUSH", T_PUSH as u64),
@@ -1171,6 +1590,27 @@ mod tests {
             ("FLW_T_TOTAL", T_TOTAL as u64),
             ("FLW_T_DEAL_LO", T_DEAL_LO as u64),
             ("FLW_T_DEAL_HI", T_DEAL_HI as u64),
+            ("FLW_ROB_STRIDE", ROB_STRIDE as u64),
+            ("FLW_R_PARENT", R_PARENT as u64),
+            ("FLW_R_ORDINAL", R_ORDINAL as u64),
+            ("FLW_R_ROW", R_ROW as u64),
+            ("FLW_R_FIRST_CHILD", R_FIRST_CHILD as u64),
+            ("FLW_R_NEXT_SIBLING", R_NEXT_SIBLING as u64),
+            ("FLW_R_LAST_CHILD", R_LAST_CHILD as u64),
+            ("FLW_R_EXPANDED", R_EXPANDED as u64),
+            ("FLW_R_REFUSED", R_REFUSED as u64),
+            ("FLW_R_RETIRED", R_RETIRED as u64),
+            ("FLW_R_CHILDREN", R_CHILDREN as u64),
+            ("FLW_ROW_STRIDE", ROW_STRIDE as u64),
+            ("FLW_W_ROOT", W_ROOT as u64),
+            ("FLW_W_CURSOR", W_CURSOR as u64),
+            ("FLW_W_FLAGS", W_FLAGS as u64),
+            ("FLW_W_REFUSED_COMP", W_REFUSED_COMP as u64),
+            ("FLW_W_ROOT_RETIRED", W_ROOT_RETIRED as u64),
+            ("FLW_W_COMMITTED", W_COMMITTED as u64),
+            ("FLW_ROW_COMPLETE", u64::from(ROW_COMPLETE)),
+            ("FLW_ROW_REFUSED", u64::from(ROW_REFUSED)),
+            ("FLW_ROB_NONE", u64::from(ROB_NONE)),
             ("FLW_MODE_GLOBAL", u64::from(MODE_GLOBAL)),
             ("FLW_MODE_PARTITION", u64::from(MODE_PARTITION)),
             ("FLW_RESUME_DEVICE", u64::from(RESUME_DEVICE)),
@@ -1186,6 +1626,7 @@ mod tests {
             ("FLW_FAIL_BARRIER", u64::from(FAIL_BARRIER)),
             ("FLW_FAIL_DONE", u64::from(FAIL_DONE)),
             ("FLW_FAIL_BUDGET", u64::from(FAIL_BUDGET)),
+            ("FLW_FAIL_ROB", u64::from(FAIL_ROB)),
             ("FLW_STATUS_FAILED", u64::from(STATUS_FAILED)),
             ("FLW_STATUS_BAD_SPAN", u64::from(STATUS_BAD_SPAN)),
         ];
@@ -1211,6 +1652,7 @@ mod tests {
             barrier_deadline: Duration::from_millis(2),
             done_deadline: None,
             longest_generation_seed: Duration::ZERO,
+            rob: None,
         }
     }
 
@@ -1382,5 +1824,91 @@ mod tests {
 
         let every = costs.plan_inputs(&stats, Frontier::Partition { rebalance_every: NonZeroU32::new(4) });
         assert_eq!(every.imbalance.map(|i| i.over_generations), Some(4));
+    }
+
+    fn rob_spec(roots: Vec<u32>, capacity: u32) -> WaveSpec {
+        let mut s = spec(Frontier::Global, 0, 64);
+        s.roots = roots;
+        s.rob = Some(RobSpec { capacity });
+        s
+    }
+
+    #[test]
+    fn a_rob_layout_places_rows_after_the_table_and_records_before_the_arena() {
+        let layout = WaveLayout::new(2, &rob_spec(vec![0, 5, 9], 16)).expect("fits");
+        assert_eq!(layout.rows_off as usize, HEADER_BYTES + 2 * TABLE_STRIDE);
+        assert_eq!(layout.row_count, 3);
+        assert_eq!(layout.ids_off, layout.rows_off + 3 * ROW_STRIDE as u32);
+        assert_eq!(layout.rob_capacity, 16);
+        assert!(layout.rob_off >= layout.staging_off + layout.staging_ids * 4);
+        assert_eq!(layout.rob_off % 8, 0);
+        assert_eq!(layout.arena_off, (layout.rob_off + 16 * ROB_STRIDE as u32).div_ceil(8) * 8);
+
+        let plain = WaveLayout::new(2, &spec(Frontier::Global, 3, 64)).expect("fits");
+        assert_eq!((plain.row_count, plain.rob_capacity), (0, 0));
+        assert_eq!(plain.ids_off, plain.rows_off, "a wave without a ROB has no rows");
+    }
+
+    #[test]
+    fn a_rob_span_starts_each_row_at_its_root_with_every_link_empty() {
+        let s = rob_spec(vec![4, 1], 8);
+        let layout = WaveLayout::new(1, &s).expect("fits");
+        let span = initial_span(&s, &layout, 0).expect("encodes");
+        assert_eq!(get_u32(&span, ROB_OFF_OFF), layout.rob_off);
+        assert_eq!(get_u32(&span, ROB_CAPACITY_OFF), 8);
+        assert_eq!(get_u32(&span, ROWS_OFF_OFF), layout.rows_off);
+        assert_eq!(get_u32(&span, ROW_COUNT_OFF), 2);
+        for (row, root) in [(0usize, 4u32), (1, 1)] {
+            let state = RowState::decode(&span, layout.rows_off as usize + row * ROW_STRIDE);
+            assert_eq!(state.root, root);
+            assert_eq!(state.committed_through, Some(root));
+            assert!(!state.complete && !state.root_retired);
+            assert_eq!((state.first_refused, state.lowest_refused, state.committed), (None, None, 0));
+            let r = layout.rob_off as usize + root as usize * ROB_STRIDE;
+            assert_eq!(get_u32(&span, r + R_ROW), row as u32);
+        }
+        for id in 0..8usize {
+            let r = layout.rob_off as usize + id * ROB_STRIDE;
+            for field in [R_PARENT, R_FIRST_CHILD, R_NEXT_SIBLING, R_LAST_CHILD] {
+                assert_eq!(get_u32(&span, r + field), ROB_NONE, "record {id} field {field:#x}");
+            }
+            assert_eq!(get_u32(&span, r + R_EXPANDED), 0);
+        }
+    }
+
+    #[test]
+    fn a_rob_refuses_repeated_roots_roots_past_its_capacity_and_an_unusable_capacity() {
+        let repeated = rob_spec(vec![2, 2], 8);
+        let layout = WaveLayout::new(1, &repeated).expect("fits");
+        assert!(initial_span(&repeated, &layout, 0).is_err());
+        let past = rob_spec(vec![8], 8);
+        let layout = WaveLayout::new(1, &past).expect("fits");
+        assert!(initial_span(&past, &layout, 0).is_err());
+        assert!(WaveLayout::new(1, &rob_spec(vec![0], 0)).is_err());
+        assert!(WaveLayout::new(1, &rob_spec(vec![0], ROB_NONE)).is_err());
+    }
+
+    #[test]
+    fn a_row_decodes_its_frontier_refusals_and_retired_root() {
+        let mut bytes = vec![0u8; ROW_STRIDE];
+        put_u32(&mut bytes, W_ROOT, 3);
+        put_u32(&mut bytes, W_CURSOR, 11);
+        put_u32(&mut bytes, W_FLAGS, ROW_REFUSED);
+        put_u32(&mut bytes, W_REFUSED_COMP, u32::MAX - 9);
+        put_u32(&mut bytes, W_ROOT_RETIRED, 1);
+        put_u32(&mut bytes, W_COMMITTED, 4);
+        let row = RowState::decode(&bytes, 0);
+        assert_eq!(row.committed_through, Some(11));
+        assert_eq!(row.first_refused, Some(11));
+        assert_eq!(row.lowest_refused, Some(9));
+        assert!(row.root_retired && !row.complete);
+        assert_eq!(row.committed, 4);
+
+        put_u32(&mut bytes, W_CURSOR, ROB_NONE);
+        put_u32(&mut bytes, W_FLAGS, ROW_COMPLETE);
+        put_u32(&mut bytes, W_REFUSED_COMP, 0);
+        let row = RowState::decode(&bytes, 0);
+        assert_eq!((row.committed_through, row.first_refused, row.lowest_refused), (None, None, None));
+        assert!(row.complete);
     }
 }

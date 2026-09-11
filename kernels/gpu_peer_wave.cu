@@ -43,6 +43,14 @@
 //       flw_generation_end(&s);
 //   }
 //   return flw_slice_end(&s);
+//
+// A wave may keep a reorder buffer: a record per segment id below
+// FLW_ROB_CAPACITY_OFF and a row per root. The thread running a segment
+// links each child with flw_push_child, in ordinal order, then calls
+// flw_rob_expanded; a segment that refuses calls flw_rob_refuse, and one
+// whose value has retired calls flw_rob_retired. Block 0 commits every row
+// in pre-order over (parent, ordinal), up to its first segment still
+// pending or refused.
 
 // ----------------------------------------------------------------- header
 
@@ -87,6 +95,11 @@
 #define FLW_MOVED_OFF             0x94u   // pending ids moved through staging by rebalances
 #define FLW_ELAPSED_NS_OFF        0x98u   // u64: slice time summed on block 0, ns
 #define FLW_REBALANCE_NS_OFF      0xA0u   // u64: block 0's time in rebalances that moved ids, ns
+#define FLW_ROB_OFF_OFF           0xA8u   // byte offset of the ROB table; 0 = no ROB
+#define FLW_ROB_CAPACITY_OFF      0xACu   // ROB records; every segment id is below it
+#define FLW_ROWS_OFF_OFF          0xB0u   // byte offset of the row table
+#define FLW_ROW_COUNT_OFF         0xB4u   // rows, one per root
+#define FLW_ROB_COMMITTED_OFF     0xB8u   // segments committed over every row
 #define FLW_HEADER_BYTES          0x100u
 
 // Per-block table, one FLW_TABLE_STRIDE entry per block.
@@ -103,6 +116,31 @@
 #define FLW_T_DEAL_LO             0x24u   // rebalance: staging start dealt to the block
 #define FLW_T_DEAL_HI             0x28u   // rebalance: staging end dealt to the block
 
+// ROB record, one FLW_ROB_STRIDE entry per segment id.
+#define FLW_ROB_STRIDE            0x28u
+#define FLW_R_PARENT              0x00u   // parent id; FLW_ROB_NONE for a root or an id never linked
+#define FLW_R_ORDINAL             0x04u   // index among the parent's children
+#define FLW_R_ROW                 0x08u   // the row the segment belongs to
+#define FLW_R_FIRST_CHILD         0x0Cu   // child with ordinal 0; FLW_ROB_NONE for none
+#define FLW_R_NEXT_SIBLING        0x10u   // the parent's next child; FLW_ROB_NONE after the last
+#define FLW_R_LAST_CHILD          0x14u   // most recently linked child
+#define FLW_R_EXPANDED            0x18u   // 1 once the segment's own step is done and its children linked
+#define FLW_R_REFUSED             0x1Cu   // 1 once the segment refused
+#define FLW_R_RETIRED             0x20u   // 1 once the segment's value retired
+#define FLW_R_CHILDREN            0x24u   // children linked
+
+// Row, one FLW_ROW_STRIDE entry per root.
+#define FLW_ROW_STRIDE            0x18u
+#define FLW_W_ROOT                0x00u   // root id
+#define FLW_W_CURSOR              0x04u   // first segment in pre-order not committed; FLW_ROB_NONE once complete
+#define FLW_W_FLAGS               0x08u   // FLW_ROW_* bits, written by block 0's walk only
+#define FLW_W_REFUSED_COMP        0x0Cu   // complement of the lowest id that refused; 0 = none
+#define FLW_W_ROOT_RETIRED        0x10u   // 1 once the root's value retired
+#define FLW_W_COMMITTED           0x14u   // segments of the row committed
+#define FLW_ROW_COMPLETE          1u
+#define FLW_ROW_REFUSED           2u
+#define FLW_ROB_NONE              0xFFFFFFFFu
+
 #define FLW_MODE_GLOBAL           0u
 #define FLW_MODE_PARTITION        1u
 #define FLW_RESUME_DEVICE         0u
@@ -114,12 +152,18 @@
 #define FLW_SLICE_FINISHED        3u
 #define FLW_SLICE_FAILED          4u
 
+// Failure codes. flw_fail keeps the largest code reported, so codes below
+// 0xF000 are the op's own, and an FLW_FAIL_* code reported beside them wins.
+// FLW_FAIL_ROB marks a broken ROB invariant (an id outside the ROB, or a
+// cycle in its links), never a program's verdict: a program refuses through
+// flw_rob_refuse.
 #define FLW_NO_SEGMENT            0xFFFFFFFEu
 #define FLW_FAIL_IDS              0xF001u
 #define FLW_FAIL_ARENA            0xF002u
 #define FLW_FAIL_BARRIER          0xF003u
 #define FLW_FAIL_DONE             0xF004u
 #define FLW_FAIL_BUDGET           0xF005u
+#define FLW_FAIL_ROB              0xF006u
 
 #define FLW_STATUS_FAILED         2u
 #define FLW_STATUS_BAD_SPAN       3u
@@ -293,6 +337,147 @@ __device__ __forceinline__ u32 flw_stride(flw_slice* s)
     return s->mode == FLW_MODE_GLOBAL ? s->width * blockDim.x : blockDim.x;
 }
 
+// -------------------------------------------------------------------- ROB
+
+// Records the wave's ROB holds, or 0 when it keeps none.
+__device__ __forceinline__ u32 flw_rob_capacity(flw_slice* s)
+{
+    return flw_get(s->base, FLW_ROB_OFF_OFF) == 0u ? 0u : flw_get(s->base, FLW_ROB_CAPACITY_OFF);
+}
+
+__device__ __forceinline__ u32* flw_rec(flw_slice* s, u32 id, u32 field)
+{
+    return (u32*)(s->base + flw_get(s->base, FLW_ROB_OFF_OFF) + (u64)id * FLW_ROB_STRIDE + field);
+}
+
+__device__ __forceinline__ u32* flw_row(flw_slice* s, u32 row, u32 field)
+{
+    return (u32*)(s->base + flw_get(s->base, FLW_ROWS_OFF_OFF) + (u64)row * FLW_ROW_STRIDE + field);
+}
+
+// Links `id` into the ROB as the next child of `parent`, in the parent's
+// row, and appends it to the next generation with flw_push. The one thread
+// running `parent` links all of its children, in ordinal order, before
+// flw_rob_expanded(parent). Returns flw_push's position, or 0xFFFFFFFF with
+// the wave failed when either id lies outside the ROB.
+__device__ __forceinline__ u32 flw_push_child(flw_slice* s, u32 parent, u32 id)
+{
+    u32 cap = flw_rob_capacity(s);
+    if (parent >= cap || id >= cap || parent == id) {
+        flw_fail(s, FLW_NO_SEGMENT, FLW_FAIL_ROB);
+        return 0xFFFFFFFFu;
+    }
+    u32 ordinal = flw_ld(flw_rec(s, parent, FLW_R_CHILDREN));
+    flw_st(flw_rec(s, id, FLW_R_PARENT), parent);
+    flw_st(flw_rec(s, id, FLW_R_ORDINAL), ordinal);
+    flw_st(flw_rec(s, id, FLW_R_ROW), flw_ld(flw_rec(s, parent, FLW_R_ROW)));
+    if (ordinal == 0u) {
+        flw_st(flw_rec(s, parent, FLW_R_FIRST_CHILD), id);
+    } else {
+        flw_st(flw_rec(s, flw_ld(flw_rec(s, parent, FLW_R_LAST_CHILD)), FLW_R_NEXT_SIBLING), id);
+    }
+    flw_st(flw_rec(s, parent, FLW_R_LAST_CHILD), id);
+    flw_st(flw_rec(s, parent, FLW_R_CHILDREN), ordinal + 1u);
+    return flw_push(s, id);
+}
+
+// The row of a ROB record, or FLW_ROB_NONE with the wave failed when `id`
+// lies outside the ROB or its record names no row.
+__device__ __forceinline__ u32 flw_rob_row(flw_slice* s, u32 id)
+{
+    if (id >= flw_rob_capacity(s)) {
+        flw_fail(s, FLW_NO_SEGMENT, FLW_FAIL_ROB);
+        return FLW_ROB_NONE;
+    }
+    u32 row = flw_ld(flw_rec(s, id, FLW_R_ROW));
+    if (row >= flw_get(s->base, FLW_ROW_COUNT_OFF)) {
+        flw_fail(s, id, FLW_FAIL_ROB);
+        return FLW_ROB_NONE;
+    }
+    return row;
+}
+
+// Marks `id`'s own step done, with every child it has linked.
+__device__ __forceinline__ void flw_rob_expanded(flw_slice* s, u32 id)
+{
+    if (flw_rob_row(s, id) == FLW_ROB_NONE) return;
+    flw_st(flw_rec(s, id, FLW_R_EXPANDED), 1u);
+}
+
+// Marks `id` refused: its row commits nothing past it in pre-order, and the
+// row keeps the lowest id that refused.
+__device__ __forceinline__ void flw_rob_refuse(flw_slice* s, u32 id)
+{
+    u32 row = flw_rob_row(s, id);
+    if (row == FLW_ROB_NONE) return;
+    flw_st(flw_rec(s, id, FLW_R_REFUSED), 1u);
+    atomicMax(flw_row(s, row, FLW_W_REFUSED_COMP), 0xFFFFFFFFu - id);
+}
+
+// Marks `id`'s value retired. For a row's root, the row's value is ready.
+__device__ __forceinline__ void flw_rob_retired(flw_slice* s, u32 id)
+{
+    u32 row = flw_rob_row(s, id);
+    if (row == FLW_ROB_NONE) return;
+    flw_st(flw_rec(s, id, FLW_R_RETIRED), 1u);
+    if (flw_ld(flw_row(s, row, FLW_W_ROOT)) == id) {
+        flw_st(flw_row(s, row, FLW_W_ROOT_RETIRED), 1u);
+    }
+}
+
+// On block 0's thread 0, while no other block writes the ROB: commits each
+// open row's expanded segments in pre-order, from its cursor up to the first
+// segment still pending or refused. A row whose pre-order runs out is
+// complete; one stopped at a refused segment is refused there. A walk that
+// takes more steps than a tree of the ROB's size allows has met a cycle or
+// a link outside the ROB, and fails the wave.
+__device__ __forceinline__ void flw_rob_walk(flw_slice* s)
+{
+    u32 cap = flw_rob_capacity(s);
+    if (cap == 0u) return;
+    u32 rows = flw_get(s->base, FLW_ROW_COUNT_OFF);
+    u64 steps = 0ull;
+    u64 limit = 2ull * (u64)cap + (u64)rows;
+    u32 all = 0u;
+    for (u32 r = 0u; r < rows; r++) {
+        u32 flags = flw_ld(flw_row(s, r, FLW_W_FLAGS));
+        if (flags != 0u) continue;
+        u32 node = flw_ld(flw_row(s, r, FLW_W_CURSOR));
+        u32 committed = 0u;
+        while (node != FLW_ROB_NONE) {
+            steps++;
+            if (node >= cap || steps > limit) {
+                flw_fail(s, FLW_NO_SEGMENT, FLW_FAIL_ROB);
+                return;
+            }
+            if (flw_ld(flw_rec(s, node, FLW_R_REFUSED)) != 0u) {
+                flags = FLW_ROW_REFUSED;
+                break;
+            }
+            if (flw_ld(flw_rec(s, node, FLW_R_EXPANDED)) == 0u) break;
+            committed++;
+            u32 next = flw_ld(flw_rec(s, node, FLW_R_FIRST_CHILD));
+            u32 up = node;
+            while (next == FLW_ROB_NONE && up != FLW_ROB_NONE) {
+                steps++;
+                if (up >= cap || steps > limit) {
+                    flw_fail(s, FLW_NO_SEGMENT, FLW_FAIL_ROB);
+                    return;
+                }
+                next = flw_ld(flw_rec(s, up, FLW_R_NEXT_SIBLING));
+                if (next == FLW_ROB_NONE) up = flw_ld(flw_rec(s, up, FLW_R_PARENT));
+            }
+            node = next;
+        }
+        if (node == FLW_ROB_NONE) flags = FLW_ROW_COMPLETE;
+        flw_st(flw_row(s, r, FLW_W_CURSOR), node);
+        flw_st(flw_row(s, r, FLW_W_COMMITTED), flw_ld(flw_row(s, r, FLW_W_COMMITTED)) + committed);
+        flw_st(flw_row(s, r, FLW_W_FLAGS), flags);
+        all += committed;
+    }
+    flw_set(s->base, FLW_ROB_COMMITTED_OFF, flw_get(s->base, FLW_ROB_COMMITTED_OFF) + all);
+}
+
 // ------------------------------------------------------------ coordination
 
 // Ids pushed for block `blk`, bounded by the region's capacity.
@@ -309,14 +494,27 @@ __device__ __forceinline__ u32 flw_pushed(flw_slice* s, u32 blk)
 // the wait. Returns 1 when the round completed; on the deadline the wave is
 // marked failed and 0 is returned. The block's stores are fenced first, so
 // a block that reads them after the round reads what this one wrote.
-__device__ __forceinline__ u32 flw_barrier(flw_slice* s, u32 first_of_slice)
+//
+// With `walk` set, block 0 of a wave with a ROB first waits until every
+// other block has arrived in this round, walks the rows while those blocks
+// wait, and only then arrives. Their deadlines cover the walk.
+__device__ __forceinline__ u32 flw_barrier(flw_slice* s, u32 first_of_slice, u32 walk)
 {
     unsigned char* b = s->base;
     __threadfence_system();
     u64 t0 = gtimer();
+    u64 deadline = (u64)flw_get(b, FLW_BARRIER_DEADLINE_OFF);
+    if (walk != 0u && s->rank == 0u && flw_rob_capacity(s) != 0u) {
+        u32 seen = atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u);
+        u32 last = (seen / s->width + 1u) * s->width - 1u;
+        while (atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u) < last && gtimer() - t0 <= deadline) {
+        }
+        if (atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u) == last) {
+            flw_rob_walk(s);
+        }
+    }
     u32 mine = atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 1u) + 1u;
     u32 goal = ((mine + s->width - 1u) / s->width) * s->width;
-    u64 deadline = (u64)flw_get(b, FLW_BARRIER_DEADLINE_OFF);
     u32 whole = 1u;
     while (atomicAdd(flw_u32(b, FLW_ARRIVE_OFF), 0u) < goal) {
         if (gtimer() - t0 > deadline) {
@@ -397,7 +595,7 @@ __device__ __forceinline__ u32 flw_slice_begin(flw_slice* s, unsigned char* base
 
         u32 go;
         if (s->coupled != 0u) {
-            u32 whole = flw_barrier(s, 1u);
+            u32 whole = flw_barrier(s, 1u, 0u);
             u32 any = 0u;
             for (u32 k = 0u; k < team_size; k++) {
                 if (flw_tget(s, k, FLW_T_EMPTY) == 0u) any = 1u;
@@ -441,7 +639,7 @@ __device__ __forceinline__ void flw_rebalance(flw_slice* s)
         if (me == 0u) {
             flw_set(b, FLW_STOP_OFF, flw_should_stop(s, now, s->rebalance));
         }
-        u32 whole = flw_barrier(s, 0u);
+        u32 whole = flw_barrier(s, 0u, 1u);
         u32 prefix = 0u;
         u32 total = 0u;
         u32 largest = 0u;
@@ -478,7 +676,7 @@ __device__ __forceinline__ void flw_rebalance(flw_slice* s)
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        u32 whole = flw_barrier(s, 0u);
+        u32 whole = flw_barrier(s, 0u, 0u);
         u32 total = flw_tget(s, me, FLW_T_TOTAL);
         flw_tset(s, me, FLW_T_DEAL_LO, (u32)((u64)me * (u64)total / (u64)w));
         flw_tset(s, me, FLW_T_DEAL_HI, (u32)((u64)(me + 1u) * (u64)total / (u64)w));
@@ -534,6 +732,7 @@ __device__ __forceinline__ void flw_generation_end(flw_slice* s)
     u32 next_gen = s->local_gen + 1u;
     u32 rebalancing = (s->mode == FLW_MODE_PARTITION && s->rebalance != 0u
                        && next_gen % s->rebalance == 0u) ? 1u : 0u;
+    __threadfence_system();
     __syncthreads();
 
     if (rebalancing != 0u) {
@@ -549,7 +748,7 @@ __device__ __forceinline__ void flw_generation_end(flw_slice* s)
                 if (me == 0u) {
                     flw_set(b, FLW_STOP_OFF, flw_should_stop(s, now, 1u));
                 }
-                u32 whole = flw_barrier(s, 0u);
+                u32 whole = flw_barrier(s, 0u, 1u);
                 if (me == 0u) {
                     // Each block's share of this generation's children,
                     // readable now that every block has arrived.
@@ -612,6 +811,7 @@ __device__ __forceinline__ u32 flw_slice_end(flw_slice* s)
 {
     unsigned char* b = s->base;
     u32 result = 0u;
+    __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence_system();
@@ -625,6 +825,9 @@ __device__ __forceinline__ u32 flw_slice_end(flw_slice* s)
                     flw_fail(s, FLW_NO_SEGMENT, FLW_FAIL_DONE);
                     break;
                 }
+            }
+            if (atomicAdd(flw_u32(b, FLW_DONE_OFF), 0u) >= goal) {
+                flw_rob_walk(s);
             }
             u32 finished = 1u;
             for (u32 k = 0u; k < s->width; k++) {
