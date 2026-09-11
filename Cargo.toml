@@ -187,6 +187,9 @@ name = "trace_mailbox_hang"
 name = "adaptive_dispatcher_demo"
 
 [[example]]
+name = "class_migration_under_load"
+
+[[example]]
 name = "backend_dispatch_demo"
 
 [[example]]
