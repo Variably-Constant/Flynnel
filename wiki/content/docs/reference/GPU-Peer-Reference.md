@@ -422,9 +422,9 @@ covers:
 
 `wave::plan::plan` prices three frontiers per generation:
 - **Global:** one barrier.
-- **Partition rebalancing every N:** a rebalance (two barriers and a copy
-  of every pending id) spread over N, plus the capacity idled as block
-  frontiers diverge.
+- **Partition rebalancing every N:** a rebalance (its calibrated fixed
+  cost, which holds its two barriers, and a copy of every pending id)
+  spread over N, plus the capacity idled as block frontiers diverge.
 - **Partition that never rebalances:** the idling alone.
 
 How the model works:
@@ -433,6 +433,9 @@ How the model works:
 - **Idling.** A team whose largest frontier is `r` times the mean idles
   `1 - 1/r`, averaged to half across an interval.
 - **No observation.** The plan is a global frontier.
+- **One-generation interval.** When the cheapest partition rebalances
+  every generation, the plan is a global frontier, which also meets
+  every generation but copies nothing.
 
 Measured with the barrier probe on an RTX 5070 with 48 SMs (medians,
 forward and reverse passes, counters in VRAM, 64 generations):

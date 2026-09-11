@@ -89,7 +89,9 @@ fn partition_cost(inputs: &PlanInputs, g: f64, n: f64) -> f64 {
     rebalance / n + inputs.generation_ns * (1.0 - 1.0 / r) / 2.0
 }
 
-/// The frontier the model prices cheapest for these inputs.
+/// The frontier the model prices cheapest for these inputs. When the
+/// cheapest partition rebalances every generation, the plan is a global
+/// frontier.
 pub fn plan(inputs: &PlanInputs) -> Plan {
     let global_cost_ns = inputs.barrier_ns;
     let global = Plan {
@@ -153,6 +155,11 @@ pub fn plan(inputs: &PlanInputs) -> Plan {
         }
     }
 
+    // An interval of one generation is a global frontier's own rhythm, which
+    // meets every generation through shared ranges and copies nothing.
+    if best.frontier == (Frontier::Partition { rebalance_every: NonZeroU32::new(1) }) {
+        return global;
+    }
     if best.cost_per_generation_ns < global_cost_ns { best } else { global }
 }
 
@@ -208,6 +215,20 @@ mod tests {
         let at = |k: f64| partition_cost(&inputs(200_000.0, 250_000.0, Some(slow)), g, k);
         let chosen = at(f64::from(n.get()));
         assert!(chosen <= at(1.0), "the interval chosen is no worse than every generation");
+    }
+
+    #[test]
+    fn an_interval_of_one_generation_is_a_global_frontier() {
+        let doubling = Imbalance { per_mille: 2000, over_generations: 1 };
+        let mut every = inputs(1_000_000.0, 250_000.0, Some(doubling));
+        every.rebalance_fixed_ns = 1.0;
+        every.copy_ns_per_id = 0.0;
+        let g = growth(doubling);
+        assert!(
+            partition_cost(&every, g, 1.0) < partition_cost(&every, g, 2.0),
+            "these inputs price rebalancing every generation cheapest"
+        );
+        assert_eq!(plan(&every).frontier, Frontier::Global);
     }
 
     #[test]

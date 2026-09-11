@@ -42,8 +42,9 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   for the host to continue. `GpuPeer::create_wave`, `submit_wave`,
   `wave_stats` and `release_wave` drive it from the host.
   `wave::plan::plan` chooses between a global frontier and a partition,
-  and the rebalance interval, from the barrier cost and an observed
-  imbalance.
+  and the rebalance interval, from the calibrated barrier and rebalance
+  costs and an observed imbalance. A best interval of one generation is
+  planned as a global frontier.
 - `GpuPeer::calibrate_waves` measures a device's wave costs at its team
   size: the barrier, the start skew, a rebalance's fixed cost and its
   copy per pending id, the fixed and per-segment cost of a slice round
