@@ -54,6 +54,19 @@ use crate::sched::plan::JobPlan;
 ///
 /// Returns `(cpu_result, gpu_result)` in caller-supplied order.
 ///
+/// # What this reads from the plan
+///
+/// The backend hint, through [`JobPlan::pick_backend`], and nothing
+/// else. There is no fan-out here: the CPU half is one closure on the
+/// calling thread and the GPU half is one dispatch to the backend. So
+/// the plan's leaf shape, `use_smt`, oversubscription factor, mailbox
+/// routing and deque tier hint are all unread, and setting them on a
+/// plan built for this call changes nothing.
+///
+/// Those knobs belong on the plan of whatever the CPU half dispatches
+/// internally, which is a separate call with a plan of its own. A shape
+/// set here reads as a routing decision and reaches nothing.
+///
 /// # Panics
 ///
 /// Resumes a panic from either half. A panic from the GPU half is

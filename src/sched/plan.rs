@@ -532,6 +532,13 @@ impl JobPlan {
     /// The static classifier picks the right [`DispatchProfile`]
     /// from the shape on call 1; the observer remains active as
     /// a safety net if the workload changes shape mid-run.
+    ///
+    /// The shape reaches the entries that fan out: the chunk, indexed,
+    /// collect, reduce and token-bucket paths, which read the knobs it
+    /// derives. It does not reach
+    /// [`crate::sched::hybrid::join_hybrid`], which takes only the
+    /// backend hint and runs its CPU half on the calling thread, so a
+    /// shape set on a plan built for that call is unread.
     pub fn with_leaf_shape(
         mut self,
         shape: crate::sched::adaptive_profile::LeafShape,
