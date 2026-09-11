@@ -67,6 +67,7 @@ pub mod layout;
 pub mod region;
 pub mod timed_lock;
 pub mod vram;
+pub mod watchdog;
 
 mod poller;
 
