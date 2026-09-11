@@ -190,6 +190,9 @@ name = "adaptive_dispatcher_demo"
 name = "class_migration_under_load"
 
 [[example]]
+name = "class_loop_cost"
+
+[[example]]
 name = "backend_dispatch_demo"
 
 [[example]]
