@@ -155,6 +155,11 @@ pub fn thread_on_core_ticks() -> u64 {
     cycles
 }
 
+/// Ticks this thread has spent on a core, in nanoseconds, read from the
+/// per-thread CPU clock.
+///
+/// Zero when that clock cannot be read, which is the no-clock value
+/// [`OccupancyWindow::sample`] turns into full occupancy.
 #[cfg(target_os = "linux")]
 pub fn thread_on_core_ticks() -> u64 {
     let mut ts = libc_timespec { tv_sec: 0, tv_nsec: 0 };
@@ -183,6 +188,10 @@ unsafe extern "C" {
     fn clock_gettime(clk_id: i32, tp: *mut libc_timespec) -> i32;
 }
 
+/// Zero, on a platform that offers no per-thread CPU clock.
+///
+/// [`OccupancyWindow::sample`] turns it into full occupancy, so a
+/// consumer reads what it read before this module existed.
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn thread_on_core_ticks() -> u64 {
     0
