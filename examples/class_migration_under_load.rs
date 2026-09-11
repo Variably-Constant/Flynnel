@@ -9,9 +9,13 @@
 //! one, without its own work having changed.
 //!
 //! Both the process-global class and the site's own learned class are
-//! printed, because they are separate state reached by separate paths,
-//! and the inputs are printed beside them so a classification can be
-//! reproduced from what produced it rather than trusted.
+//! printed, because they are separate state reached by separate paths.
+//! The site's class is decided per classifier tick from the mean and
+//! cv^2 of the delta window that tick classified, and those two are
+//! printed beside it so a classification can be reproduced from what
+//! produced it rather than trusted. The lifetime cv^2 is printed as well;
+//! it drifts with every leaf the site has run and does not decide the
+//! class.
 //!
 //! A migration needs at least 64 leaves in one delta window to take the
 //! fast path, and otherwise needs the same observation repeated across
@@ -88,6 +92,8 @@ where
 struct SiteView {
     leaves: u64,
     cv2: Option<u64>,
+    window_mean_ns: Option<u64>,
+    window_cv2: Option<u64>,
     learned: Option<WorkloadClass>,
 }
 
@@ -95,6 +101,8 @@ fn read_site(state: &CallSiteState) -> SiteView {
     SiteView {
         leaves: state.leaf_count(),
         cv2: state.cv2_per_mille(),
+        window_mean_ns: state.window_mean_ns(),
+        window_cv2: state.window_cv2_per_mille(),
         learned: state.learned_class(),
     }
 }
@@ -488,7 +496,7 @@ fn main() {
     // clean the class column looks.
     println!(
         "elapsed_s  phase   dispatches  leaves  per_disp  items_per_leaf  \
-         cv2_per_mille  site_class  global_class  last_ms  box_cores  own_cores  foreign_cores"
+         cv2_per_mille  window_mean_ns  window_cv2  site_class  global_class  last_ms  box_cores  own_cores  foreign_cores"
     );
 
     let site = SiteRef::new(&SITE);
@@ -556,6 +564,14 @@ fn main() {
                 Some(v) => v.to_string(),
                 None => "none".to_string(),
             };
+            let window_mean = match view.window_mean_ns {
+                Some(v) => v.to_string(),
+                None => "none".to_string(),
+            };
+            let window_cv2 = match view.window_cv2 {
+                Some(v) => v.to_string(),
+                None => "none".to_string(),
+            };
             let learned = match view.learned {
                 Some(c) => format!("{c:?}"),
                 None => "none".to_string(),
@@ -580,7 +596,7 @@ fn main() {
                 }
             };
             println!(
-                "{:9.1}  {:6}  {:10}  {:8}  {:8.1}  {:14.1}  {:>13}  {:>12}  {:>12}  {:7.2}  {:>11}  {:>11}  {:>13}",
+                "{:9.1}  {:6}  {:10}  {:8}  {:8.1}  {:14.1}  {:>13}  {:>14}  {:>10}  {:>12}  {:>12}  {:7.2}  {:>11}  {:>11}  {:>13}",
                 elapsed_s,
                 phase.name(),
                 dispatches,
@@ -588,6 +604,8 @@ fn main() {
                 per_disp,
                 items_per_leaf,
                 cv2,
+                window_mean,
+                window_cv2,
                 learned,
                 format!("{:?}", active_workload_class()),
                 last_ms,
