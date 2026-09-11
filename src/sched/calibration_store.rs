@@ -59,7 +59,7 @@ pub const CALIBRATION_MAGIC: u64 = 0x464C_4342_0000_0001;
 
 /// Raising this changes every host stamp, so the next start on any host
 /// measures again. Raise it whenever a stored field changes meaning.
-pub const LAYOUT_VERSION: u32 = 1;
+pub const LAYOUT_VERSION: u32 = 2;
 
 /// Devices a table records. A host with more reports the first
 /// [`MAX_ACCEL`] and the rest go unrecorded rather than overflowing.
@@ -251,6 +251,23 @@ pub const ACCEL_TIMED_LOCK_OK: u32 = 1 << 1;
 /// link allows and a PCIe one does not.
 pub const ACCEL_SYS_ATOMICS_OK: u32 = 1 << 2;
 
+/// The segmented-wave costs measured on one device at one team size.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WaveCostRecord {
+    /// Team size the costs were measured at.
+    pub width: u32,
+    /// Cost of one cross-block generation barrier, ns.
+    pub barrier_ns: u64,
+    /// Host round trip of a wave slice apart from its segments, ns.
+    pub fixed_ns: u64,
+    /// Substrate cost of one segment, ps.
+    pub segment_ps: u64,
+    /// Rebalance cost of moving one pending id, ps.
+    pub copy_ps_per_id: u64,
+    /// Longest generation of the calibration waves, ns.
+    pub generation_ns: u64,
+}
+
 /// One device's capabilities and the timings measured against it.
 ///
 /// The capability fields are read from the driver and do not vary with
@@ -298,7 +315,21 @@ pub struct AccelCalibration {
     pub delta_ns: u64,
     /// Kernel launch and synchronise baseline.
     pub launch_ns: u64,
-    _pad: [u8; 24],
+    /// Team size the wave costs below were measured at; 0 when none have
+    /// been recorded.
+    pub wave_width: u32,
+    _wave_reserved: u32,
+    /// Cost of one cross-block generation barrier at `wave_width`, ns.
+    pub wave_barrier_ns: u64,
+    /// Host round trip of a wave slice apart from its segments, ns.
+    pub wave_fixed_ns: u64,
+    /// Substrate cost of one segment, ps.
+    pub wave_segment_ps: u64,
+    /// Rebalance cost of moving one pending id, ps.
+    pub wave_copy_ps_per_id: u64,
+    /// Longest generation of the calibration waves, ns.
+    pub wave_generation_ns: u64,
+    _pad: [u8; 56],
 }
 
 impl Default for AccelCalibration {
@@ -319,7 +350,14 @@ impl Default for AccelCalibration {
             clock_err_ns: 0,
             delta_ns: 0,
             launch_ns: 0,
-            _pad: [0; 24],
+            wave_width: 0,
+            _wave_reserved: 0,
+            wave_barrier_ns: 0,
+            wave_fixed_ns: 0,
+            wave_segment_ps: 0,
+            wave_copy_ps_per_id: 0,
+            wave_generation_ns: 0,
+            _pad: [0; 56],
         }
     }
 }
@@ -371,7 +409,14 @@ impl AccelCalibration {
             clock_err_ns,
             delta_ns,
             launch_ns,
-            _pad: [0; 24],
+            wave_width: 0,
+            _wave_reserved: 0,
+            wave_barrier_ns: 0,
+            wave_fixed_ns: 0,
+            wave_segment_ps: 0,
+            wave_copy_ps_per_id: 0,
+            wave_generation_ns: 0,
+            _pad: [0; 56],
         }
     }
 
@@ -389,6 +434,32 @@ impl AccelCalibration {
     /// Whether a capability bit is set.
     pub fn has(&self, flag: u32) -> bool {
         self.flags & flag != 0
+    }
+
+    /// This record carrying `wave` as its wave costs.
+    pub fn with_wave(mut self, wave: WaveCostRecord) -> Self {
+        self.wave_width = wave.width;
+        self.wave_barrier_ns = wave.barrier_ns;
+        self.wave_fixed_ns = wave.fixed_ns;
+        self.wave_segment_ps = wave.segment_ps;
+        self.wave_copy_ps_per_id = wave.copy_ps_per_id;
+        self.wave_generation_ns = wave.generation_ns;
+        self
+    }
+
+    /// The wave costs this record carries, when any have been recorded.
+    pub fn wave(&self) -> Option<WaveCostRecord> {
+        if self.wave_width == 0 {
+            return None;
+        }
+        Some(WaveCostRecord {
+            width: self.wave_width,
+            barrier_ns: self.wave_barrier_ns,
+            fixed_ns: self.wave_fixed_ns,
+            segment_ps: self.wave_segment_ps,
+            copy_ps_per_id: self.wave_copy_ps_per_id,
+            generation_ns: self.wave_generation_ns,
+        })
     }
 }
 
@@ -888,6 +959,35 @@ mod tests {
             !AccelCalibration::default().is_trustworthy(),
             "an empty slot describes no device at all"
         );
+    }
+
+    #[test]
+    fn wave_costs_ride_the_device_record_through_a_round_trip() {
+        let dir = temp_dir("wave");
+        let s = stamp(12, 24);
+        let store = CalibrationStore::open_or_create(&dir, &s).expect("create");
+        let wave = WaveCostRecord {
+            width: 32,
+            barrier_ns: 2_100,
+            fixed_ns: 180_000,
+            segment_ps: 450,
+            copy_ps_per_id: 1_900,
+            generation_ns: 1_800,
+        };
+        let device = AccelCalibration::new(
+            AccelKind::GpuPeer, 0, 120, 48, 2_505_000, 12_227,
+            ACCEL_DOORBELL_OK, 3_000, 3_400, 3_700, 1_970, 120, 19_700, 41_000,
+        );
+        assert_eq!(device.wave(), None, "a device record starts with no wave costs");
+        let carried = device.with_wave(wave);
+        {
+            let w = store.try_acquire_writer().expect("no other writer");
+            w.publish(&sample_cpu(), &[carried]);
+        }
+        let (_cpu, accel) = store.read().expect("a published record reads back");
+        assert_eq!(accel[0].wave(), Some(wave), "the wave costs survive the round trip");
+        assert_eq!(accel[0].rtt_median_ns, 3_400, "and leave the device timings as they were");
+        cleanup(&dir);
     }
 
     #[test]

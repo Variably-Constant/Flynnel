@@ -272,7 +272,14 @@ fn calibrate_or_reuse(
                 None => (Default::default(), Vec::new()),
             };
             match slots.iter().position(|a| a.ordinal as usize == ordinal) {
-                Some(i) => slots[i] = record,
+                // The wave costs come from a separate calibration run, so a
+                // start that re-measures the device timings keeps them.
+                Some(i) => {
+                    slots[i] = match slots[i].wave() {
+                        Some(wave) => record.with_wave(wave),
+                        None => record,
+                    };
+                }
                 None => slots.push(record),
             }
             writer.publish(&cpu, &slots);
