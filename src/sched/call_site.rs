@@ -1391,9 +1391,14 @@ mod tests {
             S.record_routing_arm(PolicyArm::Alternative, 300_000);
         }
 
+        // Two cadences of calls, taken from the constant rather than a
+        // number chosen here: the trial fires on every
+        // ARM_TRIAL_CADENCE-th selection, so a shorter run can miss it
+        // entirely and say nothing about whether it fires at all.
+        let calls = 2 * ARM_TRIAL_CADENCE;
         let mut caller_plan = 0;
         let mut class_routing = 0;
-        for _ in 0..12 {
+        for _ in 0..calls {
             match S.choose_routing_arm() {
                 PolicyArm::Alternative => caller_plan += 1,
                 PolicyArm::Default => class_routing += 1,
@@ -1402,12 +1407,13 @@ mod tests {
         assert!(
             caller_plan > class_routing,
             "the faster arm must win the routing: caller plan {caller_plan}, class routing \
-             {class_routing}"
+             {class_routing} over {calls} calls"
         );
-        assert!(
-            class_routing > 0,
-            "the slower arm must still run on the trial cadence, or a routing that becomes \
-             the better one again is never found"
+        assert_eq!(
+            class_routing, 2,
+            "the slower arm runs once per cadence of {ARM_TRIAL_CADENCE} and no more often, \
+             so a routing that becomes the better one again is found without paying for it \
+             every dispatch"
         );
         let (default_ns, alternative_ns) = S.routing_ewmas();
         assert!(
