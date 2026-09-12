@@ -653,7 +653,17 @@ pub struct WaveStats {
     pub longest_generation_ns: u32,
     /// The largest block's share over the mean, per mille: of the pending
     /// ids at a partition rebalance, or of the children pushed in one
-    /// generation on a global frontier. 0 when nothing was measured.
+    /// generation on a global frontier. 1000 is an even share, and the
+    /// largest reading of the wave is the one kept. 0 when nothing was
+    /// measured.
+    ///
+    /// The mean is taken over the blocks that could have held work, not
+    /// over the team. Every block of a partition has a region of its own,
+    /// so there the two are the same. A global frontier is dealt in runs
+    /// of one block's threads from rank 0, so a generation of n ids
+    /// reaches only its first `ceil(n / 256)` blocks, and a block holding
+    /// everything when it was the only block dealt anything is an even
+    /// share rather than the worst imbalance there is.
     pub imbalance_per_mille: u32,
     /// Rebalances run.
     pub rebalances: u32,

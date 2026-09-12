@@ -767,9 +767,21 @@ __device__ __forceinline__ void flw_generation_end(flw_slice* s)
                             sum += delta;
                             if (delta > largest) largest = delta;
                         }
+                        // The share is taken over the blocks the
+                        // generation could reach, not over the team. A
+                        // global frontier is dealt in runs of blockDim.x
+                        // from rank 0, so a generation of n ids reaches
+                        // ceil(n / blockDim.x) blocks and no others, and
+                        // one of those holding every child is not
+                        // imbalance - it is the only block that was
+                        // given anything to hold.
+                        u32 ran = s->end > s->start ? s->end - s->start : 0u;
+                        u32 engaged = (ran + blockDim.x - 1u) / blockDim.x;
+                        if (engaged > s->width) engaged = s->width;
+                        if (engaged == 0u) engaged = 1u;
                         if (sum > 0u) {
                             atomicMax(flw_u32(b, FLW_IMBALANCE_OFF),
-                                      flw_sat((u64)largest * 1000ull * (u64)s->width / (u64)sum));
+                                      flw_sat((u64)largest * 1000ull * (u64)engaged / (u64)sum));
                         }
                         flw_rob_walk(s);
                         flw_set(b, FLW_START_OFF, next_start);

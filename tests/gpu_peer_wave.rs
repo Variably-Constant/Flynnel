@@ -211,6 +211,46 @@ fn a_partition_that_rebalances_runs_every_segment_once_and_records_imbalance() {
     peer.release_wave(wave).expect("release the span");
 }
 
+/// A global frontier narrower than one block's threads reaches only the
+/// first block, so that block holding every child is the whole of what
+/// could have happened, and reads as balanced.
+///
+/// The share is taken over the blocks a generation could reach. Taken
+/// over the team instead, this read the maximum - a thousand times the
+/// team's width - for every wave whose first generation is narrower than
+/// a block, which is every wave with fewer roots than a block has
+/// threads. Because the figure is kept with a maximum across
+/// generations, that first one pinned it there whatever the rest of the
+/// wave did, and the counter could report nothing else.
+#[test]
+fn a_narrow_global_frontier_is_not_reported_as_imbalance() {
+    let _device = common::device();
+    let mut peer = peer(4);
+    let r = roots(3);
+    let wave = peer
+        .create_wave(&spec(
+            Frontier::Global,
+            Resume::Device,
+            SliceBudget::Unbounded,
+            r.clone(),
+            4096,
+        ))
+        .expect("create the wave");
+    // The generations run 3, 6, 12, 24, 48, 96 and 192 ids, every one of
+    // them inside the 256 threads of a single block, so one block is all
+    // any of them could reach and the figure is 1000 whatever the team
+    // size turns out to be on this device.
+    let (status, count, sum) = slice(&mut peer, &wave, OP_TREE, &args(6, NO_FAIL, 0));
+    let stats = peer.wave_stats(&wave).expect("read the wave");
+    assert_eq!(status, STATUS_DONE, "{stats:?}");
+    assert_eq!((count, sum), expected(&r, 6));
+    assert_eq!(
+        stats.imbalance_per_mille, 1000,
+        "every generation reached one block and that block took all of it: {stats:?}"
+    );
+    peer.release_wave(wave).expect("release the span");
+}
+
 /// A budget smaller than the wave makes slices stop early and yield, and
 /// the wave still runs every segment exactly once across them.
 #[test]

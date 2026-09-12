@@ -59,6 +59,20 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   directly, and a separate test asserts that each gated host does read
   its own thread clock - so an arm that goes dead fails a test instead
   of reporting zeros.
+- A global frontier's `imbalance_per_mille` is taken over the blocks a
+  generation could reach rather than over the team. The frontier is
+  dealt in runs of one block's threads from rank 0, so a generation of
+  `n` ids reaches only its first `ceil(n / 256)` blocks; measuring the
+  largest block's share against the whole team therefore scored a
+  generation that reached ONE block as the worst imbalance possible,
+  `1000 * team`. Since the figure keeps the largest reading of the wave,
+  and a wave with fewer roots than a block has threads always starts
+  with such a generation, the counter reported `1000 * team` for the
+  whole run whatever the later generations did. It was measured at
+  exactly 8000, 24000 and 48000 across 36 cells at teams 8, 24 and 48,
+  with no variation at any depth or in any round - a constant, not a
+  measurement. A partition is unaffected: every block there has a region
+  of its own, so the blocks that could hold work are the team.
 
 ### Added
 
