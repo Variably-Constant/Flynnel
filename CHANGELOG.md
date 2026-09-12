@@ -245,6 +245,29 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   caller's cap, never one item per leaf, and unless the cap binds first,
   one item fewer would not cover a dispatch.
 
+- A host with no NVIDIA driver gets the error the API documents instead
+  of an aborted process. cudarc resolves its driver symbols lazily and
+  panics when it cannot load libcuda, and both `CudaBackend::with_device`
+  and `GpuPeer::init` reached a driver call with no probe - the second
+  while documenting that it never panics when no device is present,
+  which is the contract a CPU-only fallback rests on. Both now prove the
+  driver loadable first, through the cached availability probe and then
+  `is_culib_present` against cudarc's own candidate library names. In
+  `GpuPeer::init` the gate sits above the current-context read, which
+  reaches the driver as well. On a GPU-less host the lib suite goes from
+  seven aborting tests to none.
+
+- `GpuPeer::create_wave` reads a device's watchdog once per process
+  rather than once per wave. `watchdog::detect` loaded NVML, initialized
+  it, read the driver model and shut it down on every call, and
+  `create_wave` calls it for every wave whose slice budget is `Detected`.
+  Measured on an RTX 5070 by a consumer crate, that was a flat 24.8 to
+  28.2 ms per wave across spans from 120 to 41 000 ids - indifferent to
+  span size because none of it was the span - and 99.7 percent of the
+  time spent setting a wave up. The driver model and the TDR settings
+  describe hardware and a driver configuration a running process cannot
+  change, so the reading is kept per device.
+
 ### Scheduler
 
 - The cooperative fan-out's mailbox gate moves from the worker count to
