@@ -295,7 +295,10 @@ pub fn per_item_cv_squared_per_mille(stats: LeafStats) -> Option<u64> {
     let spread = stats
         .sumsq_per_item
         .saturating_sub(mean_sq.saturating_mul(stats.items));
-    let var = spread / stats.count;
+    // Over the items, not the leaves: each leaf contributed its squared
+    // time over its item count, so the subtraction leaves an
+    // item-weighted sum of squared deviations.
+    let var = spread / stats.items;
     Some(var.saturating_mul(1000) / mean_sq.max(1))
 }
 

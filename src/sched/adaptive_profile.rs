@@ -826,7 +826,7 @@ pub fn tick_auto_classify() {
             0
         } else {
             let mean_sq = scaled_mean.saturating_mul(scaled_mean);
-            let var = dsumsq_per_item.saturating_sub(mean_sq.saturating_mul(ditems)) / dcount;
+            let var = dsumsq_per_item.saturating_sub(mean_sq.saturating_mul(ditems)) / ditems;
             var.saturating_mul(1000) / mean_sq.max(1)
         };
         (mean, spread)

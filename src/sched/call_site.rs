@@ -571,10 +571,12 @@ impl CallSiteState {
     /// items each leaf covered. `None` on the same terms as
     /// [`Self::per_item_ns`].
     ///
-    /// A leaf of `n` items averages `n` of them, so its squared time
-    /// over `n` estimates the per-item variance whatever size the leaf
-    /// came out at. Leaves of mixed sizes running identical items read
-    /// near zero here and read high in [`Self::cv2_per_mille`].
+    /// The recorder keeps each leaf's squared time over its item count,
+    /// so the sum of those less the mean squared times the items is the
+    /// item-weighted sum of squared deviations, and the variance is that
+    /// over the items rather than over the leaves. Leaves of mixed sizes
+    /// running identical items read near zero here and read high in
+    /// [`Self::cv2_per_mille`].
     pub fn per_item_cv2_per_mille(&self) -> Option<u64> {
         let leaves = self.leaf_count.load(Ordering::Relaxed);
         if leaves < 4 {
@@ -592,7 +594,7 @@ impl CallSiteState {
         let sumsq_per_item = self.leaf_sumsq_per_item.load(Ordering::Relaxed);
         let mean_sq = mean_scaled.saturating_mul(mean_scaled);
         let spread = sumsq_per_item.saturating_sub(mean_sq.saturating_mul(items));
-        let var = spread / leaves;
+        let var = spread / items;
         Some(var.saturating_mul(1000) / mean_sq.max(1))
     }
 
@@ -676,7 +678,7 @@ impl CallSiteState {
                 let mean_sq = scaled_mean.saturating_mul(scaled_mean);
                 let var = dsumsq_per_item
                     .saturating_sub(mean_sq.saturating_mul(ditems))
-                    / dcount;
+                    / ditems;
                 var.saturating_mul(1000) / mean_sq.max(1)
             };
             (mean, spread)
