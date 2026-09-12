@@ -92,6 +92,20 @@ Two things a consumer has to do rather than read:
   measurement. A partition is unaffected: every block there has a region
   of its own, so the blocks that could hold work are the team.
 
+- A call site's per-item cv^2, the figure that decides a class above
+  the port-heavy boundary, is formed in 128 bits from the recorder's
+  scaled sums with no integer variance in between. It used to move in
+  steps of `1000 / (mean^2 >> 16)` per mille - 26 at 1.6 us per item
+  and 333 at the 500 ns bottom of the heavy band - against class edges
+  at 50 and 500, so a site whose items cost a few microseconds read a
+  cv^2 of 0, 25 or 51 depending on how a window's sums rounded and
+  crossed the Streaming/MemoryBound edge tick to tick. Measured on a
+  1.6 us-per-item shape on a quiet host: the class flapped on both the
+  adaptive and the pinned arms before, and holds one class on every
+  trial after, at the same wall. `CallSiteState::per_item_cv2_per_mille`
+  and `window_cv2_per_mille` report the corrected figure; the integer
+  mean is the one rounding left, at most `2 / mean` per mille.
+
 ### Added
 
 - A call site measures what acting on its class is worth. The site runs
