@@ -193,6 +193,9 @@ name = "class_migration_under_load"
 name = "class_loop_cost"
 
 [[example]]
+name = "smt_wake_cost"
+
+[[example]]
 name = "backend_dispatch_demo"
 
 [[example]]
