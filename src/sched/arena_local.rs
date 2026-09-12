@@ -2049,12 +2049,20 @@ fn worker_loop(
         // threads concurrently; only parking the sibling frees
         // the FP pipe for the primary's dependency chain.
         //
-        // Two-step wait for cheap re-acquire on slow iter cadences
-        // (criterion 10ms x N benches): yield-spin then micro-sleep
-        // before truly parking. Avoids parker.unpark syscall on
-        // the common rapid-fire case while still allowing the OS
-        // to deschedule the sibling for FP-contention-sensitive
-        // workloads.
+        // Two-step wait for cheap re-acquire on slow iter cadences:
+        // a yield spin, then rounds of a short sleep, then the parker.
+        // A sibling in the sleep rounds is awake, so the unpark that
+        // acquire_smt sends on the next request is a flag store rather
+        // than a wake syscall, and the sibling notices the request at
+        // the end of its current sleep. The rounds ask for
+        // SMT_SIBLING_SLEEP_US, and what a sleep delivers is the host's
+        // floor, not the request: 0.19 to 0.22 ms on the Linux and
+        // FreeBSD guests, 0.53 to 0.57 ms on Windows. So the stage runs
+        // about 20 to 60 ms rather than the 10 ms its constants read
+        // as, and a sibling reacts within that floor. Measured against
+        // parking straight after the yield spin, the stage changes the
+        // wall of a with_smt dispatch after 5 to 20 ms of idle by less
+        // than the run-to-run spread of identical code.
         if !is_primary && smt_requests.load(Ordering::Acquire) == 0 {
             const SMT_SIBLING_SPIN_ROUNDS: u32 = 1000;
             let mut spun = 0u32;
