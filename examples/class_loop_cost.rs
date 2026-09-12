@@ -665,6 +665,12 @@ fn main() {
         window(shape, routing, site, &mut buf, &table, measured);
     let class_pre = SITE.learned_class();
     let global_pre = active_workload_class();
+    let stats_pre = (
+        SITE.window_mean_ns(),
+        SITE.window_cv2_per_mille(),
+        SITE.per_item_ns(),
+        SITE.per_item_cv2_per_mille(),
+    );
 
     load_window(
         shape,
@@ -685,8 +691,13 @@ fn main() {
     let global_post = active_workload_class();
 
     let ratio = if pre_ms > 0.0 { post_ms / pre_ms } else { f64::NAN };
+    // Trailing columns: what the site's latest classifier tick decided
+    // from (window mean per-item ns, window cv^2 per mille) and the
+    // site's lifetime per-item figures, after each window. A "-" is a
+    // figure the site could not yet report.
+    let opt = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     println!(
-        "{} {} {:.4} {:.4} {:.4} {} {} {:?} {:?} {:.1} {:.1} {} {} {} {} {} {}",
+        "{} {} {:.4} {:.4} {:.4} {} {} {:?} {:?} {:.1} {:.1} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
         shape.name(),
         routing.name(),
         pre_ms,
@@ -704,6 +715,14 @@ fn main() {
         post_n,
         pre_host,
         post_host,
+        opt(stats_pre.0),
+        opt(stats_pre.1),
+        opt(stats_pre.2),
+        opt(stats_pre.3),
+        opt(SITE.window_mean_ns()),
+        opt(SITE.window_cv2_per_mille()),
+        opt(SITE.per_item_ns()),
+        opt(SITE.per_item_cv2_per_mille()),
     );
     if pre_n == 0 || post_n == 0 {
         eprintln!("the windows ran {pre_n} dispatches before and {post_n} after; raise the window");
