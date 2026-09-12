@@ -232,10 +232,14 @@ fn detect_linux() -> Option<NumaTopology> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(rest) = name.strip_prefix("node") {
-            if let Ok(id) = rest.parse::<u32>() {
-                nodes.push(id);
-            }
+        let Some(rest) = name.strip_prefix("node") else { continue };
+        match rest.parse::<u32>() {
+            Ok(id) => nodes.push(id),
+            Err(e) => eprintln!(
+                "flynnel numa: {root}/node{rest} is not a node id ({e}), so that entry \
+                 contributes no node",
+                root = root.display()
+            ),
         }
     }
     if nodes.is_empty() {
