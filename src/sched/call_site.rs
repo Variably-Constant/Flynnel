@@ -1291,12 +1291,19 @@ mod tests {
             Some(PER_ITEM_NS),
             "per-item cost reads the same whatever the leaves came out at"
         );
+        // The scale that decides a class, not a comparison against
+        // another statistic: classify_observed calls a site uniform
+        // below cv2_low_per_mille and high-variance at or above
+        // cv2_high_per_mille, so per-item work that never varied has to
+        // read under the first of those.
         let per_item_cv2 = S.per_item_cv2_per_mille().expect("items were recorded");
-        let leaf_cv2 = S.cv2_per_mille().expect("leaves were recorded");
+        let low = crate::sched::adaptive_profile::class_thresholds()
+            .cv2_low_per_mille
+            .load(Ordering::Relaxed);
         assert!(
-            per_item_cv2 < leaf_cv2,
-            "per-item spread {per_item_cv2} must sit below the leaf-time spread {leaf_cv2} \
-             the mixed sizes produced"
+            per_item_cv2 < low,
+            "per-item spread {per_item_cv2} must read as uniform, under {low}, on work whose \
+             per-item cost never changed"
         );
     }
 

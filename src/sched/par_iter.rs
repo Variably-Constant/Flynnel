@@ -328,7 +328,7 @@ impl LocalLeafBuffer {
         // because a leaf of n items averages n of them. A leaf of no
         // items contributes time to the leaf statistics and nothing to
         // the per-item ones, which is what it can honestly say.
-        let per_item_sq = if items == 0 { 0 } else { sq / items };
+        let per_item_sq = sq.checked_div(items).unwrap_or(0);
 
         self.global_sum_ns = self.global_sum_ns.saturating_add(nanos);
         self.global_sumsq_scaled = self.global_sumsq_scaled.saturating_add(sq);
