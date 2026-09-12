@@ -661,6 +661,23 @@ impl GpuPeer {
         // bind_to_thread, so afterwards the current context is always
         // the one this call retained and the comparison would be with
         // itself.
+        // Two gates before anything reads the driver, including the
+        // context read below. cudarc resolves its symbols lazily and
+        // panics when it cannot load libcuda, so the driver is proven
+        // loadable first and a host without one leaves through the
+        // error this function documents.
+        if !crate::backend::detect::cuda_available() {
+            return Err(GpuPeerError::NoDevice(
+                "the CUDA driver is not loadable on this host".to_string(),
+            ));
+        }
+        // SAFETY: the call only attempts a `libloading::Library::new` on
+        // each candidate name and reports whether one resolved.
+        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+            return Err(GpuPeerError::NoDevice(
+                "the CUDA driver is not loadable on this host".to_string(),
+            ));
+        }
         let prior = current_context();
         let ctx = CudaContext::new(config.device_ordinal)
             .map_err(|e| GpuPeerError::NoDevice(format!("{e:?}")))?;
@@ -1637,6 +1654,16 @@ impl Drop for GpuPeer {
 mod tests {
     use super::*;
 
+    /// Whether this host can run the tests that need a device, naming
+    /// on stdout the ones it turns into no-ops.
+    fn device_present(test_name: &str) -> bool {
+        if crate::backend::detect::cuda_available() {
+            return true;
+        }
+        println!("{test_name}: no CUDA driver on this host, so the test body did not run");
+        false
+    }
+
     /// The foreign-context detector fires, and the ordering that lets
     /// it fire is what this pins.
     ///
@@ -1650,6 +1677,9 @@ mod tests {
     /// Requires a CUDA device.
     #[test]
     fn init_reports_displacing_a_foreign_context() {
+        if !device_present("init_reports_displacing_a_foreign_context") {
+            return;
+        }
         // A non-primary context is the only thing the peer's primary
         // context can displace; every consumer today holds the primary
         // one, where there is nothing to report.
@@ -1689,6 +1719,9 @@ mod tests {
     /// Requires a CUDA device.
     #[test]
     fn a_pointer_from_a_displaced_context_is_refused_not_misread() {
+        if !device_present("a_pointer_from_a_displaced_context_is_refused_not_misread") {
+            return;
+        }
         const N: usize = 256;
         const PATTERN: u8 = 0xAB;
 
@@ -1758,6 +1791,9 @@ mod tests {
     /// pass the test above while being useless.
     #[test]
     fn init_reports_nothing_when_it_displaces_nothing() {
+        if !device_present("init_reports_nothing_when_it_displaces_nothing") {
+            return;
+        }
         let peer = GpuPeer::init(GpuPeerConfig::default())
             .expect("a CUDA device is required for this test");
         assert!(

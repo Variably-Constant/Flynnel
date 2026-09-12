@@ -107,6 +107,19 @@ impl CudaBackend {
     /// indexes into the platform's enumerated GPUs (0 for the
     /// first NVIDIA GPU).
     pub fn with_device(device_id: u32) -> Result<Self, BackendError> {
+        // Two gates before the first driver call. cudarc resolves its
+        // symbols lazily and panics when it cannot load libcuda, so the
+        // driver must be known loadable first: `cuda_available` is the
+        // cached probe, and `is_culib_present` answers against cudarc's
+        // own library-name candidates.
+        if !crate::backend::detect::cuda_available() {
+            return Err(BackendError::DeviceUnavailable(Backend::Cuda { device_id }));
+        }
+        // SAFETY: the call only attempts a `libloading::Library::new` on
+        // each candidate name and reports whether one resolved.
+        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+            return Err(BackendError::DeviceUnavailable(Backend::Cuda { device_id }));
+        }
         let context =
             CudaContext::new(device_id as usize).map_err(|e| map_driver_error(device_id, e))?;
         let stream = context.default_stream();
