@@ -48,6 +48,27 @@ const SITE_CLASSIFY_QUANTUM: u64 = 16;
 /// migration fires (same value as the global observer's hysteresis).
 const SITE_MIGRATION_HYSTERESIS: u32 = 2;
 
+/// cv^2 per mille of per-item cost, from the recorder's summed per-item
+/// squares (each leaf's `ns^2 / (items << 16)`), the integer mean per
+/// item, and the item count those sums cover.
+///
+/// Formed in 128 bits from the scaled sums directly. An integer variance
+/// in between would move in steps of `1000 / (mean^2 >> 16)` per mille -
+/// 26 at 1.6 us per item, 333 at 500 ns - against class edges at 50 and
+/// 500. The integer mean is the one rounding left, and it biases the
+/// result by at most `2 / mean` per mille: under 4 at 500 ns per item,
+/// the lowest cost the cv^2 edges apply to.
+fn per_item_cv2(sumsq_per_item: u64, mean: u64, items: u64) -> u64 {
+    let mean_sq = (mean as u128).saturating_mul(mean as u128);
+    let expected = mean_sq.saturating_mul(items as u128);
+    if expected == 0 {
+        return 0;
+    }
+    let total = (sumsq_per_item as u128) << 16;
+    let spread = total.saturating_sub(expected);
+    (spread.saturating_mul(1000) / expected) as u64
+}
+
 /// Policy-arm trial cadence: every Nth arm selection returns the
 /// non-preferred arm so its EWMA stays fresh enough to detect drift.
 const ARM_TRIAL_CADENCE: u32 = 16;
@@ -602,14 +623,8 @@ impl CallSiteState {
         // subtract a smaller square than the terms carry and report the
         // difference as spread.
         let mean_ns = self.leaf_sum_ns.load(Ordering::Relaxed) / items;
-        let mean_sq = ((mean_ns as u128).saturating_mul(mean_ns as u128) >> 16) as u64;
-        if mean_sq == 0 {
-            return Some(0);
-        }
         let sumsq_per_item = self.leaf_sumsq_per_item.load(Ordering::Relaxed);
-        let spread = sumsq_per_item.saturating_sub(mean_sq.saturating_mul(items));
-        let var = spread / items;
-        Some(var.saturating_mul(1000) / mean_sq)
+        Some(per_item_cv2(sumsq_per_item, mean_ns, items))
     }
 
     /// Mean cost of one item, in nanoseconds, over the delta window the
@@ -685,16 +700,7 @@ impl CallSiteState {
         // such a sample can say.
         let per_item = dsum.checked_div(ditems);
         let (mean_ns, cv2) = if let Some(mean) = per_item {
-            let mean_sq = ((mean as u128).saturating_mul(mean as u128) >> 16) as u64;
-            let spread = if mean_sq == 0 {
-                0
-            } else {
-                let var = dsumsq_per_item
-                    .saturating_sub(mean_sq.saturating_mul(ditems))
-                    / ditems;
-                var.saturating_mul(1000) / mean_sq
-            };
-            (mean, spread)
+            (mean, per_item_cv2(dsumsq_per_item, mean, ditems))
         } else {
             let mean = dsum / dcount;
             let scaled_mean = (dsum >> 8) / dcount;
@@ -1172,6 +1178,42 @@ pub(crate) fn registry_len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_per_item_spread_is_read_at_its_own_value() {
+        // Sixteen leaves of 1024 items: eight at 1280 ns per item, eight
+        // at 1920. Mean 1600, standard deviation 320, cv^2 exactly 40
+        // per mille. The recorder's per-leaf term, ns^2 / (items << 16),
+        // is 25600 and 57600 for the two leaf kinds, both exact. The
+        // batch crosses the classify quantum, so it ticks once.
+        static S: CallSiteState = CallSiteState::new();
+        const ITEMS: u64 = 1024;
+        let (fast, slow) = (1280u64 * ITEMS, 1920u64 * ITEMS);
+        let sq = |ns: u64| (ns >> 8).saturating_mul(ns >> 8);
+        let per_item_sq = |ns: u64| {
+            ((ns as u128).saturating_mul(ns as u128) / ((ITEMS as u128) << 16)) as u64
+        };
+        S.record_batch_site_only(
+            8 * fast + 8 * slow,
+            8 * sq(fast) + 8 * sq(slow),
+            16,
+            16 * ITEMS,
+            8 * per_item_sq(fast) + 8 * per_item_sq(slow),
+        );
+        assert_eq!(S.window_mean_ns(), Some(1600));
+        assert_eq!(S.per_item_ns(), Some(1600));
+        // An integer variance in between reads 25 here: one unit of
+        // 1000 / (1600^2 >> 16), which is the wrong side of the 50 edge
+        // from the value the leaves carry.
+        assert_eq!(S.window_cv2_per_mille(), Some(40));
+        assert_eq!(S.per_item_cv2_per_mille(), Some(40));
+        let low = crate::sched::adaptive_profile::class_thresholds()
+            .cv2_low_per_mille
+            .load(Ordering::Relaxed);
+        if 40 < low {
+            assert_eq!(S.learned_class(), Some(WorkloadClass::Streaming));
+        }
+    }
 
     #[test]
     fn caller_site_is_distinct_per_call_site_and_stable_per_site() {
