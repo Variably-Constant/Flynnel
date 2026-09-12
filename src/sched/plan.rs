@@ -766,10 +766,16 @@ impl JobPlan {
     /// Re-derive the profile-driven knobs from this plan's site's
     /// learned class, when (a) the caller pinned nothing and (b) the
     /// site has classified itself. Returns the plan unchanged
-    /// otherwise. Called at the top of the generic dispatch entries
-    /// after [`Self::with_site_if_none`], so repeat dispatches from
-    /// the same call site run with that site's own learned routing
-    /// instead of the process-global prior.
+    /// otherwise, so repeat dispatches from the same call site can run
+    /// with that site's own learned routing instead of the
+    /// process-global prior.
+    ///
+    /// The generic dispatch entries reach this through
+    /// [`Self::apply_site_class_measured`] rather than calling it
+    /// directly: it is that choice's Default arm, taken when the site's
+    /// measurements say the class-derived routing is the faster of the
+    /// two. A caller applying it on its own gets the class every time,
+    /// measured against nothing.
     pub fn apply_site_class(mut self) -> Self {
         if self.caller_pinned() {
             return self;
@@ -790,6 +796,41 @@ impl JobPlan {
             self.estimated_per_item_ns = Some(ns);
         }
         self
+    }
+
+    /// [`Self::apply_site_class`] under the site's routing A/B, with the
+    /// arm it ran so the caller can report what that dispatch cost.
+    ///
+    /// The class is a description of the workload; this is the check on
+    /// what acting on it is worth. On
+    /// [`crate::sched::call_site::PolicyArm::Default`] the class
+    /// re-derives the plan as before; on `Alternative` the plan stands
+    /// as the caller built it. The site explores both, keeps the faster
+    /// by EWMA, and re-tests on a cadence, so a class that has stopped
+    /// describing the work costs at most the trial rate rather than
+    /// every dispatch until something notices.
+    ///
+    /// Returns `None` for the arm when there is no site to measure
+    /// against or the caller pinned the plan, which are the cases where
+    /// nothing was chosen and so nothing should be recorded.
+    pub fn apply_site_class_measured(
+        self,
+    ) -> (Self, Option<crate::sched::call_site::PolicyArm>) {
+        use crate::sched::call_site::PolicyArm;
+        if self.caller_pinned() {
+            return (self, None);
+        }
+        let Some(site) = self.site else {
+            return (self, None);
+        };
+        if site.get().learned_class().is_none() {
+            return (self, None);
+        }
+        let arm = site.get().choose_routing_arm();
+        match arm {
+            PolicyArm::Default => (self.apply_site_class(), Some(arm)),
+            PolicyArm::Alternative => (self, Some(arm)),
+        }
     }
 
     /// Builder: set the hardware class.

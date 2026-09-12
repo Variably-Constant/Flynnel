@@ -467,6 +467,40 @@ thread_local! {
 /// cross the batch threshold; without it a dispatch recording
 /// fewer than FLUSH_THRESHOLD leaves on the calling thread
 /// publishes nothing.
+/// Reports one dispatch's wall time against the routing arm it ran, so
+/// the site's A/B has an outcome to weigh rather than a class to trust.
+///
+/// Held by the entry and dropped on every path out of it, including the
+/// inline-collapse and probe returns, because a dispatch that took one
+/// of those is still a dispatch that arm produced.
+struct RecordRoutingArm {
+    site: Option<crate::sched::call_site::SiteRef>,
+    arm: Option<crate::sched::call_site::PolicyArm>,
+    started: std::time::Instant,
+}
+
+impl RecordRoutingArm {
+    fn start(
+        site: Option<crate::sched::call_site::SiteRef>,
+        arm: Option<crate::sched::call_site::PolicyArm>,
+    ) -> Self {
+        Self { site, arm, started: std::time::Instant::now() }
+    }
+}
+
+impl Drop for RecordRoutingArm {
+    fn drop(&mut self) {
+        let Some(site) = self.site else {
+            return;
+        };
+        let Some(arm) = self.arm else {
+            return;
+        };
+        site.get()
+            .record_routing_arm(arm, self.started.elapsed().as_nanos() as u64);
+    }
+}
+
 struct FlushLeafStatsOnExit;
 
 impl Drop for FlushLeafStatsOnExit {
@@ -1504,9 +1538,10 @@ where
     // Per-call-site identity from the caller's source location
     // (track_caller chain). An outer entry's attachment (or a
     // caller's explicit with_site) wins.
-    let plan_owned = plan
+    let (plan_owned, routing_arm) = plan
         .with_site_if_none(crate::sched::call_site::caller_site())
-        .apply_site_class();
+        .apply_site_class_measured();
+    let _routing = RecordRoutingArm::start(plan_owned.site, routing_arm);
     let plan = &plan_owned;
     // Declared before the flush guard so it drops after it: the pool
     // totals it differences are published by that flush, and a
@@ -1879,9 +1914,10 @@ where
     }
     // Per-call-site identity from the caller's source location
     // (track_caller chain); an outer attachment wins.
-    let plan_owned = plan
+    let (plan_owned, routing_arm) = plan
         .with_site_if_none(crate::sched::call_site::caller_site())
-        .apply_site_class();
+        .apply_site_class_measured();
+    let _routing = RecordRoutingArm::start(plan_owned.site, routing_arm);
     let plan = &plan_owned;
     let chunk = chunk_size.max(1);
     if n <= chunk {
@@ -2188,9 +2224,10 @@ where
     }
     // Per-call-site identity from the caller's source location
     // (track_caller chain); an outer attachment wins.
-    let plan_owned = plan
+    let (plan_owned, routing_arm) = plan
         .with_site_if_none(crate::sched::call_site::caller_site())
-        .apply_site_class();
+        .apply_site_class_measured();
+    let _routing = RecordRoutingArm::start(plan_owned.site, routing_arm);
     let plan = &plan_owned;
     // Capped to one worker, or under the dispatch floor by the
     // caller's own estimate: the body runs here, as in
@@ -2342,9 +2379,10 @@ where
     }
     // Per-call-site identity from the caller's source location
     // (track_caller chain); an outer attachment wins.
-    let plan_owned = plan
+    let (plan_owned, routing_arm) = plan
         .with_site_if_none(crate::sched::call_site::caller_site())
-        .apply_site_class();
+        .apply_site_class_measured();
+    let _routing = RecordRoutingArm::start(plan_owned.site, routing_arm);
     let plan = &plan_owned;
     let _flush_on_exit = FlushLeafStatsOnExit;
     // Capped to one worker, or under the dispatch floor by the
@@ -2666,9 +2704,10 @@ where
     // (track_caller chain). An outer entry (heartbeat /
     // token-bucket / tiny-tasks) that already attached its own
     // site wins via with_site_if_none.
-    let plan_owned = plan
+    let (plan_owned, routing_arm) = plan
         .with_site_if_none(crate::sched::call_site::caller_site())
-        .apply_site_class();
+        .apply_site_class_measured();
+    let _routing = RecordRoutingArm::start(plan_owned.site, routing_arm);
     let plan = &plan_owned;
     let _flush_on_exit = FlushLeafStatsOnExit;
 
@@ -2912,9 +2951,10 @@ where
     // (track_caller chain): heartbeat's serial spans record into
     // this site, and the site's cv^2 + policy arms drive the
     // heartbeat-vs-SLAW choice below.
-    let plan_owned = plan
+    let (plan_owned, routing_arm) = plan
         .with_site_if_none(crate::sched::call_site::caller_site())
-        .apply_site_class();
+        .apply_site_class_measured();
+    let _routing = RecordRoutingArm::start(plan_owned.site, routing_arm);
     let plan = &plan_owned;
 
     // Plan-estimate gate (entry-only, no rdtsc-polling in hot loop).
@@ -3146,9 +3186,10 @@ where
     }
     // Per-call-site identity from the caller's source location
     // (track_caller chain); an outer attachment wins.
-    let plan_owned = plan
+    let (plan_owned, routing_arm) = plan
         .with_site_if_none(crate::sched::call_site::caller_site())
-        .apply_site_class();
+        .apply_site_class_measured();
+    let _routing = RecordRoutingArm::start(plan_owned.site, routing_arm);
     let plan = &plan_owned;
 
     // Entry gate identical to `collect_indexed_heartbeat`: skip the

@@ -196,6 +196,14 @@ pub struct CallSiteState {
     arm_ewma_ns: [AtomicU64; 2],
     arm_samples: [AtomicU32; 2],
     arm_calls: AtomicU32,
+    // The same shape for the routing decision, kept apart from the
+    // execution-policy arms because the two consumers would otherwise
+    // average each other's dispatches into one EWMA and neither could
+    // read its own effect. Default is the plan the learned class
+    // re-derives; Alternative is the plan as the caller built it.
+    routing_ewma_ns: [AtomicU64; 2],
+    routing_samples: [AtomicU32; 2],
+    routing_calls: AtomicU32,
     // Hybrid-placement model: per-log2-size-bucket end-to-end EWMAs
     // for the CPU side and the backend side, plus a per-bucket call
     // counter driving the re-probe cadence.
@@ -303,6 +311,9 @@ impl CallSiteState {
             arm_ewma_ns: [const { AtomicU64::new(0) }; 2],
             arm_samples: [const { AtomicU32::new(0) }; 2],
             arm_calls: AtomicU32::new(0),
+            routing_ewma_ns: [const { AtomicU64::new(0) }; 2],
+            routing_samples: [const { AtomicU32::new(0) }; 2],
+            routing_calls: AtomicU32::new(0),
             place_cpu_ns: [const { AtomicU64::new(0) }; PLACEMENT_BUCKETS],
             place_backend_ns: [const { AtomicU64::new(0) }; PLACEMENT_BUCKETS],
             place_calls: [const { AtomicU32::new(0) }; PLACEMENT_BUCKETS],
@@ -792,6 +803,64 @@ impl CallSiteState {
             };
         }
         best
+    }
+
+    /// Pick whether this dispatch runs the routing the learned class
+    /// re-derives ([`PolicyArm::Default`]) or the plan as the caller
+    /// built it ([`PolicyArm::Alternative`]).
+    ///
+    /// Same selection as [`Self::choose_arm`] and for the same reason,
+    /// on its own counters: explore until both arms have
+    /// [`ARM_MIN_SAMPLES`], then take the lower EWMA, and every
+    /// [`ARM_TRIAL_CADENCE`]th call run the other one so a routing that
+    /// stopped being the better choice is found rather than assumed.
+    ///
+    /// A class is a description of the work and this is the check on
+    /// what that description costs. Where the two disagree the
+    /// measurement wins, which is what keeps a class that has gone
+    /// wrong from being expensive as well as wrong.
+    pub fn choose_routing_arm(&self) -> PolicyArm {
+        let calls = self.routing_calls.fetch_add(1, Ordering::Relaxed);
+        let s0 = self.routing_samples[0].load(Ordering::Relaxed);
+        let s1 = self.routing_samples[1].load(Ordering::Relaxed);
+        if s0 < ARM_MIN_SAMPLES || s1 < ARM_MIN_SAMPLES {
+            return if s1 < s0 {
+                PolicyArm::Alternative
+            } else {
+                PolicyArm::Default
+            };
+        }
+        let e0 = ewma_value(&self.routing_ewma_ns[0]);
+        let e1 = ewma_value(&self.routing_ewma_ns[1]);
+        let best = if e1 < e0 {
+            PolicyArm::Alternative
+        } else {
+            PolicyArm::Default
+        };
+        if calls % ARM_TRIAL_CADENCE == ARM_TRIAL_CADENCE - 1 {
+            return match best {
+                PolicyArm::Default => PolicyArm::Alternative,
+                PolicyArm::Alternative => PolicyArm::Default,
+            };
+        }
+        best
+    }
+
+    /// Record one dispatch's wall time under the routing arm it ran.
+    pub fn record_routing_arm(&self, arm: PolicyArm, wall_ns: u64) {
+        let i = arm.idx();
+        ewma_update(&self.routing_ewma_ns[i], wall_ns);
+        self.routing_samples[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current per-arm EWMA wall times for the routing decision,
+    /// `(class_derived_ns, caller_plan_ns)`; zero means no samples yet.
+    /// Diagnostics and tests.
+    pub fn routing_ewmas(&self) -> (u64, u64) {
+        (
+            ewma_value(&self.routing_ewma_ns[0]),
+            ewma_value(&self.routing_ewma_ns[1]),
+        )
     }
 
     /// Record one dispatch's wall time under `arm`.
@@ -1306,6 +1375,45 @@ mod tests {
             per_item_cv2 < low,
             "per-item spread {per_item_cv2} must read as uniform, under {low}, on work whose \
              per-item cost never changed"
+        );
+    }
+
+    #[test]
+    fn routing_arm_adopts_the_caller_plan_when_the_class_routing_is_slower() {
+        // The case the measurement exists for: a site whose class has
+        // stopped describing its work, so the routing that class
+        // re-derives costs more than the plan the caller built. The
+        // class is not consulted here at all - only what each arm's
+        // dispatches took.
+        static S: CallSiteState = CallSiteState::new();
+        for _ in 0..4 {
+            S.record_routing_arm(PolicyArm::Default, 900_000);
+            S.record_routing_arm(PolicyArm::Alternative, 300_000);
+        }
+
+        let mut caller_plan = 0;
+        let mut class_routing = 0;
+        for _ in 0..12 {
+            match S.choose_routing_arm() {
+                PolicyArm::Alternative => caller_plan += 1,
+                PolicyArm::Default => class_routing += 1,
+            }
+        }
+        assert!(
+            caller_plan > class_routing,
+            "the faster arm must win the routing: caller plan {caller_plan}, class routing \
+             {class_routing}"
+        );
+        assert!(
+            class_routing > 0,
+            "the slower arm must still run on the trial cadence, or a routing that becomes \
+             the better one again is never found"
+        );
+        let (default_ns, alternative_ns) = S.routing_ewmas();
+        assert!(
+            alternative_ns < default_ns,
+            "the arms report what they cost: class routing {default_ns} ns, caller plan \
+             {alternative_ns} ns"
         );
     }
 
