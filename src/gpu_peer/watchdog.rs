@@ -109,7 +109,28 @@ pub fn decide(
 
 /// Read the driver model and the TDR settings for CUDA device `ordinal`
 /// and decide which watchdog applies.
+///
+/// Read once per device per process. Both reads describe hardware and a
+/// driver configuration that a running process cannot change, and the
+/// driver-model read loads NVML, initializes it and shuts it down, which
+/// costs tens of milliseconds whatever the span being sized.
 pub fn detect(ordinal: usize) -> WatchdogState {
+    static CACHE: std::sync::Mutex<Vec<(usize, WatchdogState)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    // A poisoned cache still holds readings, and every entry in it is a
+    // value some earlier call already returned.
+    let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, state)) = cache.iter().find(|(known, _)| *known == ordinal) {
+        return state.clone();
+    }
+    let state = read_watchdog(ordinal);
+    cache.push((ordinal, state.clone()));
+    state
+}
+
+/// One reading of the driver model and the TDR settings for `ordinal`.
+fn read_watchdog(ordinal: usize) -> WatchdogState {
     let model = pci_bus_id(ordinal).and_then(|bus_id| nvml_driver_model(&bus_id));
     #[cfg(windows)]
     let tdr = Some(tdr_settings());
