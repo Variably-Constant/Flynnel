@@ -222,6 +222,29 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   So the claim this entry makes is the one the measurement supports:
   the fix does not cost the narrow widths anything.
 
+- The crate builds and lints on Linux and FreeBSD. Three defects sat in
+  code one platform compiles and the other does not, so a Windows-only
+  gate could not see any of them: an undocumented public function in the
+  non-Windows arms of `thread_on_core_ticks`, which failed
+  `deny(missing_docs)`; a nested `if let` pair in the Linux NUMA probe,
+  which clippy rejects at `-D warnings`; and the TDR defaults in
+  `examples/gpu_peer_generation_barrier`, read only by `cfg(windows)`
+  code and therefore dead elsewhere.
+
+  A malformed entry under `/sys/devices/system/node` is now reported on
+  stderr rather than discarded. An entry whose name does not begin with
+  `node` is not a node and is skipped as before; one that does and whose
+  suffix is not a number is named, since nothing else would say the
+  topology was read from fewer nodes than the directory offered.
+
+  The leaf-floor test that covers the per-item recursion floor asserted
+  an exact leaf count, which is reachable only above a particular
+  `pool_dispatch_cost_ns`. That figure is measured per process and moves
+  with load, so the test passed on a loaded host and failed on a quiet
+  one. It now asserts what the floor owes on any host: never above the
+  caller's cap, never one item per leaf, and unless the cap binds first,
+  one item fewer would not cover a dispatch.
+
 ### Scheduler
 
 - The cooperative fan-out's mailbox gate moves from the worker count to
