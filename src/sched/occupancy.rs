@@ -88,9 +88,18 @@ impl OccupancyWindow {
     /// rather than reading every interval as idle.
     pub fn sample(&self) -> OccupancySample {
         let (thread, wall) = clock_pair();
+        let wall_ticks = wall.saturating_sub(self.wall_at_start);
+        if !HAS_THREAD_CLOCK {
+            // The fraction is unknowable here, and the two readings a
+            // consumer could take from an unknowable one are not
+            // symmetric: reading every interval as idle would move a
+            // decision, and reading it as owned leaves the decision
+            // where it sat before this module existed.
+            return OccupancySample { thread_ticks: wall_ticks, wall_ticks };
+        }
         OccupancySample {
             thread_ticks: thread.saturating_sub(self.thread_at_start),
-            wall_ticks: wall.saturating_sub(self.wall_at_start),
+            wall_ticks,
         }
     }
 }
@@ -158,13 +167,12 @@ pub fn thread_on_core_ticks() -> u64 {
 /// Ticks this thread has spent on a core, in nanoseconds, read from the
 /// per-thread CPU clock.
 ///
-/// Zero when that clock cannot be read, which is the no-clock value
-/// [`OccupancyWindow::sample`] turns into full occupancy.
-#[cfg(target_os = "linux")]
+/// Zero when that clock cannot be read.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn thread_on_core_ticks() -> u64 {
     let mut ts = libc_timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: an out parameter this stack frame owns; the clock id is
-    // the per-thread CPU clock, defined on every Linux this targets.
+    // the per-thread CPU clock, defined on every target this arm covers.
     let r = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) };
     if r != 0 {
         return 0;
@@ -172,17 +180,22 @@ pub fn thread_on_core_ticks() -> u64 {
     (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[repr(C)]
 struct libc_timespec {
     tv_sec: i64,
     tv_nsec: i64,
 }
 
+/// The per-thread CPU clock's id, which each kernel numbers for itself:
+/// 3 on Linux, 14 on FreeBSD.
 #[cfg(target_os = "linux")]
 const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "freebsd")]
+const CLOCK_THREAD_CPUTIME_ID: i32 = 14;
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[link(name = "c")]
 unsafe extern "C" {
     fn clock_gettime(clk_id: i32, tp: *mut libc_timespec) -> i32;
@@ -190,12 +203,23 @@ unsafe extern "C" {
 
 /// Zero, on a platform that offers no per-thread CPU clock.
 ///
-/// [`OccupancyWindow::sample`] turns it into full occupancy, so a
-/// consumer reads what it read before this module existed.
-#[cfg(not(any(windows, target_os = "linux")))]
+/// [`HAS_THREAD_CLOCK`] is what tells a reader that the zero means no
+/// clock rather than no time on core.
+#[cfg(not(any(windows, target_os = "linux", target_os = "freebsd")))]
 pub fn thread_on_core_ticks() -> u64 {
     0
 }
+
+/// Whether this platform reports a thread's own CPU time.
+///
+/// [`thread_on_core_ticks`] returns zero both where no such clock exists
+/// and where a thread genuinely spent no time on a core, so the count
+/// alone cannot tell a reader which it is holding. This can.
+#[cfg(any(windows, target_os = "linux", target_os = "freebsd"))]
+pub const HAS_THREAD_CLOCK: bool = true;
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "freebsd")))]
+pub const HAS_THREAD_CLOCK: bool = false;
 
 #[cfg(test)]
 mod tests {
@@ -227,7 +251,7 @@ mod tests {
         let w = OccupancyWindow::start();
         std::thread::sleep(std::time::Duration::from_millis(40));
         let s = w.sample();
-        if thread_on_core_ticks() == 0 {
+        if !HAS_THREAD_CLOCK {
             // No thread clock: the figure is inert and reports full
             // occupancy, so there is nothing to assert about sleeping.
             assert_eq!(s.percent(), 100);
