@@ -5,7 +5,7 @@ measurements from `benches/` and `tests/` on the two bench hosts, an
 RTX 3070 with a Ryzen 7 2700 (16 threads) and an RTX 5070 with a
 Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
-## Unreleased
+## 0.5.0 - 2026-09-12
 
 This release is **0.5.0, not 0.4.1**: it changes public signatures under
 `sched::occupancy`, and in a `0.x` version the minor position is where a
