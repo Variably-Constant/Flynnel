@@ -81,8 +81,11 @@ const WORKS_US: [u32; 2] = [0, 250];
 const SPREADS_PERMILLE: [u32; 2] = [0, 1_000];
 
 /// Windows' documented TDR defaults when the registry carries no value:
-/// level 3 recovers the adapter, after a delay of 2 seconds.
+/// level 3 recovers the adapter, after a delay of 2 seconds. Only the
+/// Windows watchdog reads them.
+#[cfg(windows)]
 const TDR_DEFAULT_LEVEL: u32 = 3;
+#[cfg(windows)]
 const TDR_DEFAULT_DELAY_S: u32 = 2;
 
 /// The device side. Every thread of every block runs it; `__syncthreads`
