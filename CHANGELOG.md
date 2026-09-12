@@ -7,6 +7,23 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ## Unreleased
 
+This release is **0.5.0, not 0.4.1**: it changes public signatures under
+`sched::occupancy`, and in a `0.x` version the minor position is where a
+breaking change goes.
+
+Two things a consumer has to do rather than read:
+
+- **A manifest pinning `flynnel = "0.4"` will not resolve this release.**
+  Cargo reads `"0.4"` as `>=0.4.0, <0.5.0`, so the build keeps resolving
+  the older crate, reports nothing, and looks exactly as it would if the
+  release had never happened. Change the requirement to `"0.5"`.
+- **`thread_on_core_ticks`, `OccupancySample` and
+  `OccupancySample::percent` have new signatures, and
+  `HAS_THREAD_CLOCK` is gone.** The Changed entry below says what each
+  became and why. A caller that only read the occupancy percentage needs
+  to decide what it does when the figure is absent, which is the point
+  of the change.
+
 ### Changed
 
 - A call site's learned class is decided from the cost of one item and
