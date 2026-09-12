@@ -4322,11 +4322,28 @@ mod tests {
             !plan.estimated_per_item_ns_explicit,
             "no caller hint, so the floor has only the site to read"
         );
-        assert_eq!(
-            adaptive_min_leaf(&plan, caller_floor),
-            caller_floor,
-            "a site measuring {PER_ITEM_NS} ns an item keeps the caller's floor of \
-             {caller_floor}; dropping to one item per leaf would hand each of them a dispatch"
+        // The floor is capped by the caller and otherwise sized so one
+        // leaf carries about a dispatch of work. Both bounds come from
+        // a dispatch cost measured per process, which reads 900 to
+        // 1100 ns unloaded and 2100 to 5500 ns loaded, so the contract
+        // is what holds on every host and an exact leaf count is not.
+        let dispatch_ns = pool_dispatch_cost_ns();
+        let measured_floor = adaptive_min_leaf(&plan, caller_floor);
+        assert!(
+            measured_floor > 1,
+            "a site measuring {PER_ITEM_NS} ns an item must not collapse to one item per \
+             leaf, which would hand each of them a dispatch; got {measured_floor}"
+        );
+        assert!(
+            measured_floor <= caller_floor,
+            "the floor never rises above the caller's {caller_floor}; got {measured_floor}"
+        );
+        assert!(
+            measured_floor == caller_floor
+                || (measured_floor as u64 + 1) * PER_ITEM_NS > dispatch_ns,
+            "a leaf carries about one dispatch of work unless the caller's floor caps it \
+             first, so one item fewer would not cover it: {measured_floor} items at \
+             {PER_ITEM_NS} ns against a dispatch measured at {dispatch_ns} ns"
         );
 
         // A site with no measurement still gets the old signal, so the
