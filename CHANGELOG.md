@@ -7,7 +7,40 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ## Unreleased
 
+### Changed
+
+- A call site's learned class is decided from the cost of one item and
+  the spread of that cost, not from whole-leaf times. A leaf's time
+  scales with the items in it, and how finely work is split follows from
+  the class, so classifying leaf times let a class hold itself in place:
+  a uniform-item site that once left `Streaming` could not return, and
+  measured 18 percent below `Streaming` on fine-grain work for as long
+  as it stayed there. Every leaf recorder now carries its item count,
+  and `CallSiteState::per_item_ns` and `per_item_cv2_per_mille` report
+  what the class was decided from. A window whose samples carry no item
+  count, such as the heartbeat's serial spans, still classifies on leaf
+  times.
+- The recursion floor comes from the site's measured per-item cost
+  rather than from `use_smt` standing in for "the items are heavy". A
+  class that turns SMT on no longer drops the floor to one item, which
+  is how a 5 ns item could be handed its own dispatch.
+- Leaf times reach the classifiers in nanoseconds. `read_tsc` returns
+  raw counter ticks on x86_64, and every consumer - the class bands,
+  `effective_use_smt`, the split multiplier, the site's window - read
+  them as nanoseconds, so every boundary sat out by the tick rate: a
+  factor of 4.66 on one bench host. The conversion happens once per
+  batch, from a rate measured once per process. On other targets the
+  fallback clock now measures elapsed time rather than reading about
+  zero.
+
 ### Added
+
+- A call site measures what acting on its class is worth. The site runs
+  a routing A/B on its own counters: one arm is the plan its learned
+  class re-derives, the other the plan as the caller built it. It
+  explores both, keeps the faster by moving average, and re-tests on a
+  cadence, so a class that stops describing the work costs the trial
+  rate rather than every dispatch until something notices.
 
 - `CallSiteState::window_mean_ns`, `window_cv2_per_mille` and
   `window_ticks` report the delta window the latest classifier tick

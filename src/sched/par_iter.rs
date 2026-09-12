@@ -80,10 +80,15 @@ fn read_tsc() -> u64 {
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        // Non-x86 fallback: use Instant. Slower but portable. The
-        // heartbeat scheduler will still work; only the
-        // amortization-bound constants differ.
-        std::time::Instant::now().elapsed().as_nanos() as u64
+        // Nanoseconds since a point fixed at first use, so two reads
+        // differ by the time between them. Timing an Instant created in
+        // the same expression measures the call itself, which is a few
+        // nanoseconds of noise around zero however long the leaf took.
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        ORIGIN
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_nanos() as u64
     }
 }
 
