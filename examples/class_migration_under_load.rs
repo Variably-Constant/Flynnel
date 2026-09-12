@@ -2,11 +2,11 @@
 //! while the run loads the box itself in a scheduled window, with the
 //! box's CPU on every row.
 //!
-//! The classifier takes two inputs, a leaf-time mean and a squared
-//! coefficient of variation, and preemption moves the second while
-//! barely moving the first. A site whose leaves are uniform therefore
-//! reads as one class on a quiet host and can read as another on a busy
-//! one, without its own work having changed.
+//! The classifier takes two inputs, the mean cost of one item and the
+//! squared coefficient of variation of that cost, and preemption moves
+//! the second while barely moving the first. A site whose items are
+//! uniform therefore reads as one class on a quiet host and can read as
+//! another on a busy one, without its own work having changed.
 //!
 //! Both the process-global class and the site's own learned class are
 //! printed, because they are separate state reached by separate paths.
@@ -24,12 +24,14 @@
 //! recorder timed, which on this dispatch's lazy bisect is one leaf in
 //! every `LEAF_SAMPLE_STRIDE` (`src/sched/par_iter.rs`).
 //!
-//! The site times whole leaves and records no item counts, so leaves of
-//! different sizes read as variance even when every item costs the same.
-//! Every row therefore lists the leaves each size ran over its interval,
-//! with their count, mean time and cv^2. When those per-size values are low
-//! and the site's window cv^2 is high, the variance came from the mix of
-//! sizes rather than from the time any one size took.
+//! Every row lists the leaves each size ran over its interval, with
+//! their count, mean time and cv^2, because the size mix is what the
+//! reading has to survive: a site's leaves change size whenever the
+//! scheduler splits differently, and per-item cost is what stays put
+//! when they do. Per-size values that are low beside a window cv^2 that
+//! is high say the spread came from the mix of sizes rather than from
+//! the time any one size took, which is the shape this example was
+//! built to catch.
 //!
 //! The ninth argument picks the routing. `adaptive` builds each plan with
 //! `JobPlan::new`, so the site's learned class re-derives the routing of
