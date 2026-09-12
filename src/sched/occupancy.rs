@@ -308,23 +308,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_thread_that_owns_its_core_reads_high() {
-        let w = OccupancyWindow::start();
-        // Spin rather than sleep: the point is an interval this thread
-        // spends running.
+    fn a_spinning_thread_reads_more_of_its_core_than_a_sleeping_one() {
+        // Two windows of the same length on the same thread, one spent
+        // running and one spent asleep, and the assertion is their
+        // ORDER rather than a figure for either. A suite running in
+        // parallel on a guest with more vCPUs than its socket has cores
+        // hands a spinning thread well under half a core - 44 percent
+        // on a two-guest 5700G - so any absolute floor is a constant
+        // chosen ahead of the distribution this module's own doc says
+        // cannot be named. The ordering holds under any load short of
+        // a thread that never ran at all, which would be its own
+        // finding.
+        let spinning = OccupancyWindow::start();
         let mut x: u64 = 0;
         let until = std::time::Instant::now() + std::time::Duration::from_millis(40);
         while std::time::Instant::now() < until {
             x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
         }
         std::hint::black_box(x);
-        let Some(pct) = w.sample().percent() else {
-            // A platform with no clock has nothing to assert about a
-            // spinning thread, and says so rather than reporting a
-            // figure this test would then check.
+        let spun = spinning.sample();
+
+        let sleeping = OccupancyWindow::start();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let slept = sleeping.sample();
+
+        let (Some(spin_pct), Some(sleep_pct)) = (spun.percent(), slept.percent()) else {
+            // No thread clock on this platform: there is no figure to
+            // order, and the samples say so rather than inventing one.
             return;
         };
-        assert!(pct >= 50, "a spinning thread should hold most of its core, read {pct}%");
+        assert!(
+            spin_pct > sleep_pct,
+            "a thread that ran for its window must read more of its core than one \
+             that slept through it: spinning {spin_pct}%, sleeping {sleep_pct}%"
+        );
     }
 
     #[test]
