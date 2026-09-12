@@ -22,8 +22,7 @@
 //! consecutive windows, so the leaf count is reported and is what to
 //! raise if nothing ever moves. That count is the leaves the site's
 //! recorder timed, which on this dispatch's lazy bisect is one leaf in
-//! every `LEAF_SAMPLE_STRIDE` (`src/sched/par_iter.rs`), and the window
-//! mean is in the recorder's unit, rdtsc ticks on x86_64.
+//! every `LEAF_SAMPLE_STRIDE` (`src/sched/par_iter.rs`).
 //!
 //! The site times whole leaves and records no item counts, so leaves of
 //! different sizes read as variance even when every item costs the same.
@@ -244,7 +243,7 @@ where
 struct SiteView {
     sampled_leaves: u64,
     cv2: Option<u64>,
-    window_mean_ticks: Option<u64>,
+    window_mean_ns: Option<u64>,
     window_cv2: Option<u64>,
     learned: Option<WorkloadClass>,
 }
@@ -253,7 +252,7 @@ fn read_site(state: &CallSiteState) -> SiteView {
     SiteView {
         sampled_leaves: state.leaf_count(),
         cv2: state.cv2_per_mille(),
-        window_mean_ticks: state.window_mean_ticks(),
+        window_mean_ns: state.window_mean_ns(),
         window_cv2: state.window_cv2_per_mille(),
         learned: state.learned_class(),
     }
@@ -657,7 +656,7 @@ fn main() {
     // or few-item sizes cannot answer it however clean the class column
     // looks.
     println!(
-        "elapsed_s  phase   dispatches  sampled_leaves  cv2_per_mille  window_mean_ticks  window_cv2  \
+        "elapsed_s  phase   dispatches  sampled_leaves  cv2_per_mille  window_mean_ns  window_cv2  \
          site_class  global_class  last_ms  box_cores  own_cores  foreign_cores  leaf_sizes"
     );
 
@@ -743,7 +742,7 @@ fn main() {
                 Some(v) => v.to_string(),
                 None => "none".to_string(),
             };
-            let window_mean = match view.window_mean_ticks {
+            let window_mean = match view.window_mean_ns {
                 Some(v) => v.to_string(),
                 None => "none".to_string(),
             };

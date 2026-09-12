@@ -87,15 +87,105 @@ fn read_tsc() -> u64 {
     }
 }
 
-/// Bracket a leaf-body invocation with TSC reads and record the
-/// delta. Every bisect-leaf emit site uses this so the
-/// [`crate::sched::split_observer`] and the site classifier can
-/// derive per-leaf variance (cv^2 is unit-invariant, so the
-/// approximate-ns TSC delta suffices). Samples batch in a
-/// thread-local buffer ([`LocalLeafBuffer::FLUSH_THRESHOLD`] = 4)
-/// before flushing: unbatched, the three global fetch_adds cost
-/// ~100ns per leaf on a 16-worker host; batched, ~30ns (2 TSC
-/// reads + thread-local access).
+/// Timestamp-counter ticks per nanosecond on this host, in
+/// sixteenths, or zero before the probe has run.
+///
+/// Sixteenths rather than a float so the conversion at a flush is an
+/// integer multiply and shift, and so the stored value is exact for
+/// the tick rates this runs on: a 3.6 GHz counter is 57.6 sixteenths.
+static TSC_PER_NS_16: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One probe at a time; a second caller waits and takes the installed
+/// rate.
+static TSC_RATE_PROBE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Ticks per nanosecond in sixteenths, measured once per process.
+///
+/// [`read_tsc`] returns raw counter ticks on x86_64, and every
+/// consumer of a leaf time works in nanoseconds, so the two flushes in
+/// [`LocalLeafBuffer`] convert with this. The counter advances at a
+/// fixed rate independent of the core's current frequency, so one
+/// measurement describes the process's whole life.
+///
+/// Off x86_64 the counter is already a nanosecond clock, so this is
+/// one sixteenth-per-nanosecond times sixteen and the conversion is
+/// the identity.
+fn tsc_per_ns_16() -> u64 {
+    use std::sync::atomic::Ordering;
+    let installed = TSC_PER_NS_16.load(Ordering::Relaxed);
+    if installed != 0 {
+        return installed;
+    }
+    let _one_at_a_time = TSC_RATE_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let already = TSC_PER_NS_16.load(Ordering::Relaxed);
+    if already != 0 {
+        return already;
+    }
+    let rate = measure_tsc_per_ns_16();
+    TSC_PER_NS_16.store(rate, Ordering::Relaxed);
+    rate
+}
+
+/// Time a fixed spin against both clocks and report the ratio.
+///
+/// The spin runs for a millisecond, which is four orders of magnitude
+/// above the pair of reads bracketing it, and the fastest of three is
+/// taken because interference only ever adds wall time and so only
+/// ever lowers the apparent rate.
+///
+/// A reading outside 1 to 16 ticks per nanosecond is refused and the
+/// nanosecond clock's own rate is installed instead: no counter this
+/// runs on is below 1 GHz or above 16 GHz, and a rate that wrong would
+/// move every classifier boundary.
+fn measure_tsc_per_ns_16() -> u64 {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // The fallback in `read_tsc` already returns nanoseconds.
+        return 16;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut best = 0u64;
+        for _ in 0..3 {
+            let wall_start = std::time::Instant::now();
+            let tsc_start = read_tsc();
+            while wall_start.elapsed() < std::time::Duration::from_millis(1) {
+                std::hint::spin_loop();
+            }
+            let ticks = read_tsc().wrapping_sub(tsc_start);
+            let nanos = wall_start.elapsed().as_nanos() as u64;
+            if nanos == 0 {
+                continue;
+            }
+            let per_ns_16 = ticks.saturating_mul(16) / nanos;
+            if per_ns_16 > best {
+                best = per_ns_16;
+            }
+        }
+        if !(16..=256).contains(&best) {
+            eprintln!(
+                "flynnel: the timestamp counter measured {} ticks per nanosecond in sixteenths, \
+                 which is outside 1 to 16 per nanosecond; leaf times are read as nanoseconds \
+                 instead",
+                best
+            );
+            return 16;
+        }
+        best
+    }
+}
+
+/// Bracket a leaf-body invocation with timestamp-counter reads and
+/// record the delta. Every bisect-leaf emit site uses this, and the
+/// two flushes in [`LocalLeafBuffer`] convert the ticks to nanoseconds
+/// with [`tsc_per_ns_16`], so [`crate::sched::split_observer`] and the
+/// site classifier receive the unit their thresholds are stated in.
+/// Samples batch in a thread-local buffer
+/// ([`LocalLeafBuffer::FLUSH_THRESHOLD`] = 4) before flushing:
+/// unbatched, the three global fetch_adds cost ~100ns per leaf on a
+/// 16-worker host; batched, ~30ns (2 TSC reads + thread-local access).
 #[inline(always)]
 fn record_leaf<F: FnOnce() -> R, R>(
     site: Option<crate::sched::call_site::SiteRef>,
@@ -123,6 +213,11 @@ fn record_leaf<F: FnOnce() -> R, R>(
 /// and up), and mixing it into the global classifier's per-item-ns
 /// boundaries would migrate the process profile off unrelated
 /// workloads. With no site attached the sample is dropped.
+///
+/// `nanos` is already nanoseconds and goes to the site unconverted:
+/// this path bypasses [`LocalLeafBuffer`], where counter ticks are
+/// turned into nanoseconds, so converting here would apply the rate
+/// twice.
 #[inline(always)]
 pub(crate) fn record_leaf_span_ns(
     site: Option<crate::sched::call_site::SiteRef>,
@@ -228,13 +323,34 @@ impl LocalLeafBuffer {
         }
     }
 
+    /// A batch of counter ticks as nanoseconds: the summed ticks, and
+    /// the summed squares of `ticks >> 8`, which carry the rate
+    /// squared.
+    ///
+    /// Both conversions are integer and lose at most the divisor, and
+    /// the squared sum is scaled by the rate before the division so a
+    /// rate below sixteen sixteenths cannot floor it to zero.
+    fn as_nanos(sum_ticks: u64, sumsq_scaled: u64) -> (u64, u64) {
+        let per_ns_16 = tsc_per_ns_16();
+        if per_ns_16 == 0 {
+            return (sum_ticks, sumsq_scaled);
+        }
+        let sum_ns = sum_ticks.saturating_mul(16) / per_ns_16;
+        let sumsq_ns = sumsq_scaled
+            .saturating_mul(256)
+            / per_ns_16.saturating_mul(per_ns_16).max(1);
+        (sum_ns, sumsq_ns)
+    }
+
     fn flush_global(&mut self) {
         if self.global_count == 0 {
             return;
         }
+        let (sum_ns, sumsq_scaled) =
+            Self::as_nanos(self.global_sum_ns, self.global_sumsq_scaled);
         crate::sched::split_observer::record_leaf_batch(
-            self.global_sum_ns,
-            self.global_sumsq_scaled,
+            sum_ns,
+            sumsq_scaled,
             self.global_count,
         );
         self.global_sum_ns = 0;
@@ -259,11 +375,9 @@ impl LocalLeafBuffer {
             thread.saturating_sub(self.site_thread_at_start),
             wall.saturating_sub(self.site_wall_at_start),
         );
-        site.record_batch_site_only(
-            self.site_sum_ns,
-            self.site_sumsq_scaled,
-            self.site_count,
-        );
+        let (sum_ns, sumsq_scaled) =
+            Self::as_nanos(self.site_sum_ns, self.site_sumsq_scaled);
+        site.record_batch_site_only(sum_ns, sumsq_scaled, self.site_count);
         self.site_sum_ns = 0;
         self.site_sumsq_scaled = 0;
         self.site_count = 0;
@@ -4136,6 +4250,7 @@ mod tests {
         let n = 5_000usize;
         let mut v: Vec<u32> = (0..n as u32).collect();
         let plan = JobPlan::new(6, n as u32);
+        let dispatch_start = std::time::Instant::now();
         for_each_chunk(&plan, &mut v, |slice| {
             // Force a non-trivial body so the TSC delta is well
             // above the rdtsc-pair resolution (~20 cycles).
@@ -4148,8 +4263,24 @@ mod tests {
         let stats = snapshot_leaf_stats();
         assert!(stats.count >= 1,
             "expected at least one leaf recorded, got {}", stats.count);
+        let dispatch_ns = dispatch_start.elapsed().as_nanos() as u64;
         assert!(stats.sum_ns > 0,
-            "expected positive total TSC delta, got {}", stats.sum_ns);
+            "expected a positive total leaf time in nanoseconds, got {}", stats.sum_ns);
+        // The leaves of one dispatch run inside it, on at most every
+        // worker at once, so their summed time cannot exceed the
+        // dispatch's own wall time times the worker count. Counter
+        // ticks would exceed that by the tick rate, which is what this
+        // catches: the leaf times and the wall clock must share a unit.
+        let workers = global_local_arena().total_workers().max(1) as u64;
+        let ceiling = dispatch_ns.saturating_mul(workers).saturating_mul(2).max(1);
+        assert!(
+            stats.sum_ns <= ceiling,
+            "{} ns of leaf time against a {} ns dispatch on {} workers reads as counter ticks \
+             rather than nanoseconds",
+            stats.sum_ns,
+            dispatch_ns,
+            workers
+        );
         // Cleanup so this test's data doesn't pollute neighbours.
         reset_leaf_stats();
     }

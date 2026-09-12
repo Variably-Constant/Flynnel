@@ -177,10 +177,10 @@ pub struct CallSiteState {
     last_count: AtomicU64,
     last_sum_ns: AtomicU64,
     last_sumsq: AtomicU64,
-    // Mean leaf time, in rdtsc ticks on x86_64, and cv^2 per mille of the
-    // delta window the latest tick classified, and how many windows have
-    // been classified.
-    window_mean_ticks: AtomicU64,
+    // Mean leaf time in nanoseconds and cv^2 per mille of the delta
+    // window the latest tick classified, and how many windows have been
+    // classified.
+    window_mean_ns: AtomicU64,
     window_cv2: AtomicU64,
     window_ticks: AtomicU64,
     // Execution-policy A/B arms: per-arm EWMA wall time + sample
@@ -285,7 +285,7 @@ impl CallSiteState {
             last_count: AtomicU64::new(0),
             last_sum_ns: AtomicU64::new(0),
             last_sumsq: AtomicU64::new(0),
-            window_mean_ticks: AtomicU64::new(0),
+            window_mean_ns: AtomicU64::new(0),
             window_cv2: AtomicU64::new(0),
             window_ticks: AtomicU64::new(0),
             arm_ewma_ns: [const { AtomicU64::new(0) }; 2],
@@ -519,16 +519,16 @@ impl CallSiteState {
         self.leaf_count.load(Ordering::Relaxed)
     }
 
-    /// Mean leaf time of the delta window the latest classifier tick
-    /// classified: the mean [`Self::learned_class`] was decided from, in
-    /// the unit leaf times are recorded in, rdtsc ticks on x86_64.
-    /// `None` until a tick has classified a window. While ticks run it may
-    /// come from a different tick than [`Self::window_cv2_per_mille`].
-    pub fn window_mean_ticks(&self) -> Option<u64> {
+    /// Mean leaf time, in nanoseconds, of the delta window the latest
+    /// classifier tick classified: the mean [`Self::learned_class`] was
+    /// decided from. `None` until a tick has classified a window. While
+    /// ticks run it may come from a different tick than
+    /// [`Self::window_cv2_per_mille`].
+    pub fn window_mean_ns(&self) -> Option<u64> {
         if self.window_ticks.load(Ordering::Relaxed) == 0 {
             None
         } else {
-            Some(self.window_mean_ticks.load(Ordering::Relaxed))
+            Some(self.window_mean_ns.load(Ordering::Relaxed))
         }
     }
 
@@ -580,7 +580,7 @@ impl CallSiteState {
             let var = sumsq_per_n.saturating_sub(mean_sq);
             var.saturating_mul(1000) / mean_sq.max(1)
         };
-        self.window_mean_ticks.store(mean_ns, Ordering::Relaxed);
+        self.window_mean_ns.store(mean_ns, Ordering::Relaxed);
         self.window_cv2.store(cv2, Ordering::Relaxed);
         self.window_ticks.fetch_add(1, Ordering::Relaxed);
         let observed = classify_observed(mean_ns, cv2);
