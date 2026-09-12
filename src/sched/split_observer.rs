@@ -263,17 +263,6 @@ pub fn observed_mean_leaf_ns() -> Option<u64> {
     Some(stats.sum_ns / stats.count)
 }
 
-/// Coefficient of variation squared (cv^2 = var/mean^2) in fixed-
-/// point parts-per-1000. Returns `None` when fewer than 4 leaves
-/// have been recorded (statistically insignificant).
-///
-/// cv^2 interpretation:
-/// - `0..50` (cv < ~0.22): leaves are nearly uniform. Static SLAW
-///   budget is optimal; multiplier=1 is fine.
-/// - `50..500` (0.22 <= cv < ~0.71): moderate spread. Baseline
-///   multiplier=2 is the right call.
-/// - `>= 500` (cv >= ~0.71): high variance. Recommend multiplier=4
-///   so steal pressure can rebalance long leaves.
 /// Mean cost of one item across the recorded leaves, in nanoseconds, or
 /// `None` below 4 leaves and when no leaf carried an item count.
 ///
@@ -310,6 +299,23 @@ pub fn per_item_cv_squared_per_mille(stats: LeafStats) -> Option<u64> {
     Some(var.saturating_mul(1000) / mean_sq.max(1))
 }
 
+/// Coefficient of variation squared (cv^2 = var/mean^2) of leaf times
+/// in fixed-point parts-per-1000. Returns `None` when fewer than 4
+/// leaves have been recorded (statistically insignificant).
+///
+/// It is the spread of whole leaves, so it moves when the same work is
+/// split into leaves of different sizes. That is what the split
+/// multiplier wants to know, and it is what a class must not be decided
+/// on, since the class decides the split;
+/// [`per_item_cv_squared_per_mille`] is the reading that holds still.
+///
+/// cv^2 interpretation:
+/// - `0..50` (cv < ~0.22): leaves are nearly uniform. Static SLAW
+///   budget is optimal; multiplier=1 is fine.
+/// - `50..500` (0.22 <= cv < ~0.71): moderate spread. Baseline
+///   multiplier=2 is the right call.
+/// - `>= 500` (cv >= ~0.71): high variance. Recommend multiplier=4
+///   so steal pressure can rebalance long leaves.
 pub fn leaf_cv_squared_per_mille(stats: LeafStats) -> Option<u64> {
     if stats.count < 4 {
         return None;

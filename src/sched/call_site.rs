@@ -667,9 +667,9 @@ impl CallSiteState {
         // A window whose samples carried no item count - the heartbeat's
         // serial spans - is classified on its leaf times, which is all
         // such a sample can say.
-        let (mean_ns, cv2) = if ditems > 0 {
-            let mean = dsum / ditems;
-            let scaled_mean = (dsum >> 8) / ditems;
+        let per_item = dsum.checked_div(ditems);
+        let (mean_ns, cv2) = if let Some(mean) = per_item {
+            let scaled_mean = (dsum >> 8) / ditems.max(1);
             let spread = if scaled_mean == 0 {
                 0
             } else {

@@ -254,6 +254,7 @@ pub(crate) fn record_leaf_span_ns(
 ///   [`crate::sched::call_site::CallSiteState::record_batch_site_only`],
 ///   flushing at the same threshold OR whenever a sample arrives
 ///   for a different site, so site batches never mix sites.
+///
 /// Each half also carries the items its leaves covered and the summed
 /// per-item squared time, which are what a dispersion of per-item cost
 /// is computed from. Leaf time alone cannot distinguish a workload whose
