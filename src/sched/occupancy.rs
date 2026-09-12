@@ -33,31 +33,119 @@
 //! Routing on it is a further step and a different one: making a
 //! dispatch's shape depend on what else is running would mean identical
 //! code behaving differently run to run.
+//!
+//! # Where there is no clock
+//!
+//! Not every platform reports a thread's own CPU time, and a read that
+//! should work can fail. Neither is reported as a number. Every count
+//! this module produces carries whether it was measured, because the
+//! figures it deals in - zero ticks on core, zero percent occupancy -
+//! are all values a genuinely starved thread can have, so any of them
+//! chosen to stand for "not measured" is a value a caller will read as
+//! a measurement.
+//!
+//! That is not hypothetical here. A `0` returned from an unimplemented
+//! platform arm is what left occupancy silently dead on FreeBSD while
+//! the crate compiled, linted and passed its suite there.
+//!
+//! A consumer therefore decides for itself what an unmeasured interval
+//! means to it, at the point where it knows. The one thing none of them
+//! does is contribute an elapsed interval with no on-core time against
+//! it, which would read as a thread that never got a core.
+
+/// Why a thread's on-core count is absent.
+///
+/// The two are different findings and do not share a value. A platform
+/// with no such clock is structural and permanent, so a caller that
+/// meets it will meet it on every call and there is nothing to report.
+/// A clock that exists here and failed to read is a fault, and a caller
+/// may want to say so.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NoReading {
+    /// This platform reports no per-thread CPU time.
+    NoClock,
+    /// The per-thread clock exists on this platform and the read failed.
+    Unreadable,
+}
+
+/// A thread's on-core count, or why there is none.
+///
+/// The absence is carried in the type rather than encoded as a zero.
+/// Zero is a count a thread can genuinely have - a thread that got no
+/// core over the interval - so a zero standing for "no measurement" is
+/// indistinguishable from a measurement, and a caller reading the number
+/// alone cannot tell which it holds. That ambiguity let a whole platform
+/// report plausible occupancy while measuring nothing at all.
+///
+/// The unit differs by platform - cycles on Windows, nanoseconds
+/// elsewhere - so a count is only ever divided by the elapsed count
+/// [`clock_pair`] returns beside it, which carries the same unit.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ThreadTicks {
+    /// Ticks this thread spent on a core.
+    Measured(u64),
+    /// No count, and why.
+    Absent(NoReading),
+}
+
+impl ThreadTicks {
+    /// The count, or `None` where there is nothing to count.
+    ///
+    /// A caller that only needs the number still has to say what it does
+    /// without one, which is the property this type exists to enforce.
+    pub fn ticks(self) -> Option<u64> {
+        match self {
+            Self::Measured(ticks) => Some(ticks),
+            Self::Absent(_) => None,
+        }
+    }
+}
 
 /// A thread's on-core ticks and the elapsed ticks they were read
-/// against, both from the same clock so their ratio is a fraction.
+/// against, both from the same clock so their ratio is a fraction, or an
+/// elapsed interval with no on-core figure to pair with it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct OccupancySample {
-    /// Ticks this thread spent on a core.
-    pub thread_ticks: u64,
-    /// Ticks of elapsed time over the same interval.
-    pub wall_ticks: u64,
+pub enum OccupancySample {
+    /// The thread's own clock was read at both ends of the window.
+    Measured {
+        /// Ticks this thread spent on a core.
+        thread_ticks: u64,
+        /// Ticks of elapsed time over the same interval.
+        wall_ticks: u64,
+    },
+    /// The interval elapsed and no on-core count exists for it.
+    Unmeasured {
+        /// Ticks of elapsed time over the interval.
+        wall_ticks: u64,
+        /// Why there is no on-core count.
+        reason: NoReading,
+    },
 }
 
 impl OccupancySample {
     /// Occupancy in hundredths: 100 is a thread that ran for the whole
-    /// interval, 30 is a thread that got under a third of it.
+    /// interval, 30 is a thread that got under a third of it, and `None`
+    /// is an interval this platform could not measure.
+    ///
+    /// `None` rather than a number, because every number here is one a
+    /// contended thread could genuinely report, so any value chosen to
+    /// stand for "not measured" is a value a caller will mistake for a
+    /// measurement.
     ///
     /// Saturates at 100. A thread cannot be on a core for more of an
     /// interval than the interval, but the two counters advance for
     /// different reasons - one per executed cycle, one at a fixed rate -
     /// so a boosted core reads slightly over.
-    pub fn percent(&self) -> u32 {
-        if self.wall_ticks == 0 {
-            return 100;
+    pub fn percent(&self) -> Option<u32> {
+        let (thread_ticks, wall_ticks) = match *self {
+            Self::Measured { thread_ticks, wall_ticks } => (thread_ticks, wall_ticks),
+            Self::Unmeasured { .. } => return None,
+        };
+        if wall_ticks == 0 {
+            return Some(100);
         }
-        let pct = self.thread_ticks.saturating_mul(100) / self.wall_ticks;
-        pct.min(100) as u32
+        let pct = thread_ticks.saturating_mul(100) / wall_ticks;
+        Some(pct.min(100) as u32)
     }
 }
 
@@ -70,7 +158,7 @@ impl OccupancySample {
 /// both come from [`clock_pair`] so they carry the same unit.
 #[derive(Debug)]
 pub struct OccupancyWindow {
-    thread_at_start: u64,
+    thread_at_start: ThreadTicks,
     wall_at_start: u64,
 }
 
@@ -83,23 +171,30 @@ impl OccupancyWindow {
 
     /// Close the window and report the interval.
     ///
-    /// On a platform with no thread clock this reports full occupancy,
-    /// so a consumer behaves exactly as it did before this existed
-    /// rather than reading every interval as idle.
+    /// The interval is measured only when both ends of it carried a
+    /// count. One end without one leaves the fraction unknowable, and
+    /// the sample says so rather than choosing a number for it: a
+    /// consumer decides what an unmeasured interval means to it, at the
+    /// point where it knows.
     pub fn sample(&self) -> OccupancySample {
         let (thread, wall) = clock_pair();
         let wall_ticks = wall.saturating_sub(self.wall_at_start);
-        if !HAS_THREAD_CLOCK {
-            // The fraction is unknowable here, and the two readings a
-            // consumer could take from an unknowable one are not
-            // symmetric: reading every interval as idle would move a
-            // decision, and reading it as owned leaves the decision
-            // where it sat before this module existed.
-            return OccupancySample { thread_ticks: wall_ticks, wall_ticks };
-        }
-        OccupancySample {
-            thread_ticks: thread.saturating_sub(self.thread_at_start),
-            wall_ticks,
+        match (self.thread_at_start, thread) {
+            (ThreadTicks::Measured(start), ThreadTicks::Measured(end)) => {
+                OccupancySample::Measured {
+                    thread_ticks: end.saturating_sub(start),
+                    wall_ticks,
+                }
+            }
+            // A read that failed at either end is reported as the fault
+            // it is; only a platform that has no clock at all reports
+            // the structural absence.
+            (ThreadTicks::Absent(NoReading::Unreadable), _)
+            | (_, ThreadTicks::Absent(NoReading::Unreadable)) => OccupancySample::Unmeasured {
+                wall_ticks,
+                reason: NoReading::Unreadable,
+            },
+            _ => OccupancySample::Unmeasured { wall_ticks, reason: NoReading::NoClock },
         }
     }
 }
@@ -115,13 +210,13 @@ impl OccupancyWindow {
 /// clamped. Linux reports thread time in nanoseconds, so both sides
 /// there are nanoseconds and the pairing is exact.
 #[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) fn clock_pair() -> (u64, u64) {
+pub(crate) fn clock_pair() -> (ThreadTicks, u64) {
     // SAFETY: `_rdtsc` reads a counter register and touches no memory.
     (thread_on_core_ticks(), unsafe { core::arch::x86_64::_rdtsc() })
 }
 
 #[cfg(not(all(windows, target_arch = "x86_64")))]
-pub(crate) fn clock_pair() -> (u64, u64) {
+pub(crate) fn clock_pair() -> (ThreadTicks, u64) {
     // Nanoseconds since a fixed point in this process, from the
     // monotonic clock. A wall clock is the wrong instrument here twice
     // over: it can step backwards, which turns a subtraction into a
@@ -132,18 +227,14 @@ pub(crate) fn clock_pair() -> (u64, u64) {
     (thread_on_core_ticks(), origin.elapsed().as_nanos() as u64)
 }
 
-/// Ticks this thread has spent on a core, or zero where the platform
-/// offers no such clock.
+/// Ticks this thread has spent on a core, in cycles, read from the
+/// thread's cycle counter.
 ///
-/// The unit differs by platform - cycles on Windows, nanoseconds on
-/// Linux - so it is only ever divided by the elapsed count
+/// The unit differs by platform - cycles on Windows, nanoseconds
+/// elsewhere - so a count is only ever divided by the elapsed count
 /// [`clock_pair`] returns beside it, which carries the same unit.
-///
-/// Zero is the no-clock sentinel and produces full occupancy through
-/// the subtraction in [`OccupancyWindow::sample`], which is the
-/// behavior that leaves an unsupported platform where it was.
 #[cfg(windows)]
-pub fn thread_on_core_ticks() -> u64 {
+pub fn thread_on_core_ticks() -> ThreadTicks {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentThread() -> isize;
@@ -155,29 +246,29 @@ pub fn thread_on_core_ticks() -> u64 {
     // `cycles` and reports failure rather than writing on error.
     let ok = unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) };
     if ok == 0 {
-        return 0;
+        return ThreadTicks::Absent(NoReading::Unreadable);
     }
     // Cycles are not nanoseconds and the conversion needs a frequency
     // this does not have. Both sides of the ratio are scaled by the
     // same unknown constant, so the ratio is unaffected and the
     // absolute figure is never read on its own.
-    cycles
+    ThreadTicks::Measured(cycles)
 }
 
 /// Ticks this thread has spent on a core, in nanoseconds, read from the
 /// per-thread CPU clock.
-///
-/// Zero when that clock cannot be read.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-pub fn thread_on_core_ticks() -> u64 {
+pub fn thread_on_core_ticks() -> ThreadTicks {
     let mut ts = libc_timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: an out parameter this stack frame owns; the clock id is
     // the per-thread CPU clock, defined on every target this arm covers.
     let r = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) };
     if r != 0 {
-        return 0;
+        return ThreadTicks::Absent(NoReading::Unreadable);
     }
-    (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
+    ThreadTicks::Measured(
+        (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64,
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -201,25 +292,16 @@ unsafe extern "C" {
     fn clock_gettime(clk_id: i32, tp: *mut libc_timespec) -> i32;
 }
 
-/// Zero, on a platform that offers no per-thread CPU clock.
+/// No count, on a platform that offers no per-thread CPU clock.
 ///
-/// [`HAS_THREAD_CLOCK`] is what tells a reader that the zero means no
-/// clock rather than no time on core.
+/// None of the gated hosts compiles this arm - they are Windows, Linux
+/// and FreeBSD - so it is written to be correct by inspection rather
+/// than by test, and the logic that consumes it is exercised on every
+/// host through [`OccupancySample`] values built directly.
 #[cfg(not(any(windows, target_os = "linux", target_os = "freebsd")))]
-pub fn thread_on_core_ticks() -> u64 {
-    0
+pub fn thread_on_core_ticks() -> ThreadTicks {
+    ThreadTicks::Absent(NoReading::NoClock)
 }
-
-/// Whether this platform reports a thread's own CPU time.
-///
-/// [`thread_on_core_ticks`] returns zero both where no such clock exists
-/// and where a thread genuinely spent no time on a core, so the count
-/// alone cannot tell a reader which it is holding. This can.
-#[cfg(any(windows, target_os = "linux", target_os = "freebsd"))]
-pub const HAS_THREAD_CLOCK: bool = true;
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "freebsd")))]
-pub const HAS_THREAD_CLOCK: bool = false;
 
 #[cfg(test)]
 mod tests {
@@ -236,47 +318,94 @@ mod tests {
             x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
         }
         std::hint::black_box(x);
-        let s = w.sample();
-        // On a platform with no thread clock this is 100 by
-        // construction, which is the same assertion.
-        assert!(
-            s.percent() >= 50,
-            "a spinning thread should hold most of its core, read {}%",
-            s.percent()
-        );
+        let Some(pct) = w.sample().percent() else {
+            // A platform with no clock has nothing to assert about a
+            // spinning thread, and says so rather than reporting a
+            // figure this test would then check.
+            return;
+        };
+        assert!(pct >= 50, "a spinning thread should hold most of its core, read {pct}%");
     }
 
     #[test]
     fn a_thread_that_sleeps_reads_low_where_the_clock_exists() {
         let w = OccupancyWindow::start();
         std::thread::sleep(std::time::Duration::from_millis(40));
-        let s = w.sample();
-        if !HAS_THREAD_CLOCK {
-            // No thread clock: the figure is inert and reports full
-            // occupancy, so there is nothing to assert about sleeping.
-            assert_eq!(s.percent(), 100);
+        let Some(pct) = w.sample().percent() else {
             return;
-        }
-        assert!(
-            s.percent() < 50,
-            "a sleeping thread used almost no core, yet read {}%",
-            s.percent()
-        );
+        };
+        assert!(pct < 50, "a sleeping thread used almost no core, yet read {pct}%");
     }
 
     #[test]
     fn a_zero_length_window_reads_full_rather_than_undefined() {
-        let s = OccupancySample { thread_ticks: 0, wall_ticks: 0 };
-        assert_eq!(s.percent(), 100, "no interval divides by no interval");
+        let s = OccupancySample::Measured { thread_ticks: 0, wall_ticks: 0 };
+        assert_eq!(s.percent(), Some(100), "no interval divides by no interval");
     }
 
     #[test]
     fn occupancy_saturates_rather_than_exceeding_the_interval() {
-        let s = OccupancySample { thread_ticks: 2_000, wall_ticks: 1_000 };
+        let s = OccupancySample::Measured { thread_ticks: 2_000, wall_ticks: 1_000 };
         assert_eq!(
             s.percent(),
-            100,
+            Some(100),
             "two clocks of different resolutions must not report 200 percent"
         );
+    }
+
+    // The arms below are the ones no gated host compiles. They are
+    // reached here by building the values directly, so the behavior a
+    // clockless platform would get is checked on every host.
+
+    #[test]
+    fn an_unmeasured_interval_reports_no_figure_rather_than_a_plausible_one() {
+        for reason in [NoReading::NoClock, NoReading::Unreadable] {
+            let s = OccupancySample::Unmeasured { wall_ticks: 1_000, reason };
+            assert_eq!(
+                s.percent(),
+                None,
+                "an interval with no on-core count has no occupancy to report"
+            );
+        }
+    }
+
+    #[test]
+    fn a_measured_zero_is_not_the_same_finding_as_no_measurement() {
+        let measured = OccupancySample::Measured { thread_ticks: 0, wall_ticks: 1_000 };
+        let unmeasured =
+            OccupancySample::Unmeasured { wall_ticks: 1_000, reason: NoReading::NoClock };
+        assert_eq!(
+            measured.percent(),
+            Some(0),
+            "a thread that genuinely got no core ran at zero percent"
+        );
+        assert_eq!(unmeasured.percent(), None);
+        assert_ne!(
+            measured.percent(),
+            unmeasured.percent(),
+            "total contention and no clock must not read the same"
+        );
+    }
+
+    #[test]
+    fn an_absent_count_yields_no_number_to_a_caller_that_wants_one() {
+        assert_eq!(ThreadTicks::Measured(7).ticks(), Some(7));
+        assert_eq!(ThreadTicks::Absent(NoReading::NoClock).ticks(), None);
+        assert_eq!(ThreadTicks::Absent(NoReading::Unreadable).ticks(), None);
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "linux", target_os = "freebsd"))]
+    fn this_host_reads_its_own_thread_clock() {
+        // The gate runs on Windows, Linux and FreeBSD, each of which has
+        // the clock, so an absent count here is a defect in that host's
+        // arm rather than an unsupported platform. Naming it this way is
+        // what turns a silently dead instrument into a failing test.
+        match thread_on_core_ticks() {
+            ThreadTicks::Measured(_) => {}
+            ThreadTicks::Absent(reason) => panic!(
+                "this platform is expected to report thread CPU time, got {reason:?}"
+            ),
+        }
     }
 }

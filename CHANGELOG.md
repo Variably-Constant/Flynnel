@@ -32,6 +32,33 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   batch, from a rate measured once per process. On other targets the
   fallback clock now measures elapsed time rather than reading about
   zero.
+- A thread's on-core count says whether it was measured, so a platform
+  that cannot read one can no longer be mistaken for a thread that got
+  no core. `thread_on_core_ticks` returns `ThreadTicks`, either
+  `Measured(ticks)` or `Absent(reason)`, where the reason separates a
+  platform with no such clock from a clock that failed to read - the
+  first is permanent and the second is a fault. `OccupancySample`
+  becomes an enum with a `Measured` and an `Unmeasured` case, and
+  `percent` returns `Option<u32>`, whose `None` is an interval nobody
+  measured. `HAS_THREAD_CLOCK` is gone: it stated the same fact as the
+  returned value, and two mechanisms for one fact drift apart.
+
+  This changes the signatures of `thread_on_core_ticks`,
+  `OccupancySample` and `OccupancySample::percent`, all public under
+  `sched::occupancy`.
+
+  A batch of leaves whose on-core count is absent at either end now
+  contributes neither figure to its call site, where before it would
+  have added elapsed time against no on-core time and read as a site
+  whose workers never held a core. The ratio is therefore taken only
+  over batches that were measured, on every platform.
+
+  The arm that reports no clock is compiled by none of the gated hosts,
+  which are Windows, Linux and FreeBSD. The behavior a platform without
+  a clock would get is tested on every host by constructing the values
+  directly, and a separate test asserts that each gated host does read
+  its own thread clock - so an arm that goes dead fails a test instead
+  of reporting zeros.
 
 ### Added
 

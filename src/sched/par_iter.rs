@@ -279,7 +279,12 @@ struct LocalLeafBuffer {
     /// buffered for the current site. Read once when the first sample
     /// of a batch arrives and once at flush, so the pair costs two
     /// clock reads per batch rather than two per leaf.
-    site_thread_at_start: u64,
+    ///
+    /// The on-core count carries whether it was measured at all, so a
+    /// platform without the clock contributes nothing to the site's
+    /// occupancy rather than contributing an elapsed interval with no
+    /// on-core time against it, which would read as total contention.
+    site_thread_at_start: crate::sched::occupancy::ThreadTicks,
     site_wall_at_start: u64,
     /// Call site the buffered site-half samples belong to; null
     /// when the recent samples carried no site. Site changes are
@@ -312,7 +317,9 @@ impl LocalLeafBuffer {
             site_count: 0,
             site_items: 0,
             site_sumsq_per_item: 0,
-            site_thread_at_start: 0,
+            site_thread_at_start: crate::sched::occupancy::ThreadTicks::Absent(
+                crate::sched::occupancy::NoReading::NoClock,
+            ),
             site_wall_at_start: 0,
             site: core::ptr::null(),
         }
@@ -429,10 +436,20 @@ impl LocalLeafBuffer {
         let site: &'static crate::sched::call_site::CallSiteState =
             unsafe { &*self.site };
         let (thread, wall) = crate::sched::occupancy::clock_pair();
-        site.add_pool_ticks(
-            thread.saturating_sub(self.site_thread_at_start),
-            wall.saturating_sub(self.site_wall_at_start),
-        );
+        // Both ends of the batch must have carried a count for the pair
+        // to describe an interval. Where either did not, this batch
+        // contributes neither figure: adding the elapsed side alone
+        // would grow the site's wall total against an unchanged on-core
+        // total, and the site would read as contended on precisely the
+        // platforms that cannot measure contention.
+        if let (Some(start), Some(end)) =
+            (self.site_thread_at_start.ticks(), thread.ticks())
+        {
+            site.add_pool_ticks(
+                end.saturating_sub(start),
+                wall.saturating_sub(self.site_wall_at_start),
+            );
+        }
         let (sum_ns, sumsq_scaled) =
             Self::as_nanos(self.site_sum_ns, self.site_sumsq_scaled);
         let (_, sumsq_per_item) = Self::as_nanos(0, self.site_sumsq_per_item);
@@ -1006,11 +1023,19 @@ fn stored_or_measured() -> HostDispatchProfile {
     let occupancy_window = crate::sched::occupancy::OccupancyWindow::start();
     let (profile, spread) = measure_host_dispatch();
     if std::env::var_os("FLYNNEL_OCCUPANCY").is_some() {
-        eprintln!(
-            "flynnel: host calibration ran at {} percent occupancy, spread {} per mille",
-            occupancy_window.sample().percent(),
-            spread,
-        );
+        // An unmeasured interval is reported as unmeasured. Printing a
+        // number for it would tell a reader the calibration ran on a
+        // quiet host when what happened is that nobody looked.
+        match occupancy_window.sample().percent() {
+            Some(percent) => eprintln!(
+                "flynnel: host calibration ran at {percent} percent occupancy, \
+                 spread {spread} per mille",
+            ),
+            None => eprintln!(
+                "flynnel: host calibration measured no occupancy on this platform, \
+                 spread {spread} per mille",
+            ),
+        }
     }
     match store.try_acquire_writer() {
         Ok(writer) => {
@@ -1148,17 +1173,19 @@ fn parse_pinned_profile(text: &str) -> Option<HostDispatchProfile> {
     })
 }
 
-/// The measurements behind [`host_dispatch_profile`]. Dispatch goes
-/// through a join bisect of its own with a fixed leaf and plans
-/// without an explicit estimate, so nothing here consults the values
-/// it produces.
 /// Reports a dispatch's occupancy to its call site as the dispatch
 /// ends, however it ends.
 ///
-/// The classifier consumes it: leaf times gathered while the pool was
-/// off its cores carry the machine's other tenants, and the figure the
-/// classifier derives from them is a variance, which preemption
-/// inflates by landing on some leaves and not others.
+/// It reports and routes nothing. What it is for is the reader: leaf
+/// times gathered while the pool was off its cores carry the machine's
+/// other tenants, and the figure the classifier derives from those
+/// times is a variance, which preemption inflates by landing on some
+/// leaves and not others. The occupancy says whether that happened; no
+/// learner refuses a window on it and no dispatch is shaped by it.
+///
+/// A dispatch whose workers never carried an on-core count contributes
+/// no ticks at all, so the elapsed total stays zero and this reports
+/// nothing rather than reporting a dispatch that never left its cores.
 struct ReportOccupancy {
     thread_at_start: u64,
     wall_at_start: u64,
@@ -1195,6 +1222,10 @@ impl Drop for ReportOccupancy {
 /// median is worth.
 const SAMPLES: usize = 9;
 
+/// The measurements behind [`host_dispatch_profile`]. Dispatch goes
+/// through a join bisect of its own with a fixed leaf and plans
+/// without an explicit estimate, so nothing here consults the values
+/// it produces.
 fn measure_host_dispatch() -> (HostDispatchProfile, u32) {
     const LEAF: usize = 256;
     const MAX_ITEMS: usize = 1 << 17;
