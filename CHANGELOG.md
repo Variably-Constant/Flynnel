@@ -268,6 +268,23 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   describe hardware and a driver configuration a running process cannot
   change, so the reading is kept per device.
 
+- Occupancy reads a thread's own CPU time on FreeBSD, where it
+  previously read nothing. `thread_on_core_ticks` had a Linux arm and a
+  fallback returning zero, and FreeBSD took the fallback, so a spinning
+  thread there reported no time on core. The per-thread CPU clock exists
+  on that kernel; its id is 14 where Linux numbers the same clock 3, so
+  one implementation now covers both and the id is chosen per kernel.
+
+  The zero that fallback returns is no longer ambiguous. It meant both
+  that a platform has no such clock and that a thread genuinely spent no
+  time on a core, and `OccupancySample::percent` guarded only a
+  zero-length interval, so a real interval with no clock read 0 where
+  the module documents full occupancy. `HAS_THREAD_CLOCK` states which
+  case a reader holds, and `OccupancyWindow::sample` reports the
+  interval as owned where the fraction is unknowable - the reading that
+  leaves a scheduler decision where it sat, against the one that would
+  move it by treating every interval as idle.
+
 ### Scheduler
 
 - The cooperative fan-out's mailbox gate moves from the worker count to
