@@ -661,9 +661,11 @@ pub struct WaveStats {
     /// over the team. Every block of a partition has a region of its own,
     /// so there the two are the same. A global frontier is dealt in runs
     /// of one block's threads from rank 0, so a generation of n ids
-    /// reaches only its first `ceil(n / 256)` blocks, and a block holding
-    /// everything when it was the only block dealt anything is an even
-    /// share rather than the worst imbalance there is.
+    /// reaches only its first `ceil(n / threads per block)` blocks, and a
+    /// block holding everything when it was the only block dealt anything
+    /// is an even share rather than the worst imbalance there is. The
+    /// kernel divides by the block dimension it was launched with, which
+    /// the poller sets; it is not a figure this type holds.
     pub imbalance_per_mille: u32,
     /// Rebalances run.
     pub rebalances: u32,

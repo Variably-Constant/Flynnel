@@ -62,7 +62,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 - A global frontier's `imbalance_per_mille` is taken over the blocks a
   generation could reach rather than over the team. The frontier is
   dealt in runs of one block's threads from rank 0, so a generation of
-  `n` ids reaches only its first `ceil(n / 256)` blocks; measuring the
+  `n` ids reaches only its first `ceil(n / threads per block)` blocks,
+  256 of them at the poller's launch; measuring the
   largest block's share against the whole team therefore scored a
   generation that reached ONE block as the worst imbalance possible,
   `1000 * team`. Since the figure keeps the largest reading of the wave,
