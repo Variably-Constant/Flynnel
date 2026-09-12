@@ -287,11 +287,14 @@ pub fn per_item_cv_squared_per_mille(stats: LeafStats) -> Option<u64> {
     if stats.count < 4 || stats.items == 0 {
         return None;
     }
-    let mean_scaled = (stats.sum_ns >> 8) / stats.items;
-    if mean_scaled == 0 {
+    // Squared in 128 bits and scaled once, as the recorder forms each
+    // leaf's term: scaling the mean first subtracts a smaller square
+    // than the terms carry, and the difference reads as spread.
+    let mean_ns = stats.sum_ns / stats.items;
+    let mean_sq = ((mean_ns as u128).saturating_mul(mean_ns as u128) >> 16) as u64;
+    if mean_sq == 0 {
         return Some(0);
     }
-    let mean_sq = mean_scaled.saturating_mul(mean_scaled);
     let spread = stats
         .sumsq_per_item
         .saturating_sub(mean_sq.saturating_mul(stats.items));
@@ -299,7 +302,7 @@ pub fn per_item_cv_squared_per_mille(stats: LeafStats) -> Option<u64> {
     // time over its item count, so the subtraction leaves an
     // item-weighted sum of squared deviations.
     let var = spread / stats.items;
-    Some(var.saturating_mul(1000) / mean_sq.max(1))
+    Some(var.saturating_mul(1000) / mean_sq)
 }
 
 /// Coefficient of variation squared (cv^2 = var/mean^2) of leaf times

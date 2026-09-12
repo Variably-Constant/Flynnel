@@ -328,7 +328,17 @@ impl LocalLeafBuffer {
         // because a leaf of n items averages n of them. A leaf of no
         // items contributes time to the leaf statistics and nothing to
         // the per-item ones, which is what it can honestly say.
-        let per_item_sq = sq.checked_div(items).unwrap_or(0);
+        //
+        // Taken from the raw nanoseconds in 128 bits and scaled once,
+        // rather than from `sq`: scaling first costs the low 8 bits of
+        // every leaf, which is nothing on a millisecond leaf and 40
+        // percent on a one-item leaf of a microsecond. That error
+        // arrives as spread, which is the one thing this figure exists
+        // to measure.
+        let per_item_sq = (nanos as u128)
+            .saturating_mul(nanos as u128)
+            .checked_div((items as u128) << 16)
+            .unwrap_or(0) as u64;
 
         self.global_sum_ns = self.global_sum_ns.saturating_add(nanos);
         self.global_sumsq_scaled = self.global_sumsq_scaled.saturating_add(sq);

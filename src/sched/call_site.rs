@@ -586,16 +586,19 @@ impl CallSiteState {
         if items == 0 {
             return None;
         }
-        let sum_scaled = self.leaf_sum_ns.load(Ordering::Relaxed) >> 8;
-        let mean_scaled = sum_scaled / items;
-        if mean_scaled == 0 {
+        // The mean squares in 128 bits and scales once, matching how the
+        // recorder forms each leaf's term: scaling the mean first would
+        // subtract a smaller square than the terms carry and report the
+        // difference as spread.
+        let mean_ns = self.leaf_sum_ns.load(Ordering::Relaxed) / items;
+        let mean_sq = ((mean_ns as u128).saturating_mul(mean_ns as u128) >> 16) as u64;
+        if mean_sq == 0 {
             return Some(0);
         }
         let sumsq_per_item = self.leaf_sumsq_per_item.load(Ordering::Relaxed);
-        let mean_sq = mean_scaled.saturating_mul(mean_scaled);
         let spread = sumsq_per_item.saturating_sub(mean_sq.saturating_mul(items));
         let var = spread / items;
-        Some(var.saturating_mul(1000) / mean_sq.max(1))
+        Some(var.saturating_mul(1000) / mean_sq)
     }
 
     /// Mean cost of one item, in nanoseconds, over the delta window the
@@ -671,15 +674,14 @@ impl CallSiteState {
         // such a sample can say.
         let per_item = dsum.checked_div(ditems);
         let (mean_ns, cv2) = if let Some(mean) = per_item {
-            let scaled_mean = (dsum >> 8) / ditems.max(1);
-            let spread = if scaled_mean == 0 {
+            let mean_sq = ((mean as u128).saturating_mul(mean as u128) >> 16) as u64;
+            let spread = if mean_sq == 0 {
                 0
             } else {
-                let mean_sq = scaled_mean.saturating_mul(scaled_mean);
                 let var = dsumsq_per_item
                     .saturating_sub(mean_sq.saturating_mul(ditems))
                     / ditems;
-                var.saturating_mul(1000) / mean_sq.max(1)
+                var.saturating_mul(1000) / mean_sq
             };
             (mean, spread)
         } else {

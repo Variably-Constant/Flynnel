@@ -821,13 +821,12 @@ pub fn tick_auto_classify() {
     // which is all such a sample can say.
     let per_item = dsum.checked_div(ditems);
     let (mean_ns, cv2) = if let Some(mean) = per_item {
-        let scaled_mean = (dsum >> 8) / ditems.max(1);
-        let spread = if scaled_mean == 0 {
+        let mean_sq = ((mean as u128).saturating_mul(mean as u128) >> 16) as u64;
+        let spread = if mean_sq == 0 {
             0
         } else {
-            let mean_sq = scaled_mean.saturating_mul(scaled_mean);
             let var = dsumsq_per_item.saturating_sub(mean_sq.saturating_mul(ditems)) / ditems;
-            var.saturating_mul(1000) / mean_sq.max(1)
+            var.saturating_mul(1000) / mean_sq
         };
         (mean, spread)
     } else {
