@@ -2165,7 +2165,7 @@ where
     // caller's own estimate: the body runs here, as in
     // for_each_chunk.
     if runs_on_caller(plan, n) {
-        run_on_caller(plan, || op(out, a, b));
+        run_on_caller(plan, out.len(), || op(out, a, b));
         return;
     }
     let leaf = min_leaf.max(1);
@@ -2320,7 +2320,7 @@ where
     // caller's own estimate: the body runs here, as in
     // for_each_chunk.
     if runs_on_caller(plan, n) {
-        run_on_caller(plan, || op(0, items));
+        run_on_caller(plan, items.len(), || op(0, items));
         return;
     }
     let leaf = min_leaf.max(1);

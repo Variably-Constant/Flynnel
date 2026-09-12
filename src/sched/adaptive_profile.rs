@@ -1111,7 +1111,7 @@ mod tests {
         let scaled = sample_ns >> 8;
         let sumsq = scaled.saturating_mul(scaled).saturating_mul(count);
         for _ in 0..AUTO_MIGRATION_HYSTERESIS {
-            record_leaf_batch(sample_ns * count, sumsq, count);
+            record_leaf_batch(sample_ns * count, sumsq, count, 0, 0);
         }
         // After `AUTO_MIGRATION_HYSTERESIS` consecutive Streaming
         // classifications, active class should have migrated.
@@ -1139,7 +1139,7 @@ mod tests {
         let count: u64 = 64;
         let scaled = sample_ns >> 8;
         let sumsq = scaled.saturating_mul(scaled).saturating_mul(count);
-        record_leaf_batch(sample_ns * count, sumsq, count);
+        record_leaf_batch(sample_ns * count, sumsq, count, 0, 0);
         assert_eq!(
             active_workload_class(),
             WorkloadClass::PortBound,

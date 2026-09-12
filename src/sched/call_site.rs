@@ -1141,7 +1141,10 @@ mod tests {
             let scaled = per >> 8;
             // site_only: synthetic test samples must not leak into
             // the process-global stats other suite tests observe.
-            S.record_batch_site_only(per * 16, scaled * scaled * 16, 16);
+            // No item count: these samples assert on leaf-time
+            // behavior, which the classifier keeps for windows that
+            // carry none.
+            S.record_batch_site_only(per * 16, scaled * scaled * 16, 16, 0, 0);
         }
         assert_eq!(S.learned_class(), Some(WorkloadClass::Streaming));
     }
@@ -1154,10 +1157,10 @@ mod tests {
         // own class with zero cross-talk between the sites.
         for _ in 0..4 {
             let l = 20u64; // 20ns leaves: FineGrain
-            LIGHT.record_batch_site_only(l * 16, 0, 16);
+            LIGHT.record_batch_site_only(l * 16, 0, 16, 0, 0);
             let h = 1_000_000u64; // 1ms uniform: Streaming
             let hs = h >> 8;
-            HEAVY.record_batch_site_only(h * 16, hs * hs * 16, 16);
+            HEAVY.record_batch_site_only(h * 16, hs * hs * 16, 16, 0, 0);
         }
         assert_eq!(LIGHT.learned_class(), Some(WorkloadClass::FineGrain));
         assert_eq!(HEAVY.learned_class(), Some(WorkloadClass::Streaming));
@@ -1169,13 +1172,13 @@ mod tests {
         static SPREAD: CallSiteState = CallSiteState::new();
         let per = 10_000u64;
         let scaled = per >> 8;
-        UNIFORM.record_batch_site_only(per * 8, scaled * scaled * 8, 8);
+        UNIFORM.record_batch_site_only(per * 8, scaled * scaled * 8, 8, 0, 0);
         // Spread: half 1us, half 100us.
         let a = 1_000u64;
         let b = 100_000u64;
         let asc = a >> 8;
         let bsc = b >> 8;
-        SPREAD.record_batch_site_only(a * 4 + b * 4, asc * asc * 4 + bsc * bsc * 4, 8);
+        SPREAD.record_batch_site_only(a * 4 + b * 4, asc * asc * 4 + bsc * bsc * 4, 8, 0, 0);
         assert!(UNIFORM.cv2_per_mille().unwrap() < 20);
         assert!(SPREAD.cv2_per_mille().unwrap() >= 500);
     }
