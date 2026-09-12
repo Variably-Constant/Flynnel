@@ -168,15 +168,23 @@ pub struct CallSiteState {
     active_tag: AtomicU8,
     pending_tag: AtomicU8,
     pending_run: AtomicU32,
-    // Cumulative leaf statistics for this site.
+    // Cumulative leaf statistics for this site, and beside them the
+    // items those leaves covered with the summed per-item squared time.
+    // The per-item pair is what a class can be decided from without the
+    // split moving it: leaf times change when the scheduler splits
+    // differently, and how it splits follows from the class.
     leaf_count: AtomicU64,
     leaf_sum_ns: AtomicU64,
     leaf_sumsq_scaled: AtomicU64,
+    leaf_items: AtomicU64,
+    leaf_sumsq_per_item: AtomicU64,
     // Snapshot of the cumulative counters at the previous classifier
     // tick; each tick classifies the delta window since then.
     last_count: AtomicU64,
     last_sum_ns: AtomicU64,
     last_sumsq: AtomicU64,
+    last_items: AtomicU64,
+    last_sumsq_per_item: AtomicU64,
     // Mean leaf time in nanoseconds and cv^2 per mille of the delta
     // window the latest tick classified, and how many windows have been
     // classified.
@@ -282,9 +290,13 @@ impl CallSiteState {
             leaf_count: AtomicU64::new(0),
             leaf_sum_ns: AtomicU64::new(0),
             leaf_sumsq_scaled: AtomicU64::new(0),
+            leaf_items: AtomicU64::new(0),
+            leaf_sumsq_per_item: AtomicU64::new(0),
             last_count: AtomicU64::new(0),
             last_sum_ns: AtomicU64::new(0),
             last_sumsq: AtomicU64::new(0),
+            last_items: AtomicU64::new(0),
+            last_sumsq_per_item: AtomicU64::new(0),
             window_mean_ns: AtomicU64::new(0),
             window_cv2: AtomicU64::new(0),
             window_ticks: AtomicU64::new(0),
@@ -462,12 +474,25 @@ impl CallSiteState {
     /// to the process-global counters (keeping the global prior and
     /// the split-multiplier observer fed) and ticks the site's own
     /// classifier when the batch crosses the site quantum.
-    pub fn record_batch(&'static self, sum_ns: u64, sumsq_scaled: u64, count: u64) {
+    pub fn record_batch(
+        &'static self,
+        sum_ns: u64,
+        sumsq_scaled: u64,
+        count: u64,
+        items: u64,
+        sumsq_per_item: u64,
+    ) {
         // Global dual-write first: preserves every existing consumer
         // of the process-wide stats (split multiplier, global
         // auto-classify, effective_use_smt fallback, tests).
-        crate::sched::split_observer::record_leaf_batch(sum_ns, sumsq_scaled, count);
-        self.record_batch_site_only(sum_ns, sumsq_scaled, count);
+        crate::sched::split_observer::record_leaf_batch(
+            sum_ns,
+            sumsq_scaled,
+            count,
+            items,
+            sumsq_per_item,
+        );
+        self.record_batch_site_only(sum_ns, sumsq_scaled, count, items, sumsq_per_item);
     }
 
     /// [`Self::record_batch`] without the process-global dual-write.
@@ -482,9 +507,13 @@ impl CallSiteState {
         sum_ns: u64,
         sumsq_scaled: u64,
         count: u64,
+        items: u64,
+        sumsq_per_item: u64,
     ) {
         self.leaf_sum_ns.fetch_add(sum_ns, Ordering::Relaxed);
         self.leaf_sumsq_scaled.fetch_add(sumsq_scaled, Ordering::Relaxed);
+        self.leaf_items.fetch_add(items, Ordering::Relaxed);
+        self.leaf_sumsq_per_item.fetch_add(sumsq_per_item, Ordering::Relaxed);
         let prior = self.leaf_count.fetch_add(count, Ordering::Relaxed);
         let new_total = prior.wrapping_add(count);
         if (prior / SITE_CLASSIFY_QUANTUM) != (new_total / SITE_CLASSIFY_QUANTUM) {
@@ -519,10 +548,60 @@ impl CallSiteState {
         self.leaf_count.load(Ordering::Relaxed)
     }
 
-    /// Mean leaf time, in nanoseconds, of the delta window the latest
-    /// classifier tick classified: the mean [`Self::learned_class`] was
-    /// decided from. `None` until a tick has classified a window. While
-    /// ticks run it may come from a different tick than
+    /// Mean cost of one item at this site, in nanoseconds, over its
+    /// cumulative history. `None` below 4 leaves, and `None` while no
+    /// recorded leaf carried an item count.
+    ///
+    /// This is the figure a class can be decided from without the split
+    /// moving it. The mean leaf time doubles when the scheduler runs
+    /// leaves twice the size, and how finely it splits follows from the
+    /// class the leaf times produced.
+    pub fn per_item_ns(&self) -> Option<u64> {
+        if self.leaf_count.load(Ordering::Relaxed) < 4 {
+            return None;
+        }
+        let items = self.leaf_items.load(Ordering::Relaxed);
+        if items == 0 {
+            return None;
+        }
+        Some(self.leaf_sum_ns.load(Ordering::Relaxed) / items)
+    }
+
+    /// cv^2 per mille of per-item cost at this site, weighted by the
+    /// items each leaf covered. `None` on the same terms as
+    /// [`Self::per_item_ns`].
+    ///
+    /// A leaf of `n` items averages `n` of them, so its squared time
+    /// over `n` estimates the per-item variance whatever size the leaf
+    /// came out at. Leaves of mixed sizes running identical items read
+    /// near zero here and read high in [`Self::cv2_per_mille`].
+    pub fn per_item_cv2_per_mille(&self) -> Option<u64> {
+        let leaves = self.leaf_count.load(Ordering::Relaxed);
+        if leaves < 4 {
+            return None;
+        }
+        let items = self.leaf_items.load(Ordering::Relaxed);
+        if items == 0 {
+            return None;
+        }
+        let sum_scaled = self.leaf_sum_ns.load(Ordering::Relaxed) >> 8;
+        let mean_scaled = sum_scaled / items;
+        if mean_scaled == 0 {
+            return Some(0);
+        }
+        let sumsq_per_item = self.leaf_sumsq_per_item.load(Ordering::Relaxed);
+        let mean_sq = mean_scaled.saturating_mul(mean_scaled);
+        let spread = sumsq_per_item.saturating_sub(mean_sq.saturating_mul(items));
+        let var = spread / leaves;
+        Some(var.saturating_mul(1000) / mean_sq.max(1))
+    }
+
+    /// Mean cost of one item, in nanoseconds, over the delta window the
+    /// latest classifier tick classified: the mean
+    /// [`Self::learned_class`] was decided from. A window whose samples
+    /// carried no item count reports its mean leaf time instead.
+    /// `None` until a tick has classified a window. While ticks run it
+    /// may come from a different tick than
     /// [`Self::window_cv2_per_mille`].
     pub fn window_mean_ns(&self) -> Option<u64> {
         if self.window_ticks.load(Ordering::Relaxed) == 0 {
@@ -532,10 +611,12 @@ impl CallSiteState {
         }
     }
 
-    /// cv^2 per mille of the delta window the latest classifier tick
-    /// classified, the variance [`Self::learned_class`] was decided from,
-    /// as opposed to [`Self::cv2_per_mille`] over the site's whole life.
-    /// `None` until a tick has classified a window.
+    /// cv^2 per mille of per-item cost over the delta window the latest
+    /// classifier tick classified, the variance [`Self::learned_class`]
+    /// was decided from, as opposed to [`Self::cv2_per_mille`] over the
+    /// site's whole life and over leaf times rather than items. A window
+    /// whose samples carried no item count reports the spread of its
+    /// leaf times instead. `None` until a tick has classified a window.
     pub fn window_cv2_per_mille(&self) -> Option<u64> {
         if self.window_ticks.load(Ordering::Relaxed) == 0 {
             None
@@ -564,21 +645,53 @@ impl CallSiteState {
         if dcount < 4 {
             return;
         }
+        let items = self.leaf_items.load(Ordering::Relaxed);
+        let sumsq_per_item = self.leaf_sumsq_per_item.load(Ordering::Relaxed);
         let dsum = sum.saturating_sub(self.last_sum_ns.load(Ordering::Relaxed));
         let dsumsq = sumsq.saturating_sub(self.last_sumsq.load(Ordering::Relaxed));
+        let ditems = items.saturating_sub(self.last_items.load(Ordering::Relaxed));
+        let dsumsq_per_item =
+            sumsq_per_item.saturating_sub(self.last_sumsq_per_item.load(Ordering::Relaxed));
         self.last_count.store(count, Ordering::Relaxed);
         self.last_sum_ns.store(sum, Ordering::Relaxed);
         self.last_sumsq.store(sumsq, Ordering::Relaxed);
+        self.last_items.store(items, Ordering::Relaxed);
+        self.last_sumsq_per_item.store(sumsq_per_item, Ordering::Relaxed);
 
-        let mean_ns = dsum / dcount;
-        let scaled_mean = (dsum >> 8) / dcount;
-        let cv2 = if scaled_mean == 0 {
-            0
+        // Per item, not per leaf. A leaf's time scales with the items in
+        // it, and how many that is comes from the split, which follows
+        // from the class this decides: classifying leaf times lets the
+        // class hold itself in place. Dividing by the items the window
+        // covered leaves a figure the split cannot move.
+        //
+        // A window whose samples carried no item count - the heartbeat's
+        // serial spans - is classified on its leaf times, which is all
+        // such a sample can say.
+        let (mean_ns, cv2) = if ditems > 0 {
+            let mean = dsum / ditems;
+            let scaled_mean = (dsum >> 8) / ditems;
+            let spread = if scaled_mean == 0 {
+                0
+            } else {
+                let mean_sq = scaled_mean.saturating_mul(scaled_mean);
+                let var = dsumsq_per_item
+                    .saturating_sub(mean_sq.saturating_mul(ditems))
+                    / dcount;
+                var.saturating_mul(1000) / mean_sq.max(1)
+            };
+            (mean, spread)
         } else {
-            let sumsq_per_n = dsumsq / dcount;
-            let mean_sq = scaled_mean.saturating_mul(scaled_mean);
-            let var = sumsq_per_n.saturating_sub(mean_sq);
-            var.saturating_mul(1000) / mean_sq.max(1)
+            let mean = dsum / dcount;
+            let scaled_mean = (dsum >> 8) / dcount;
+            let spread = if scaled_mean == 0 {
+                0
+            } else {
+                let sumsq_per_n = dsumsq / dcount;
+                let mean_sq = scaled_mean.saturating_mul(scaled_mean);
+                let var = sumsq_per_n.saturating_sub(mean_sq);
+                var.saturating_mul(1000) / mean_sq.max(1)
+            };
+            (mean, spread)
         };
         self.window_mean_ns.store(mean_ns, Ordering::Relaxed);
         self.window_cv2.store(cv2, Ordering::Relaxed);
@@ -1123,6 +1236,63 @@ mod tests {
             "and it broke the run, so 6 needs two agreeing calls again"
         );
         assert_eq!(S.stabilise_seed_depth(6), 6);
+    }
+
+    #[test]
+    fn a_class_survives_the_same_work_split_into_different_leaf_sizes() {
+        // One site, identical per-item cost throughout: 1 us an item.
+        // The first windows run 1024-item leaves, the next run leaves
+        // from 1 item to 512, which is what a site gets once its class
+        // turns SMT on and the recursion floor drops. Leaf times then
+        // span three orders of magnitude while the work has not changed
+        // at all, and a classifier reading leaf times migrates on that
+        // alone.
+        static S: CallSiteState = CallSiteState::new();
+        const PER_ITEM_NS: u64 = 1_000;
+
+        let record = |items: u64, leaves: u64| {
+            let leaf_ns = PER_ITEM_NS * items;
+            let scaled = leaf_ns >> 8;
+            let sq = scaled.saturating_mul(scaled);
+            S.record_batch_site_only(
+                leaf_ns * leaves,
+                sq * leaves,
+                leaves,
+                items * leaves,
+                (sq / items) * leaves,
+            );
+        };
+
+        for _ in 0..8 {
+            record(1_024, 16);
+        }
+        let uniform = S.learned_class();
+        assert!(uniform.is_some(), "a site fed 128 leaves has classified");
+
+        for _ in 0..8 {
+            record(1, 8);
+            record(64, 4);
+            record(512, 4);
+        }
+
+        assert_eq!(
+            S.learned_class(),
+            uniform,
+            "the same work in leaves of 1 to 512 items must hold the class the 1024-item \
+             leaves produced; per-item cost never changed"
+        );
+        assert_eq!(
+            S.per_item_ns(),
+            Some(PER_ITEM_NS),
+            "per-item cost reads the same whatever the leaves came out at"
+        );
+        let per_item_cv2 = S.per_item_cv2_per_mille().expect("items were recorded");
+        let leaf_cv2 = S.cv2_per_mille().expect("leaves were recorded");
+        assert!(
+            per_item_cv2 < leaf_cv2,
+            "per-item spread {per_item_cv2} must sit below the leaf-time spread {leaf_cv2} \
+             the mixed sizes produced"
+        );
     }
 
     #[test]

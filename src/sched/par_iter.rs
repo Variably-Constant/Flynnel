@@ -186,9 +186,14 @@ fn measure_tsc_per_ns_16() -> u64 {
 /// ([`LocalLeafBuffer::FLUSH_THRESHOLD`] = 4) before flushing:
 /// unbatched, the three global fetch_adds cost ~100ns per leaf on a
 /// 16-worker host; batched, ~30ns (2 TSC reads + thread-local access).
+/// `items` is how many items the leaf covered, which is what makes the
+/// classifier's reading a property of the work rather than of the split
+/// that produced it: a job cut into leaves of different sizes has leaf
+/// times that differ by the sizes alone.
 #[inline(always)]
 fn record_leaf<F: FnOnce() -> R, R>(
     site: Option<crate::sched::call_site::SiteRef>,
+    items: usize,
     body: F,
 ) -> R {
     crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafStart, 0);
@@ -198,7 +203,7 @@ fn record_leaf<F: FnOnce() -> R, R>(
     crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafEnd, 0);
     LOCAL_LEAF_BUFFER.with(|cell| {
         let mut buf = cell.borrow_mut();
-        buf.add(site, dt);
+        buf.add(site, dt, items as u64);
     });
     out
 }
@@ -225,8 +230,12 @@ pub(crate) fn record_leaf_span_ns(
 ) {
     if let Some(site) = site {
         let scaled = nanos >> 8;
+        // No item count: a span covers whatever the promotion loop got
+        // through, so it feeds the leaf statistics and contributes
+        // nothing to the per-item ones rather than entering them as a
+        // single item of its whole duration.
         site.get()
-            .record_batch_site_only(nanos, scaled.saturating_mul(scaled), 1);
+            .record_batch_site_only(nanos, scaled.saturating_mul(scaled), 1, 0, 0);
     }
 }
 
@@ -245,13 +254,21 @@ pub(crate) fn record_leaf_span_ns(
 ///   [`crate::sched::call_site::CallSiteState::record_batch_site_only`],
 ///   flushing at the same threshold OR whenever a sample arrives
 ///   for a different site, so site batches never mix sites.
+/// Each half also carries the items its leaves covered and the summed
+/// per-item squared time, which are what a dispersion of per-item cost
+/// is computed from. Leaf time alone cannot distinguish a workload whose
+/// items differ from one the scheduler cut into leaves that differ.
 struct LocalLeafBuffer {
     global_sum_ns: u64,
     global_sumsq_scaled: u64,
     global_count: u64,
+    global_items: u64,
+    global_sumsq_per_item: u64,
     site_sum_ns: u64,
     site_sumsq_scaled: u64,
     site_count: u64,
+    site_items: u64,
+    site_sumsq_per_item: u64,
     /// On-core and elapsed counts for this worker, spanning the leaves
     /// buffered for the current site. Read once when the first sample
     /// of a batch arrives and once at flush, so the pair costs two
@@ -282,9 +299,13 @@ impl LocalLeafBuffer {
             global_sum_ns: 0,
             global_sumsq_scaled: 0,
             global_count: 0,
+            global_items: 0,
+            global_sumsq_per_item: 0,
             site_sum_ns: 0,
             site_sumsq_scaled: 0,
             site_count: 0,
+            site_items: 0,
+            site_sumsq_per_item: 0,
             site_thread_at_start: 0,
             site_wall_at_start: 0,
             site: core::ptr::null(),
@@ -292,12 +313,26 @@ impl LocalLeafBuffer {
     }
 
     #[inline(always)]
-    fn add(&mut self, site: Option<crate::sched::call_site::SiteRef>, nanos: u64) {
+    fn add(
+        &mut self,
+        site: Option<crate::sched::call_site::SiteRef>,
+        nanos: u64,
+        items: u64,
+    ) {
         let scaled = nanos >> 8;
         let sq = scaled.saturating_mul(scaled);
+        // The per-item term is this leaf's squared time over its item
+        // count. Summed across leaves it gives an unbiased estimate of
+        // the per-item variance whatever sizes the leaves came out at,
+        // because a leaf of n items averages n of them. A leaf of no
+        // items contributes time to the leaf statistics and nothing to
+        // the per-item ones, which is what it can honestly say.
+        let per_item_sq = if items == 0 { 0 } else { sq / items };
 
         self.global_sum_ns = self.global_sum_ns.saturating_add(nanos);
         self.global_sumsq_scaled = self.global_sumsq_scaled.saturating_add(sq);
+        self.global_items = self.global_items.saturating_add(items);
+        self.global_sumsq_per_item = self.global_sumsq_per_item.saturating_add(per_item_sq);
         self.global_count += 1;
         if self.global_count >= Self::FLUSH_THRESHOLD {
             self.flush_global();
@@ -316,6 +351,8 @@ impl LocalLeafBuffer {
             }
             self.site_sum_ns = self.site_sum_ns.saturating_add(nanos);
             self.site_sumsq_scaled = self.site_sumsq_scaled.saturating_add(sq);
+            self.site_items = self.site_items.saturating_add(items);
+            self.site_sumsq_per_item = self.site_sumsq_per_item.saturating_add(per_item_sq);
             self.site_count += 1;
             if self.site_count >= Self::FLUSH_THRESHOLD {
                 self.flush_site();
@@ -348,14 +385,19 @@ impl LocalLeafBuffer {
         }
         let (sum_ns, sumsq_scaled) =
             Self::as_nanos(self.global_sum_ns, self.global_sumsq_scaled);
+        let (_, sumsq_per_item) = Self::as_nanos(0, self.global_sumsq_per_item);
         crate::sched::split_observer::record_leaf_batch(
             sum_ns,
             sumsq_scaled,
             self.global_count,
+            self.global_items,
+            sumsq_per_item,
         );
         self.global_sum_ns = 0;
         self.global_sumsq_scaled = 0;
         self.global_count = 0;
+        self.global_items = 0;
+        self.global_sumsq_per_item = 0;
     }
 
     fn flush_site(&mut self) {
@@ -377,10 +419,19 @@ impl LocalLeafBuffer {
         );
         let (sum_ns, sumsq_scaled) =
             Self::as_nanos(self.site_sum_ns, self.site_sumsq_scaled);
-        site.record_batch_site_only(sum_ns, sumsq_scaled, self.site_count);
+        let (_, sumsq_per_item) = Self::as_nanos(0, self.site_sumsq_per_item);
+        site.record_batch_site_only(
+            sum_ns,
+            sumsq_scaled,
+            self.site_count,
+            self.site_items,
+            sumsq_per_item,
+        );
         self.site_sum_ns = 0;
         self.site_sumsq_scaled = 0;
         self.site_count = 0;
+        self.site_items = 0;
+        self.site_sumsq_per_item = 0;
     }
 }
 
@@ -1316,9 +1367,9 @@ fn collapses_inline(plan: &JobPlan, n: usize) -> bool {
 /// Run `body` on the calling thread, recording it as a leaf and
 /// latching the site when it outruns the collapse threshold.
 #[inline]
-fn run_on_caller<R>(plan: &JobPlan, body: impl FnOnce() -> R) -> R {
+fn run_on_caller<R>(plan: &JobPlan, items: usize, body: impl FnOnce() -> R) -> R {
     let t0 = std::time::Instant::now();
-    let out = record_leaf(plan.site, body);
+    let out = record_leaf(plan.site, items, body);
     if let Some(site) = plan.site {
         site.get()
             .note_collapsed_body(t0.elapsed().as_nanos() as u64, inline_collapse_threshold_ns());
@@ -1461,7 +1512,7 @@ where
     // downstream measures actual cost; let it run instead of
     // shortcutting here based on a guess.
     if runs_on_caller(plan, n) {
-        run_on_caller(plan, || op(items));
+        run_on_caller(plan, items.len(), || op(items));
         return;
     }
 
@@ -1603,7 +1654,7 @@ where
         // the items are light).
         let (first, after_first) = items.split_at_mut(1);
         let start = std::time::Instant::now();
-        record_leaf(plan.site, || op(first));
+        record_leaf(plan.site, first.len(), || op(first));
         let first_ns = start.elapsed().as_nanos() as u64;
         if after_first.is_empty() {
             // n=1: the single item was just processed inline.
@@ -1618,7 +1669,7 @@ where
             } else {
                 let (more, rest) = after_first.split_at_mut(extra);
                 let t2 = std::time::Instant::now();
-                record_leaf(plan.site, || op(more));
+                record_leaf(plan.site, more.len(), || op(more));
                 let more_ns = t2.elapsed().as_nanos() as u64;
                 (first_ns + more_ns, 1 + extra, rest)
             }
@@ -1671,7 +1722,7 @@ where
                 }
                 let (one, rest) = tail.split_at_mut(1);
                 let start = std::time::Instant::now();
-                record_leaf(plan.site, || op(one));
+                record_leaf(plan.site, one.len(), || op(one));
                 per_elem_ns = per_elem_ns.min(start.elapsed().as_nanos().max(1) as u64);
                 tail = rest;
             }
@@ -1682,7 +1733,7 @@ where
         {
             let (confirm, rest) = tail.split_at_mut(CONFIRM_SIZE);
             let start = std::time::Instant::now();
-            record_leaf(plan.site, || op(confirm));
+            record_leaf(plan.site, confirm.len(), || op(confirm));
             let confirm_ns = start.elapsed().as_nanos() as u64;
             per_elem_ns = per_elem_ns.min(confirm_ns.max(1) / CONFIRM_SIZE as u64);
             tail = rest;
@@ -1691,7 +1742,7 @@ where
         if est_tail_ns < dispatch_floor_ns {
             // Dispatch overhead would exceed remaining work; complete
             // the tail serially on the calling thread.
-            record_leaf(plan.site, || op(tail));
+            record_leaf(plan.site, tail.len(), || op(tail));
             return;
         }
         // Tail is worth parallelizing. Match the observer-tuned
@@ -1854,7 +1905,7 @@ where
     F: Fn(&mut [T]) + Sync,
 {
     if items.len() <= min_leaf {
-        record_leaf(plan.site, || op(items));
+        record_leaf(plan.site, items.len(), || op(items));
         return;
     }
     // Replenish on stealing pressure.
@@ -1869,7 +1920,7 @@ where
     // is consumed, capping the leaf count at the intended
     // max_budget.
     if cur_splits <= 1 {
-        record_leaf(plan.site, || op(items));
+        record_leaf(plan.site, items.len(), || op(items));
         return;
     }
     let mid = items.len() / 2;
@@ -1918,7 +1969,7 @@ where
     F: Fn(&mut [T]) + Sync,
 {
     if items.len() <= min_leaf {
-        record_leaf(plan.site, || op(items));
+        record_leaf(plan.site, items.len(), || op(items));
         return;
     }
     // Rayon's replenish formula: max(workers, splits/2).
@@ -1928,7 +1979,7 @@ where
         splits
     };
     if cur_splits <= 1 {
-        record_leaf(plan.site, || op(items));
+        record_leaf(plan.site, items.len(), || op(items));
         return;
     }
     let mid = items.len() / 2;
@@ -1951,6 +2002,7 @@ where
 #[inline]
 fn record_leaf_sampled<F: FnOnce() -> R, R>(
     site: Option<crate::sched::call_site::SiteRef>,
+    items: usize,
     body: F,
 ) -> R {
     thread_local! {
@@ -1962,7 +2014,7 @@ fn record_leaf_sampled<F: FnOnce() -> R, R>(
         v >= LEAF_SAMPLE_STRIDE
     });
     if should_sample {
-        record_leaf(site, body)
+        record_leaf(site, items, body)
     } else {
         // Unsampled leaves still appear in the trace (one cached
         // load each when tracing is off) so a traced dispatch shows
@@ -2000,7 +2052,7 @@ where
     F: Fn(&mut [T]) + Sync,
 {
     if items.len() <= min_leaf {
-        record_leaf_sampled(plan.site, || op(items));
+        record_leaf_sampled(plan.site, items.len(), || op(items));
         return;
     }
     // Decide whether to split: always split during the seed phase
@@ -2031,7 +2083,7 @@ where
     if !should_split {
         // No steal pressure observed, so the entire remaining slice
         // runs inline as one leaf rather than splitting further.
-        record_leaf_sampled(plan.site, || op(items));
+        record_leaf_sampled(plan.site, items.len(), || op(items));
         return;
     }
     let mid = items.len() / 2;
@@ -2141,7 +2193,7 @@ where
     F: Fn(&mut [T1], &[T2], &[T3]) + Sync,
 {
     if out.len() <= min_leaf {
-        record_leaf(plan.site, || op(out, a, b));
+        record_leaf(plan.site, out.len(), || op(out, a, b));
         return;
     }
     let cur_splits = if migrated { max_budget } else { splits };
@@ -2149,7 +2201,7 @@ where
     // splitting at cur_splits=1 emits two children each holding
     // 0 budget, both immediately leaf, doubling leaf count.
     if cur_splits <= 1 {
-        record_leaf(plan.site, || op(out, a, b));
+        record_leaf(plan.site, out.len(), || op(out, a, b));
         return;
     }
     let mid = out.len() >> 1;
@@ -2324,7 +2376,7 @@ where
             let (first, rest) = items.split_at_mut(leaf.min(probe_quota));
             let first_n = first.len();
             let t0 = std::time::Instant::now();
-            record_leaf(plan.site, || op(0, first));
+            record_leaf(plan.site, first_n, || op(0, first));
             let first_ns = t0.elapsed().as_nanos() as u64;
             let (probe_ns, probed, tail): (u64, usize, &mut [T]) =
                 if first_ns >= probe_trust_floor_ns() || probe_quota <= first_n {
@@ -2336,7 +2388,7 @@ where
                     } else {
                         let (more, rest2) = rest.split_at_mut(extra);
                         let t2 = std::time::Instant::now();
-                        record_leaf(plan.site, || op(first_n, more));
+                        record_leaf(plan.site, more.len(), || op(first_n, more));
                         let more_ns = t2.elapsed().as_nanos() as u64;
                         (first_ns + more_ns, first_n + extra, rest2)
                     }
@@ -2460,7 +2512,7 @@ where
         // sampled variant rate-limited to 1-in-8, which never
         // accumulated enough flushes for the auto-migration to fire
         // on realistic small-N workloads (e.g. 16-chunk grep).
-        record_leaf(plan.site, || op(start, items));
+        record_leaf(plan.site, items.len(), || op(start, items));
         return;
     }
     let ctx_ptr = crate::sched::arena_local::current_worker_ctx();
@@ -2490,7 +2542,7 @@ where
         // No steal pressure observed, so the entire remaining slice
         // runs inline as one leaf rather than splitting further. This is the rayon continuation-stealing
         // pattern: only fork further when somebody is starving.
-        record_leaf(plan.site, || op(start, items));
+        record_leaf(plan.site, items.len(), || op(start, items));
         return;
     }
     let mid = items.len() / 2;
@@ -2520,13 +2572,13 @@ where
     F: Fn(usize, &mut [T]) + Sync,
 {
     if items.len() <= min_leaf {
-        record_leaf(plan.site, || op(start, items));
+        record_leaf(plan.site, items.len(), || op(start, items));
         return;
     }
     let cur_splits = if migrated { max_budget } else { splits };
     // Leaf at `<= 1` (see `bisect` for the doubling-bug rationale).
     if cur_splits <= 1 {
-        record_leaf(plan.site, || op(start, items));
+        record_leaf(plan.site, items.len(), || op(start, items));
         return;
     }
     let mid = items.len() >> 1;
@@ -2630,7 +2682,7 @@ where
         // once; the bulk dispatch below starts past them.
         let first_n = leaf.min(probe_quota);
         let t0 = std::time::Instant::now();
-        record_leaf(plan.site, || {
+        record_leaf(plan.site, first_n, || {
             for i in 0..first_n {
                 // SAFETY: `i < first_n <= n = buf.len()`; slots
                 // below `probed` are written only here and in the
@@ -2650,7 +2702,7 @@ where
                     (first_ns, first_n)
                 } else {
                     let t2 = std::time::Instant::now();
-                    record_leaf(plan.site, || {
+                    record_leaf(plan.site, extra, || {
                         for i in first_n..first_n + extra {
                             // SAFETY: `i < first_n + extra < n`;
                             // disjoint from the first-unit range.
@@ -2730,13 +2782,13 @@ where
     }
 
     if items.len() <= min_leaf {
-        record_leaf(plan.site, || fill_leaf(items, start, f));
+        record_leaf(plan.site, items.len(), || fill_leaf(items, start, f));
         return;
     }
     let cur_splits = if migrated { max_budget } else { splits };
     // Leaf at `<= 1` (see `bisect` for the doubling-bug rationale).
     if cur_splits <= 1 {
-        record_leaf(plan.site, || fill_leaf(items, start, f));
+        record_leaf(plan.site, items.len(), || fill_leaf(items, start, f));
         return;
     }
     let mid = items.len() >> 1;
@@ -3227,13 +3279,13 @@ where
     F: Fn(&mut [T]) + Sync,
 {
     if items.len() <= chunk_size {
-        record_leaf(plan.site, || op(items));
+        record_leaf(plan.site, items.len(), || op(items));
         return;
     }
     let cur_splits = if migrated { max_budget } else { splits };
     // Leaf at `<= 1` (see `bisect` for the doubling-bug rationale).
     if cur_splits <= 1 {
-        record_leaf(plan.site, || op(items));
+        record_leaf(plan.site, items.len(), || op(items));
         return;
     }
     let mid = items.len() / 2;

@@ -767,6 +767,13 @@ static AUTO_LAST_SUM_NS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 static AUTO_LAST_SUMSQ: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+/// The same snapshot for the items those leaves covered and their
+/// summed per-item squared time, which is what the window is classified
+/// on when the samples carried item counts.
+static AUTO_LAST_ITEMS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static AUTO_LAST_SUMSQ_PER_ITEM: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// One tick of the closing-loop observer. Reads the global leaf
 /// stats, computes the delta since the last tick, runs
@@ -794,21 +801,47 @@ pub fn tick_auto_classify() {
     }
     let dsum = stats.sum_ns.saturating_sub(prev_sum);
     let dsumsq = stats.sumsq_scaled.saturating_sub(prev_sumsq);
+    let ditems = stats
+        .items
+        .saturating_sub(AUTO_LAST_ITEMS.load(Ordering::Relaxed));
+    let dsumsq_per_item = stats
+        .sumsq_per_item
+        .saturating_sub(AUTO_LAST_SUMSQ_PER_ITEM.load(Ordering::Relaxed));
 
     AUTO_LAST_COUNT.store(stats.count, Ordering::Relaxed);
     AUTO_LAST_SUM_NS.store(stats.sum_ns, Ordering::Relaxed);
     AUTO_LAST_SUMSQ.store(stats.sumsq_scaled, Ordering::Relaxed);
+    AUTO_LAST_ITEMS.store(stats.items, Ordering::Relaxed);
+    AUTO_LAST_SUMSQ_PER_ITEM.store(stats.sumsq_per_item, Ordering::Relaxed);
 
-    let mean_ns = dsum / dcount;
-    // cv^2 = variance / mean^2 on the delta window.
-    let scaled_mean = (dsum >> 8) / dcount;
-    let cv2 = if scaled_mean == 0 {
-        0
+    // Per item, so the reading describes the work rather than the split
+    // that produced it: leaf times scale with the items in a leaf, and
+    // the split follows from the class this decides. A window whose
+    // samples carried no item count is classified on its leaf times,
+    // which is all such a sample can say.
+    let (mean_ns, cv2) = if ditems > 0 {
+        let mean = dsum / ditems;
+        let scaled_mean = (dsum >> 8) / ditems;
+        let spread = if scaled_mean == 0 {
+            0
+        } else {
+            let mean_sq = scaled_mean.saturating_mul(scaled_mean);
+            let var = dsumsq_per_item.saturating_sub(mean_sq.saturating_mul(ditems)) / dcount;
+            var.saturating_mul(1000) / mean_sq.max(1)
+        };
+        (mean, spread)
     } else {
-        let sumsq_per_n = dsumsq / dcount;
-        let mean_sq = scaled_mean.saturating_mul(scaled_mean);
-        let var = sumsq_per_n.saturating_sub(mean_sq);
-        var.saturating_mul(1000) / mean_sq.max(1)
+        let mean = dsum / dcount;
+        let scaled_mean = (dsum >> 8) / dcount;
+        let spread = if scaled_mean == 0 {
+            0
+        } else {
+            let sumsq_per_n = dsumsq / dcount;
+            let mean_sq = scaled_mean.saturating_mul(scaled_mean);
+            let var = sumsq_per_n.saturating_sub(mean_sq);
+            var.saturating_mul(1000) / mean_sq.max(1)
+        };
+        (mean, spread)
     };
     let observed = classify_observed(mean_ns, cv2);
     let observed_tag = workload_class_to_tag(observed);
@@ -853,13 +886,15 @@ pub fn tick_auto_classify() {
 /// (e.g., the application starts a new bench cell with a different
 /// expected workload shape and wants the observer to converge from
 /// scratch rather than smooth across the old phase). The function
-/// is idempotent and cheap (5 Relaxed atomic stores).
+/// is idempotent and cheap (7 Relaxed atomic stores).
 pub fn reset_auto_classify_state() {
     AUTO_PENDING_TAG.store(TAG_PORT_BOUND, Ordering::Relaxed);
     AUTO_PENDING_RUN.store(0, Ordering::Relaxed);
     AUTO_LAST_COUNT.store(0, Ordering::Relaxed);
     AUTO_LAST_SUM_NS.store(0, Ordering::Relaxed);
     AUTO_LAST_SUMSQ.store(0, Ordering::Relaxed);
+    AUTO_LAST_ITEMS.store(0, Ordering::Relaxed);
+    AUTO_LAST_SUMSQ_PER_ITEM.store(0, Ordering::Relaxed);
 }
 
 /// Serializes tests that migrate or depend on the process-wide

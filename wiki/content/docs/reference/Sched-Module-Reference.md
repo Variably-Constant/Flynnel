@@ -925,10 +925,10 @@ Spawn the background observer on the IO pool (no-op when IO pool disabled). The 
 ### `LeafStats`
 
 ```rust
-pub struct LeafStats { /* mean, variance, sample count */ }
+pub struct LeafStats { /* count, summed time, summed squares, items, summed per-item squares */ }
 ```
 
-Aggregate leaf-time statistics produced by `snapshot_leaf_stats`.
+Aggregate leaf statistics produced by `snapshot_leaf_stats`. Beside the leaf-time counters it carries the items those leaves covered and the summed per-item squared time, which `observed_per_item_ns` and `per_item_cv_squared_per_mille` read. The per-item pair is what the classifier decides on: a leaf's time scales with the items in it, so leaf times alone move when the scheduler splits the same work more finely.
 
 ## `idempotent`
 

@@ -99,6 +99,14 @@ static LEAF_TIME_SUM_NS: AtomicU64 = AtomicU64::new(0);
 static LEAF_TIME_SUMSQ: AtomicU64 = AtomicU64::new(0);
 static LEAF_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// Items the recorded leaves covered, and the summed per-item squared
+// time. A leaf's time divided by its item count is what the classifier
+// can read as a property of the work: leaf times alone move when the
+// scheduler changes how finely it splits, and that split is a decision
+// the classifier's own output drives.
+static LEAF_ITEMS: AtomicU64 = AtomicU64::new(0);
+static LEAF_SUMSQ_PER_ITEM: AtomicU64 = AtomicU64::new(0);
+
 
 /// Record one leaf's execution time. Called by `par_iter` leaves
 /// after the body runs. Cheap: 3 Relaxed atomic adds.
@@ -124,6 +132,9 @@ pub fn record_leaf_time_ns(nanos: u64) {
     let scaled = nanos >> 8;
     LEAF_TIME_SUMSQ.fetch_add(scaled.saturating_mul(scaled), Ordering::Relaxed);
     LEAF_COUNT.fetch_add(1, Ordering::Relaxed);
+    // A bare time carries no item count, so it feeds the leaf
+    // statistics and leaves the per-item ones untouched rather than
+    // entering them as one item costing the whole leaf.
 }
 
 /// Record a batch of leaf-time samples, pre-aggregated by a
@@ -135,9 +146,17 @@ pub fn record_leaf_time_ns(nanos: u64) {
 /// once per leaf, but with the same atomic-contention cost paid
 /// once per batch instead of once per leaf.
 #[inline]
-pub fn record_leaf_batch(sum_ns: u64, sumsq_scaled: u64, count: u64) {
+pub fn record_leaf_batch(
+    sum_ns: u64,
+    sumsq_scaled: u64,
+    count: u64,
+    items: u64,
+    sumsq_per_item: u64,
+) {
     LEAF_TIME_SUM_NS.fetch_add(sum_ns, Ordering::Relaxed);
     LEAF_TIME_SUMSQ.fetch_add(sumsq_scaled, Ordering::Relaxed);
+    LEAF_ITEMS.fetch_add(items, Ordering::Relaxed);
+    LEAF_SUMSQ_PER_ITEM.fetch_add(sumsq_per_item, Ordering::Relaxed);
     let prior = LEAF_COUNT.fetch_add(count, Ordering::Relaxed);
     // Drive the auto-classify-and-migrate observer at every
     // AUTO_CLASSIFY_QUANTUM-th leaf so the routing decision tracks
@@ -184,6 +203,8 @@ pub fn reset_leaf_stats() {
     LEAF_TIME_SUM_NS.store(0, Ordering::Relaxed);
     LEAF_TIME_SUMSQ.store(0, Ordering::Relaxed);
     LEAF_COUNT.store(0, Ordering::Relaxed);
+    LEAF_ITEMS.store(0, Ordering::Relaxed);
+    LEAF_SUMSQ_PER_ITEM.store(0, Ordering::Relaxed);
 }
 
 /// Snapshot of the variance counters. Used by the observer + tests.
@@ -196,6 +217,13 @@ pub struct LeafStats {
     /// Sum of squared leaf times in fixed-point scale; the unit
     /// matches the `cv2_fixed` consumer's expected scaling.
     pub sumsq_scaled: u64,
+    /// Items the observed leaves covered. Zero when no recorded leaf
+    /// carried a count, which the per-item readings report as no
+    /// reading rather than as zero cost.
+    pub items: u64,
+    /// Sum over leaves of a leaf's squared time divided by its item
+    /// count, in the same fixed-point scale as `sumsq_scaled`.
+    pub sumsq_per_item: u64,
 }
 
 /// Read the current variance counters atomically. Returned snapshot is
@@ -206,6 +234,8 @@ pub fn snapshot_leaf_stats() -> LeafStats {
         count: LEAF_COUNT.load(Ordering::Relaxed),
         sum_ns: LEAF_TIME_SUM_NS.load(Ordering::Relaxed),
         sumsq_scaled: LEAF_TIME_SUMSQ.load(Ordering::Relaxed),
+        items: LEAF_ITEMS.load(Ordering::Relaxed),
+        sumsq_per_item: LEAF_SUMSQ_PER_ITEM.load(Ordering::Relaxed),
     }
 }
 
@@ -244,6 +274,42 @@ pub fn observed_mean_leaf_ns() -> Option<u64> {
 ///   multiplier=2 is the right call.
 /// - `>= 500` (cv >= ~0.71): high variance. Recommend multiplier=4
 ///   so steal pressure can rebalance long leaves.
+/// Mean cost of one item across the recorded leaves, in nanoseconds, or
+/// `None` below 4 leaves and when no leaf carried an item count.
+///
+/// The process-wide counterpart of
+/// [`crate::sched::call_site::CallSiteState::per_item_ns`], and what
+/// the classifier's per-item bands are stated in.
+#[inline]
+pub fn observed_per_item_ns(stats: LeafStats) -> Option<u64> {
+    if stats.count < 4 || stats.items == 0 {
+        return None;
+    }
+    Some(stats.sum_ns / stats.items)
+}
+
+/// cv^2 per mille of per-item cost, weighted by the items each leaf
+/// covered, or `None` on the same terms as [`observed_per_item_ns`].
+///
+/// Unlike [`leaf_cv_squared_per_mille`] this does not move when the
+/// scheduler splits the same work into leaves of different sizes, which
+/// is what lets a class describe the workload rather than the split.
+pub fn per_item_cv_squared_per_mille(stats: LeafStats) -> Option<u64> {
+    if stats.count < 4 || stats.items == 0 {
+        return None;
+    }
+    let mean_scaled = (stats.sum_ns >> 8) / stats.items;
+    if mean_scaled == 0 {
+        return Some(0);
+    }
+    let mean_sq = mean_scaled.saturating_mul(mean_scaled);
+    let spread = stats
+        .sumsq_per_item
+        .saturating_sub(mean_sq.saturating_mul(stats.items));
+    let var = spread / stats.count;
+    Some(var.saturating_mul(1000) / mean_sq.max(1))
+}
+
 pub fn leaf_cv_squared_per_mille(stats: LeafStats) -> Option<u64> {
     if stats.count < 4 {
         return None;
