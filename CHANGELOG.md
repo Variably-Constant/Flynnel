@@ -172,6 +172,24 @@ Two things a consumer has to do rather than read:
     host-run segments to the same span.
 - `GpuPeer::fetch_bulk_at` and `write_resident_bulk_at` read and write a
   resident span at an offset.
+- `GpuPeerConfig::lane_teams` gives each lane its own team width, so one
+  peer serves narrow waves from a one-block lane and wide ones from a
+  wide lane. A wave's barrier is paid by every block of its team whether
+  or not that block was dealt work: a global frontier reaches only its
+  first `ceil(n / threads per block)` blocks, so a wave whose
+  generations fit inside one block's threads ran faster on a team of one
+  than on any wider team at every depth measured, and the only way to
+  get both widths from Flynnel was two peers. Now
+  `GpuPeer::create_wave_on_lane` lays a wave out for a named lane's
+  team and pins it there; `GpuPeer::lane_team_size` reports each lane's
+  width; `GpuPeer::pin_bulk_on_lane` chooses a handle's lane. Each entry
+  is clamped to the device's streaming multiprocessor count and reported
+  the way `blocks_per_lane` is, and a config naming some lanes but not
+  all is refused rather than padded. The kernel is unchanged: every lane
+  was already launched as its own grid at a width the kernel is handed.
+  `create_wave` refuses a peer whose lanes differ, since the lane the
+  pool would pick may not run the width the wave was laid out for;
+  `team_size` and `calibrate_waves` describe lane 0.
 - `GpuPeerConfig::user_ops_nvrtc_options` passes NVRTC options to the
   composed user-op module, such as `--fmad=false` for a kernel that must
   match the host bit for bit. A composed module is compiled once per

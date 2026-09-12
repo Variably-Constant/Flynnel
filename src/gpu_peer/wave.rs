@@ -993,13 +993,47 @@ fn rebalance_fit(points: &[(f64, f64, f64)]) -> (f64, f64) {
 }
 
 impl GpuPeer {
-    /// Lay out and pin a wave for this peer's team.
+    /// Lay out and pin a wave for this peer's team, on whichever lane the
+    /// pool assigns.
     ///
-    /// The wave's width is [`GpuPeer::team_size`], which every submission
-    /// runs on: the device refuses a span whose width differs from the team
-    /// running it.
+    /// The wave's width is [`GpuPeer::team_size`]: the device refuses a
+    /// span whose width differs from the team running it, so this serves
+    /// a peer whose lanes all run the same team. A peer built with
+    /// [`GpuPeerConfig::lane_teams`](super::GpuPeerConfig::lane_teams) is
+    /// refused here, because the lane the pool would pick may not run the width
+    /// the wave was laid out for; such a peer creates each wave with
+    /// [`Self::create_wave_on_lane`], naming the lane whose team fits it.
     pub fn create_wave(&mut self, spec: &WaveSpec) -> Result<Wave, GpuPeerError> {
-        let width = self.team_size();
+        if !self.lanes_share_a_team() {
+            return Err(GpuPeerError::Unavailable(
+                "the lanes run teams of different widths, so a wave must name its lane: \
+                 use create_wave_on_lane",
+            ));
+        }
+        self.create_wave_pinned(spec, None)
+    }
+
+    /// Lay out and pin a wave on `lane`, sized for that lane's team.
+    ///
+    /// Every slice of the wave runs on `lane`, since a wave's tasks ride
+    /// its handle's lane, so the width the device checks at each slice
+    /// is the width of the team that serves it. A wave whose generations
+    /// fit inside one block's threads belongs on a lane of one block,
+    /// where it pays no barrier at all; a wide one belongs on a wide
+    /// lane. `lane` is taken modulo the lane count.
+    pub fn create_wave_on_lane(&mut self, spec: &WaveSpec, lane: u32) -> Result<Wave, GpuPeerError> {
+        self.create_wave_pinned(spec, Some(lane))
+    }
+
+    fn create_wave_pinned(&mut self, spec: &WaveSpec, lane: Option<u32>) -> Result<Wave, GpuPeerError> {
+        let width = match lane {
+            Some(chosen) => {
+                let lanes = self.geometry().lanes.max(1);
+                self.lane_team_size(chosen % lanes)
+                    .ok_or(GpuPeerError::Unavailable("no team width recorded for the lane"))?
+            }
+            None => self.team_size(),
+        };
         let (budget_ns, watchdog_basis) = match spec.slice_budget {
             SliceBudget::Detected => {
                 let state = super::watchdog::detect(self.device_ordinal);
@@ -1014,7 +1048,10 @@ impl GpuPeer {
         };
         let layout = WaveLayout::new(width, spec)?;
         let bytes = initial_span(spec, &layout, budget_ns)?;
-        let handle = self.pin_bulk(&bytes)?;
+        let handle = match lane {
+            Some(chosen) => self.pin_bulk_on_lane(&bytes, chosen)?,
+            None => self.pin_bulk(&bytes)?,
+        };
         Ok(Wave { handle, layout, budget_ns, watchdog_basis, in_flight: Cell::new(None) })
     }
 
@@ -1268,8 +1305,11 @@ impl GpuPeer {
         self.wave_costs
     }
 
-    /// Measure this device's wave costs at [`GpuPeer::team_size`] and keep
-    /// them.
+    /// Measure this device's wave costs at lane 0's team,
+    /// [`GpuPeer::team_size`], and keep them. The stored record holds one
+    /// width per device, so on a peer whose lanes differ these are the
+    /// costs of lane 0's width and a wave on a lane of another width has
+    /// no measured costs to plan from.
     ///
     /// Flynnel's calibration op ([`layout::OP_WAVE_CALIBRATE`]) walks a
     /// binary segment tree whose segments only push their children, from 64
@@ -1366,7 +1406,7 @@ impl GpuPeer {
         let mut rebalance_times = Vec::with_capacity(CALIBRATION_REPEATS);
         let mut longest = 0u64;
         for _ in 0..CALIBRATION_REPEATS {
-            let wave = self.create_wave(&spec)?;
+            let wave = self.create_wave_on_lane(&spec, 0)?;
             let started = Instant::now();
             let ticket = self.submit_wave(&wave, layout::OP_WAVE_CALIBRATE, &depth.to_le_bytes())?;
             let status = self.wait_status(ticket, Duration::from_secs(30))?;

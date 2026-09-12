@@ -47,12 +47,17 @@ pub struct Poller {
     vram_base: u64,
     vram_block_bytes: u32,
     vram_blocks: u32,
-    /// Blocks serving each lane. Above 1, a lane is worked by a team
-    /// of consecutive blocks: rank 0 owns the ring and the descriptor,
-    /// every rank runs the user op over its share of the work. This is
-    /// what lets a doorbell op use the whole device rather than the
-    /// single SM one block occupies.
-    blocks_per_lane: u32,
+    /// Blocks serving each lane, one entry per lane. Above 1, a lane is
+    /// worked by a team of consecutive blocks: rank 0 owns the ring and
+    /// the descriptor, every rank runs the user op over its share of the
+    /// work. This is what lets a doorbell op use the whole device rather
+    /// than the single SM one block occupies.
+    ///
+    /// Each lane is launched as its own grid at its own width, and the
+    /// kernel derives a block's lane and rank from the width it was
+    /// handed, so lanes of different widths coexist without the kernel
+    /// knowing there is more than one.
+    lane_teams: Vec<u32>,
     /// How long rank 0 waits for its team before retiring the slot as
     /// incomplete. Separate from the quantum: a healthy team assembles
     /// in microseconds, so tying this to the quantum made a caller wait
@@ -77,7 +82,7 @@ impl Poller {
         vram_base: u64,
         vram_block_bytes: u32,
         vram_blocks: u32,
-        blocks_per_lane: u32,
+        lane_teams: Vec<u32>,
         barrier_deadline_ns: u64,
     ) -> Self {
         Self {
@@ -89,18 +94,29 @@ impl Poller {
             vram_base,
             vram_block_bytes,
             vram_blocks,
-            blocks_per_lane: blocks_per_lane.max(1),
+            lane_teams: lane_teams.into_iter().map(|team| team.max(1)).collect(),
             barrier_deadline_ns: barrier_deadline_ns.max(1),
             paused: false,
         }
     }
 
+    /// The team width `lane` runs, refused for a lane the poller was not
+    /// built with rather than defaulted, because a lane with no recorded
+    /// width is a lane the region and the poller disagree about.
+    fn team_of(&self, lane: u32) -> Result<u32, GpuPeerError> {
+        self.lane_teams
+            .get(lane as usize)
+            .copied()
+            .ok_or(GpuPeerError::Unavailable("no team width recorded for the lane"))
+    }
+
     /// Quanta of `lane` that have fully drained, according to that
     /// lane's exit counter.
-    fn completed_launches(&self, region: &PeerRegion, lane: u32) -> u32 {
+    fn completed_launches(&self, region: &PeerRegion, lane: u32, team: u32) -> u32 {
         // Every rank of the lane's team increments the lane's own
-        // counter, so a drained quantum is blocks_per_lane exits.
-        region.load_u32(lane_exits_off(lane)) / self.blocks_per_lane.max(1)
+        // counter, so a drained quantum is one exit per block of the
+        // team.
+        region.load_u32(lane_exits_off(lane)) / team.max(1)
     }
 
     /// Launch a new quantum for `lane` when none is resident on it.
@@ -129,8 +145,9 @@ impl Poller {
         if self.launches.len() < lane_count as usize {
             self.launches.resize(lane_count as usize, 0);
         }
+        let team = self.team_of(lane)?;
         let launched = self.launches[lane as usize];
-        if self.completed_launches(region, lane) < launched {
+        if self.completed_launches(region, lane, team) < launched {
             return Ok(()); // a quantum is still resident (or draining)
         }
         let generation = launched.wrapping_add(1);
@@ -161,17 +178,17 @@ impl Poller {
         b.arg(&self.vram_blocks);
         let barrier_deadline = self.barrier_deadline_ns;
         b.arg(&barrier_deadline);
-        b.arg(&self.blocks_per_lane);
+        b.arg(&team);
         b.arg(&lane);
         // SAFETY: argument types match flynnel_peer_poller(u8*, u32,
         // u32, u32, u64, u64, u32, u8*, u32, u32, u64, u32, u32); the grid
-        // is one lane's team of consecutive blocks, which is what the
-        // kernel's lane = lane_base + blockIdx.x / blocks_per_lane
-        // assumes; dev_base is the live registered mapping and
-        // vram_base the live (or absent = 0) pool.
+        // is this one lane's team of consecutive blocks at this lane's
+        // width, which is what the kernel's lane = lane_base +
+        // blockIdx.x / blocks_per_lane assumes; dev_base is the live
+        // registered mapping and vram_base the live (or absent = 0) pool.
         unsafe {
             b.launch(LaunchConfig {
-                grid_dim: (self.blocks_per_lane, 1, 1),
+                grid_dim: (team, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             })

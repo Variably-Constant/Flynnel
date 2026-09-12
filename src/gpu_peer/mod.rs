@@ -399,7 +399,28 @@ pub struct GpuPeerConfig {
     /// wider than the device loses ranks at its barrier, and says so on
     /// stderr when it does. [`GpuPeer::team_size`] is the size in use,
     /// and it is the `team_size` the user op receives.
+    ///
+    /// Every lane runs this team unless [`Self::lane_teams`] gives each
+    /// lane its own.
     pub blocks_per_lane: u32,
+    /// Blocks serving each lane, one entry per lane, for a peer whose
+    /// lanes run teams of different widths. Empty, the default, runs
+    /// every lane at [`Self::blocks_per_lane`].
+    ///
+    /// A wave's barrier is paid by every block of its team whether or
+    /// not that block was dealt any work, so a wave whose generations
+    /// fit inside one block's threads runs fastest on a team of one,
+    /// and a wide one on a wide team. A peer with lanes of different
+    /// widths serves both from one region: the caller creates each wave
+    /// on the lane whose team fits it with
+    /// [`GpuPeer::create_wave_on_lane`], and it runs there.
+    ///
+    /// Non-empty, this must hold exactly [`Self::lanes`] entries or
+    /// [`GpuPeer::init`] refuses the config; a zero entry runs as one
+    /// block. Each entry is clamped to the device's streaming
+    /// multiprocessor count and reported the way `blocks_per_lane` is.
+    /// [`GpuPeer::lane_team_size`] is the width a lane runs.
+    pub lane_teams: Vec<u32>,
     /// User opcode implementations as CUDA C source defining
     /// `extern "C" __device__ unsigned flynnel_user_op(unsigned op,
     /// unsigned char* block, unsigned count, volatile unsigned char*
@@ -464,6 +485,7 @@ impl Default for GpuPeerConfig {
             vram_block_bytes: 65_536,
             vram_blocks: 1024,
             blocks_per_lane: 1,
+            lane_teams: Vec::new(),
             user_ops_cuda: None,
             user_ops_nvrtc_options: Vec::new(),
         }
@@ -536,8 +558,9 @@ pub struct GpuPeer {
     poller: poller::Poller,
     pool: Option<VramPool>,
     calibration: PeerCalibration,
-    /// Blocks serving each lane after the clamp to the SM count.
-    team_size: u32,
+    /// Blocks serving each lane after the clamp to the SM count, one
+    /// entry per lane. Never empty: a region has at least one lane.
+    lane_teams: Vec<u32>,
     /// The poller quantum and the kernel's team barrier deadline, which a
     /// wave's slice budget is derived after.
     quantum_ns: u64,
@@ -794,16 +817,32 @@ impl GpuPeer {
             );
         }
         let sm_count = crate::backend::detect::cuda_sm_count(config.device_ordinal);
-        let requested_team = config.blocks_per_lane.max(1);
-        let team_size = clamp_team_size(requested_team, sm_count);
-        if team_size != requested_team {
-            eprintln!(
-                "flynnel gpu_peer: blocks_per_lane {requested_team} exceeds device \
-                 {}'s {team_size} streaming multiprocessors; each lane runs a team \
-                 of {team_size}",
-                config.device_ordinal
-            );
+        // One team width per lane. A config that names some lanes and
+        // not others is refused rather than padded: the caller has
+        // said the lanes differ, and a padded lane would run at a
+        // width nobody chose.
+        let lane_count = geometry.lanes.max(1) as usize;
+        let requested: Vec<u32> = if config.lane_teams.is_empty() {
+            vec![config.blocks_per_lane.max(1); lane_count]
+        } else if config.lane_teams.len() == lane_count {
+            config.lane_teams.iter().map(|t| (*t).max(1)).collect()
+        } else {
+            return Err(GpuPeerError::Unavailable(
+                "lane_teams must name a team for every lane, or be empty",
+            ));
+        };
+        let lane_teams: Vec<u32> =
+            requested.iter().map(|&asked| clamp_team_size(asked, sm_count)).collect();
+        for (lane, (&asked, &got)) in requested.iter().zip(&lane_teams).enumerate() {
+            if got != asked {
+                eprintln!(
+                    "flynnel gpu_peer: lane {lane} asked for {asked} blocks, which exceeds \
+                     device {}'s {got} streaming multiprocessors; it runs a team of {got}",
+                    config.device_ordinal
+                );
+            }
         }
+        let lane0_team = *lane_teams.first().expect("a region has at least one lane");
         let poller = poller::Poller::new(
             lane_streams,
             f_poller,
@@ -812,7 +851,7 @@ impl GpuPeer {
             vbase,
             vbytes,
             vblocks,
-            team_size,
+            lane_teams.clone(),
             config.barrier_deadline_ns,
         );
         let wide_stream = ctx
@@ -824,12 +863,12 @@ impl GpuPeer {
             poller,
             pool,
             calibration,
-            team_size,
+            lane_teams,
             quantum_ns: config.quantum_ns,
             barrier_deadline_ns: config.barrier_deadline_ns.max(1),
             device_ordinal: config.device_ordinal,
             user_ops: config.user_ops_cuda.is_some(),
-            wave_costs: wave::stored_wave_costs(config.device_ordinal, team_size),
+            wave_costs: wave::stored_wave_costs(config.device_ordinal, lane0_team),
             _module: module,
             _stream: stream,
             wide_stream,
@@ -864,12 +903,31 @@ impl GpuPeer {
         self.region.geometry()
     }
 
-    /// Blocks serving each lane: [`GpuPeerConfig::blocks_per_lane`],
-    /// clamped to the device's streaming multiprocessor count when the
-    /// driver reports one. This is the `team_size` a user op receives.
+    /// Blocks serving lane 0 after the clamp to the device's streaming
+    /// multiprocessor count - which is every lane's team unless
+    /// [`GpuPeerConfig::lane_teams`] set them apart. A wave from
+    /// [`GpuPeer::create_wave`] is sized for it, and it is the
+    /// `team_size` a user op on lane 0 receives.
+    ///
+    /// [`Self::lane_team_size`] is the width of any other lane.
     #[inline]
     pub fn team_size(&self) -> u32 {
-        self.team_size
+        *self.lane_teams.first().expect("a region has at least one lane")
+    }
+
+    /// Blocks serving `lane` after the clamp to the device's streaming
+    /// multiprocessor count, or `None` for a lane the region does not
+    /// have. This is the `team_size` a user op on that lane receives,
+    /// and the width a wave created on it takes.
+    #[inline]
+    pub fn lane_team_size(&self, lane: u32) -> Option<u32> {
+        self.lane_teams.get(lane as usize).copied()
+    }
+
+    /// Whether every lane runs the same team, which is what lets
+    /// [`GpuPeer::create_wave`] leave the lane to the pool.
+    pub(crate) fn lanes_share_a_team(&self) -> bool {
+        self.lane_teams.windows(2).all(|pair| pair[0] == pair[1])
     }
 
     /// NVRTC compilations of a composed user-op module so far in this
@@ -1134,7 +1192,32 @@ impl GpuPeer {
     ///
     /// The returned handle names the first block; `resident_ptr` gives
     /// its device address and the span is contiguous by construction.
+    /// The handle's lane, which every task on it rides, follows from
+    /// the block; [`Self::pin_bulk_on_lane`] chooses it instead.
     pub fn pin_bulk(&mut self, data: &[u8]) -> Result<ResidentHandle, GpuPeerError> {
+        self.pin_bulk_to(data, None)
+    }
+
+    /// [`Self::pin_bulk`] with the handle's lane chosen by the caller,
+    /// taken modulo the lane count.
+    ///
+    /// A lane is routing: the tasks on a handle run through that lane's
+    /// ring, in order, on that lane's team. The pool ties no block to a
+    /// lane, so any block may be served from any lane, and this is how
+    /// a wave lands on the lane whose team matches its width.
+    pub fn pin_bulk_on_lane(
+        &mut self,
+        data: &[u8],
+        lane: u32,
+    ) -> Result<ResidentHandle, GpuPeerError> {
+        self.pin_bulk_to(data, Some(lane))
+    }
+
+    fn pin_bulk_to(
+        &mut self,
+        data: &[u8],
+        lane: Option<u32>,
+    ) -> Result<ResidentHandle, GpuPeerError> {
         let pool = self
             .pool
             .as_mut()
@@ -1161,9 +1244,10 @@ impl GpuPeer {
         self.wide_stream
             .synchronize()
             .map_err(|e| GpuPeerError::Driver(format!("pin_bulk sync: {e:?}")))?;
+        let lanes = self.region.geometry().lanes.max(1);
         Ok(ResidentHandle {
             block: first,
-            lane: first % self.region.geometry().lanes,
+            lane: lane.map_or(first % lanes, |chosen| chosen % lanes),
             bytes: data.len() as u32,
         })
     }

@@ -251,6 +251,48 @@ fn a_narrow_global_frontier_is_not_reported_as_imbalance() {
     peer.release_wave(wave).expect("release the span");
 }
 
+/// A peer whose lanes run teams of different widths serves a wave from
+/// each lane at that lane's width, and refuses to size a wave that names
+/// no lane, since the lane the pool would pick may not run the width the
+/// wave was laid out for.
+#[test]
+fn lanes_of_different_teams_each_run_a_wave_sized_for_them() {
+    let _device = common::device();
+    let mut peer = GpuPeer::init(GpuPeerConfig {
+        user_ops_cuda: Some(OPS.to_string()),
+        lanes: 2,
+        lane_teams: vec![1, 4],
+        vram_block_bytes: 65_536,
+        vram_blocks: 256,
+        ..GpuPeerConfig::default()
+    })
+    .expect("init a peer with a one-block lane and a four-block lane");
+    assert_eq!(peer.lane_team_size(0), Some(1));
+    let wide = peer.lane_team_size(1).expect("lane 1 exists");
+    assert!(
+        (1..=4).contains(&wide),
+        "lane 1 runs at most the four blocks it asked for, clamped to the device: {wide}"
+    );
+    assert_eq!(peer.lane_team_size(2), None, "the region has two lanes");
+    assert_eq!(peer.team_size(), 1, "team_size is lane 0's");
+
+    let r = roots(3);
+    let s = spec(Frontier::Global, Resume::Device, SliceBudget::Unbounded, r.clone(), 4096);
+    assert!(
+        peer.create_wave(&s).is_err(),
+        "a wave naming no lane cannot be sized when the lanes differ"
+    );
+    for lane in 0..2u32 {
+        let wave = peer.create_wave_on_lane(&s, lane).expect("create the wave on its lane");
+        let (status, count, sum) = slice(&mut peer, &wave, OP_TREE, &args(6, NO_FAIL, 0));
+        let stats = peer.wave_stats(&wave).expect("read the wave");
+        assert_eq!(status, STATUS_DONE, "lane {lane}: {stats:?}");
+        assert_eq!((count, sum), expected(&r, 6), "lane {lane}: every segment exactly once");
+        assert_eq!(stats.barrier_timeouts, 0, "lane {lane}: {stats:?}");
+        peer.release_wave(wave).expect("release the span");
+    }
+}
+
 /// A budget smaller than the wave makes slices stop early and yield, and
 /// the wave still runs every segment exactly once across them.
 #[test]
