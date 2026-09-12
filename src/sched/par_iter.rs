@@ -680,8 +680,14 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
 /// Which of three regimes applies turns on whether the plan's per-item
 /// estimate is authoritative, not on how heavy the items are.
 ///
-/// Without an authoritative estimate there is no figure to size
-/// against, so `use_smt` stands in for one: it is the static
+/// Without an authoritative estimate, a site that has measured its own
+/// per-item cost supplies one: the floor is sized from it exactly as
+/// from a caller's hint. That reading is a property of the work, so a
+/// fine-grain site keeps its floor however its class routes, where
+/// `use_smt` alone would drop the floor to 1 and hand a 5 ns item its
+/// own dispatch.
+///
+/// With neither, `use_smt` stands in for a figure: it is the static
 /// classifier's signal that items are heavy, and the floor drops to 1
 /// so a batch narrower than `caller_floor` still splits instead of
 /// running serially on the calling worker. Every other hintless plan
@@ -700,10 +706,24 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
 #[inline]
 fn adaptive_min_leaf(plan: &JobPlan, caller_floor: usize) -> usize {
     if !plan.estimated_per_item_ns_explicit {
-        // No authoritative ns hint, but the static classifier may
-        // have signaled heavy per-item work via use_smt=true
-        // (LatencyBound profile). For heavy items each leaf is
-        // its own item -- min_leaf=1 lets the bisect split N=5
+        // The site's own measurement first: it is per item, so it says
+        // what use_smt was standing in for and says it about this
+        // workload rather than about the class the last window
+        // produced. A site running 5 ns items keeps its floor here even
+        // while its class holds SMT on, which is the case the floor
+        // used to get wrong: the class turned SMT on, the floor fell to
+        // 1, and the split that produced fed the class that chose it.
+        if let Some(site) = plan.site
+            && let Some(per_item_ns) = site.get().per_item_ns()
+            && per_item_ns > 0
+        {
+            let from_cost = (pool_dispatch_cost_ns() / per_item_ns).max(1) as usize;
+            return from_cost.min(caller_floor);
+        }
+        // No authoritative ns hint and nothing measured, but the static
+        // classifier may have signaled heavy per-item work via
+        // use_smt=true (LatencyBound profile). For heavy items each
+        // leaf is its own item -- min_leaf=1 lets the bisect split N=5
         // NMFD-shape batches into 5 leaves so the worker pool
         // actually parallelizes. Without the min_leaf=1 floor the
         // caller_floor (typically 256) caps min_leaf above
@@ -4217,6 +4237,62 @@ mod tests {
     // test that doesn't depend on calibration outcome (e.g., one
     // that directly drives the observer state via a test-only
     // setter).
+
+    #[test]
+    fn a_measured_fine_grain_site_keeps_its_floor_while_its_class_holds_smt_on() {
+        use crate::sched::call_site::{CallSiteState, SiteRef};
+
+        // A site that has measured 5 ns items, which is fine-grain: a
+        // leaf of one such item is three orders of magnitude under one
+        // dispatch, so the floor must stay where the caller put it.
+        static FINE: CallSiteState = CallSiteState::new();
+        const PER_ITEM_NS: u64 = 5;
+        const ITEMS: u64 = 4_096;
+        let leaf_ns = PER_ITEM_NS * ITEMS;
+        let scaled = leaf_ns >> 8;
+        let sq = scaled.saturating_mul(scaled);
+        let per_item_sq = (leaf_ns as u128)
+            .saturating_mul(leaf_ns as u128)
+            .checked_div((ITEMS as u128) << 16)
+            .unwrap_or(0) as u64;
+        for _ in 0..4 {
+            FINE.record_batch_site_only(leaf_ns * 8, sq * 8, 8, ITEMS * 8, per_item_sq * 8);
+        }
+        assert_eq!(
+            FINE.per_item_ns(),
+            Some(PER_ITEM_NS),
+            "the site measured its own per-item cost"
+        );
+
+        // use_smt is what the floor used to read as "items are heavy".
+        // It says nothing about this site's items, and the measurement
+        // does.
+        let caller_floor = MIN_LEAF_ITEMS;
+        let plan = JobPlan::bare(6, 65_536)
+            .with_smt()
+            .with_site(SiteRef::new(&FINE));
+        assert!(plan.use_smt, "the arrangement under test has SMT on");
+        assert!(
+            !plan.estimated_per_item_ns_explicit,
+            "no caller hint, so the floor has only the site to read"
+        );
+        assert_eq!(
+            adaptive_min_leaf(&plan, caller_floor),
+            caller_floor,
+            "a site measuring {PER_ITEM_NS} ns an item keeps the caller's floor of \
+             {caller_floor}; dropping to one item per leaf would hand each of them a dispatch"
+        );
+
+        // A site with no measurement still gets the old signal, so the
+        // heavy-item case that floor exists for is unchanged.
+        static UNMEASURED: CallSiteState = CallSiteState::new();
+        let bare = JobPlan::bare(6, 8).with_smt().with_site(SiteRef::new(&UNMEASURED));
+        assert_eq!(
+            adaptive_min_leaf(&bare, caller_floor),
+            1,
+            "with nothing measured, use_smt still stands in for a per-item figure"
+        );
+    }
 
     #[test]
     fn bench_audit_explicit_heavy_reduce_routes_to_bisect() {
