@@ -15,7 +15,7 @@ This page is the setup-and-run guide; the architecture, protocol, and cost model
 
 ```toml
 [dependencies]
-flynnel = { version = "0.4", features = ["shared-memory-worker-reference"] }
+flynnel = { version = "0.5", features = ["shared-memory-worker-reference"] }
 ```
 
 ## Step 1 - decide your handler protocol
