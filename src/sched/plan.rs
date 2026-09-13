@@ -88,6 +88,16 @@ pub struct JobPlan {
     /// runs parallel where the same batch would otherwise fold inline.
     /// The vector classes say nothing the batch size does not, and
     /// steer nothing.
+    ///
+    /// What a matrix-extension class asserts is the regime, not that
+    /// the host has the unit. The cost structure it names is the one
+    /// [`crate::sched::mode_region::run_in_region`] is built for, where
+    /// entry costs amortize per region rather than per op, and
+    /// [`crate::sched::mode_region::ScalarFallback`] exists so that
+    /// regime runs on a host without the extension. A caller emulating
+    /// tile ops on vector silicon is describing this regime accurately
+    /// and should declare it; the class is a claim about the shape of
+    /// the work, and the arithmetic underneath it is the backend's.
     pub hw_class: HwClass,
     /// Quality tier.
     pub variant: Variant,

@@ -116,9 +116,15 @@ mod tests {
     /// process state serialize on one lock.
     fn global_test_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // A panic in one test poisons the lock, and taking that as a
+        // failure here reports every later test in the module as broken
+        // too. The guard restores the default routing on drop whether
+        // or not its test panicked, so the state a later test inherits
+        // is the same either way: recover the guard and let the one
+        // test that failed be the one that reads as failed.
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .expect("global_test_lock poisoned by prior test panic")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// RAII guard: acquires the serializing lock and restores the
@@ -184,12 +190,12 @@ mod tests {
 
         let ot = Arc::clone(&observed_tree);
         let om = Arc::clone(&observed_mailbox);
-        // Deadline-based loop: spin until BOTH values observed or
-        // 500 ms elapses. Iteration-count loops race with the main
-        // thread's 5 ms sleep on fast hosts (1M atomic loads finish
-        // in <5 ms on Zen+, so producer can exit before the second
-        // migration ever lands).
-        let deadline = Instant::now() + Duration::from_millis(500);
+        // The producer spins until it has seen both values or the
+        // deadline passes. The deadline bounds a broken build rather
+        // than pacing the test: the main thread waits for the first
+        // observation and flips on it, so neither side depends on the
+        // other reaching a point within some interval.
+        let deadline = Instant::now() + Duration::from_secs(10);
         let producer = thread::spawn(move || {
             while Instant::now() < deadline {
                 match active_cooperative_routing() {
@@ -208,13 +214,24 @@ mod tests {
             }
         });
 
-        // Give the producer enough iterations to observe Tree, then flip.
-        std::thread::sleep(Duration::from_millis(5));
+        // Flip once the producer has actually observed the first value,
+        // not after an interval it is assumed to observe one in. A
+        // thread that has not been scheduled yet has observed nothing,
+        // and a flip before its first load leaves it nothing to see -
+        // which is a failure of the test's pacing rather than of the
+        // migration it is checking.
+        let handshake = Instant::now() + Duration::from_secs(10);
+        while !observed_tree.load(Ordering::Relaxed) && Instant::now() < handshake {
+            std::hint::spin_loop();
+        }
+        assert!(
+            observed_tree.load(Ordering::Relaxed),
+            "producer never saw ForceTree in 10 s, so the migration did not reach another thread"
+        );
         migrate_cooperative_routing(CooperativeRouting::ForceMailbox);
 
         producer.join().expect("producer thread should not panic");
 
-        assert!(observed_tree.load(Ordering::Relaxed), "producer never saw ForceTree");
         assert!(
             observed_mailbox.load(Ordering::Relaxed),
             "producer never saw ForceMailbox after migration"
