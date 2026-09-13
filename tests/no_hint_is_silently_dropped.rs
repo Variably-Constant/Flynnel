@@ -82,8 +82,14 @@ fn every_builder_sets_the_field_it_names() {
     assert!(!base().with_mailbox_routing(false).use_mailbox_routing);
     // Auto is the default, so both non-default variants are set here:
     // a builder that ignored its argument would still read back Auto.
-    assert_eq!(base().with_k_gating(KGating::PerSlot).k_gating, KGating::PerSlot);
-    assert_eq!(base().with_k_gating(KGating::CounterOnly).k_gating, KGating::CounterOnly);
+    // with_k_gating is deprecated because the field steers nothing;
+    // what it still owes a caller is that it stores what it was given,
+    // which is what this asserts and all it asserts.
+    #[allow(deprecated)]
+    {
+        assert_eq!(base().with_k_gating(KGating::PerSlot).k_gating, KGating::PerSlot);
+        assert_eq!(base().with_k_gating(KGating::CounterOnly).k_gating, KGating::CounterOnly);
+    }
     assert_eq!(
         base().with_cooperative_routing(CooperativeRouting::ForceTree).cooperative_routing,
         CooperativeRouting::ForceTree

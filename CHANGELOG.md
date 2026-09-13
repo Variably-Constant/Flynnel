@@ -7,6 +7,35 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ## Unreleased
 
+### Changed
+
+- A declared matrix-extension `hw_class` promotes the scheduler tier.
+  `with_hw_class` set a field that nothing outside tests read, under a
+  `SchedTier` doc naming `hw_class` among the inputs the tier is
+  selected from. The smallest tile a caller can mean by `AmxBf16`,
+  `AmxInt8`, `Sme` or a tensor-core class is a multiply-accumulate over
+  a 16x16 block, orders above the dispatch the inline fold weighs
+  against, so the tier selection now treats such a class as heavy per
+  item alongside an explicit per-item cost and `use_smt`. The vector
+  classes say nothing the batch size does not and still steer nothing.
+  `SchedTier`'s doc now lists what the selection reads.
+
+### Deprecated
+
+- `JobPlan::with_k_gating`, which steers nothing. K-gating is
+  process-global: every worker carries both backings and an atomic tag
+  picks which its pushes and steals use, flipped for all workers at
+  once by `AdaptiveDispatcher::migrate_k_gating`. A per-dispatch gating
+  would push to the backing the tag does not name, and such a job is
+  reachable only while the orphan-drain flag is set - a flag any pop or
+  steal clears on finding that backing empty, so a push racing a probe
+  could leave a job no thief looks for again. Honoring it per dispatch
+  means probing both backings on every steal, which is the cost that
+  flag exists to avoid. The field's doc claimed the cooperative
+  dispatch family consumed it; that family reads `cooperative_routing`.
+  `with_workload_shape` still carries the shape's gating hint and it
+  still steers nothing, which its doc now says.
+
 ### Fixed
 
 - `with_task_span_ns` and `with_k_inner_log2` steer something. Both

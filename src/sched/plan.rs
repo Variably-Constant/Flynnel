@@ -356,10 +356,22 @@ pub struct JobPlan {
     /// CounterOnly on smaller-store-buffer cores (in-order ARM,
     /// embedded).
     ///
-    /// The current `WorkerCtx` is KHL-backed (PerSlot) per the
-    /// Zen+ measurement; this hint is consumed by the
-    /// cooperative-dispatch family that retains the option to
-    /// route through alternative substrates on other host classes.
+    /// Nothing reads this field, and a dispatch is not the granularity
+    /// at which K-gating can be chosen.
+    ///
+    /// Every worker carries both backings at once and an atomic tag
+    /// says which one its pushes and steals use;
+    /// [`crate::sched::arena_local::LocalArena::migrate_all_workers_k_gating`]
+    /// flips every tag in one pass, and
+    /// [`crate::sched::dispatch::AdaptiveDispatcher::migrate_k_gating`]
+    /// is the way to ask for that. A job pushed to the backing the tag
+    /// does not name is reachable only while the owner's
+    /// orphan-drain flag is set, and any pop or steal that finds that
+    /// backing empty clears the flag - so a per-dispatch gating would
+    /// race a concurrent probe and could leave a job that no thief
+    /// looks for again. Honoring it per dispatch means probing both
+    /// backings on every steal, which is the cost the flag exists to
+    /// avoid.
     pub k_gating: crate::sched::k_gating::KGating,
     /// Per-call cooperative-routing override consumed by
     /// [`crate::sched::cooperative::cooperative_join_n`]. `Auto`
@@ -421,9 +433,18 @@ impl JobPlan {
         self
     }
 
-    /// Builder: override the K_gating axis for this dispatch.
-    /// See [`Self::k_gating`] for the trade-offs. The default
-    /// (`KGating::Auto`) resolves to the host's calibrated winner.
+    /// Builder: set [`Self::k_gating`], which steers nothing.
+    ///
+    /// K-gating is process-global. Use
+    /// [`crate::sched::dispatch::AdaptiveDispatcher::migrate_k_gating`]
+    /// to change it.
+    #[deprecated(
+        since = "0.5.1",
+        note = "steers nothing: K-gating is process-global, so use \
+                AdaptiveDispatcher::migrate_k_gating. A per-dispatch \
+                gating would push to a worker's dormant backing, which \
+                a concurrent probe can render unreachable."
+    )]
     pub fn with_k_gating(mut self, gating: crate::sched::k_gating::KGating) -> Self {
         self.k_gating = gating;
         self
@@ -464,11 +485,18 @@ impl JobPlan {
     /// `with_*` builders should call this ahead of those builders -
     /// this method overwrites k_gating / use_mailbox_routing /
     /// oversubscription_log2 with shape-derived values.
+    ///
+    /// Two of those three steer: the mailbox flag gates the right-half
+    /// push in `join`, and the oversubscription factor sets the split
+    /// budget. [`Self::k_gating`] is carried and read by nothing, so a
+    /// shape whose hints differ only in gating routes identically.
     pub fn with_workload_shape(
         mut self,
         shape: crate::sched::workload_shape::WorkloadShape,
     ) -> Self {
         let h = shape.hints();
+        // Carried so the plan reports the shape's whole hint set; it
+        // steers nothing, for the reason on `k_gating`.
         self.k_gating = h.k_gating;
         self.use_mailbox_routing = h.use_mailbox_routing;
         // A declared shape is the caller describing the workload, so
