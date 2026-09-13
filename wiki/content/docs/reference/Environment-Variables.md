@@ -78,6 +78,16 @@ Enable per-`join_in_worker` dispatch tracing to stderr. Accumulates three proces
 
 Default: off.
 
+### `FLYNNEL_MODEL_REPORT=<any value>`
+
+Report to stderr when a chunked walk carried a `task_overhead_ns` and still could not reach the Tiny-Tasks model, so the overhead sized nothing and the split fell back to the caller's `min_leaf`. The model needs a per-item cost the caller stated or the entry probe measured; an overhead on its own is inert.
+
+A per-item cost without an overhead is deliberately **not** reported. That cost steers the tier pick, the inline-collapse decision, the adaptive leaf floor and the seed depth by itself, so such a plan is not silently doing nothing.
+
+One line per distinct `(items, task_overhead_ns)` shape, so a size sweep prints once per size rather than once per dispatch. Read by [`src/sched/par_iter.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/par_iter.rs) via `model_reporting()`; the check is cached in a `OnceLock<bool>`.
+
+Default: off.
+
 ### `FLYNNEL_HOST_PROFILE_NS=<dispatch>,<collapse>,<wake>`
 
 Pin the host dispatch profile to the three nanosecond counts given, and skip the calibration entirely. Read by [`src/sched/par_iter.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/par_iter.rs) inside `calibrate_host_dispatch`.
@@ -141,6 +151,7 @@ The detection helpers in `flynnel::backend::detect` do not read env vars directl
 | `FLYNNEL_ADAPTIVE_SPIN=1` | off | Opt in to the adaptive spin-window controller |
 | `FLYNNEL_TRACE=on` | off | Enable scheduler-event tracing |
 | `FLYNNEL_TRACE_DISPATCH=<any>` | off | Per-`join_in_worker` dispatch trace to stderr |
+| `FLYNNEL_MODEL_REPORT=<any>` | off | Report a `task_overhead_ns` that could not reach the Tiny-Tasks model |
 | `FLYNNEL_HOST_PROFILE_NS=d,c,w` | unset (measured) | Pin the host dispatch profile and skip calibration |
 | `FLYNNEL_PROFILE_SAMPLES=<any>` | off | Every sample behind each host-dispatch calibration point to stderr |
 | `FLYNNEL_LOCKLATCH_DIAGNOSE=1` | off | Per-`LockLatch::wait()` diagnostic to stderr |

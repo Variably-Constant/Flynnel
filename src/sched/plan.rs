@@ -863,6 +863,14 @@ impl JobPlan {
     /// [`Self::estimated_total_ns`] to make static serial-vs-parallel
     /// decisions at entry, bypassing rdtsc-polling in the hot loop.
     ///
+    /// This alone does not size a leaf. It steers the tier pick, the
+    /// inline-collapse decision, the adaptive leaf floor and the seed
+    /// depth, all from the cost by itself. The Tiny-Tasks leaf width in
+    /// [`Self::optimal_chunk_count_for`] needs a per-task overhead as
+    /// well, so add [`Self::with_task_overhead_ns`] to reach it. A plan
+    /// stating only the cost is not inert; it simply splits by the SLAW
+    /// budget rather than by the model.
+    ///
     /// Also re-runs the static initial classifier
     /// ([`crate::sched::adaptive_profile::infer_class_static`]) with
     /// the new hint and updates the plan's `use_smt` /
@@ -912,6 +920,14 @@ impl JobPlan {
 
     /// Builder: per-task scheduler overhead (Tiny-Tasks). See field
     /// docs on [`Self::task_overhead_ns`].
+    ///
+    /// Inert on its own. It is read only by
+    /// [`Self::optimal_chunk_count_for`], which needs a per-item cost
+    /// as well, so a plan setting this and nothing else routes exactly
+    /// as a plan setting neither. Pair it with
+    /// [`Self::with_estimated_per_item_ns`], or leave the entry probe
+    /// to measure the cost, and the chunked walks size their leaf from
+    /// the model.
     pub fn with_task_overhead_ns(mut self, overhead_ns: u32) -> Self {
         self.task_overhead_ns = Some(overhead_ns);
         self

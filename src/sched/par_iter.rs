@@ -2252,10 +2252,47 @@ where
 /// once, and the SMT siblings are parked unless this plan wakes them.
 fn model_leaf(plan: &JobPlan, n: usize) -> Option<usize> {
     if !plan.estimated_per_item_ns_explicit || plan.task_overhead_ns.is_none() {
+        report_unreachable_model(plan, n);
         return None;
     }
     let chunks = plan.optimal_chunk_count_for(plan.resolved_workers(), n)? as usize;
     Some(n.div_ceil(chunks.max(1)))
+}
+
+/// Report a plan that declared a per-task overhead and still could not
+/// reach the model, which means the overhead bought nothing.
+///
+/// A per-item cost without an overhead is not reported: that cost
+/// steers the tier pick, the collapse decision, the leaf floor and the
+/// seed depth on its own, so the plan is doing work the model is not
+/// party to. Only the overhead is inert alone, and only the walk can
+/// tell whether the probe supplied the missing half.
+///
+/// One line per distinct shape, so a sweep prints once per size rather
+/// than once per dispatch.
+fn report_unreachable_model(plan: &JobPlan, n: usize) {
+    if plan.task_overhead_ns.is_none() || !model_reporting() {
+        return;
+    }
+    static LAST_SHAPE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+    let key = ((n as u64) << 32) ^ u64::from(plan.task_overhead_ns.unwrap_or(0));
+    if LAST_SHAPE.swap(key, core::sync::atomic::Ordering::Relaxed) != key {
+        eprintln!(
+            "tiny-tasks model not consulted: items {n} task_overhead_ns {:?} \
+             estimated_per_item_ns {:?} stated {}. The model needs a per-item \
+             cost the caller stated or the entry probe measured, so the \
+             overhead sized nothing and the split used the caller's min_leaf.",
+            plan.task_overhead_ns, plan.estimated_per_item_ns, plan.estimated_per_item_ns_explicit
+        );
+    }
+}
+
+/// Whether to report a plan whose Tiny-Tasks hints could not be used.
+/// Off unless `FLYNNEL_MODEL_REPORT` is set, because a plan that never
+/// asked for the model is the common case and is not a defect.
+fn model_reporting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLYNNEL_MODEL_REPORT").is_some())
 }
 
 /// Same as [`for_each_chunk_triple`] but the recursion floor is
@@ -4898,6 +4935,30 @@ mod tests {
             None,
             "an overhead alone leaves the model without work to spread"
         );
+    }
+
+    #[test]
+    fn an_overhead_alone_is_inert_and_a_per_item_cost_alone_is_not() {
+        let n = 4096usize;
+        // Both reach no model width, but they are not the same case and
+        // the reporting treats them differently.
+        let overhead_only = JobPlan::new(6, n as u32).with_task_overhead_ns(500);
+        assert_eq!(model_leaf(&overhead_only, n), None);
+        assert!(
+            !overhead_only.estimated_per_item_ns_explicit,
+            "an overhead alone leaves the cost unstated, which is the reported case"
+        );
+
+        let cost_only = JobPlan::new(6, n as u32).with_estimated_per_item_ns(50);
+        assert_eq!(model_leaf(&cost_only, n), None);
+        assert!(
+            cost_only.task_overhead_ns.is_none(),
+            "a cost alone leaves no overhead, which is not reported: the cost \
+             still steers the tier pick, the collapse decision and the leaf floor"
+        );
+        // The cost alone does steer something, which is why it is not
+        // reported as a dropped hint.
+        assert!(cost_only.estimated_total_ns().is_some());
     }
 
     #[test]
