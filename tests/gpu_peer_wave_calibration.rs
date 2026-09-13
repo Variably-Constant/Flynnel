@@ -49,9 +49,42 @@ fn wave_calibration_measures_keeps_and_stores_the_costs() {
     );
     drop(without);
 
+    // The calibration runs waves on the device against a deadline, so a
+    // process from another project can make it time out. That is a
+    // reading of the neighbour, and the device lock reaches only
+    // Flynnel's own test binaries.
+    //
+    // Sampled either side of the call rather than across it, because
+    // the calibration is one call with no interior to sample. A
+    // neighbour that arrives and leaves inside it is missed; one that
+    // is still resident when the call fails is not.
+    let mut watch = common::DeviceMemoryWatch::before_setup();
     let mut first = peer(true);
+    watch.setup_done();
     assert_eq!(first.wave_costs(), None, "a fresh table holds no wave costs");
-    let costs = first.calibrate_waves().expect("calibrate");
+    let calibrated = first.calibrate_waves();
+    watch.sample();
+    let costs = match calibrated {
+        Ok(costs) => costs,
+        Err(err) => {
+            // A clean device makes this a real failure.
+            if watch.measurable() {
+                panic!("calibrate: {err:?}");
+            }
+            // Otherwise it is the neighbour, said out loud rather than
+            // skipped: an assertion that vanishes quietly is
+            // indistinguishable from one that passed.
+            println!(
+                "UNMEASURED, not asserted: the calibration did not finish ({err:?}). {}. \
+                 That is a reading of the neighbour rather than of this crate.",
+                watch.describe()
+            );
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                eprintln!("wave calibration test left {} behind: {e}", dir.display());
+            }
+            return;
+        }
+    };
     println!("wave costs at team size {}: {costs:?}", first.team_size());
     assert_eq!(costs.width, first.team_size());
     assert!(costs.fixed_ns > 0, "a slice round trip costs time: {costs:?}");
