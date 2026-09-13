@@ -1220,10 +1220,19 @@ impl JobPlan {
     /// process arena's primaries, plus its SMT siblings when this plan
     /// wakes them, capped by [`Self::worker_cap`].
     ///
-    /// The siblings park unless a dispatch with `use_smt` is in
-    /// flight, so `NumaArena::total_workers` counts threads that exist
-    /// rather than threads that run and reads 24 on a 12-core host
-    /// where 12 run. This is the count to divide work by.
+    /// Under the default worker sizing this equals the arena's whole
+    /// width: the per-node count defaults to the node's logical
+    /// threads, and no SMT extension is spawned when the primaries
+    /// already cover them, so a 24-thread host reads 24 whatever the
+    /// plan says about SMT.
+    ///
+    /// It diverges from `NumaArena::total_workers` only where the
+    /// primaries are fewer than the logical threads:
+    /// `FLYNNEL_SCHED_PHYSICAL_ONLY=on`, `FLYNNEL_SCHED_SMT=off`, or an
+    /// explicit `FLYNNEL_SCHED_WORKERS` below the logical count. There
+    /// the siblings exist and park unless a dispatch with `use_smt` is
+    /// in flight, so `total_workers` counts threads that exist rather
+    /// than threads that run, and this is the count to divide work by.
     ///
     /// Starts the arena if it is not already running.
     #[inline]
@@ -1964,6 +1973,16 @@ mod tests {
         let primaries = arena.primary_workers();
         let total = arena.total_workers();
         assert!(primaries <= total);
+        // Under the default sizing the two are equal, because the
+        // per-node count is the node's logical threads and no SMT
+        // extension is spawned when the primaries already cover them.
+        // The assertions below hold either way; only the last has
+        // anything to compare when they differ.
+        assert_eq!(
+            arena.smt_extension_workers(),
+            total - primaries,
+            "the extension is whatever the primaries do not cover"
+        );
 
         let mut parked = JobPlan::new(6, 4096);
         parked.use_smt = false;

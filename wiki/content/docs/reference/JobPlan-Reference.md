@@ -420,7 +420,9 @@ pub fn resolved_workers(&self) -> usize
 
 How many workers will actually run this plan's work: the process arena's primaries, plus its SMT siblings when the plan wakes them, capped by [`worker_cap`](#worker_cap-optionu32).
 
-The distinction matters. `NumaArena::total_workers` counts the siblings whether or not they are awake, and they park unless a dispatch with `use_smt` is in flight, so it reads 24 on a 12-core SMT host where 12 threads run. The Tiny-Tasks model divides work by parallelism, so sizing a plan that parks its siblings against 24 overstates it twofold and asks for chunks about 1.4 times too narrow.
+Under the default worker sizing this equals the arena's whole width. The per-node count defaults to the node's logical threads, and `NumaArena::new` spawns an SMT extension only when the primaries do not already cover them, so primaries equal logical threads and there are no siblings to park. A 24-thread host reads 24 whatever the plan says about SMT.
+
+It diverges from `NumaArena::total_workers` only where the primaries are fewer than the logical threads: `FLYNNEL_SCHED_PHYSICAL_ONLY=on`, `FLYNNEL_SCHED_SMT=off`, or an explicit `FLYNNEL_SCHED_WORKERS` below the logical count. There the siblings exist and park unless a dispatch with `use_smt` is in flight, so `total_workers` counts threads that exist rather than threads that run, and the Tiny-Tasks model sized against it overstates parallelism twofold and asks for chunks about 1.4 times too narrow.
 
 Starts the arena if it is not already running, so it is not a free inspection on a process that has not yet used the pool.
 

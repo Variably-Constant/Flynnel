@@ -53,13 +53,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   run this plan's work: the arena's primaries, plus its SMT siblings
   when the plan wakes them, capped by `worker_cap`. `effective_workers`
   takes the pool width as an argument and there was no supported route
-  to it from outside the crate. The distinction is load-bearing rather
-  than cosmetic: `NumaArena::total_workers` counts siblings whether or
-  not they are awake, so it reads 24 on a 12-core SMT host where 12
-  threads run, and the Tiny-Tasks model divides work by parallelism.
-  Sizing a plan that parks the siblings against 24 overstates its
-  parallelism twofold and asks for chunks about 1.4 times too narrow.
-  The chunked walks divide by this count.
+  to it from outside the crate. The chunked walks divide by this count.
+
+  Under the default worker sizing it equals the arena's whole width,
+  because the per-node count defaults to the node's logical threads and
+  no SMT extension is spawned when the primaries already cover them. It
+  diverges only under `FLYNNEL_SCHED_PHYSICAL_ONLY=on`,
+  `FLYNNEL_SCHED_SMT=off`, or an explicit `FLYNNEL_SCHED_WORKERS` below
+  the logical count, where the siblings exist and park unless a
+  dispatch with `use_smt` wakes them. There `NumaArena::total_workers`
+  counts threads that exist rather than threads that run, and sizing a
+  plan against it overstates parallelism twofold, asking for chunks
+  about 1.4 times too narrow. The arena's own doc gave that 24-against-12
+  example without saying it describes the non-default sizing.
 
 ### Changed
 

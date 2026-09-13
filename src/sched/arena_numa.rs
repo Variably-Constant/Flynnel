@@ -188,10 +188,20 @@ impl NumaArena {
     ///
     /// This counts the siblings whether or not they are awake, and
     /// they are parked unless a dispatch with `use_smt` is in flight.
-    /// So on a 12-core host with SMT this reads 24 while 12 threads
-    /// run. A caller sizing something to physical cores wants
-    /// [`Self::primary_workers`]; this is the right count only for
-    /// "how many threads exist".
+    ///
+    /// Under the default worker sizing there are none to count: the
+    /// per-node worker count defaults to the node's logical threads,
+    /// and [`Self::new`] spawns an SMT extension only when the
+    /// primaries do not already cover them, so primaries equal logical
+    /// threads and this equals [`Self::primary_workers`].
+    ///
+    /// The two diverge when the primaries are fewer than the logical
+    /// threads, which is `FLYNNEL_SCHED_PHYSICAL_ONLY=on`,
+    /// `FLYNNEL_SCHED_SMT=off`, or an explicit `FLYNNEL_SCHED_WORKERS`
+    /// below the logical count. There a 12-primary arena on a 24-thread
+    /// host reads 24 here while 12 threads run, and a caller sizing
+    /// work to threads that will execute wants
+    /// [`Self::primary_workers`].
     pub fn total_workers(&self) -> usize {
         self.nodes.iter().map(|a| a.worker_count()).sum()
     }
