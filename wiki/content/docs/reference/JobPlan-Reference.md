@@ -231,13 +231,11 @@ Per-tier deque the recursive-split right-half is pushed to. `None` (default) mea
 
 ### `k_gating: crate::sched::k_gating::KGating`
 
-**This field steers nothing, and [`with_k_gating`](#builder-methods) is deprecated as of 0.5.1.** It is stored and read by no dispatch path. K-gating is process-global, not per-call.
+**Removed in 0.6.0**, along with `JobPlan::with_k_gating` and `WorkloadShapeHints::k_gating`. The field was written by the constructors, the builder and the shape mapping, and read by no dispatch path.
 
-Every worker carries a KHL per-slot backing and an Fcl counter-only backing at once, and an atomic tag says which one its pushes and steals use. `migrate_all_workers_k_gating(KGating::*)` flips every tag in one pass, which is the granularity `AdaptiveDispatcher::migrate_k_gating` operates at. See [`KGating`](Foundation-Types-Reference.md#kgating) for the trade-offs between the two backings.
+K-gating is process-global, per worker rather than per call. Every worker carries a KHL per-slot backing and an Fcl counter-only backing at once, with an atomic tag naming the live one, and a job pushed to the other is reachable only while that worker's orphan-drain flag is set - a flag any pop or steal clears on finding that backing empty. Honouring a per-dispatch hint means probing both backings on every steal, which is the cost the flag exists to reclaim. So the field could not be wired, and a hint with no reader cannot report that it is doing nothing.
 
-It is not a wiring gap. A job pushed to the backing the tag does not name is reachable only while that worker's orphan-drain flag is set, and both the owner's pop and a thief's steal clear that flag on finding the dormant backing empty, so a push racing either probe could leave a job no thief looks for again. Honouring the hint per dispatch means probing both backings on every steal, which is the cost the flag exists to avoid.
-
-[`new`](#new), [`bare`](#bare), [`set_profile`](#set_profile), and [`for_op_generic`](#for_op_generic) all default this to `Auto`.
+To pin a backing, use `AdaptiveDispatcher::migrate_k_gating` or `LocalArena::migrate_all_workers_k_gating`, which flip every worker's tag in one pass. The [`KGating`](Foundation-Types-Reference.md#kgating) type itself is unchanged.
 
 ### `cooperative_routing: crate::sched::adaptive_cooperative::CooperativeRouting`
 
@@ -329,10 +327,10 @@ All builders take `self` by value and return `Self`, supporting chains like `Job
 | `with_effective_task_count(count: u32)` | Sets `effective_task_count = Some(count)`. |
 | `with_k_inner_log2(log2: u8)` | Sets `k_inner_log2 = Some(log2)`. |
 | `with_backend(Backend)` | Sets `backend_hint = Some(backend)`. |
-| `with_k_gating(KGating)` | **Deprecated since 0.5.1, steers nothing.** Sets `k_gating`, which no dispatch path reads. K-gating is process-global; see [`k_gating`](#k_gating-crateschedk_gatingkgating) for why a dispatch cannot choose it. |
+| `with_k_gating(KGating)` | **Removed in 0.6.0.** It set a field no dispatch read, and a dispatch is not the granularity K-gating has. Use `AdaptiveDispatcher::migrate_k_gating`; see [`k_gating`](#k_gating-crateschedk_gatingkgating). |
 | `with_mailbox_routing(bool)` | Sets `use_mailbox_routing`. The realistic_bench finding is that blanket mailbox routing regresses Compute / Heavy; opt in only when the call site's locality structure justifies SMT-pair concentration. |
 | `with_deque_tier_hint(DequeTier)` | Sets `deque_tier_hint = Some(tier)`. Pins the recursive-split right-half to a narrower coherence neighborhood than `Public`. Same trade-off as `with_mailbox_routing`. |
-| `with_workload_shape(WorkloadShape)` | Overwrites `k_gating`, `use_mailbox_routing`, and `oversubscription_log2` from a declarative shape ([`WorkloadShape`](Foundation-Types-Reference.md#workloadshape)). Two of the three steer; the `k_gating` it writes is read by nothing, as above. Call this before other `with_*` builders that touch those fields, since it overwrites them. |
+| `with_workload_shape(WorkloadShape)` | Overwrites `use_mailbox_routing` and `oversubscription_log2` from a declarative shape ([`WorkloadShape`](Foundation-Types-Reference.md#workloadshape)). Call this before other `with_*` builders that touch those fields, since it overwrites them. |
 | `with_site(SiteRef)` | Attaches a caller-owned per-call-site state, replacing any prior attachment. Declare `static SITE: CallSiteState = CallSiteState::new();` and pass `SiteRef::new(&SITE)`. |
 | `with_site_if_none(SiteRef)` | Attaches only when no site is present; the generic dispatch entries use this so an outer attachment always wins. |
 | `with_bisect_variant(BisectVariant)` | Sets `bisect_variant = Some(v)`. Selects an in-tree scheduler-policy variant for bench-driven A/B research. Production code leaves this `None`. |

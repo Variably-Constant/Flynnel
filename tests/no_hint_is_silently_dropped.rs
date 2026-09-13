@@ -2,7 +2,7 @@
 //! steer routing still steer it.
 //!
 //! A caller who sets a hint and gets no error is entitled to assume it
-//! took effect. `JobPlan` has twenty-three builders and no way to
+//! took effect. `JobPlan` has twenty-two builders and no way to
 //! report that one of them was ignored, so a hint that stops working
 //! is invisible from the outside: the call compiles, the plan is
 //! returned, the work runs, and the routing is simply not what was
@@ -22,25 +22,29 @@
 //!   the direction is asserted. This catches a hint that is stored and
 //!   then ignored, which is the failure that actually happened.
 //!
-//! All twenty-three builders are covered. Three of them have no field
+//! All twenty-two builders are covered. Three of them have no field
 //! of their own to read back and are asserted on what they resolve to
-//! instead: `with_workload_shape` writes three other hints, and the two
+//! instead: `with_workload_shape` writes two other hints, and the two
 //! site builders differ only in whether they defer to a site already
 //! attached.
 //!
 //! A round-trip assertion is not coverage. It proves the setter stores
 //! a value and says nothing about whether anything reads it, so a hint
 //! wired to no reader at all passes the first kind of check forever.
-//! Two did: `with_task_span_ns` and `with_k_inner_log2` shipped in
+//! Three did. `with_task_span_ns` and `with_k_inner_log2` shipped in
 //! 0.5.0 setting fields nothing consulted, under a file whose name
-//! claims exactly that cannot happen. Both now have an assertion of the
-//! second kind, and a hint added here needs one before it is covered.
+//! claims exactly that cannot happen; both now have an assertion of the
+//! second kind. `with_k_gating` could not be wired at all and is gone,
+//! along with the field it set, which is why the count moved.
+//!
+//! A hint added here needs an assertion of the second kind before it is
+//! covered. A hint that cannot be given one does not belong on the
+//! plan.
 
 use flynnel::backend::Backend;
 use flynnel::sched::adaptive_cooperative::CooperativeRouting;
 use flynnel::sched::call_site::caller_site;
 use flynnel::sched::deque_tier::DequeTier;
-use flynnel::sched::k_gating::KGating;
 use flynnel::sched::plan::BisectVariant;
 use flynnel::sched::workload_shape::WorkloadShape;
 use flynnel::{DispatchProfile, HwClass, JobPlan, LeafShape, Variant};
@@ -80,16 +84,6 @@ fn every_builder_sets_the_field_it_names() {
     );
     assert!(base().with_mailbox_routing(true).use_mailbox_routing);
     assert!(!base().with_mailbox_routing(false).use_mailbox_routing);
-    // Auto is the default, so both non-default variants are set here:
-    // a builder that ignored its argument would still read back Auto.
-    // with_k_gating is deprecated because the field steers nothing;
-    // what it still owes a caller is that it stores what it was given,
-    // which is what this asserts and all it asserts.
-    #[allow(deprecated)]
-    {
-        assert_eq!(base().with_k_gating(KGating::PerSlot).k_gating, KGating::PerSlot);
-        assert_eq!(base().with_k_gating(KGating::CounterOnly).k_gating, KGating::CounterOnly);
-    }
     assert_eq!(
         base().with_cooperative_routing(CooperativeRouting::ForceTree).cooperative_routing,
         CooperativeRouting::ForceTree
@@ -176,8 +170,8 @@ fn a_profile_the_caller_named_survives_a_later_cost_hint() {
 
 /// A declared workload shape resolves to the low-level hints it names.
 ///
-/// This builder is a bundle: it writes `k_gating`, `use_mailbox_routing`
-/// and `oversubscription_log2` from the shape rather than storing a
+/// This builder is a bundle: it writes `use_mailbox_routing` and
+/// `oversubscription_log2` from the shape rather than storing a
 /// shape of its own. So there is no field to read back, and a shape
 /// that resolved to nothing would be indistinguishable from one that
 /// was never given. What is asserted is that two different shapes
@@ -189,15 +183,10 @@ fn a_declared_workload_shape_resolves_to_the_hints_it_names() {
     let bursty = base().with_workload_shape(WorkloadShape::ProducerFast { burst: 64 });
 
     assert_ne!(
-        (streaming.k_gating, streaming.use_mailbox_routing, streaming.oversubscription_log2),
-        (bursty.k_gating, bursty.use_mailbox_routing, bursty.oversubscription_log2),
+        (streaming.use_mailbox_routing, streaming.oversubscription_log2),
+        (bursty.use_mailbox_routing, bursty.oversubscription_log2),
         "two different shapes produced the same hints, so the shape was \
          not consulted"
-    );
-    assert_eq!(
-        bursty.k_gating,
-        KGating::PerSlot,
-        "a producer-fast shape names per-slot gating"
     );
 
     // A shape is the caller describing the workload, so the factor it

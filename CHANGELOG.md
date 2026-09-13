@@ -5,7 +5,32 @@ measurements from `benches/` and `tests/` on the two bench hosts, an
 RTX 3070 with a Ryzen 7 2700 (16 threads) and an RTX 5070 with a
 Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
-## 0.5.1 - 2026-09-13
+## 0.6.0 - 2026-09-13
+
+### Removed
+
+- `JobPlan::k_gating`, `JobPlan::with_k_gating` and
+  `WorkloadShapeHints::k_gating`. The field was written by three
+  constructors, the builder and the shape mapping, and read by nothing.
+  It could not be wired either: every worker carries a KHL and an Fcl
+  backing at once with an atomic tag naming the live one, and a job
+  pushed to the other is reachable only while that worker's orphan-drain
+  flag is set - a flag any pop or steal clears on finding that backing
+  empty, so a push racing a probe strands the job. Honoring the hint per
+  dispatch means probing both backings on every steal, which is the cost
+  the flag exists to reclaim.
+
+  A hint with no reader cannot report that it is doing nothing, so it
+  reads as working forever. Deprecating it would have left that on the
+  surface for another release.
+
+  `KGating` itself is untouched and still load-bearing:
+  `calibrate_k_gating`, the per-worker `AtomicU32` tags,
+  `LocalArena::migrate_all_workers_k_gating` and
+  `AdaptiveDispatcher::migrate_k_gating` are the granularity K-gating
+  actually has. Callers pinning a backing should use the migrate call.
+
+  `WorkloadShape::hints()` now returns the hints that steer.
 
 ### Added
 
@@ -59,22 +84,6 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   classes say nothing the batch size does not and still steer nothing.
   `SchedTier`'s doc now lists what the selection reads.
 
-### Deprecated
-
-- `JobPlan::with_k_gating`, which steers nothing. K-gating is
-  process-global: every worker carries both backings and an atomic tag
-  picks which its pushes and steals use, flipped for all workers at
-  once by `AdaptiveDispatcher::migrate_k_gating`. A per-dispatch gating
-  would push to the backing the tag does not name, and such a job is
-  reachable only while the orphan-drain flag is set - a flag any pop or
-  steal clears on finding that backing empty, so a push racing a probe
-  could leave a job no thief looks for again. Honoring it per dispatch
-  means probing both backings on every steal, which is the cost that
-  flag exists to avoid. The field's doc claimed the cooperative
-  dispatch family consumed it; that family reads `cooperative_routing`.
-  `with_workload_shape` still carries the shape's gating hint and it
-  still steers nothing, which its doc now says.
-
 ### Fixed
 
 - The wiki's `JobPlan` reference carried four claims the code does not
@@ -83,7 +92,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   `optimal_chunk_count`; reserved for span-aware extensions" and the
   formula beside it divided by the overhead alone. `k_gating`'s entry
   described a per-call backing selector and the builder table said the
-  hint made "this dispatch land on a pinned backing". `k_inner_log2`
+  hint made "this dispatch land on a pinned backing"; both entries are
+  gone with the field they described. `k_inner_log2`
   described a kernel naming `mul_slice` and `add_slice` that this crate
   does not contain. `hw_class` named only a mode-region path and not the
   tier promotion. The reference now also documents

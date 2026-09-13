@@ -355,34 +355,6 @@ pub struct JobPlan {
     /// `crate::backend::shared_mem::variant_dispatch` (gated on
     /// the `shared-memory-worker-reference` feature).
     pub deque_tier_hint: Option<crate::sched::deque_tier::DequeTier>,
-    /// Per-call K_gating axis hint. See
-    /// [`crate::sched::k_gating::KGating`] for the publication-
-    /// signal axis: counter-only (Chase-Lev / Fcl - one shared
-    /// bottom atomic) vs per-slot (KHL / KHPD - distributed slot
-    /// seq atomics). `Auto` (the default) resolves to the host's
-    /// calibrated winner via
-    /// [`crate::sched::k_gating::calibrate_k_gating`] - PerSlot on
-    /// store-buffer-rich cores (Zen+, Sapphire Rapids+),
-    /// CounterOnly on smaller-store-buffer cores (in-order ARM,
-    /// embedded).
-    ///
-    /// Nothing reads this field, and a dispatch is not the granularity
-    /// at which K-gating can be chosen.
-    ///
-    /// Every worker carries both backings at once and an atomic tag
-    /// says which one its pushes and steals use;
-    /// [`crate::sched::arena_local::LocalArena::migrate_all_workers_k_gating`]
-    /// flips every tag in one pass, and
-    /// [`crate::sched::dispatch::AdaptiveDispatcher::migrate_k_gating`]
-    /// is the way to ask for that. A job pushed to the backing the tag
-    /// does not name is reachable only while the owner's
-    /// orphan-drain flag is set, and any pop or steal that finds that
-    /// backing empty clears the flag - so a per-dispatch gating would
-    /// race a concurrent probe and could leave a job that no thief
-    /// looks for again. Honoring it per dispatch means probing both
-    /// backings on every steal, which is the cost the flag exists to
-    /// avoid.
-    pub k_gating: crate::sched::k_gating::KGating,
     /// Per-call cooperative-routing override consumed by
     /// [`crate::sched::cooperative::cooperative_join_n`]. `Auto`
     /// (the default) defers to the process-global tag via
@@ -443,23 +415,6 @@ impl JobPlan {
         self
     }
 
-    /// Builder: set [`Self::k_gating`], which steers nothing.
-    ///
-    /// K-gating is process-global. Use
-    /// [`crate::sched::dispatch::AdaptiveDispatcher::migrate_k_gating`]
-    /// to change it.
-    #[deprecated(
-        since = "0.5.1",
-        note = "steers nothing: K-gating is process-global, so use \
-                AdaptiveDispatcher::migrate_k_gating. A per-dispatch \
-                gating would push to a worker's dormant backing, which \
-                a concurrent probe can render unreachable."
-    )]
-    pub fn with_k_gating(mut self, gating: crate::sched::k_gating::KGating) -> Self {
-        self.k_gating = gating;
-        self
-    }
-
     /// Builder: override the cooperative-routing axis for this
     /// dispatch. See [`Self::cooperative_routing`] for the
     /// workload guide. The default ([`crate::sched::adaptive_cooperative::CooperativeRouting::Auto`])
@@ -476,7 +431,7 @@ impl JobPlan {
 
     /// Builder: install a declarative [`crate::sched::workload_shape::WorkloadShape`]
     /// hint. Resolves to a bundle of low-level K-axis hints
-    /// ([`Self::k_gating`], [`Self::use_mailbox_routing`],
+    /// ([`Self::use_mailbox_routing`],
     /// [`Self::oversubscription_log2`]) via
     /// [`crate::sched::workload_shape::WorkloadShape::hints`]. The
     /// shape API is the convenience surface for callers that
@@ -493,21 +448,16 @@ impl JobPlan {
     ///
     /// Power users that have already set specific knobs via other
     /// `with_*` builders should call this ahead of those builders -
-    /// this method overwrites k_gating / use_mailbox_routing /
+    /// this method overwrites use_mailbox_routing and
     /// oversubscription_log2 with shape-derived values.
     ///
-    /// Two of those three steer: the mailbox flag gates the right-half
-    /// push in `join`, and the oversubscription factor sets the split
-    /// budget. [`Self::k_gating`] is carried and read by nothing, so a
-    /// shape whose hints differ only in gating routes identically.
+    /// Both steer: the mailbox flag gates the right-half push in
+    /// `join`, and the oversubscription factor sets the split budget.
     pub fn with_workload_shape(
         mut self,
         shape: crate::sched::workload_shape::WorkloadShape,
     ) -> Self {
         let h = shape.hints();
-        // Carried so the plan reports the shape's whole hint set; it
-        // steers nothing, for the reason on `k_gating`.
-        self.k_gating = h.k_gating;
         self.use_mailbox_routing = h.use_mailbox_routing;
         // A declared shape is the caller describing the workload, so
         // its factor counts as theirs: the dispatch entries take it
@@ -528,10 +478,7 @@ impl JobPlan {
     /// `use_mailbox_routing`, and `deque_tier_hint` from that
     /// class's profile. Construction also resolves the process-
     /// global cooperative-routing and bisect-variant tags (one
-    /// Acquire-load each, ~1 ns). The `k_gating` axis stays
-    /// `Auto`, so the K_inner=3 deque-backing choice (KHL vs Fcl)
-    /// remains runtime-swappable via `AdaptiveWorker`'s AtomicU32
-    /// tag.
+    /// Acquire-load each, ~1 ns).
     ///
     /// Refinement after call 1 is per call site: the generic
     /// dispatch entries attach a [`crate::sched::call_site::CallSiteState`]
@@ -659,7 +606,6 @@ impl JobPlan {
             use_mailbox_routing: false,
             leaf_shape: crate::sched::adaptive_profile::LeafShape::Unknown,
             deque_tier_hint: None,
-            k_gating: crate::sched::k_gating::KGating::Auto,
             cooperative_routing: crate::sched::adaptive_cooperative::CooperativeRouting::Auto,
             site: None,
             profile_explicit: false,
@@ -726,7 +672,6 @@ impl JobPlan {
             use_mailbox_routing: profile.use_mailbox_routing(),
             leaf_shape: crate::sched::adaptive_profile::LeafShape::Unknown,
             deque_tier_hint: profile.deque_tier_hint(),
-            k_gating: crate::sched::k_gating::KGating::Auto,
             // Resolve from the process-global active tag at construction
             // time (one AtomicU8 Acquire-load, ~1 ns). When the global
             // is also Auto (the default), the call falls through to the
@@ -771,7 +716,6 @@ impl JobPlan {
             use_mailbox_routing: false,
             leaf_shape: crate::sched::adaptive_profile::LeafShape::Unknown,
             deque_tier_hint: None,
-            k_gating: crate::sched::k_gating::KGating::Auto,
             cooperative_routing:
                 crate::sched::adaptive_cooperative::active_cooperative_routing(),
             site: None,

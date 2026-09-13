@@ -2,33 +2,32 @@
 //!
 //! The user describes their workload declaratively and the
 //! dispatcher picks the primitive + optimization mode. The
-//! benefit: user code stops naming `KGating::PerSlot` /
-//! `push_burst` / `with_mailbox_routing` directly; the framework
-//! maps the shape to those knobs.
+//! benefit: user code stops naming `push_burst` /
+//! `with_mailbox_routing` directly; the framework maps the shape to
+//! those knobs.
 //!
 //! Hint inference at build-time has zero per-op cost; the mapping
-//! shape -> {k_gating, mailbox, oversubscription} runs ONCE at
-//! plan construction and the per-call dispatch path stays direct
-//! atomic ops.
+//! shape to {burst, mailbox, oversubscription} runs once at plan
+//! construction and the per-call dispatch path stays direct atomic
+//! ops.
 //!
 //! ## The shape taxonomy
 //!
 //! Five workload shapes that map cleanly to the Flynn-axis
 //! taxonomy + the K-hierarchy:
 //!
-//! | Shape          | Flynn axis | K_gating                    | Burst | Mailbox                       |
-//! |----------------|------------|-----------------------------|-------|-------------------------------|
-//! | `Streaming`    | SISD       | Auto (host calibration)     | no    | no                            |
-//! | `ProducerFast` | SIMC       | PerSlot                     | YES   | no                            |
-//! | `WorkSteal`    | MIMD       | Auto (host calibration)     | no    | no                            |
-//! | `Cooperative`  | SIMC/MIMC  | PerSlot                     | YES   | YES when `n_cores >= 8`       |
-//! | `VariantRace`  | MISD       | PerSlot                     | no    | no                            |
+//! | Shape          | Flynn axis | Burst | Mailbox                 | Oversubscription |
+//! |----------------|------------|-------|-------------------------|------------------|
+//! | `Streaming`    | SISD       | no    | no                      | plan's own       |
+//! | `ProducerFast` | SIMC       | yes   | no                      | 2 at burst >= 64 |
+//! | `WorkSteal`    | MIMD       | no    | no                      | 2 at 8 consumers |
+//! | `Cooperative`  | SIMC/MIMC  | yes   | yes when `n_cores >= 8` | plan's own       |
+//! | `VariantRace`  | MISD       | no    | no                      | 0                |
 //!
 //! ## Mapping vs the existing K-axis hints
 //!
 //! [`WorkloadShape`] is the high-level API. Internally it maps to
 //! the existing low-level hints already on `JobPlan`:
-//! - `k_gating`: which publication signal protocol
 //! - `use_mailbox_routing`: SIMC owner-directed hand-off
 //! - `oversubscription_log2`: leaf-count multiplier for splitting
 //!
@@ -37,8 +36,6 @@
 //! cases without forcing the user to learn the K-axis vocabulary.
 
 #![allow(clippy::missing_errors_doc)]
-
-use crate::sched::k_gating::KGating;
 
 /// Declarative high-level workload-shape hint. Maps to the
 /// low-level K-axis hints on [`crate::sched::JobPlan`] via
@@ -93,8 +90,6 @@ pub enum WorkloadShape {
 /// low-level hints atomically.
 #[derive(Copy, Clone, Debug)]
 pub struct WorkloadShapeHints {
-    /// K_gating axis hint (per-slot vs counter-only publication).
-    pub k_gating: KGating,
     /// Whether to enable mailbox routing for the right-half push
     /// in `join`.
     pub use_mailbox_routing: bool,
@@ -114,13 +109,11 @@ impl WorkloadShape {
     pub const fn hints(self) -> WorkloadShapeHints {
         match self {
             WorkloadShape::Streaming => WorkloadShapeHints {
-                k_gating: KGating::Auto,
                 use_mailbox_routing: false,
                 oversubscription_log2: None,
                 use_burst: false,
             },
             WorkloadShape::ProducerFast { burst } => WorkloadShapeHints {
-                k_gating: KGating::PerSlot,
                 use_mailbox_routing: false,
                 // Larger bursts get more oversubscription so each
                 // worker has steal-headroom for variance.
@@ -131,7 +124,6 @@ impl WorkloadShape {
                 n_consumers,
                 batch_size: _,
             } => WorkloadShapeHints {
-                k_gating: KGating::Auto,
                 use_mailbox_routing: false,
                 // Many consumers benefit from oversubscription;
                 // few don't.
@@ -139,7 +131,6 @@ impl WorkloadShape {
                 use_burst: false,
             },
             WorkloadShape::Cooperative { n_cores } => WorkloadShapeHints {
-                k_gating: KGating::PerSlot,
                 // Mailbox routing pays off when n_cores >= n_workers
                 // (the cooperative gate inside fan_out_in_worker
                 // demotes mailbox -> deque when N < n_workers).
@@ -150,7 +141,6 @@ impl WorkloadShape {
                 use_burst: true,
             },
             WorkloadShape::VariantRace { n_variants: _ } => WorkloadShapeHints {
-                k_gating: KGating::PerSlot,
                 use_mailbox_routing: false,
                 // Each variant racer is its own entry; oversubscription
                 // matches racer count.
@@ -168,15 +158,13 @@ mod tests {
     #[test]
     fn streaming_maps_to_minimal_hints() {
         let h = WorkloadShape::Streaming.hints();
-        assert_eq!(h.k_gating, KGating::Auto);
         assert!(!h.use_mailbox_routing);
         assert!(!h.use_burst);
     }
 
     #[test]
-    fn producer_fast_enables_burst_and_per_slot() {
+    fn producer_fast_enables_burst() {
         let h = WorkloadShape::ProducerFast { burst: 64 }.hints();
-        assert_eq!(h.k_gating, KGating::PerSlot);
         assert!(h.use_burst);
         assert_eq!(h.oversubscription_log2, Some(2));
     }
@@ -188,10 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn work_steal_uses_auto_gating() {
+    fn work_steal_does_not_burst() {
         let h = WorkloadShape::WorkSteal { n_consumers: 4, batch_size: 16 }.hints();
-        assert_eq!(h.k_gating, KGating::Auto);
         assert!(!h.use_burst);
+        assert_eq!(h.oversubscription_log2, Some(1));
     }
 
     #[test]
@@ -204,9 +192,9 @@ mod tests {
     }
 
     #[test]
-    fn variant_race_uses_per_slot_no_burst() {
+    fn variant_race_does_not_burst() {
         let h = WorkloadShape::VariantRace { n_variants: 3 }.hints();
-        assert_eq!(h.k_gating, KGating::PerSlot);
         assert!(!h.use_burst);
+        assert_eq!(h.oversubscription_log2, Some(0));
     }
 }

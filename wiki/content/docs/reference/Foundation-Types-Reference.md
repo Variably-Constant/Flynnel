@@ -236,23 +236,23 @@ pub enum WorkloadShape {
 }
 ```
 
-Declarative shape hint that the dispatcher maps to `(k_gating, use_mailbox_routing, oversubscription_log2)` knob triples at plan-construction time. The application names what the workload is rather than which knobs to turn; the scheduler maps shape to knobs once at `JobPlan::with_workload_shape(...)` time and the per-call dispatch path stays direct atomic ops.
+Declarative shape hint that the dispatcher maps to `(use_mailbox_routing, oversubscription_log2, use_burst)` at plan-construction time. The application names what the workload is rather than which knobs to turn; the scheduler maps shape to knobs once at `JobPlan::with_workload_shape(...)` time and the per-call dispatch path stays direct atomic ops.
 
-**Two of the three steer.** `use_mailbox_routing` and `oversubscription_log2` reach the dispatch. The `k_gating` a shape writes is stored and read by nothing: K-gating is process-global, per worker rather than per call. See [`KGating`](#kgating) below and the [`k_gating` field](JobPlan-Reference.md#k_gating-crateschedk_gatingkgating) for why a dispatch cannot choose it. The gating column below records what the shape writes, not an effect it has.
+`WorkloadShapeHints::k_gating` was removed in 0.6.0 along with the plan field it wrote, which no dispatch read. See [`KGating`](#kgating) below.
 
 | Shape | Flynn axis | Mapped knobs (per `WorkloadShape::hints()`) |
 |---|---|---|
 | `Streaming` | SISD | minimal hints; falls through to inline execution |
-| `ProducerFast { burst }` | SIMC | writes `k_gating = PerSlot`, which steers nothing |
-| `WorkSteal { n_consumers, batch_size }` | MIMD | writes `k_gating = Auto`; the splitter picks leaves per the standard SLAW path |
-| `Cooperative { n_cores }` | SIMC / MIMC | enables mailbox routing once `n_cores` >= a documented threshold |
-| `VariantRace` | MISD | writes `k_gating = PerSlot`, which steers nothing |
+| `ProducerFast { burst }` | SIMC | enables burst; oversubscription 2 at `burst >= 64`, else 1 |
+| `WorkSteal { n_consumers, batch_size }` | MIMD | oversubscription 2 at `n_consumers >= 8`, else 1; the splitter picks leaves per the standard SLAW path |
+| `Cooperative { n_cores }` | SIMC / MIMC | enables burst, and mailbox routing once `n_cores >= 8` |
+| `VariantRace` | MISD | oversubscription 0, one leaf per racer |
 
 API:
 
 - [`JobPlan::with_workload_shape(shape)`](JobPlan-Reference.md#builder-methods) - consume the shape and overwrite the three knobs.
 
-Calls to other `with_*` builders that touch the same knobs (`with_mailbox_routing`, `with_oversubscription_log2`) should come after `with_workload_shape` so they win. `with_k_gating` is deprecated as of 0.5.1 and its ordering is moot, since neither the builder nor the shape's gating hint reaches a dispatch.
+Calls to other `with_*` builders that touch the same knobs (`with_mailbox_routing`, `with_oversubscription_log2`) should come after `with_workload_shape` so they win.
 
 ## `KGating`
 
@@ -276,8 +276,8 @@ Per-worker K_inner=3 deque-backing selector. Every `AdaptiveWorker` holds an `At
 
 API:
 
-- [`JobPlan::with_k_gating(KGating)`](JobPlan-Reference.md#builder-methods) - **deprecated since 0.5.1 and steers nothing.** It sets a plan field no dispatch path reads. A dispatch cannot pin the choice: the tag is per worker, and a job pushed to the backing the tag does not name is reachable only while that worker's orphan-drain flag is set, which any pop or steal clears on finding the dormant backing empty.
-- `migrate_all_workers_k_gating(KGating)` (on `LocalArena`) - flip every worker's tag globally at runtime. This is the granularity K-gating actually has.
+- `migrate_all_workers_k_gating(KGating)` (on `LocalArena`) - flip every worker's tag globally at runtime. This is the granularity K-gating has, and `AdaptiveDispatcher::migrate_k_gating` is the surface to reach it through.
+- `JobPlan::with_k_gating` and the `JobPlan::k_gating` field were **removed in 0.6.0**. A dispatch could not pin the choice: the tag is per worker, and a job pushed to the backing the tag does not name is reachable only while that worker's orphan-drain flag is set, which any pop or steal clears on finding the dormant backing empty.
 - [`calibrate_k_gating()`](Sched-Module-Reference.md#k_gating) - run the per-host calibration probe; cached in `CALIBRATED_GATING`.
 
 ## `BisectVariant`
