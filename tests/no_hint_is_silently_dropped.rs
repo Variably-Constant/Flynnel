@@ -449,6 +449,14 @@ fn the_order_hints_are_given_does_not_change_the_plan() {
     );
 }
 
+/// A per-item cost that declares `multiple` times this host's measured
+/// inline-collapse threshold across `n` items, so a walk given it
+/// dispatches rather than running on the caller.
+fn declared_ns_per_item_above_collapse(n: usize, multiple: u64) -> u32 {
+    let total = flynnel::sched::par_iter::inline_collapse_threshold_ns().saturating_mul(multiple);
+    u32::try_from(total.div_ceil(n.max(1) as u64).max(1)).unwrap_or(u32::MAX)
+}
+
 /// Count the leaves of an indexed walk, and the indices it covered.
 fn indexed_walk(plan: &JobPlan, n: usize, min_leaf: usize) -> (usize, Vec<usize>) {
     use std::sync::Mutex;
@@ -479,11 +487,14 @@ fn indexed_walk(plan: &JobPlan, n: usize, min_leaf: usize) -> (usize, Vec<usize>
 #[test]
 fn a_task_overhead_steers_how_finely_an_in_place_walk_splits() {
     let n = 64usize;
-    // 100 us an item puts the run past the inline-collapse threshold,
-    // so neither arm reaches one leaf by running on the caller.
+    // Declare four times the host's measured collapse threshold across
+    // the run, so neither arm reaches one leaf by collapsing to the
+    // caller instead. Read rather than assumed: the threshold is a
+    // figure this host measures, not a constant.
+    let per_item = declared_ns_per_item_above_collapse(n, 4);
     let plan = |overhead_ns: u32| {
         JobPlan::new(6, n as u32)
-            .with_estimated_per_item_ns(100_000)
+            .with_estimated_per_item_ns(per_item)
             .with_task_overhead_ns(overhead_ns)
     };
     let every_index: Vec<usize> = (0..n).collect();
@@ -513,9 +524,10 @@ fn a_task_overhead_steers_how_finely_an_in_place_walk_splits() {
 fn a_caller_floor_wins_over_a_finer_model_width() {
     let n = 4096usize;
     // A negligible overhead asks for a chunk per item, which this
-    // floor forbids.
+    // floor forbids. The declared cost clears the host's measured
+    // collapse threshold so the unfloored arm dispatches.
     let plan = JobPlan::new(6, n as u32)
-        .with_estimated_per_item_ns(100_000)
+        .with_estimated_per_item_ns(declared_ns_per_item_above_collapse(n, 4))
         .with_task_overhead_ns(1);
 
     let (floored, seen) = indexed_walk(&plan, n, n);
