@@ -38,12 +38,18 @@ use std::time::{Duration, Instant};
 /// Sampling runs across the region, not at its ends: a neighbour that
 /// arrives and leaves between two endpoint samples is invisible to
 /// both.
+///
+/// This module is compiled into every test binary that declares it, and
+/// each uses a different part, so what one binary does not call is dead
+/// code there under `-D warnings`.
+#[allow(dead_code)]
 pub struct DeviceMemoryWatch {
     before_setup: Option<u64>,
     after_setup: Option<u64>,
     peak: Option<u64>,
 }
 
+#[allow(dead_code)]
 impl DeviceMemoryWatch {
     /// Sample before any device buffers exist.
     pub fn before_setup() -> Self {
