@@ -5,7 +5,7 @@ measurements from `benches/` and `tests/` on the two bench hosts, an
 RTX 3070 with a Ryzen 7 2700 (16 threads) and an RTX 5070 with a
 Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
-## Unreleased
+## 0.5.1 - 2026-09-13
 
 ### Added
 
