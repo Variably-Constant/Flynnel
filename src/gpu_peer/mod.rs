@@ -354,6 +354,31 @@ fn device_capabilities(ordinal: usize) -> DeviceCapabilities {
     }
 }
 
+/// Bytes of device memory in use, and the device's total, for the
+/// device the calling thread's current context is on.
+///
+/// `None` when no context is current or the driver refuses the query.
+///
+/// This reports the whole device, every process included. It answers
+/// what is resident rather than what this process allocated, which is
+/// what a caller wanting to know whether it has the device to itself
+/// needs: a run sizing an allocation against the total alone will
+/// collide with a neighbour that the total cannot see.
+///
+/// Memory is what the driver exposes. Utilization is not on this
+/// surface, so a process holding a context while launching nothing
+/// registers here as its allocation and not as load.
+pub fn device_memory_in_use() -> Option<(u64, u64)> {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    // SAFETY: two out parameters the driver writes and does not read.
+    let r = unsafe { cu::cuMemGetInfo_v2(&mut free, &mut total) };
+    if r != cu::CUresult::CUDA_SUCCESS {
+        return None;
+    }
+    Some((total.saturating_sub(free) as u64, total as u64))
+}
+
 /// Construction parameters. The defaults suit control-plane traffic
 /// (4 KB slots); bulk streaming raises `slot_bytes`.
 #[derive(Debug, Clone)]

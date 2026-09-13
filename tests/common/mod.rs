@@ -20,6 +20,100 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Whether a foreign process was resident on the device while a timed
+/// region ran, so a reading taken across it is about the neighbour.
+///
+/// The lock above excludes Flynnel's own test binaries and nothing
+/// else. A process from another project holds the device regardless,
+/// and a wall-clock assertion then measures it. The driver exposes
+/// memory but not utilization, so memory is the signal here: a
+/// neighbour's allocation is visible where its load is not.
+///
+/// The threshold is measured rather than chosen. Sample before the
+/// device work is set up and again once its buffers exist, and the
+/// difference is this run's own footprint on this host. Nothing more is
+/// allocated after that, so a rise during the timed region larger than
+/// the run's own footprint is somebody else.
+///
+/// Sampling runs across the region, not at its ends: a neighbour that
+/// arrives and leaves between two endpoint samples is invisible to
+/// both.
+pub struct DeviceMemoryWatch {
+    before_setup: Option<u64>,
+    after_setup: Option<u64>,
+    peak: Option<u64>,
+}
+
+impl DeviceMemoryWatch {
+    /// Sample before any device buffers exist.
+    pub fn before_setup() -> Self {
+        Self {
+            before_setup: flynnel::gpu_peer::device_memory_in_use().map(|(used, _)| used),
+            after_setup: None,
+            peak: None,
+        }
+    }
+
+    /// Sample once the run's own buffers exist and before the timed
+    /// region starts. Everything above this is another process.
+    pub fn setup_done(&mut self) {
+        self.after_setup = flynnel::gpu_peer::device_memory_in_use().map(|(used, _)| used);
+        self.peak = self.after_setup;
+    }
+
+    /// Take a reading inside the timed region.
+    pub fn sample(&mut self) {
+        if let Some((used, _)) = flynnel::gpu_peer::device_memory_in_use() {
+            self.peak = Some(self.peak.map_or(used, |p| p.max(used)));
+        }
+    }
+
+    /// This run's own device footprint, in bytes.
+    fn own_footprint(&self) -> Option<u64> {
+        match (self.before_setup, self.after_setup) {
+            (Some(before), Some(after)) => Some(after.saturating_sub(before)),
+            _ => None,
+        }
+    }
+
+    /// Bytes that appeared after this run finished allocating.
+    fn arrived(&self) -> Option<u64> {
+        match (self.after_setup, self.peak) {
+            (Some(after), Some(peak)) => Some(peak.saturating_sub(after)),
+            _ => None,
+        }
+    }
+
+    /// Whether a wall-clock reading taken across this region is about
+    /// this crate rather than about a neighbour.
+    ///
+    /// Unknown when the driver would not answer, and an unknown reading
+    /// is treated as measurable: refusing to assert whenever the query
+    /// fails would turn a driver quirk into a suite that never checks
+    /// anything.
+    pub fn measurable(&self) -> bool {
+        match (self.arrived(), self.own_footprint()) {
+            (Some(arrived), Some(own)) => arrived <= own,
+            _ => true,
+        }
+    }
+
+    /// What the device did across the region, for a message that has to
+    /// explain why a reading was not used.
+    pub fn describe(&self) -> String {
+        match (self.before_setup, self.after_setup, self.peak) {
+            (Some(before), Some(after), Some(peak)) => format!(
+                "device memory {before} bytes before setup, {after} after this run's own \
+                 buffers ({} of its own), peaking at {peak} during the region, so {} arrived \
+                 from elsewhere",
+                after.saturating_sub(before),
+                peak.saturating_sub(after)
+            ),
+            _ => "device memory unavailable from the driver".to_string(),
+        }
+    }
+}
+
 /// Held for as long as one test needs the device. Dropping it releases
 /// the device to the next waiter, in any test binary.
 pub struct DeviceLock {

@@ -365,21 +365,33 @@ fn a_barrier_expiry_records_its_count_and_the_ring_depth() {
 /// times margin, which is the property that would break first on
 /// hardware slower than this one.
 ///
-/// The 64-block case is what the bound has to survive: 2, 4 and 8 clear
-/// any bound by hundreds of times, and 64 measures 55 us against the
-/// 5 ms deadline. A 64-block request runs at the device's SM count where
-/// that is smaller, so on a 48-SM card this is the 48-block team. It reached 412 us once, on a run where another test
-/// binary held the device at the same time, which put it at 82 percent
-/// of this bound and turned the assertion into a reading of the
-/// neighbour. The device lock in [`common`] is what makes 55 the figure
-/// this test sees.
+/// The 64-block case is what the bound has to survive. A 64-block
+/// request runs at the device's SM count where that is smaller, so on a
+/// 48-SM card this is the 48-block team, and it cannot assemble until
+/// that many are free. Teams of 2, 4 and 8 need a handful and clear any
+/// bound by hundreds of times: 1,760, 4,320 and 7,136 ns on an RTX 5070
+/// against 1,888, 6,176 and 11,648 with the device loaded.
+///
+/// The 48-block team on a quiet RTX 5070 waits 267,104 ns, which is
+/// 18.7 times under the 5 ms deadline and 1.87 times under the bound
+/// asserted here. Under load the same binary at the same commit read
+/// 412,416, 926,432, 2,112,704 and 2,369,440 ns: a spread of about nine
+/// times decided by the neighbour.
+///
+/// The device lock in [`common`] excludes Flynnel's own test binaries
+/// and nothing else, so a process from another project still holds the
+/// device. [`common::DeviceMemoryWatch`] is what separates the two
+/// cases, and a reading taken against a neighbour is reported as
+/// unmeasured instead of failing.
 #[test]
 fn a_healthy_team_costs_far_less_at_the_barrier_than_its_deadline() {
     let _device = common::device();
     const DEADLINE_NS: u64 = 5_000_000;
     for team in [2u32, 4, 8, 64] {
+        let mut watch = common::DeviceMemoryWatch::before_setup();
         let mut peer = impatient_team_peer(team, DEADLINE_NS);
         let mut payload = vec![0u8; RESIDENT_PREFIX + MARKS];
+        watch.setup_done();
 
         for _ in 0..32 {
             let t = peer
@@ -391,6 +403,7 @@ fn a_healthy_team_costs_far_less_at_the_barrier_than_its_deadline() {
             );
             peer.read_result(t, &mut payload).expect("read");
             peer.reap(t).expect("reap");
+            watch.sample();
         }
 
         let waited = peer.barrier_wait_max_ns();
@@ -401,13 +414,31 @@ fn a_healthy_team_costs_far_less_at_the_barrier_than_its_deadline() {
             peer.team_size()
         );
 
+        // An expiry is a correctness statement and holds whatever else
+        // is on the device: a team that missed its deadline missed it.
         assert_eq!(stalls, 0, "team {team}: no team should have missed on an idle host");
+
+        // The wait is wall-clock, and a 64-block request runs at the
+        // device's SM count, so it cannot assemble until that many are
+        // free. A neighbour holding them makes this a reading of the
+        // neighbour. Say so rather than report it as a regression, and
+        // say it loudly: a skipped assertion that prints nothing is
+        // indistinguishable from one that passed.
+        if !watch.measurable() {
+            println!(
+                "team {team}: UNMEASURED, not asserted. {}. The {waited} ns above is a \
+                 reading of that neighbour, not of this crate.",
+                watch.describe()
+            );
+            continue;
+        }
         assert!(
             (waited as u64) < DEADLINE_NS / 10,
             "team {team}: a healthy team waited {waited} ns, within an order \
              of magnitude of its {DEADLINE_NS} ns deadline. The default rests \
              on that margin being large, and without it the deadline abandons \
-             teams that assemble normally"
+             teams that assemble normally. {}",
+            watch.describe()
         );
     }
 }
