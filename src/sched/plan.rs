@@ -81,6 +81,13 @@ pub struct JobPlan {
     /// together. Important for amortizing tier-dispatch overhead.
     pub batch_size: u32,
     /// Target hardware class.
+    ///
+    /// A matrix-extension class ([`HwClass::is_matrix_extension`]) says
+    /// the item is a tile operation, and the tier selection treats that
+    /// as heavy per item however small the batch: a plan declaring one
+    /// runs parallel where the same batch would otherwise fold inline.
+    /// The vector classes say nothing the batch size does not, and
+    /// steer nothing.
     pub hw_class: HwClass,
     /// Quality tier.
     pub variant: Variant,
@@ -843,7 +850,8 @@ impl JobPlan {
         }
     }
 
-    /// Builder: set the hardware class.
+    /// Builder: set the hardware class. See [`Self::hw_class`] for what
+    /// a matrix-extension class steers.
     pub fn with_hw_class(mut self, hw: HwClass) -> Self {
         self.hw_class = hw;
         self
@@ -1324,6 +1332,14 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
                 >= crate::sched::par_iter::inline_collapse_threshold_ns()
         });
 
+    // A declared matrix-extension target is the caller saying the item
+    // is a tile operation, which is heavy per item whatever the batch:
+    // the smallest AMX or tensor-core tile is a multiply-accumulate
+    // over a 16x16 block, orders above the dispatch this decides
+    // against. The vector classes say nothing a batch size does not
+    // already say, so only the matrix ones promote.
+    let tile_override = plan.hw_class.is_matrix_extension();
+
     let base = kband_for(plan.k_outer);
     match base {
         SchedTier::Inline => {
@@ -1352,7 +1368,7 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
             // heavy-per-item work. The par_iter probes reclassify
             // light hint-less work to FineGrain (use_smt off), so
             // tiny light batches stay inline.
-            if plan.batch_size >= 256 || heavy_override || plan.use_smt {
+            if plan.batch_size >= 256 || heavy_override || tile_override || plan.use_smt {
                 SchedTier::Local
             } else {
                 SchedTier::Inline
@@ -1376,7 +1392,7 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
             // `flynnel_def` column. Adding the use_smt check makes
             // the static classifier's class choice authoritative
             // for the inline-vs-parallel decision.
-            if plan.batch_size < 32 && !heavy_override && !plan.use_smt {
+            if plan.batch_size < 32 && !heavy_override && !tile_override && !plan.use_smt {
                 SchedTier::Inline
             } else {
                 SchedTier::Local
@@ -1384,7 +1400,7 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
         }
         SchedTier::Hierarchical => {
             if !topo.is_multi_node() {
-                if plan.batch_size < 32 && !heavy_override && !plan.use_smt {
+                if plan.batch_size < 32 && !heavy_override && !tile_override && !plan.use_smt {
                     SchedTier::Inline
                 } else {
                     SchedTier::Local
@@ -1595,6 +1611,29 @@ mod tests {
         let plan = JobPlan::new(6, 5);
         assert_eq!(pick_tier(&plan, &topo), SchedTier::Local,
             "small-batch LatencyBound (classifier no-hint default) stays Local");
+    }
+
+    #[test]
+    fn a_matrix_extension_class_promotes_a_batch_that_would_fold_inline() {
+        let topo = NumaTopology::fallback();
+        // PortBound so use_smt is off and the cost estimate is not
+        // explicit: with batch 8 the only thing that can move this off
+        // Inline is the declared class.
+        let vector = JobPlan::set_profile(2, 8, DispatchProfile::PortBound)
+            .with_hw_class(HwClass::Avx512f);
+        assert!(!vector.use_smt, "the arrangement under test has SMT off");
+        assert_eq!(
+            pick_tier(&vector, &topo),
+            SchedTier::Inline,
+            "a vector class says nothing the batch size does not"
+        );
+        let tiled = JobPlan::set_profile(2, 8, DispatchProfile::PortBound)
+            .with_hw_class(HwClass::AmxBf16);
+        assert_eq!(
+            pick_tier(&tiled, &topo),
+            SchedTier::Local,
+            "a tile item is heavy per item however small the batch"
+        );
     }
 
     #[test]

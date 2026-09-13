@@ -61,7 +61,9 @@ impl fmt::Display for Variant {
 // ---------------------------------------------------------------------------
 
 /// Which scheduler tier runs a given job. Selected per call by the
-/// dispatch policy from `(k_outer, batch_size, numa_topology, hw_class)`.
+/// dispatch policy from the plan's `k_outer` band, then promoted or
+/// folded by `batch_size`, an explicit per-item cost, a
+/// matrix-extension `hw_class`, `use_smt`, and the NUMA topology.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SchedTier {
     /// No scheduler: serial in caller. Used for `K_outer <= 4`
