@@ -1207,6 +1207,10 @@ pub fn gemm_tandem_batched(
     check_dim(a.len() == bu * mu * ku, "gemm: a length")?;
     check_dim(b.len() == bu * ku * nu, "gemm: b length")?;
     let (per_a, per_b, per_c) = (mu * ku, ku * nu, mu * nu);
+    // The caller's K_inner hint, resolved once: the CPU half carries
+    // this many output cells per k-iteration and the device half is
+    // unaffected, so the two halves stay bit-identical either way.
+    let lanes = plan.k_inner_lanes();
     let mut out = vec![0f64; bu * per_c];
     let out_addr = out.as_mut_ptr() as usize;
     let device_err: Arc<Mutex<Option<GpuPeerError>>> = Arc::new(Mutex::new(None));
@@ -1218,7 +1222,15 @@ pub fn gemm_tandem_batched(
         bu,
         |r| {
             tandem_cpu_runs(r, |lo, hi| {
-                let c = cpu::gemm_batched(&a[lo * per_a..hi * per_a], &b[lo * per_b..hi * per_b], hi - lo, mu, nu, ku);
+                let c = cpu::gemm_batched_lanes(
+                    &a[lo * per_a..hi * per_a],
+                    &b[lo * per_b..hi * per_b],
+                    hi - lo,
+                    mu,
+                    nu,
+                    ku,
+                    lanes,
+                );
                 // SAFETY: `out` outlives the split; runs write disjoint item ranges.
                 unsafe { scatter(out_addr, lo * per_c, &c) };
             });
@@ -1680,6 +1692,12 @@ pub mod cpu {
     }
 
     /// Batched row-major `C = A * B`.
+    ///
+    /// One output cell at a time, accumulating over `k` in index order.
+    /// This is the reference the device kernels are checked against bit
+    /// for bit, so its arithmetic does not change; a caller wanting the
+    /// lane-blocked inner loop calls [`gemm_batched_lanes`], which
+    /// produces the same bits.
     pub fn gemm_batched(a: &[f64], b: &[f64], batch: usize, m: usize, n: usize, k: usize) -> Vec<f64> {
         let mut c = vec![0f64; batch * m * n];
         for bi in 0..batch {
@@ -1693,6 +1711,66 @@ pub mod cpu {
                         acc = ab[i * k + kk].mul_add(bb[kk * n + j], acc);
                     }
                     cb[i * n + j] = acc;
+                }
+            }
+        }
+        c
+    }
+
+    /// [`gemm_batched`] carrying `lanes` output cells through each
+    /// k-iteration instead of one (BLIS K_inner).
+    ///
+    /// One row element of `a` is read once and applied to `lanes`
+    /// consecutive columns of `b`, so a k-iteration issues `lanes`
+    /// independent `mul_add`s into `lanes` accumulators. Each output
+    /// cell still accumulates over `k` in the same order against the
+    /// same operands, so every cell is bit-identical to
+    /// [`gemm_batched`]; what changes is how many of them are in
+    /// flight, which is what lets a row of them sit in registers or a
+    /// SIMD lane group rather than one at a time.
+    ///
+    /// `lanes` of 0 or 1 is the one-cell loop. Columns past the last
+    /// whole group of `lanes` run one at a time, so any `n` is valid
+    /// and no caller has to align its widths.
+    pub fn gemm_batched_lanes(
+        a: &[f64],
+        b: &[f64],
+        batch: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        lanes: usize,
+    ) -> Vec<f64> {
+        if lanes <= 1 {
+            return gemm_batched(a, b, batch, m, n, k);
+        }
+        let mut c = vec![0f64; batch * m * n];
+        let mut acc = vec![0f64; lanes];
+        for bi in 0..batch {
+            let ab = &a[bi * m * k..(bi + 1) * m * k];
+            let bb = &b[bi * k * n..(bi + 1) * k * n];
+            let cb = &mut c[bi * m * n..(bi + 1) * m * n];
+            for i in 0..m {
+                let arow = &ab[i * k..(i + 1) * k];
+                let mut j = 0;
+                while j + lanes <= n {
+                    acc.iter_mut().for_each(|x| *x = 0.0);
+                    for (kk, &aik) in arow.iter().enumerate() {
+                        let brow = &bb[kk * n + j..kk * n + j + lanes];
+                        for (x, &bkj) in acc.iter_mut().zip(brow) {
+                            *x = aik.mul_add(bkj, *x);
+                        }
+                    }
+                    cb[i * n + j..i * n + j + lanes].copy_from_slice(&acc);
+                    j += lanes;
+                }
+                while j < n {
+                    let mut one = 0f64;
+                    for (kk, &aik) in arow.iter().enumerate() {
+                        one = aik.mul_add(bb[kk * n + j], one);
+                    }
+                    cb[i * n + j] = one;
+                    j += 1;
                 }
             }
         }
@@ -2204,6 +2282,32 @@ mod tests {
             EinsumSpec::parse("ijk->i", &[2, 3], None),
             Err(EinsumError::RankMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn a_lane_blocked_matmul_is_bit_identical_to_the_one_cell_loop() {
+        // The reference is the oracle four device-parity tests compare
+        // against bit for bit, so a width that changed any bit would
+        // move those tests' ground truth rather than only its own
+        // speed. Column counts either side of each width exercise the
+        // whole groups and the one-at-a-time tail.
+        let (batch, m, k) = (3usize, 5usize, 7usize);
+        for n in [1usize, 2, 3, 4, 5, 7, 8, 9, 16, 17] {
+            let a: Vec<f64> = (0..batch * m * k).map(|i| (i as f64 * 0.37).sin()).collect();
+            let b: Vec<f64> = (0..batch * k * n).map(|i| (i as f64 * 0.11).cos()).collect();
+            let want = cpu::gemm_batched(&a, &b, batch, m, n, k);
+            for lanes in [0usize, 1, 2, 3, 4, 8, 16, 64] {
+                let got = cpu::gemm_batched_lanes(&a, &b, batch, m, n, k, lanes);
+                assert_eq!(got.len(), want.len(), "n={n} lanes={lanes}");
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "n={n} lanes={lanes} cell {i}: {g} vs {w}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

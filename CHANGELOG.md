@@ -5,6 +5,37 @@ measurements from `benches/` and `tests/` on the two bench hosts, an
 RTX 3070 with a Ryzen 7 2700 (16 threads) and an RTX 5070 with a
 Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
+## Unreleased
+
+### Fixed
+
+- `with_task_span_ns` and `with_k_inner_log2` steer something. Both
+  shipped in 0.5.0 setting a field that nothing in the crate read, so a
+  caller setting either got no error, no effect, and no way to tell.
+  `task_span_ns` is now the other half of a chunk's fixed cost in
+  `JobPlan::optimal_chunk_count`, which divides by `overhead + span`
+  rather than by overhead alone: a larger span yields fewer, coarser
+  chunks, and an unset or zero span leaves every existing split exactly
+  where it was. `k_inner_log2` resolves through the new
+  `JobPlan::k_inner_lanes` to the cell count
+  `gpu_peer::linalg::cpu::gemm_batched_lanes` carries per k-iteration,
+  which `gemm_tandem_batched` now uses for the CPU half of its split.
+  Every output cell accumulates over `k` in the same order against the
+  same operands at every width, so the result is bit-identical to the
+  one-cell loop and the device-parity oracle `cpu::gemm_batched` is
+  untouched.
+- `k_inner_log2`'s documentation described a kernel this crate does not
+  contain, naming `mul_slice`, `add_slice`, `FpN<N>` widths and a
+  scalar fallback, and recommended widths per instruction set. It now
+  states what reads the hint and what that does, and recommends no
+  width: which one pays is a property of the host and the matrix shape,
+  and `benches/gemm_k_inner.rs` measures it.
+- `tests/no_hint_is_silently_dropped.rs` asserted only that these two
+  builders stored their value, which a hint wired to no reader passes
+  forever - under a file whose name claims that cannot happen. Both now
+  have an assertion that the hint changes what it names, and the header
+  says a round-trip assertion is not coverage.
+
 ## 0.5.0 - 2026-09-12
 
 This release is **0.5.0, not 0.4.1**: it changes public signatures under

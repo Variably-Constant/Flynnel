@@ -315,6 +315,11 @@ harness = false
 required-features = ["cuda-reference"]
 
 [[bench]]
+name = "gemm_k_inner"
+harness = false
+required-features = ["gpu-peer"]
+
+[[bench]]
 name = "inline_collapse"
 harness = false
 

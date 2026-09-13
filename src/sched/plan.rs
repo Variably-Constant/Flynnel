@@ -172,13 +172,17 @@ pub struct JobPlan {
     /// caller whose per-chunk cost is real but negligible wants `None`
     /// or the scheduler's own share, never zero.
     pub task_overhead_ns: Option<u32>,
-    /// Per-task critical-path span in nanoseconds (Tiny-Tasks model).
-    /// The portion of a task that cannot be further parallelized
-    /// (e.g., serial sub-step before SIMD fan-out). For uniform-leaf
-    /// workloads (matmul, slice ops) this is 0; for heterogeneous
-    /// or recursive bodies (binsplit, FFT butterfly), it represents
-    /// the inner-serial cost that bounds speedup. Set to `None` to
-    /// assume zero span.
+    /// Per-chunk serial span in nanoseconds (Tiny-Tasks model): the
+    /// part of a chunk that does not shrink when the chunk does, such
+    /// as a serial prologue before a fan-out or the trunk of a
+    /// recursive body. For uniform-leaf workloads (matmul, slice ops)
+    /// it is 0; `None` is read as 0.
+    ///
+    /// [`Self::optimal_chunk_count`] adds it to
+    /// [`Self::task_overhead_ns`] to form the fixed cost a chunk pays
+    /// whatever work it carries, so a larger span yields fewer, coarser
+    /// chunks: splitting again buys less than the split costs. It is
+    /// read there and nowhere else.
     pub task_span_ns: Option<u32>,
     /// Caller-supplied effective task count when the natural item
     /// count over-states the parallelism budget. Example: a 1M-item
@@ -186,22 +190,28 @@ pub struct JobPlan {
     /// task count of `1M / 16 = 62.5k`. `optimal_chunk_count`
     /// consults this instead of `batch_size` when present.
     pub effective_task_count: Option<u32>,
-    /// BLIS K_inner axis: SIMD-lane fanout within
-    /// a single matmul leaf. `Some(log2)` requests the kernel to
-    /// process `2^log2` output cells per k-iteration via slice
-    /// SIMD primitives (`mul_slice` + `add_slice`) instead of one
-    /// scalar `mul_scalar` + `add_scalar` per cell.
+    /// BLIS K_inner axis: how many output cells the batched matmul's
+    /// inner loop carries per k-iteration, as a log2. `Some(log2)`
+    /// asks for `2^log2` cells, `None` for one.
     ///
-    /// Recommended values:
-    /// - `Some(3)` (M=8): matches AVX-512 / Zen 4 wide registers
-    ///   for FpN<8> (Fp256). Default for matmul ops on capable hosts.
-    /// - `Some(2)` (M=4): AVX2 / Zen 3 fallback.
-    /// - `None`: scalar inner loop (current behavior). Use when
-    ///   the matmul shape is too small for SIMD batching to amortize.
+    /// Read through [`Self::k_inner_lanes`] by
+    /// [`crate::gpu_peer::linalg::gemm_tandem_batched`], which hands it
+    /// to [`crate::gpu_peer::linalg::cpu::gemm_batched_lanes`] for the
+    /// CPU half of the split. It steers that loop and nothing else: the
+    /// device half is untouched, and no other op consults it.
     ///
-    /// Gating: callers should set this only when `b.cols >= 2^log2`
-    /// and the `FpN<N>` width supports SIMD slice ops (N in
-    /// {4, 8, 16, 32}). Otherwise the kernel falls back to scalar.
+    /// Every output cell still accumulates over `k` in the same order
+    /// against the same operands whatever the width, so the result is
+    /// bit-identical to the one-cell loop. What the width changes is
+    /// how many accumulators are live at once, which is what allows a
+    /// group of them to sit in registers rather than one at a time.
+    ///
+    /// No width is recommended here, because the width that pays is a
+    /// property of the host's register file and the matrix shape rather
+    /// than of this crate: measure it with `benches/gemm_k_inner.rs` on
+    /// the host in question. A width wider than the matrix's column
+    /// count costs nothing and gains nothing - every column falls to
+    /// the one-at-a-time tail.
     pub k_inner_log2: Option<u8>,
     /// Backend hint: which dispatch target to route this job to.
     /// `None` means "use the CPU backend"; `Some(b)` requests
@@ -938,6 +948,22 @@ impl JobPlan {
         self
     }
 
+    /// Output cells a matmul inner loop carries per k-iteration:
+    /// `2^k_inner_log2`, and 1 when the hint is unset.
+    ///
+    /// The shift is capped at the pointer width, so no `log2` a caller
+    /// can pass overflows it. A width wider than the matrix's column
+    /// count is not an error: the blocked loop takes no whole group and
+    /// every column falls to the one-at-a-time tail, which is the same
+    /// arithmetic as a width of 1.
+    #[inline]
+    pub fn k_inner_lanes(&self) -> usize {
+        match self.k_inner_log2 {
+            None => 1,
+            Some(log2) => 1usize << u32::from(log2).min(usize::BITS - 1),
+        }
+    }
+
     /// Builder: route this job to a specific backend. See field
     /// docs on [`Self::backend_hint`].
     pub fn with_backend(mut self, backend: Backend) -> Self {
@@ -1122,44 +1148,46 @@ impl JobPlan {
     /// Optimal chunk count via the Tiny-Tasks model (Acar 2013):
     ///
     /// ```text
-    /// C_opt = clamp(sqrt(W * P / O), 1, N)
+    /// C_opt = clamp(sqrt(W * P / (O + S)), 1, N)
     /// ```
     ///
     /// where `W` is total estimated work in ns, `P` is worker count,
-    /// `O` is per-task overhead, and `N` is the effective task count
-    /// (`effective_task_count` if set, else `batch_size`).
+    /// `O` is per-task overhead, `S` is the per-chunk serial span
+    /// ([`Self::task_span_ns`], zero when unset), and `N` is the
+    /// effective task count (`effective_task_count` if set, else
+    /// `batch_size`).
     ///
     /// Returns `None` if `estimated_per_item_ns` or `task_overhead_ns`
     /// are unset - callers must fall back to the SLAW splitter's
     /// budget heuristic.
     ///
-    /// Derivation sketch: total-time = serial_work / C + overhead * C.
-    /// d/dC = -W/C^2 + O = 0 ⇒ C = sqrt(W / O). Including parallelism
+    /// Derivation sketch: total-time = serial_work / C + (O + S) * C.
+    /// A chunk pays the scheduler's overhead and its own serial span
+    /// once each, whatever work it carries, so the two enter the
+    /// optimisation as one per-chunk fixed cost. d/dC = -W/C^2 +
+    /// (O + S) = 0 ⇒ C = sqrt(W / (O + S)). Including parallelism
     /// (P workers running in parallel) bumps the optimal C up by a
-    /// factor of sqrt(P) because each worker's overhead is paid
-    /// once but the work is divided P-ways.
+    /// factor of sqrt(P) because each worker's fixed cost is paid
+    /// once but the work is divided P-ways. A larger span therefore
+    /// yields fewer, coarser chunks: the serial part is paid per
+    /// chunk and splitting further buys less than it costs.
     #[inline]
     pub fn optimal_chunk_count(&self, workers: usize) -> Option<u32> {
         let per_item = self.estimated_per_item_ns? as u64;
         let overhead = self.task_overhead_ns? as u64;
         let n = self.effective_task_count.unwrap_or(self.batch_size) as u64;
-        if n == 0 || overhead == 0 || per_item == 0 {
+        // The span is the other half of a chunk's fixed cost; unset
+        // means zero, which leaves the formula as overhead alone.
+        let fixed = overhead.saturating_add(self.task_span_ns.unwrap_or(0) as u64);
+        if n == 0 || fixed == 0 || per_item == 0 {
             return Some(n as u32);
         }
         let w_total = per_item.saturating_mul(n);
         let p = (workers as u64).max(1);
-        // C = sqrt(W * P / O). Use isqrt to stay in integer space.
-        let radicand = w_total
-            .saturating_mul(p)
-            .checked_div(overhead)
-            .unwrap_or(0);
+        // C = sqrt(W * P / (O + S)). Use isqrt to stay in integer space.
+        let radicand = w_total.saturating_mul(p).checked_div(fixed).unwrap_or(0);
         let c_opt = integer_sqrt(radicand);
-        let c = c_opt.max(1).min(n);
-        // Account for span: if the workload has a serial span, the
-        // floor is `W / (span + overhead)` (Amdahl-style). Currently
-        // unused in the formula because span estimates are rare; left
-        // as forward-compat for when ops thread it through.
-        Some(c as u32)
+        Some(c_opt.max(1).min(n) as u32)
     }
 }
 
@@ -1642,6 +1670,46 @@ mod tests {
             .with_task_overhead_ns(5000);
         let c_heavy = heavy_overhead.optimal_chunk_count(8).unwrap();
         assert!(c_heavy <= c8, "heavier overhead should reduce chunks");
+    }
+
+    #[test]
+    fn a_serial_span_coarsens_the_split_and_no_span_leaves_it_alone() {
+        let base = || JobPlan::new(6, 4096).with_estimated_per_item_ns(50).with_task_overhead_ns(500);
+        let none = base().optimal_chunk_count(8).expect("estimates are set");
+        // Unset and zero are the same answer: the span enters as an
+        // added fixed cost, and zero adds nothing.
+        assert_eq!(
+            base().with_task_span_ns(0).optimal_chunk_count(8),
+            Some(none),
+            "a zero span must not move the split"
+        );
+        // A span the size of the overhead doubles the per-chunk fixed
+        // cost, so the chunk count falls.
+        let equal = base().with_task_span_ns(500).optimal_chunk_count(8).expect("set");
+        assert!(equal < none, "span 500 gave {equal} chunks, no span gave {none}");
+        // Monotone: more span, never more chunks.
+        let mut prev = none;
+        for span in [100u32, 500, 2_000, 10_000, 100_000] {
+            let c = base().with_task_span_ns(span).optimal_chunk_count(8).expect("set");
+            assert!(c <= prev, "span {span} gave {c} chunks after {prev}");
+            prev = c;
+        }
+        assert!(prev >= 1, "the split never collapses below one chunk");
+    }
+
+    #[test]
+    fn k_inner_lanes_is_two_to_the_hint_and_one_when_unset() {
+        assert_eq!(JobPlan::new(6, 64).k_inner_lanes(), 1, "unset is one cell");
+        for log2 in 0u8..8 {
+            assert_eq!(
+                JobPlan::new(6, 64).with_k_inner_log2(log2).k_inner_lanes(),
+                1usize << log2,
+                "log2 {log2}"
+            );
+        }
+        // A width no pointer can hold is capped rather than shifted
+        // past the type, so no caller value is undefined behavior.
+        assert!(JobPlan::new(6, 64).with_k_inner_log2(u8::MAX).k_inner_lanes() > 0);
     }
 
     #[test]

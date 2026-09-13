@@ -27,6 +27,14 @@
 //! instead: `with_workload_shape` writes three other hints, and the two
 //! site builders differ only in whether they defer to a site already
 //! attached.
+//!
+//! A round-trip assertion is not coverage. It proves the setter stores
+//! a value and says nothing about whether anything reads it, so a hint
+//! wired to no reader at all passes the first kind of check forever.
+//! Two did: `with_task_span_ns` and `with_k_inner_log2` shipped in
+//! 0.5.0 setting fields nothing consulted, under a file whose name
+//! claims exactly that cannot happen. Both now have an assertion of the
+//! second kind, and a hint added here needs one before it is covered.
 
 use flynnel::backend::Backend;
 use flynnel::sched::adaptive_cooperative::CooperativeRouting;
@@ -259,6 +267,65 @@ fn a_leaf_shape_steers_smt_at_every_size() {
             !JobPlan::new(0, n).with_leaf_shape(LeafShape::Streaming).use_smt,
             "n={n}: Streaming must keep them parked"
         );
+    }
+}
+
+/// A serial span decides how coarsely the Tiny-Tasks model splits.
+///
+/// This hint shipped in 0.5.0 setting a field nothing read, and the
+/// round-trip assertion above passed throughout, which is the exact
+/// failure this file exists to catch. A hint with no reader now fails
+/// here rather than passing on the setter alone.
+#[test]
+fn a_task_span_steers_the_chunk_count() {
+    let base = || JobPlan::new(6, 4096).with_estimated_per_item_ns(50).with_task_overhead_ns(500);
+    let none = base().optimal_chunk_count(8).expect("estimates are set");
+    let spanned = base().with_task_span_ns(2_000).optimal_chunk_count(8).expect("set");
+    assert!(
+        spanned < none,
+        "a span must coarsen the split: {spanned} chunks against {none} with no span"
+    );
+    assert_eq!(
+        base().with_task_span_ns(0).optimal_chunk_count(8),
+        Some(none),
+        "a zero span must leave the split where it was"
+    );
+}
+
+/// A K_inner width resolves to the cell count the matmul inner loop
+/// carries. Shipped in 0.5.0 setting a field nothing read, alongside a
+/// doc describing a kernel this crate does not contain.
+#[test]
+fn a_k_inner_width_resolves_to_a_cell_count() {
+    assert_eq!(JobPlan::new(6, 64).k_inner_lanes(), 1, "unset is one cell");
+    for log2 in 0u8..8 {
+        assert_eq!(
+            JobPlan::new(6, 64).with_k_inner_log2(log2).k_inner_lanes(),
+            1usize << log2,
+            "log2 {log2}"
+        );
+    }
+}
+
+/// The width steers the matmul's inner loop and moves none of its bits.
+///
+/// The matmul lives behind `gpu-peer`; the width's resolution above
+/// does not, so the hint is covered either way.
+#[cfg(feature = "gpu-peer")]
+#[test]
+fn a_k_inner_width_steers_the_matmul_inner_loop_without_moving_a_bit() {
+    use flynnel::gpu_peer::linalg::cpu;
+
+    let (batch, m, n, k) = (2usize, 4usize, 9usize, 5usize);
+    let a: Vec<f64> = (0..batch * m * k).map(|i| (i as f64 * 0.41).sin()).collect();
+    let b: Vec<f64> = (0..batch * k * n).map(|i| (i as f64 * 0.23).cos()).collect();
+    let want = cpu::gemm_batched(&a, &b, batch, m, n, k);
+    for log2 in 0u8..5 {
+        let lanes = JobPlan::new(6, 64).with_k_inner_log2(log2).k_inner_lanes();
+        let got = cpu::gemm_batched_lanes(&a, &b, batch, m, n, k, lanes);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "log2={log2} cell {i}");
+        }
     }
 }
 
