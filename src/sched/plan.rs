@@ -1230,6 +1230,12 @@ impl JobPlan {
     /// the count this plan carries. Same model and same `None`; the
     /// result is at least one chunk and at most `n`, saturating at
     /// `u32::MAX` rather than wrapping.
+    ///
+    /// Reads `estimated_per_item_ns` as a field. A profile fills it
+    /// with a default, so a plan that states only `task_overhead_ns`
+    /// gets an answer here computed from a cost its caller never wrote.
+    /// The chunked walks require the cost to have been stated or
+    /// probed, and consult `estimated_per_item_ns_explicit` first.
     #[inline]
     pub fn optimal_chunk_count_for(&self, workers: usize, n: usize) -> Option<u32> {
         let per_item = self.estimated_per_item_ns? as u64;
@@ -1912,12 +1918,22 @@ mod tests {
                 .is_none(),
             "a per-item cost without an overhead has no fixed cost to divide by"
         );
+        // Unspecified is the profile that supplies no default cost.
+        // JobPlan::new takes one from its profile, so a plan built that
+        // way and given an overhead does reach the model.
+        let no_cost =
+            JobPlan::set_profile(6, 4096, crate::dispatch_profile::DispatchProfile::Unspecified);
+        assert!(no_cost.estimated_per_item_ns.is_none());
+        assert!(
+            no_cost.with_task_overhead_ns(500).optimal_chunk_count_for(8, n).is_none(),
+            "an overhead without a per-item cost has no work to spread"
+        );
         assert!(
             JobPlan::new(6, 4096)
                 .with_task_overhead_ns(500)
                 .optimal_chunk_count_for(8, n)
-                .is_none(),
-            "an overhead without a per-item cost has no work to spread"
+                .is_some(),
+            "a profile-default cost is still a cost to this method"
         );
 
         // Cheap items against a tiny overhead ask for far more chunks
