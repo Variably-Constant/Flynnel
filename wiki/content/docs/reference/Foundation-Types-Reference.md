@@ -46,7 +46,13 @@ pub enum SchedTier {
 }
 ```
 
-Which scheduler tier runs a given job. Picked per call by [`pick_tier`](Sched-Module-Reference.md#pick_tier) from `(k_outer, batch_size, numa_topology, hw_class)`.
+Which scheduler tier runs a given job. Picked per call by [`pick_tier`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/plan.rs), which reads `k_outer`, `batch_size`, the NUMA topology, `leaf_shape`, `hw_class`, `use_smt`, and `estimated_per_item_ns` when the caller stated it.
+
+Three of those override the K-band and batch-size bands in the table below:
+
+- **`leaf_shape`** set to anything but `Unknown` is the caller asserting the work is parallel, and at `batch_size >= 8` it promotes out of `Inline` whatever `k_outer` says. This is the only unambiguous opt-in, because `bisect_variant` and `estimated_per_item_ns` are auto-populated by the classifier and reflect its defaults rather than the caller.
+- **A stated `estimated_per_item_ns`** whose product with `batch_size` clears the host's measured collapse threshold promotes out of `Inline` at any batch size. A classifier default does not qualify.
+- **A matrix-extension `hw_class`**, and `use_smt`, likewise promote a batch that would otherwise fold inline.
 
 | Tier | Execution | When picked |
 |------|-----------|-------------|
@@ -85,7 +91,11 @@ pub enum HwClass {
 }
 ```
 
-Hardware class a primitive may target. Orthogonal to [`SchedTier`](#schedtier). Maps the K-axis hardware regime: vector SIMD at `K_R = 0..6` and matrix-extension regime at `K_R = 10..16`.
+Hardware class a primitive may target. Maps the K-axis hardware regime: vector SIMD at `K_R = 0..6` and matrix-extension regime at `K_R = 10..16`.
+
+**A matrix-extension class steers [`SchedTier`](#schedtier) as of 0.5.1.** Declaring `Sme`, `AmxBf16`, `AmxInt8`, `AmxFp16`, or either tensor-core class promotes the tier, so a tile batch too small to clear the inline fold dispatches instead of folding onto the caller. The smallest tile such a class can mean is a multiply-accumulate over a 16x16 block, orders above the dispatch cost the fold weighs against. The vector classes say nothing the batch size does not and steer nothing.
+
+The class asserts the regime, not that the host carries the unit. It is a claim about the shape of the work: tile-based dispatch, entered as a mode region, entry costs amortised per region rather than per op. `ScalarFallback` exists so `run_in_region` code compiles and runs where the extension is absent, so declaring a matrix-extension class on vector silicon emulating tile ops is accurate rather than a lie that happens to help.
 
 | Class | Regime | Typical silicon |
 |-------|--------|-----------------|
@@ -226,21 +236,23 @@ pub enum WorkloadShape {
 }
 ```
 
-Declarative shape hint that the dispatcher maps to `(k_gating, use_mailbox_routing, oversubscription_log2)` knob triples at plan-construction time. The application names what the workload IS rather than which knobs to turn; the scheduler maps shape -> knobs once at `JobPlan::with_workload_shape(...)` time and the per-call dispatch path stays direct atomic ops.
+Declarative shape hint that the dispatcher maps to `(k_gating, use_mailbox_routing, oversubscription_log2)` knob triples at plan-construction time. The application names what the workload is rather than which knobs to turn; the scheduler maps shape to knobs once at `JobPlan::with_workload_shape(...)` time and the per-call dispatch path stays direct atomic ops.
+
+**Two of the three steer.** `use_mailbox_routing` and `oversubscription_log2` reach the dispatch. The `k_gating` a shape writes is stored and read by nothing: K-gating is process-global, per worker rather than per call. See [`KGating`](#kgating) below and the [`k_gating` field](JobPlan-Reference.md#k_gating-crateschedk_gatingkgating) for why a dispatch cannot choose it. The gating column below records what the shape writes, not an effect it has.
 
 | Shape | Flynn axis | Mapped knobs (per `WorkloadShape::hints()`) |
 |---|---|---|
 | `Streaming` | SISD | minimal hints; falls through to inline execution |
-| `ProducerFast { burst }` | SIMC | sets `k_gating = PerSlot` (KHL backing) so burst pushes pack 3 jobs per cache-line transfer |
-| `WorkSteal { n_consumers, batch_size }` | MIMD | sets `k_gating = Auto`; lets the splitter pick leaves per the standard SLAW path |
+| `ProducerFast { burst }` | SIMC | writes `k_gating = PerSlot`, which steers nothing |
+| `WorkSteal { n_consumers, batch_size }` | MIMD | writes `k_gating = Auto`; the splitter picks leaves per the standard SLAW path |
 | `Cooperative { n_cores }` | SIMC / MIMC | enables mailbox routing once `n_cores` >= a documented threshold |
-| `VariantRace` | MISD | sets `k_gating = PerSlot`; disables burst flushing (each variant runs independently) |
+| `VariantRace` | MISD | writes `k_gating = PerSlot`, which steers nothing |
 
 API:
 
 - [`JobPlan::with_workload_shape(shape)`](JobPlan-Reference.md#builder-methods) - consume the shape and overwrite the three knobs.
 
-Calls to other `with_*` builders that touch the same knobs (`with_k_gating`, `with_mailbox_routing`, `with_oversubscription_log2`) should come AFTER `with_workload_shape` so they win.
+Calls to other `with_*` builders that touch the same knobs (`with_mailbox_routing`, `with_oversubscription_log2`) should come after `with_workload_shape` so they win. `with_k_gating` is deprecated as of 0.5.1 and its ordering is moot, since neither the builder nor the shape's gating hint reaches a dispatch.
 
 ## `KGating`
 
@@ -264,8 +276,8 @@ Per-worker K_inner=3 deque-backing selector. Every `AdaptiveWorker` holds an `At
 
 API:
 
-- [`JobPlan::with_k_gating(KGating)`](JobPlan-Reference.md#builder-methods) - pin the choice for one dispatch.
-- `migrate_all_workers_k_gating(KGating)` (on `LocalArena`) - flip every worker's tag globally at runtime.
+- [`JobPlan::with_k_gating(KGating)`](JobPlan-Reference.md#builder-methods) - **deprecated since 0.5.1 and steers nothing.** It sets a plan field no dispatch path reads. A dispatch cannot pin the choice: the tag is per worker, and a job pushed to the backing the tag does not name is reachable only while that worker's orphan-drain flag is set, which any pop or steal clears on finding the dormant backing empty.
+- `migrate_all_workers_k_gating(KGating)` (on `LocalArena`) - flip every worker's tag globally at runtime. This is the granularity K-gating actually has.
 - [`calibrate_k_gating()`](Sched-Module-Reference.md#k_gating) - run the per-host calibration probe; cached in `CALIBRATED_GATING`.
 
 ## `BisectVariant`
