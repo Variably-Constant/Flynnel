@@ -42,6 +42,13 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   a kernel accumulating into a caller's buffer could not reach it and
   had to hand-roll a leaf floor from a constant of its own. Reported by
   a consumer with the constant attached.
+- `gpu_peer::device_memory_in_use()` reports bytes in use and the
+  device total for the calling thread's current context, covering the
+  whole device rather than this process. A caller sizing an allocation
+  against the total alone collides with a neighbour the total cannot
+  see. Memory is what the driver exposes; utilization is not on this
+  surface, so a process holding a context while launching nothing
+  registers as its allocation and not as load.
 - `JobPlan::resolved_workers()` answers how many workers will actually
   run this plan's work: the arena's primaries, plus its SMT siblings
   when the plan wakes them, capped by `worker_cap`. `effective_workers`
@@ -93,6 +100,22 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
+- The GPU tests no longer report a neighbour as a Flynnel regression.
+  `gpu_peer_team`'s barrier assertion and `gpu_peer_wave_calibration`
+  are wall-clock, and the device lock in the test tree excludes
+  Flynnel's own test binaries and nothing else, so a process from
+  another project holds the device and the reading becomes about it.
+  A 48-block team cannot assemble until that many streaming
+  multiprocessors are free, so it is the size that suffers: on one host
+  the same binary at the same commit read 267,104 ns quiet and
+  2,369,440 ns loaded, a spread of about nine times, while teams of 2,
+  4 and 8 barely moved. Both tests now sample device memory across
+  their timed region through the new `gpu_peer::device_memory_in_use`
+  and report a reading taken against foreign residency as unmeasured
+  rather than failed, printing rather than skipping quietly. The
+  threshold is the run's own measured footprint, not a chosen number.
+  Deadline expiries are still asserted unconditionally: a team that
+  missed its deadline missed it whatever else was resident.
 - The wiki's `JobPlan` reference carried four claims the code does not
   support, each the published form of a defect this release corrects.
   `task_span_ns` was documented as "currently unused in
