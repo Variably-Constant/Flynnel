@@ -58,7 +58,11 @@ Number of independent operations being scheduled together. The tier picker promo
 
 ### `hw_class: HwClass`
 
-Target hardware class. See [HwClass](Foundation-Types-Reference.md#hwclass). Defaults to `Scalar`. Matrix-extension classes (AMX, SME, tensor cores) trigger the [mode-region batching](Sched-Module-Reference.md#mode_region) path.
+Target hardware class. See [HwClass](Foundation-Types-Reference.md#hwclass). Defaults to `Scalar`.
+
+A declared matrix-extension class (`AmxBf16`, `AmxInt8`, `Sme`, or a tensor-core class) promotes the scheduler tier, so a tile batch too small to clear the inline fold dispatches instead of folding. The smallest tile such a class can mean is a multiply-accumulate over a 16x16 block, orders above the dispatch cost the fold weighs against. The vector classes say nothing the batch size does not and steer nothing.
+
+The class asserts the **regime**, not that the host has the unit. It is a claim about the shape of the work: tile-based dispatch, entered as a mode region, with entry costs amortised per region rather than per op. `ScalarFallback` exists so `run_in_region` code compiles and runs where the matrix extension is absent, so declaring the class on vector silicon emulating tile ops is accurate rather than a lie that happens to help. The arithmetic underneath is the backend's.
 
 ### `variant: Variant`
 
@@ -133,7 +137,9 @@ Typical: ~200 to 500 ns for the Flynnel join path with the adaptive splitter.
 
 ### `task_span_ns: Option<u32>`
 
-Per-task critical-path span (Tiny-Tasks model). The portion of a task that cannot be further parallelized (e.g., serial sub-step before SIMD fan-out). For uniform-leaf workloads (matmul, slice ops) this is 0; for heterogeneous or recursive bodies (binsplit, FFT butterfly), it represents the inner-serial cost that bounds speedup. Currently unused in `optimal_chunk_count`; reserved for span-aware extensions.
+Per-task critical-path span (Tiny-Tasks model). The portion of a task that cannot be further parallelized (e.g., serial sub-step before SIMD fan-out). For uniform-leaf workloads (matmul, slice ops) this is 0; for heterogeneous or recursive bodies (binsplit, FFT butterfly), it represents the inner-serial cost that bounds speedup.
+
+It is the other half of a chunk's fixed cost: [`optimal_chunk_count`](#optimal_chunk_count) divides by `task_overhead_ns + task_span_ns` rather than by the overhead alone, so a larger span yields fewer, coarser chunks. Unset and zero are the same answer, and a plan that sets neither splits exactly as it did before the span was read.
 
 ### `effective_task_count: Option<u32>`
 
@@ -141,7 +147,9 @@ Caller-supplied effective task count when the natural item count over-states the
 
 ### `k_inner_log2: Option<u8>`
 
-BLIS K_inner axis: SIMD-lane fanout within a single matmul leaf. `Some(log2)` requests the kernel to process `2^log2` output cells per k-iteration via slice SIMD primitives (`mul_slice` + `add_slice`) instead of scalar `mul_scalar` + `add_scalar` per cell.
+BLIS K_inner axis: how many output cells the batched matmul's inner loop carries per k-iteration, as a log2. `Some(log2)` asks for `2^log2` cells, `None` for one.
+
+It resolves through `JobPlan::k_inner_lanes()` to the cell count `gpu_peer::linalg::cpu::gemm_batched_lanes` carries, which `gemm_tandem_batched` consults for the CPU half of a tandem dispatch. Carrying more cells per k-iteration is a register-blocking choice: each cell's accumulation order is unchanged, so the result is bit-identical to the one-cell loop at every width and lane count. A value of 0 or 1 runs the one-cell loop.
 
 Recommended values:
 
@@ -223,9 +231,13 @@ Per-tier deque the recursive-split right-half is pushed to. `None` (default) mea
 
 ### `k_gating: crate::sched::k_gating::KGating`
 
-Per-call K_inner=3 deque-backing selector. Default = `KGating::Auto` (the scheduler picks per host between KHL per-slot Vyukov and Fcl counter-only Chase-Lev based on the startup calibration). `KGating::CounterOnly` forces the Fcl backing; `KGating::PerSlot` forces KHL. See [`KGating`](Foundation-Types-Reference.md#kgating) for the trade-offs.
+**This field steers nothing, and [`with_k_gating`](#builder-methods) is deprecated as of 0.5.1.** It is stored and read by no dispatch path. K-gating is process-global, not per-call.
 
-[`new`](#new), [`bare`](#bare), [`set_profile`](#set_profile), and [`for_op_generic`](#for_op_generic) all default this to `Auto`; the runtime-swappable `migrate_all_workers_k_gating(KGating::*)` flips every worker's active backing without disturbing per-call plans.
+Every worker carries a KHL per-slot backing and an Fcl counter-only backing at once, and an atomic tag says which one its pushes and steals use. `migrate_all_workers_k_gating(KGating::*)` flips every tag in one pass, which is the granularity `AdaptiveDispatcher::migrate_k_gating` operates at. See [`KGating`](Foundation-Types-Reference.md#kgating) for the trade-offs between the two backings.
+
+It is not a wiring gap. A job pushed to the backing the tag does not name is reachable only while that worker's orphan-drain flag is set, and both the owner's pop and a thief's steal clear that flag on finding the dormant backing empty, so a push racing either probe could leave a job no thief looks for again. Honouring the hint per dispatch means probing both backings on every steal, which is the cost the flag exists to avoid.
+
+[`new`](#new), [`bare`](#bare), [`set_profile`](#set_profile), and [`for_op_generic`](#for_op_generic) all default this to `Auto`.
 
 ### `cooperative_routing: crate::sched::adaptive_cooperative::CooperativeRouting`
 
@@ -317,10 +329,10 @@ All builders take `self` by value and return `Self`, supporting chains like `Job
 | `with_effective_task_count(count: u32)` | Sets `effective_task_count = Some(count)`. |
 | `with_k_inner_log2(log2: u8)` | Sets `k_inner_log2 = Some(log2)`. |
 | `with_backend(Backend)` | Sets `backend_hint = Some(backend)`. |
-| `with_k_gating(KGating)` | Sets `k_gating`. Overrides the `Auto` default so this dispatch lands on a pinned backing (`CounterOnly` = Fcl, `PerSlot` = KHL) regardless of the per-host startup calibration. |
+| `with_k_gating(KGating)` | **Deprecated since 0.5.1, steers nothing.** Sets `k_gating`, which no dispatch path reads. K-gating is process-global; see [`k_gating`](#k_gating-crateschedk_gatingkgating) for why a dispatch cannot choose it. |
 | `with_mailbox_routing(bool)` | Sets `use_mailbox_routing`. The realistic_bench finding is that blanket mailbox routing regresses Compute / Heavy; opt in only when the call site's locality structure justifies SMT-pair concentration. |
 | `with_deque_tier_hint(DequeTier)` | Sets `deque_tier_hint = Some(tier)`. Pins the recursive-split right-half to a narrower coherence neighborhood than `Public`. Same trade-off as `with_mailbox_routing`. |
-| `with_workload_shape(WorkloadShape)` | Overwrites `k_gating`, `use_mailbox_routing`, and `oversubscription_log2` from a declarative shape ([`WorkloadShape`](Foundation-Types-Reference.md#workloadshape)). Call this BEFORE other `with_*` builders that touch those fields, since it overwrites them. |
+| `with_workload_shape(WorkloadShape)` | Overwrites `k_gating`, `use_mailbox_routing`, and `oversubscription_log2` from a declarative shape ([`WorkloadShape`](Foundation-Types-Reference.md#workloadshape)). Two of the three steer; the `k_gating` it writes is read by nothing, as above. Call this before other `with_*` builders that touch those fields, since it overwrites them. |
 | `with_site(SiteRef)` | Attaches a caller-owned per-call-site state, replacing any prior attachment. Declare `static SITE: CallSiteState = CallSiteState::new();` and pass `SiteRef::new(&SITE)`. |
 | `with_site_if_none(SiteRef)` | Attaches only when no site is present; the generic dispatch entries use this so an outer attachment always wins. |
 | `with_bisect_variant(BisectVariant)` | Sets `bisect_variant = Some(v)`. Selects an in-tree scheduler-policy variant for bench-driven A/B research. Production code leaves this `None`. |
@@ -381,14 +393,38 @@ pub fn optimal_chunk_count(&self, workers: usize) -> Option<u32>
 Tiny-Tasks model (Acar 2013):
 
 ```text
-C_opt = clamp(sqrt(W * P / O), 1, N)
+C_opt = clamp(sqrt(W * P / (O + S)), 1, N)
 ```
 
-Where `W` is total estimated work in ns (`estimated_per_item_ns * batch_size`), `P` is `workers`, `O` is `task_overhead_ns`, and `N` is `effective_task_count` (falling back to `batch_size`).
+Where `W` is total estimated work in ns (`estimated_per_item_ns * batch_size`), `P` is `workers`, `O` is `task_overhead_ns`, `S` is [`task_span_ns`](#task_span_ns-optionu32) (zero when unset), and `N` is `effective_task_count` (falling back to `batch_size`).
 
-Returns `None` if `estimated_per_item_ns` or `task_overhead_ns` is unset, in which case callers fall back to the SLAW splitter's budget heuristic.
+Returns `None` if `estimated_per_item_ns` or `task_overhead_ns` is unset, in which case callers fall back to the SLAW splitter's budget heuristic. It reads `estimated_per_item_ns` as a field, and a profile fills that field with a default, so a plan stating only `task_overhead_ns` gets an answer computed from a cost its caller never wrote.
 
-Derivation: total-time = `serial_work / C + overhead * C`. `d/dC = -W/C^2 + O = 0`, giving `C = sqrt(W / O)`. Including parallelism (`P` workers running concurrently) bumps the optimal `C` by `sqrt(P)` because each worker's overhead is paid once but the work is divided P-ways.
+Derivation: total-time = `serial_work / C + (O + S) * C`. A chunk pays the scheduler's overhead and its own serial span once each whatever work it carries, so the two enter as one per-chunk fixed cost. `d/dC = -W/C^2 + (O + S) = 0`, giving `C = sqrt(W / (O + S))`. Including parallelism (`P` workers running concurrently) bumps the optimal `C` by `sqrt(P)` because each worker's fixed cost is paid once but the work is divided P-ways.
+
+### `optimal_chunk_count_for`
+
+```rust
+pub fn optimal_chunk_count_for(&self, workers: usize, n: usize) -> Option<u32>
+```
+
+The same model over `n` items instead of over the count the plan carries. A plan's `batch_size` is not always the length of the slice a helper is about to walk: an entry probe has consumed a prefix, or one plan is reused across calls. `optimal_chunk_count` delegates to this with its own count.
+
+At least one chunk and at most `n`. Saturates at `u32::MAX` rather than wrapping, because an item count past that range asks for more chunks than the return type can name.
+
+This is what the in-place chunked walks consult. [`for_each_chunk_indexed_min_leaf` and `for_each_chunk_triple_min_leaf`](Sched-Module-Reference.md#for_each_chunk_indexed-and-for_each_chunk_indexed_min_leaf) derive their leaf width from it when the plan carries both `estimated_per_item_ns` and `task_overhead_ns`, treating the caller's `min_leaf` as a floor under the derived width. Those walks additionally require the per-item cost to have been stated by the caller or measured by the entry probe; a profile default does not reach them.
+
+### `resolved_workers`
+
+```rust
+pub fn resolved_workers(&self) -> usize
+```
+
+How many workers will actually run this plan's work: the process arena's primaries, plus its SMT siblings when the plan wakes them, capped by [`worker_cap`](#worker_cap-optionu32).
+
+The distinction matters. `NumaArena::total_workers` counts the siblings whether or not they are awake, and they park unless a dispatch with `use_smt` is in flight, so it reads 24 on a 12-core SMT host where 12 threads run. The Tiny-Tasks model divides work by parallelism, so sizing a plan that parks its siblings against 24 overstates it twofold and asks for chunks about 1.4 times too narrow.
+
+Starts the arena if it is not already running, so it is not a free inspection on a process that has not yet used the pool.
 
 ## Example
 

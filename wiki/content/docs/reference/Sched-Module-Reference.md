@@ -144,6 +144,8 @@ pub fn for_each_chunk_triple<T1, T2, T3, F>(
 
 Apply `op` to every chunk-triple of `(out, a, b)` in parallel. All three slices must have the same length. Used for `out = f(a, b)` slice kernels (mul_slice / add_slice / sub_slice). The `_min_leaf` variant takes a caller-supplied leaf floor (use `min_leaf = 1` for heavy per-element work like row-update or per-row spmv). With an explicit per-item estimate on the plan whose total is under the host's measured collapse threshold (`par_iter::inline_collapse_threshold_ns`, floored at the pool's measured dispatch cost), both run `op` once over the whole slices on the calling thread, as `for_each_chunk` does (Ryzen 7 2700, 1 ns per item: 1000 items 0.5 us against 13.7 us dispatched).
 
+`min_leaf` is a floor on leaf size and `out.len() / min_leaf` caps the leaf count, and the Tiny-Tasks sizing described under [`for_each_chunk_indexed_min_leaf`](#for_each_chunk_indexed-and-for_each_chunk_indexed_min_leaf) applies here too.
+
 ### `for_each_chunk_indexed` and `for_each_chunk_indexed_min_leaf`
 
 ```rust
@@ -151,6 +153,12 @@ pub fn for_each_chunk_indexed<T, F>(plan: &JobPlan, items: &mut [T], op: F)
 ```
 
 Indexed-collect pattern: closure receives `(start_idx, &mut [T])` so the body can know the absolute slot index. The `_min_leaf` variant takes a caller-supplied floor (use `min_leaf = 1` for heavy per-element work like matmul O(k), spmv O(nnz_per_row), LU row update, Jacobi rotation, etc.). With an explicit per-item estimate on the plan whose total is under the host's measured collapse threshold (`par_iter::inline_collapse_threshold_ns`, floored at the pool's measured dispatch cost), both run the body once on the calling thread, as `for_each_chunk` does.
+
+**What `min_leaf` bounds.** It is a floor on the size of a leaf, not a granularity leaves are multiples of. The recursion stops at `min_leaf` items, so `items.len() / min_leaf` is a hard cap on how many leaves can ever exist, whatever the worker count. Tying it to a cache blocking width therefore caps the parallelism at `items.len() / width`, and a sweep of that width is also a sweep of the leaf count.
+
+**Tiny-Tasks sizing (0.5.1).** When the plan carries both `estimated_per_item_ns` and `task_overhead_ns`, the leaf width comes from [`JobPlan::optimal_chunk_count_for`](JobPlan-Reference.md#optimal_chunk_count_for) and `min_leaf` is the floor under it rather than the whole answer. A per-item cost the entry probe measured counts as carried, so supplying `task_overhead_ns` alone reaches the model on the host's own measurement. A plan carrying neither, or only the per-item cost, splits exactly as it did before. The model divides by [`resolved_workers`](JobPlan-Reference.md#resolved_workers), the workers that actually run, not the pool width that counts parked SMT siblings.
+
+`for_each_chunk_min_leaf` bounds from the opposite side: there the value caps what `adaptive_min_leaf` may pick, so the recursion stops at or below `min_leaf` and the same quotient is a lower bound on the leaf count. `for_each_chunk_ref` takes a chunk width rather than a bisect bound.
 
 ### `for_each_indexed` and `for_each_chunk_ref`
 

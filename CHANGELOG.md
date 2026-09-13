@@ -77,6 +77,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
+- The wiki's `JobPlan` reference carried four claims the code does not
+  support, each the published form of a defect this release corrects.
+  `task_span_ns` was documented as "currently unused in
+  `optimal_chunk_count`; reserved for span-aware extensions" and the
+  formula beside it divided by the overhead alone. `k_gating`'s entry
+  described a per-call backing selector and the builder table said the
+  hint made "this dispatch land on a pinned backing". `k_inner_log2`
+  described a kernel naming `mul_slice` and `add_slice` that this crate
+  does not contain. `hw_class` named only a mode-region path and not the
+  tier promotion. The reference now also documents
+  `optimal_chunk_count_for` and `resolved_workers`, and the scheduler
+  reference states what `min_leaf` bounds on each helper that takes it,
+  which is the sentence a consumer needed and did not have.
 - `with_task_span_ns` and `with_k_inner_log2` steer something. Both
   shipped in 0.5.0 setting a field that nothing in the crate read, so a
   caller setting either got no error, no effect, and no way to tell.
