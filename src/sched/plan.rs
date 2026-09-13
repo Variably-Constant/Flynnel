@@ -1250,15 +1250,26 @@ impl JobPlan {
         Some(as_count(c_opt.max(1).min(n)))
     }
 
-    /// The worker count this plan will spread over, which is
-    /// [`Self::effective_workers`] resolved against the process-global
-    /// arena that [`crate::sched::par_iter`] dispatches to.
+    /// The workers that will actually run this plan's work: the
+    /// process arena's primaries, plus its SMT siblings when this plan
+    /// wakes them, capped by [`Self::worker_cap`].
     ///
-    /// Starts that arena if it is not already running.
+    /// The siblings park unless a dispatch with `use_smt` is in
+    /// flight, so `NumaArena::total_workers` counts threads that exist
+    /// rather than threads that run and reads 24 on a 12-core host
+    /// where 12 run. This is the count to divide work by.
+    ///
+    /// Starts the arena if it is not already running.
     #[inline]
     #[must_use]
     pub fn resolved_workers(&self) -> usize {
-        self.effective_workers(crate::sched::arena::global_local_arena().total_workers())
+        let arena = crate::sched::arena::global_local_arena();
+        let running = if self.effective_use_smt() {
+            arena.total_workers()
+        } else {
+            arena.primary_workers()
+        };
+        self.effective_workers(running)
     }
 }
 
@@ -1942,5 +1953,35 @@ mod tests {
         );
         let capped = JobPlan::new(6, 4096).with_workers(2).resolved_workers();
         assert_eq!(capped, uncapped.min(2));
+    }
+
+    #[test]
+    fn the_resolved_count_is_threads_that_run_not_threads_that_exist() {
+        let arena = crate::sched::arena::global_local_arena();
+        let primaries = arena.primary_workers();
+        let total = arena.total_workers();
+        assert!(primaries <= total);
+
+        let mut parked = JobPlan::new(6, 4096);
+        parked.use_smt = false;
+        assert_eq!(
+            parked.resolved_workers(),
+            primaries,
+            "a plan that leaves the siblings parked is sized to the primaries"
+        );
+        assert!(
+            parked.resolved_workers() <= total,
+            "the running count can never exceed the threads that exist"
+        );
+
+        // Where the host has siblings, the two counts differ, and a
+        // plan sized to the wrong one overstates its parallelism.
+        if total > primaries {
+            assert!(
+                parked.resolved_workers() < total,
+                "sizing a non-SMT plan to {total} threads counts {} parked ones",
+                total - primaries
+            );
+        }
     }
 }

@@ -2305,8 +2305,11 @@ where
     }
     let leaf = min_leaf.max(1);
     let workers = plan.effective_workers(global_local_arena().total_workers());
-    // The caller's floor bounds the model's width from below.
-    let dispatch_leaf = model_leaf(plan, workers, n).map_or(leaf, |derived| leaf.max(derived));
+    // The caller's floor bounds the model's width from below. The
+    // model divides by the workers that run, not by `workers`, which
+    // counts SMT siblings this plan leaves parked.
+    let dispatch_leaf =
+        model_leaf(plan, plan.resolved_workers(), n).map_or(leaf, |derived| leaf.max(derived));
     let max_budget = workers.saturating_mul(plan.effective_leaves_per_worker()).max(1);
     bisect_triple(plan, out, a, b, &op, dispatch_leaf, max_budget, max_budget, false);
 }
@@ -2557,9 +2560,15 @@ where
 
     // The caller's floor bounds the model's width from below. Read
     // from `effective_plan` over the items left after the probe, so a
-    // probed cost counts and the width sizes the remaining run.
-    let dispatch_leaf = model_leaf(effective_plan, workers, items_to_dispatch.len())
-        .map_or(leaf, |derived| leaf.max(derived));
+    // probed cost counts and the width sizes the remaining run. The
+    // model divides by the workers that run, not by `workers`, which
+    // counts SMT siblings this plan leaves parked.
+    let dispatch_leaf = model_leaf(
+        effective_plan,
+        effective_plan.resolved_workers(),
+        items_to_dispatch.len(),
+    )
+    .map_or(leaf, |derived| leaf.max(derived));
 
     // Default: continuation-steal-lazy bisect with absolute-index
     // passthrough. Uses adaptive_seed_depth so heavy items get more

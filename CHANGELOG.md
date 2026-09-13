@@ -17,10 +17,17 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   a kernel accumulating into a caller's buffer could not reach it and
   had to hand-roll a leaf floor from a constant of its own. Reported by
   a consumer with the constant attached.
-- `JobPlan::resolved_workers()` answers the worker count a dispatch
-  from this plan will spread over. `effective_workers` takes the pool
-  width as an argument, and there was no supported route to that width
-  from outside the crate.
+- `JobPlan::resolved_workers()` answers how many workers will actually
+  run this plan's work: the arena's primaries, plus its SMT siblings
+  when the plan wakes them, capped by `worker_cap`. `effective_workers`
+  takes the pool width as an argument and there was no supported route
+  to it from outside the crate. The distinction is load-bearing rather
+  than cosmetic: `NumaArena::total_workers` counts siblings whether or
+  not they are awake, so it reads 24 on a 12-core SMT host where 12
+  threads run, and the Tiny-Tasks model divides work by parallelism.
+  Sizing a plan that parks the siblings against 24 overstates its
+  parallelism twofold and asks for chunks about 1.4 times too narrow.
+  The chunked walks divide by this count.
 
 ### Changed
 
