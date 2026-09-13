@@ -73,6 +73,13 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   parallel-leaf count. `for_each_chunk_min_leaf` bounds from the
   opposite side, capping what `adaptive_min_leaf` may pick, and
   `for_each_chunk_ref` takes a chunk width rather than a bisect bound.
+- A declared matrix-extension `hw_class` no longer promotes a batch of
+  one. One item is one leaf, so there is nothing to split and the
+  dispatch can only add its own cost. A consumer's sweep on an
+  AMX-emulating strip measures a one-tile grid at 2,388 ns serial
+  against 2,827 ns dispatched. The promotion is still too eager above
+  one: the same sweep has a 2x2 grid at 0.94x and a 4x4 at 2.71x, so
+  the crossover lies between 4 and 16 tiles and is not yet measured.
 - A declared matrix-extension `hw_class` promotes the scheduler tier.
   `with_hw_class` set a field that nothing outside tests read, under a
   `SchedTier` doc naming `hw_class` among the inputs the tier is

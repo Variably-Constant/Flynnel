@@ -1373,12 +1373,20 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
         });
 
     // A declared matrix-extension target is the caller saying the item
-    // is a tile operation, which is heavy per item whatever the batch:
-    // the smallest AMX or tensor-core tile is a multiply-accumulate
-    // over a 16x16 block, orders above the dispatch this decides
-    // against. The vector classes say nothing a batch size does not
-    // already say, so only the matrix ones promote.
-    let tile_override = plan.hw_class.is_matrix_extension();
+    // is a tile operation: the smallest AMX or tensor-core tile is a
+    // multiply-accumulate over a 16x16 block. The vector classes say
+    // nothing a batch size does not already say, so only the matrix
+    // ones promote.
+    //
+    // One tile is never promoted: one item is one leaf, so there is
+    // nothing to split and the dispatch can only add its own cost. On
+    // an AMX-emulating strip a one-tile grid measures 2,388 ns serial
+    // against 2,827 ns dispatched.
+    //
+    // Above one tile this is still too eager. The same sweep has a
+    // 2x2 grid at 0.94x and a 4x4 at 2.71x, so the crossover lies
+    // between 4 and 16 tiles and is not yet measured.
+    let tile_override = plan.hw_class.is_matrix_extension() && plan.batch_size > 1;
 
     let base = kband_for(plan.k_outer);
     match base {
@@ -1672,8 +1680,27 @@ mod tests {
         assert_eq!(
             pick_tier(&tiled, &topo),
             SchedTier::Local,
-            "a tile item is heavy per item however small the batch"
+            "a tile batch with something to split promotes"
         );
+    }
+
+    #[test]
+    fn a_single_tile_is_not_promoted_because_one_item_cannot_be_split() {
+        let topo = NumaTopology::fallback();
+        let one = JobPlan::set_profile(2, 1, DispatchProfile::PortBound)
+            .with_hw_class(HwClass::AmxBf16);
+        assert!(!one.use_smt, "the arrangement under test has SMT off");
+        assert_eq!(
+            pick_tier(&one, &topo),
+            SchedTier::Inline,
+            "one item is one leaf, so a dispatch adds its cost and splits nothing"
+        );
+
+        // Two is the smallest batch with anything to split, and the
+        // class is the only thing that can move it off Inline here.
+        let two = JobPlan::set_profile(2, 2, DispatchProfile::PortBound)
+            .with_hw_class(HwClass::AmxBf16);
+        assert_eq!(pick_tier(&two, &topo), SchedTier::Local);
     }
 
     #[test]
