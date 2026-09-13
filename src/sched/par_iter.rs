@@ -2242,11 +2242,19 @@ where
 /// `None` unless the plan carries a `task_overhead_ns` and a per-item
 /// cost the caller stated or the entry probe measured. A classifier
 /// default for the profile does not count as stated.
-fn model_leaf(plan: &JobPlan, workers: usize, n: usize) -> Option<usize> {
-    if !plan.estimated_per_item_ns_explicit {
+///
+/// Both hints are checked before the worker count is resolved, because
+/// resolving it reads the SMT variance decision and starts the arena,
+/// and a plan carrying neither hint must pay neither.
+///
+/// Divides by the workers that run rather than the pool's width: the
+/// model's parallelism term is how many workers split the work at
+/// once, and the SMT siblings are parked unless this plan wakes them.
+fn model_leaf(plan: &JobPlan, n: usize) -> Option<usize> {
+    if !plan.estimated_per_item_ns_explicit || plan.task_overhead_ns.is_none() {
         return None;
     }
-    let chunks = plan.optimal_chunk_count_for(workers, n)? as usize;
+    let chunks = plan.optimal_chunk_count_for(plan.resolved_workers(), n)? as usize;
     Some(n.div_ceil(chunks.max(1)))
 }
 
@@ -2305,11 +2313,8 @@ where
     }
     let leaf = min_leaf.max(1);
     let workers = plan.effective_workers(global_local_arena().total_workers());
-    // The caller's floor bounds the model's width from below. The
-    // model divides by the workers that run, not by `workers`, which
-    // counts SMT siblings this plan leaves parked.
-    let dispatch_leaf =
-        model_leaf(plan, plan.resolved_workers(), n).map_or(leaf, |derived| leaf.max(derived));
+    // The caller's floor bounds the model's width from below.
+    let dispatch_leaf = model_leaf(plan, n).map_or(leaf, |derived| leaf.max(derived));
     let max_budget = workers.saturating_mul(plan.effective_leaves_per_worker()).max(1);
     bisect_triple(plan, out, a, b, &op, dispatch_leaf, max_budget, max_budget, false);
 }
@@ -2560,15 +2565,9 @@ where
 
     // The caller's floor bounds the model's width from below. Read
     // from `effective_plan` over the items left after the probe, so a
-    // probed cost counts and the width sizes the remaining run. The
-    // model divides by the workers that run, not by `workers`, which
-    // counts SMT siblings this plan leaves parked.
-    let dispatch_leaf = model_leaf(
-        effective_plan,
-        effective_plan.resolved_workers(),
-        items_to_dispatch.len(),
-    )
-    .map_or(leaf, |derived| leaf.max(derived));
+    // probed cost counts and the width sizes the remaining run.
+    let dispatch_leaf = model_leaf(effective_plan, items_to_dispatch.len())
+        .map_or(leaf, |derived| leaf.max(derived));
 
     // Default: continuation-steal-lazy bisect with absolute-index
     // passthrough. Uses adaptive_seed_depth so heavy items get more
@@ -4888,14 +4887,14 @@ mod tests {
     #[test]
     fn a_plan_without_both_hints_has_no_model_width_and_keeps_the_caller_floor() {
         let n = 4096usize;
-        assert_eq!(model_leaf(&JobPlan::new(6, n as u32), 8, n), None);
+        assert_eq!(model_leaf(&JobPlan::new(6, n as u32), n), None);
         assert_eq!(
-            model_leaf(&JobPlan::new(6, n as u32).with_estimated_per_item_ns(50), 8, n),
+            model_leaf(&JobPlan::new(6, n as u32).with_estimated_per_item_ns(50), n),
             None,
             "a per-item cost alone leaves the model without a fixed cost"
         );
         assert_eq!(
-            model_leaf(&JobPlan::new(6, n as u32).with_task_overhead_ns(500), 8, n),
+            model_leaf(&JobPlan::new(6, n as u32).with_task_overhead_ns(500), n),
             None,
             "an overhead alone leaves the model without work to spread"
         );
@@ -4918,10 +4917,10 @@ mod tests {
             "the profile supplies a default, which is what makes this the interesting case"
         );
         assert!(!plan.estimated_per_item_ns_explicit);
-        assert_eq!(model_leaf(&plan, 8, n), None);
+        assert_eq!(model_leaf(&plan, n), None);
 
         // The same plan with the cost stated does reach the model.
-        assert!(model_leaf(&plan.with_estimated_per_item_ns(50), 8, n).is_some());
+        assert!(model_leaf(&plan.with_estimated_per_item_ns(50), n).is_some());
     }
 
     #[test]
@@ -4932,7 +4931,6 @@ mod tests {
                 &JobPlan::new(6, n as u32)
                     .with_estimated_per_item_ns(per_item)
                     .with_task_overhead_ns(overhead),
-                8,
                 n,
             )
             .expect("both hints are set")
@@ -4949,7 +4947,6 @@ mod tests {
                 .with_estimated_per_item_ns(50)
                 .with_task_overhead_ns(500)
                 .with_task_span_ns(4_500),
-            8,
             n,
         )
         .expect("both hints are set");
@@ -4963,7 +4960,6 @@ mod tests {
             &JobPlan::new(6, n as u32)
                 .with_estimated_per_item_ns(100_000)
                 .with_task_overhead_ns(u32::MAX),
-            8,
             n,
         )
         .expect("both hints are set");
@@ -4975,7 +4971,6 @@ mod tests {
             &JobPlan::new(6, n as u32)
                 .with_estimated_per_item_ns(100_000)
                 .with_task_overhead_ns(1),
-            8,
             n,
         )
         .expect("both hints are set");
