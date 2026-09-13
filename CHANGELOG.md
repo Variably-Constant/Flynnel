@@ -7,8 +7,40 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ## Unreleased
 
+### Added
+
+- `JobPlan::optimal_chunk_count_for(workers, n)` sizes the Tiny-Tasks
+  model over an item count the caller names, where
+  `optimal_chunk_count` sizes it over the plan's own `batch_size`. The
+  model was consulted at one site in the crate,
+  `collect_indexed_tiny_tasks`, which allocates and returns a `Vec`, so
+  a kernel accumulating into a caller's buffer could not reach it and
+  had to hand-roll a leaf floor from a constant of its own. Reported by
+  a consumer with the constant attached.
+- `JobPlan::resolved_workers()` answers the worker count a dispatch
+  from this plan will spread over. `effective_workers` takes the pool
+  width as an argument, and there was no supported route to that width
+  from outside the crate.
+
 ### Changed
 
+- `for_each_chunk_indexed_min_leaf` and `for_each_chunk_triple_min_leaf`
+  derive their leaf width from the Tiny-Tasks model when the plan
+  carries both `estimated_per_item_ns` and `task_overhead_ns`, treating
+  the caller's `min_leaf` as a floor under the derived width rather
+  than as the whole answer. A per-item cost the entry probe measured
+  counts as carried, so a plan supplying only `task_overhead_ns` reaches
+  the model on this host's own measurement. A plan carrying neither
+  hint, or only the per-item cost, splits exactly where it did: no call
+  site in `src/` sets `task_overhead_ns`.
+- Every helper taking `min_leaf` documents what the parameter bounds.
+  It is a floor on leaf size, not a granularity leaves are multiples
+  of, so `items.len() / min_leaf` caps the leaf count at any worker
+  count; a consumer read it as a granularity, tied it to a cache
+  blocking width, and turned a four-cell blocking sweep into a sweep of
+  parallel-leaf count. `for_each_chunk_min_leaf` bounds from the
+  opposite side, capping what `adaptive_min_leaf` may pick, and
+  `for_each_chunk_ref` takes a chunk width rather than a bisect bound.
 - A declared matrix-extension `hw_class` promotes the scheduler tier.
   `with_hw_class` set a field that nothing outside tests read, under a
   `SchedTier` doc naming `hw_class` among the inputs the tier is

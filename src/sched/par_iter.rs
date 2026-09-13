@@ -1551,6 +1551,13 @@ where
 /// Passing a floor does not request a leaf count. It sets the point
 /// the recursion stops, and the count that results depends on the
 /// per-item estimate and on how much the pool steals.
+///
+/// `min_leaf` bounds leaf size from the opposite side to the sibling
+/// helpers: `adaptive_min_leaf` may only pick at or below it, so
+/// `items.len() / min_leaf` is a lower bound on the leaf count. In
+/// [`for_each_chunk_indexed_min_leaf`] and
+/// [`for_each_chunk_triple_min_leaf`] it reaches the bisect unchanged
+/// and the same quotient is an upper bound.
 #[track_caller]
 pub fn for_each_chunk_min_leaf<T, F>(
     plan: &JobPlan,
@@ -2229,6 +2236,20 @@ where
     for_each_chunk_triple_min_leaf(plan, out, a, b, leaf, op)
 }
 
+/// Leaf width from the Tiny-Tasks model over `n` items: `n` items in
+/// `c` chunks, rounded up so `c` chunks still cover `n`.
+///
+/// `None` unless the plan carries a `task_overhead_ns` and a per-item
+/// cost the caller stated or the entry probe measured. A classifier
+/// default for the profile does not count as stated.
+fn model_leaf(plan: &JobPlan, workers: usize, n: usize) -> Option<usize> {
+    if !plan.estimated_per_item_ns_explicit {
+        return None;
+    }
+    let chunks = plan.optimal_chunk_count_for(workers, n)? as usize;
+    Some(n.div_ceil(chunks.max(1)))
+}
+
 /// Same as [`for_each_chunk_triple`] but the recursion floor is
 /// caller-supplied. At small N (say n=1k with the default
 /// `MIN_LEAF_ITEMS=256`), the bisect floor caps the chunk count at
@@ -2237,6 +2258,16 @@ where
 /// `PAR_MIN_ELEMS = 64`) so the SLAW budget (`workers * multiplier`)
 /// caps chunk count instead, matching rayon's per-chunk fanout at
 /// small N.
+///
+/// `min_leaf` is a floor on leaf size, not a granularity leaves are
+/// multiples of: the recursion stops at `min_leaf` items, so
+/// `out.len() / min_leaf` caps how many leaves can exist at any worker
+/// count.
+///
+/// With both `estimated_per_item_ns` and `task_overhead_ns` set, the
+/// width comes from [`JobPlan::optimal_chunk_count_for`] and
+/// `min_leaf` is the floor under it. With either unset, the floor is
+/// the whole answer.
 #[track_caller]
 pub fn for_each_chunk_triple_min_leaf<T1, T2, T3, F>(
     plan: &JobPlan,
@@ -2274,8 +2305,10 @@ where
     }
     let leaf = min_leaf.max(1);
     let workers = plan.effective_workers(global_local_arena().total_workers());
+    // The caller's floor bounds the model's width from below.
+    let dispatch_leaf = model_leaf(plan, workers, n).map_or(leaf, |derived| leaf.max(derived));
     let max_budget = workers.saturating_mul(plan.effective_leaves_per_worker()).max(1);
-    bisect_triple(plan, out, a, b, &op, leaf, max_budget, max_budget, false);
+    bisect_triple(plan, out, a, b, &op, dispatch_leaf, max_budget, max_budget, false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2389,6 +2422,19 @@ const PROBE_SMALL_MIN_N: usize = 2;
 /// `min_leaf >= 1`. Setting `min_leaf == 1` produces one job per
 /// item - the right choice when the body is heavy and the total
 /// item count equals the worker count.
+///
+/// `min_leaf` is a floor on leaf size, not a granularity leaves are
+/// multiples of: the recursion stops at `min_leaf` items, so
+/// `items.len() / min_leaf` caps how many leaves can exist at any
+/// worker count. Tying it to a cache blocking width caps the
+/// parallelism at `items.len() / width`.
+///
+/// With both `estimated_per_item_ns` and `task_overhead_ns` set, the
+/// width comes from [`JobPlan::optimal_chunk_count_for`] and
+/// `min_leaf` is the floor under it. A cost the entry probe measured
+/// counts, so `task_overhead_ns` alone reaches the model on a plan
+/// that lets the probe run. With neither, or with only the per-item
+/// cost, the floor is the whole answer.
 ///
 /// Probe sizing shared by the min_leaf-style entries (this and
 /// [`collect_indexed`]): at `n >= PROBE_MIN_N` the probe is
@@ -2509,6 +2555,12 @@ where
         return;
     }
 
+    // The caller's floor bounds the model's width from below. Read
+    // from `effective_plan` over the items left after the probe, so a
+    // probed cost counts and the width sizes the remaining run.
+    let dispatch_leaf = model_leaf(effective_plan, workers, items_to_dispatch.len())
+        .map_or(leaf, |derived| leaf.max(derived));
+
     // Default: continuation-steal-lazy bisect with absolute-index
     // passthrough. Uses adaptive_seed_depth so heavy items get more
     // eager splits for load-balance headroom; light items get
@@ -2516,7 +2568,7 @@ where
     if effective_plan.bisect_variant.is_none() {
         let seed_depth = adaptive_seed_depth(effective_plan, items_to_dispatch.len(), workers);
         bisect_lazy_steal_driven_indexed(
-            effective_plan, items_to_dispatch, start_offset, &op, leaf, seed_depth, 0,
+            effective_plan, items_to_dispatch, start_offset, &op, dispatch_leaf, seed_depth, 0,
         );
         return;
     }
@@ -2527,7 +2579,14 @@ where
         .saturating_mul(effective_plan.effective_leaves_per_worker())
         .max(1);
     bisect_indexed(
-        effective_plan, items_to_dispatch, start_offset, &op, leaf, max_budget, max_budget, false,
+        effective_plan,
+        items_to_dispatch,
+        start_offset,
+        &op,
+        dispatch_leaf,
+        max_budget,
+        max_budget,
+        false,
     );
 }
 
@@ -2540,6 +2599,10 @@ where
 /// runs over a zero-sized slice of length `n` so the probe, the
 /// per-call-site statistics and the lazy-steal bisect all apply
 /// unchanged. Nothing is allocated for the slice.
+///
+/// `min_leaf` is a floor on leaf size, so `n / min_leaf` caps the leaf
+/// count, and the Tiny-Tasks sizing on
+/// [`for_each_chunk_indexed_min_leaf`] applies here too.
 ///
 /// For a per-chunk body over a read-only slice use
 /// [`for_each_chunk_ref`].
@@ -2570,6 +2633,10 @@ where
 /// batch width (a tile kernel, a resolver that takes a run of ids)
 /// and never writes the input. Built on [`for_each_indexed`] over
 /// the chunk count, one chunk per index.
+///
+/// `min_leaf` is the chunk width here, not a bisect bound as in the
+/// sibling helpers: the leaf count is
+/// `items.len().div_ceil(min_leaf)`.
 #[track_caller]
 pub fn for_each_chunk_ref<T, F>(plan: &JobPlan, items: &[T], min_leaf: usize, f: F)
 where
@@ -2719,6 +2786,10 @@ where
 ///   right cap, not the leaf floor.
 /// - `MIN_LEAF_ITEMS` (~256) for fine-grain work where the floor
 ///   amortizes join overhead.
+///
+/// It is a floor on leaf size, not a granularity leaves are multiples
+/// of: the recursion stops at `min_leaf` indices, so `n / min_leaf`
+/// caps the leaf count at any worker count.
 ///
 /// # Safety contract
 ///
@@ -4803,5 +4874,102 @@ mod tests {
         assert!(SITE.collapse_overran(), "the overrun latched the site");
         assert!(!collapses_inline(&plan, n),
             "the same plan no longer collapses at this site");
+    }
+
+    #[test]
+    fn a_plan_without_both_hints_has_no_model_width_and_keeps_the_caller_floor() {
+        let n = 4096usize;
+        assert_eq!(model_leaf(&JobPlan::new(6, n as u32), 8, n), None);
+        assert_eq!(
+            model_leaf(&JobPlan::new(6, n as u32).with_estimated_per_item_ns(50), 8, n),
+            None,
+            "a per-item cost alone leaves the model without a fixed cost"
+        );
+        assert_eq!(
+            model_leaf(&JobPlan::new(6, n as u32).with_task_overhead_ns(500), 8, n),
+            None,
+            "an overhead alone leaves the model without work to spread"
+        );
+    }
+
+    #[test]
+    fn a_classifier_default_cost_is_not_a_stated_one_and_yields_no_model_width() {
+        let n = 4096usize;
+        // set_profile fills estimated_per_item_ns from the profile's
+        // default without marking it stated, which is the case that
+        // must not reach the model.
+        let plan = JobPlan::set_profile(
+            6,
+            n as u32,
+            crate::dispatch_profile::DispatchProfile::MemoryBound,
+        )
+        .with_task_overhead_ns(500);
+        assert!(
+            plan.estimated_per_item_ns.is_some(),
+            "the profile supplies a default, which is what makes this the interesting case"
+        );
+        assert!(!plan.estimated_per_item_ns_explicit);
+        assert_eq!(model_leaf(&plan, 8, n), None);
+
+        // The same plan with the cost stated does reach the model.
+        assert!(model_leaf(&plan.with_estimated_per_item_ns(50), 8, n).is_some());
+    }
+
+    #[test]
+    fn the_model_width_grows_with_overhead_and_shrinks_with_per_item_cost() {
+        let n = 4096usize;
+        let width = |per_item: u32, overhead: u32| {
+            model_leaf(
+                &JobPlan::new(6, n as u32)
+                    .with_estimated_per_item_ns(per_item)
+                    .with_task_overhead_ns(overhead),
+                8,
+                n,
+            )
+            .expect("both hints are set")
+        };
+
+        // A dearer chunk is worth fewer of, so each carries more items.
+        assert!(width(50, 5_000) > width(50, 500));
+        // A dearer item pays for a chunk sooner, so each carries fewer.
+        assert!(width(500, 500) < width(50, 500));
+        // The span is the other half of a chunk's fixed cost and moves
+        // the width the same way the overhead does.
+        let with_span = model_leaf(
+            &JobPlan::new(6, n as u32)
+                .with_estimated_per_item_ns(50)
+                .with_task_overhead_ns(500)
+                .with_task_span_ns(4_500),
+            8,
+            n,
+        )
+        .expect("both hints are set");
+        assert_eq!(with_span, width(50, 5_000));
+    }
+
+    #[test]
+    fn a_fixed_cost_that_swamps_the_work_collapses_the_width_to_the_whole_run() {
+        let n = 64usize;
+        let one_chunk = model_leaf(
+            &JobPlan::new(6, n as u32)
+                .with_estimated_per_item_ns(100_000)
+                .with_task_overhead_ns(u32::MAX),
+            8,
+            n,
+        )
+        .expect("both hints are set");
+        assert_eq!(one_chunk, n, "one chunk over n items is n items wide");
+
+        // And the opposite end: a negligible overhead against the same
+        // items asks for a chunk per item.
+        let per_item = model_leaf(
+            &JobPlan::new(6, n as u32)
+                .with_estimated_per_item_ns(100_000)
+                .with_task_overhead_ns(1),
+            8,
+            n,
+        )
+        .expect("both hints are set");
+        assert_eq!(per_item, 1);
     }
 }

@@ -448,3 +448,85 @@ fn the_order_hints_are_given_does_not_change_the_plan() {
         "oversubscription depends on builder order"
     );
 }
+
+/// Count the leaves of an indexed walk, and the indices it covered.
+fn indexed_walk(plan: &JobPlan, n: usize, min_leaf: usize) -> (usize, Vec<usize>) {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let leaves = AtomicUsize::new(0);
+    let seen: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    let mut items: Vec<usize> = (0..n).collect();
+    flynnel::sched::par_iter::for_each_chunk_indexed_min_leaf(
+        plan,
+        &mut items,
+        min_leaf,
+        |start, chunk| {
+            leaves.fetch_add(1, Ordering::Relaxed);
+            let mut got = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            got.extend(start..start + chunk.len());
+        },
+    );
+    let mut visited = seen.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    visited.sort_unstable();
+    (leaves.load(Ordering::Relaxed), visited)
+}
+
+/// `with_task_overhead_ns` steers how finely an in-place walk splits.
+///
+/// The round-trip above proves only that the field stores what it was
+/// given. This moves nothing but the overhead and counts the leaves.
+#[test]
+fn a_task_overhead_steers_how_finely_an_in_place_walk_splits() {
+    let n = 64usize;
+    // 100 us an item puts the run past the inline-collapse threshold,
+    // so neither arm reaches one leaf by running on the caller.
+    let plan = |overhead_ns: u32| {
+        JobPlan::new(6, n as u32)
+            .with_estimated_per_item_ns(100_000)
+            .with_task_overhead_ns(overhead_ns)
+    };
+    let every_index: Vec<usize> = (0..n).collect();
+
+    let (coarse_leaves, coarse_seen) = indexed_walk(&plan(u32::MAX), n, 1);
+    assert_eq!(coarse_seen, every_index, "the coarse walk must cover every index once");
+    assert_eq!(
+        coarse_leaves, 1,
+        "an overhead that swamps the work asks for one chunk, so the walk is one leaf"
+    );
+
+    let (fine_leaves, fine_seen) = indexed_walk(&plan(1), n, 1);
+    assert_eq!(fine_seen, every_index, "the fine walk must cover every index once");
+    if plan(1).resolved_workers() > 1 {
+        // The seed depth is at least log2(workers), so a pool wider
+        // than one splits at least once.
+        assert!(
+            fine_leaves > 1,
+            "a negligible overhead must split; got {fine_leaves} leaves"
+        );
+    }
+}
+
+/// The caller's `min_leaf` is a floor under the model, not a value the
+/// model may go below.
+#[test]
+fn a_caller_floor_wins_over_a_finer_model_width() {
+    let n = 4096usize;
+    // A negligible overhead asks for a chunk per item, which this
+    // floor forbids.
+    let plan = JobPlan::new(6, n as u32)
+        .with_estimated_per_item_ns(100_000)
+        .with_task_overhead_ns(1);
+
+    let (floored, seen) = indexed_walk(&plan, n, n);
+    assert_eq!(seen, (0..n).collect::<Vec<_>>(), "the walk must cover every index once");
+    assert_eq!(floored, 1, "a floor of the whole slice is one leaf whatever the model asks");
+
+    if plan.resolved_workers() > 1 {
+        let (unfloored, _) = indexed_walk(&plan, n, 1);
+        assert!(
+            unfloored > floored,
+            "without the floor the same plan splits; got {unfloored} leaves"
+        );
+    }
+}

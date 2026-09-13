@@ -1207,6 +1207,9 @@ impl JobPlan {
     /// are unset - callers must fall back to the SLAW splitter's
     /// budget heuristic.
     ///
+    /// Sizes against this plan's own task count. For a run of some
+    /// other length, [`Self::optimal_chunk_count_for`] takes the count.
+    ///
     /// Derivation sketch: total-time = serial_work / C + (O + S) * C.
     /// A chunk pays the scheduler's overhead and its own serial span
     /// once each, whatever work it carries, so the two enter the
@@ -1219,21 +1222,43 @@ impl JobPlan {
     /// chunk and splitting further buys less than it costs.
     #[inline]
     pub fn optimal_chunk_count(&self, workers: usize) -> Option<u32> {
+        let n = self.effective_task_count.unwrap_or(self.batch_size) as usize;
+        self.optimal_chunk_count_for(workers, n)
+    }
+
+    /// [`Self::optimal_chunk_count`] over `n` items instead of over
+    /// the count this plan carries. Same model and same `None`; the
+    /// result is at least one chunk and at most `n`, saturating at
+    /// `u32::MAX` rather than wrapping.
+    #[inline]
+    pub fn optimal_chunk_count_for(&self, workers: usize, n: usize) -> Option<u32> {
         let per_item = self.estimated_per_item_ns? as u64;
         let overhead = self.task_overhead_ns? as u64;
-        let n = self.effective_task_count.unwrap_or(self.batch_size) as u64;
+        let n = n as u64;
         // The span is the other half of a chunk's fixed cost; unset
         // means zero, which leaves the formula as overhead alone.
         let fixed = overhead.saturating_add(self.task_span_ns.unwrap_or(0) as u64);
+        let as_count = |c: u64| c.min(u32::MAX as u64) as u32;
         if n == 0 || fixed == 0 || per_item == 0 {
-            return Some(n as u32);
+            return Some(as_count(n));
         }
         let w_total = per_item.saturating_mul(n);
         let p = (workers as u64).max(1);
         // C = sqrt(W * P / (O + S)). Use isqrt to stay in integer space.
         let radicand = w_total.saturating_mul(p).checked_div(fixed).unwrap_or(0);
         let c_opt = integer_sqrt(radicand);
-        Some(c_opt.max(1).min(n) as u32)
+        Some(as_count(c_opt.max(1).min(n)))
+    }
+
+    /// The worker count this plan will spread over, which is
+    /// [`Self::effective_workers`] resolved against the process-global
+    /// arena that [`crate::sched::par_iter`] dispatches to.
+    ///
+    /// Starts that arena if it is not already running.
+    #[inline]
+    #[must_use]
+    pub fn resolved_workers(&self) -> usize {
+        self.effective_workers(crate::sched::arena::global_local_arena().total_workers())
     }
 }
 
@@ -1841,5 +1866,81 @@ mod tests {
         // Federated does not collapse on batch_size; large K is its
         // own concern (single op may take milliseconds).
         assert_eq!(pick_tier(&plan, &topo), SchedTier::Federated);
+    }
+
+    #[test]
+    fn the_no_argument_chunk_count_is_the_item_count_form_over_its_own_count() {
+        let p = JobPlan::new(6, 4096)
+            .with_estimated_per_item_ns(50)
+            .with_task_overhead_ns(500);
+        assert_eq!(p.optimal_chunk_count(8), p.optimal_chunk_count_for(8, 4096));
+
+        // effective_task_count is the count the no-argument form uses
+        // when set, so the item-count form reproduces it by being
+        // handed that number and not batch_size.
+        let counted = p.with_effective_task_count(256);
+        assert_eq!(
+            counted.optimal_chunk_count(8),
+            counted.optimal_chunk_count_for(8, 256)
+        );
+        assert_ne!(
+            counted.optimal_chunk_count_for(8, 4096),
+            counted.optimal_chunk_count_for(8, 256),
+            "a different item count must give a different answer, or the parameter does nothing"
+        );
+    }
+
+    #[test]
+    fn a_chunk_count_needs_both_hints_and_never_exceeds_the_item_count() {
+        let n = 4096usize;
+        assert!(JobPlan::new(6, 4096).optimal_chunk_count_for(8, n).is_none());
+        assert!(
+            JobPlan::new(6, 4096)
+                .with_estimated_per_item_ns(50)
+                .optimal_chunk_count_for(8, n)
+                .is_none(),
+            "a per-item cost without an overhead has no fixed cost to divide by"
+        );
+        assert!(
+            JobPlan::new(6, 4096)
+                .with_task_overhead_ns(500)
+                .optimal_chunk_count_for(8, n)
+                .is_none(),
+            "an overhead without a per-item cost has no work to spread"
+        );
+
+        // Cheap items against a tiny overhead ask for far more chunks
+        // than there are items; the clamp is what stops it.
+        let c = JobPlan::new(6, 4096)
+            .with_estimated_per_item_ns(u32::MAX)
+            .with_task_overhead_ns(1)
+            .optimal_chunk_count_for(64, n)
+            .expect("both hints are set");
+        assert!(c as usize <= n, "chunk count must clamp at the item count");
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn an_item_count_past_the_return_type_saturates_rather_than_wrapping() {
+        // Zero fixed cost returns the item count itself, which is the
+        // path a count wider than the return type reaches.
+        let huge = u32::MAX as usize + 1024;
+        let p = JobPlan::new(6, 4096)
+            .with_estimated_per_item_ns(50)
+            .with_task_overhead_ns(0);
+        assert_eq!(p.optimal_chunk_count_for(8, huge), Some(u32::MAX));
+    }
+
+    #[test]
+    fn a_worker_cap_reaches_the_resolved_count() {
+        let uncapped = JobPlan::new(6, 4096).resolved_workers();
+        assert!(uncapped >= 1, "a pool is at least one worker wide");
+        assert_eq!(
+            JobPlan::new(6, 4096).with_workers(1).resolved_workers(),
+            1,
+            "a cap of one is how a caller asks for serial execution"
+        );
+        let capped = JobPlan::new(6, 4096).with_workers(2).resolved_workers();
+        assert_eq!(capped, uncapped.min(2));
     }
 }
