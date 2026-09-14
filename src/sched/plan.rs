@@ -1248,6 +1248,15 @@ impl JobPlan {
     /// in flight, so `total_workers` counts threads that exist rather
     /// than threads that run, and this is the count to divide work by.
     ///
+    /// It is also capped by the CPUs this process is allowed to use
+    /// right now, from
+    /// [`crate::sched::host_width::allowed_parallelism`]. The pool is
+    /// spawned once and its threads outlive a change to the process
+    /// affinity mask or the cgroup quota, so on a host that has narrowed
+    /// since startup the arena counts workers that can no longer reach a
+    /// core. Chunking against that count divides the work among threads
+    /// that will not run it.
+    ///
     /// Starts the arena if it is not already running.
     #[inline]
     #[must_use]
@@ -1258,7 +1267,8 @@ impl JobPlan {
         } else {
             arena.primary_workers()
         };
-        self.effective_workers(running)
+        let allowed = crate::sched::host_width::allowed_parallelism();
+        self.effective_workers(running.min(allowed))
     }
 }
 
