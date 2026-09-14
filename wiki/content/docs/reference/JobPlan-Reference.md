@@ -369,6 +369,8 @@ pub fn effective_use_smt(&self) -> bool
 
 Returns whether SMT siblings should activate for this dispatch, accounting for both the plan's `use_smt` field AND the variance-driven SMT-suppression observer. When the per-leaf cv-squared sampler indicates uniform-cost work (low variance), this returns `false` even if `plan.use_smt` is `true`, because SMT-2 siblings help when they can fill stall bubbles in heterogeneous workloads but hurt when every leaf is the same shape (the siblings would contest the same execution unit). See the [load-bearing invariants](../explanation/Architecture-Overview.md) for the full mechanism.
 
+**Which variance it reads.** The figure is the delta window the site's classifier last ticked over, through `CallSiteState::window_cv2_per_mille`, which is the same quantity the `cv2_low_per_mille` threshold bounds when a class is decided. The site's lifetime `cv2_per_mille` answers only until a window has been classified. That distinction is load-bearing: the lifetime figure is an equal-weight average over every leaf the site has ever run, so spread entering it during a busy stretch can be diluted only by running enough later leaves to outweigh it, and an SMT decision resting on it does not come back when the host goes quiet. A site-less plan still consults the process-wide counters.
+
 ### `pick_backend`
 
 ```rust
@@ -423,6 +425,8 @@ How many workers will actually run this plan's work: the process arena's primari
 Under the default worker sizing this equals the arena's whole width. The per-node count defaults to the node's logical threads, and `NumaArena::new` spawns an SMT extension only when the primaries do not already cover them, so primaries equal logical threads and there are no siblings to park. A 24-thread host reads 24 whatever the plan says about SMT.
 
 It diverges from `NumaArena::total_workers` only where the primaries are fewer than the logical threads: `FLYNNEL_SCHED_PHYSICAL_ONLY=on`, `FLYNNEL_SCHED_SMT=off`, or an explicit `FLYNNEL_SCHED_WORKERS` below the logical count. There the siblings exist and park unless a dispatch with `use_smt` is in flight, so `total_workers` counts threads that exist rather than threads that run, and the Tiny-Tasks model sized against it overstates parallelism twofold and asks for chunks about 1.4 times too narrow.
+
+It is also capped by the CPUs the process is allowed to use at that moment, from `sched::host_width::allowed_parallelism`. The pool is spawned once and its threads outlive a change to the process affinity mask or the cgroup CPU quota, so on a host that has narrowed since startup the arena counts workers that can no longer reach a core, and chunking against that count divides work among threads that will not run it. The query honours both the affinity mask and the cgroup quota and is re-read at most every 250 ms, because it costs a syscall and, on Linux, a cgroup read.
 
 Starts the arena if it is not already running, so it is not a free inspection on a process that has not yet used the pool.
 
