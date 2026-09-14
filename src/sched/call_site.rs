@@ -93,7 +93,7 @@ const FULL_WEIGHT: u64 = 1000;
 /// where it knows. Zero is not that answer: it is the weight of a batch
 /// that never got a core, which is a reading rather than the absence of
 /// one.
-fn batch_weight_per_mille(on_core_ticks: u64, wall_ticks: u64) -> Option<u64> {
+pub(crate) fn batch_weight_per_mille(on_core_ticks: u64, wall_ticks: u64) -> Option<u64> {
     if wall_ticks == 0 {
         return None;
     }
@@ -232,6 +232,11 @@ pub struct CallSiteState {
     leaf_sumsq_scaled: AtomicU64,
     leaf_items: AtomicU64,
     leaf_sumsq_per_item: AtomicU64,
+    // Summed weight of the batches those sums came from, in parts per
+    // mille of a batch. The sums above carry the same factor, so this is
+    // the count they divide by; `leaf_count` counts leaves and is what
+    // the sample guards and the tick quantum read.
+    leaf_weight_sum: AtomicU64,
     // Snapshot of the cumulative counters at the previous classifier
     // tick; each tick classifies the delta window since then.
     last_count: AtomicU64,
@@ -239,6 +244,7 @@ pub struct CallSiteState {
     last_sumsq: AtomicU64,
     last_items: AtomicU64,
     last_sumsq_per_item: AtomicU64,
+    last_weight_sum: AtomicU64,
     // Mean leaf time in nanoseconds and cv^2 per mille of the delta
     // window the latest tick classified, and how many windows have been
     // classified.
@@ -354,11 +360,13 @@ impl CallSiteState {
             leaf_sumsq_scaled: AtomicU64::new(0),
             leaf_items: AtomicU64::new(0),
             leaf_sumsq_per_item: AtomicU64::new(0),
+            leaf_weight_sum: AtomicU64::new(0),
             last_count: AtomicU64::new(0),
             last_sum_ns: AtomicU64::new(0),
             last_sumsq: AtomicU64::new(0),
             last_items: AtomicU64::new(0),
             last_sumsq_per_item: AtomicU64::new(0),
+            last_weight_sum: AtomicU64::new(0),
             window_mean_ns: AtomicU64::new(0),
             window_cv2: AtomicU64::new(0),
             window_ticks: AtomicU64::new(0),
@@ -575,10 +583,54 @@ impl CallSiteState {
         items: u64,
         sumsq_per_item: u64,
     ) {
-        self.leaf_sum_ns.fetch_add(sum_ns, Ordering::Relaxed);
-        self.leaf_sumsq_scaled.fetch_add(sumsq_scaled, Ordering::Relaxed);
-        self.leaf_items.fetch_add(items, Ordering::Relaxed);
-        self.leaf_sumsq_per_item.fetch_add(sumsq_per_item, Ordering::Relaxed);
+        self.record_batch_weighted(sum_ns, sumsq_scaled, count, items, sumsq_per_item, None)
+    }
+
+    /// [`Self::record_batch_site_only`] with the share of the batch's
+    /// interval its worker spent on a core, from
+    /// [`batch_weight_per_mille`].
+    ///
+    /// Every sum carries the weight as a factor and so does the count
+    /// they are divided by, so each statistic is a ratio of weighted
+    /// totals: a batch that held its cores counts for a whole batch and
+    /// one that got a third of them counts for a third. The means are
+    /// unchanged by the weighting and only the influence moves, which is
+    /// what a sample of unknown extra spread is worth.
+    ///
+    /// `None` records the batch at full weight. That is what a platform
+    /// with no thread clock, and a batch whose ends did not both carry a
+    /// reading, must contribute: an unweighted sample rather than a
+    /// suppressed one, because no reading is not evidence of contention.
+    ///
+    /// The sums scale by up to [`FULL_WEIGHT`] and are not divided back
+    /// down, which keeps the ratios exact rather than truncating a small
+    /// batch's items to zero. That costs ten bits of headroom on
+    /// counters that already saturate, and `leaf_sumsq_scaled` is the
+    /// one close enough to its ceiling for that to be reachable.
+    ///
+    /// `leaf_count` is left unweighted, because it is a count of leaves
+    /// rather than a quantity the statistics divide: it drives the
+    /// sample guards and the classifier quantum, and weighting it would
+    /// put both out by whatever the host was doing.
+    pub(crate) fn record_batch_weighted(
+        &'static self,
+        sum_ns: u64,
+        sumsq_scaled: u64,
+        count: u64,
+        items: u64,
+        sumsq_per_item: u64,
+        weight_per_mille: Option<u64>,
+    ) {
+        let w = weight_per_mille.unwrap_or(FULL_WEIGHT).min(FULL_WEIGHT);
+        let scale = |v: u64| v.saturating_mul(w);
+        self.leaf_sum_ns.fetch_add(scale(sum_ns), Ordering::Relaxed);
+        self.leaf_sumsq_scaled
+            .fetch_add(scale(sumsq_scaled), Ordering::Relaxed);
+        self.leaf_items.fetch_add(scale(items), Ordering::Relaxed);
+        self.leaf_sumsq_per_item
+            .fetch_add(scale(sumsq_per_item), Ordering::Relaxed);
+        self.leaf_weight_sum
+            .fetch_add(scale(count), Ordering::Relaxed);
         let prior = self.leaf_count.fetch_add(count, Ordering::Relaxed);
         let new_total = prior.wrapping_add(count);
         if (prior / SITE_CLASSIFY_QUANTUM) != (new_total / SITE_CLASSIFY_QUANTUM) {
@@ -597,6 +649,10 @@ impl CallSiteState {
         }
         let sum = self.leaf_sum_ns.load(Ordering::Relaxed);
         let sumsq = self.leaf_sumsq_scaled.load(Ordering::Relaxed);
+        // The sums carry each batch's weight as a factor, so the count
+        // they divide by has to carry it too. `n` above is leaves, which
+        // is what the four-sample guard is about.
+        let n = self.leaf_weight_sum.load(Ordering::Relaxed).max(1);
         let mean_scaled = (sum >> 8) / n;
         if mean_scaled == 0 {
             return Some(0);
@@ -716,6 +772,11 @@ impl CallSiteState {
         let ditems = items.saturating_sub(self.last_items.load(Ordering::Relaxed));
         let dsumsq_per_item =
             sumsq_per_item.saturating_sub(self.last_sumsq_per_item.load(Ordering::Relaxed));
+        let weight_sum = self.leaf_weight_sum.load(Ordering::Relaxed);
+        let dweight = weight_sum
+            .saturating_sub(self.last_weight_sum.load(Ordering::Relaxed))
+            .max(1);
+        self.last_weight_sum.store(weight_sum, Ordering::Relaxed);
         self.last_count.store(count, Ordering::Relaxed);
         self.last_sum_ns.store(sum, Ordering::Relaxed);
         self.last_sumsq.store(sumsq, Ordering::Relaxed);
@@ -735,12 +796,15 @@ impl CallSiteState {
         let (mean_ns, cv2) = if let Some(mean) = per_item {
             (mean, per_item_cv2(dsumsq_per_item, mean, ditems))
         } else {
-            let mean = dsum / dcount;
-            let scaled_mean = (dsum >> 8) / dcount;
+            // Divided by the window's summed weight rather than its leaf
+            // count, because the sums carry each batch's weight as a
+            // factor and a leaf count does not.
+            let mean = dsum / dweight;
+            let scaled_mean = (dsum >> 8) / dweight;
             let spread = if scaled_mean == 0 {
                 0
             } else {
-                let sumsq_per_n = dsumsq / dcount;
+                let sumsq_per_n = dsumsq / dweight;
                 let mean_sq = scaled_mean.saturating_mul(scaled_mean);
                 let var = sumsq_per_n.saturating_sub(mean_sq);
                 var.saturating_mul(1000) / mean_sq.max(1)

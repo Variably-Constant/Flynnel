@@ -442,23 +442,30 @@ impl LocalLeafBuffer {
         // would grow the site's wall total against an unchanged on-core
         // total, and the site would read as contended on precisely the
         // platforms that cannot measure contention.
-        if let (Some(start), Some(end)) =
+        // The same pair gives the batch its weight, so a batch recorded
+        // while its worker was off its core counts for the share of the
+        // interval it actually ran. A pair that measured nothing weighs
+        // a whole batch: no reading is not evidence of contention.
+        let weight = if let (Some(start), Some(end)) =
             (self.site_thread_at_start.ticks(), thread.ticks())
         {
-            site.add_pool_ticks(
-                end.saturating_sub(start),
-                wall.saturating_sub(self.site_wall_at_start),
-            );
-        }
+            let on_core = end.saturating_sub(start);
+            let elapsed = wall.saturating_sub(self.site_wall_at_start);
+            site.add_pool_ticks(on_core, elapsed);
+            crate::sched::call_site::batch_weight_per_mille(on_core, elapsed)
+        } else {
+            None
+        };
         let (sum_ns, sumsq_scaled) =
             Self::as_nanos(self.site_sum_ns, self.site_sumsq_scaled);
         let (_, sumsq_per_item) = Self::as_nanos(0, self.site_sumsq_per_item);
-        site.record_batch_site_only(
+        site.record_batch_weighted(
             sum_ns,
             sumsq_scaled,
             self.site_count,
             self.site_items,
             sumsq_per_item,
+            weight,
         );
         self.site_sum_ns = 0;
         self.site_sumsq_scaled = 0;
