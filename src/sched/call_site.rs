@@ -69,6 +69,39 @@ fn per_item_cv2(sumsq_per_item: u64, mean: u64, items: u64) -> u64 {
     (spread.saturating_mul(1000) / expected) as u64
 }
 
+/// The weight of a batch that spent its whole interval on a core.
+const FULL_WEIGHT: u64 = 1000;
+
+/// A batch's weight in parts per mille: the share of its interval the
+/// worker spent on a core, from the tick pair the recorder reads at both
+/// ends of the batch.
+///
+/// Formed from the two sums directly in 128 bits. The occupancy reported
+/// beside a dispatch is in hundredths, and taking the weight from that
+/// would move it in steps of ten per mille, which is the whole spread
+/// between a batch that got 99 percent of its cores and one that got
+/// 100.
+///
+/// Capped at [`FULL_WEIGHT`]. The two counts come from different clocks
+/// on Windows - executed cycles against a fixed-rate timestamp counter -
+/// so a boosted core reads over one, and a batch cannot count for more
+/// than one batch because its host was generous.
+///
+/// `None` where the pair describes no interval: a batch whose ends did
+/// not both carry an on-core count, or one whose elapsed count is zero.
+/// A caller decides what an unweighted batch means to it, at the point
+/// where it knows. Zero is not that answer: it is the weight of a batch
+/// that never got a core, which is a reading rather than the absence of
+/// one.
+fn batch_weight_per_mille(on_core_ticks: u64, wall_ticks: u64) -> Option<u64> {
+    if wall_ticks == 0 {
+        return None;
+    }
+    let share = (on_core_ticks as u128).saturating_mul(FULL_WEIGHT as u128)
+        / (wall_ticks as u128);
+    Some((share as u64).min(FULL_WEIGHT))
+}
+
 /// Policy-arm trial cadence: every Nth arm selection returns the
 /// non-preferred arm so its EWMA stays fresh enough to detect drift.
 const ARM_TRIAL_CADENCE: u32 = 16;
@@ -1178,6 +1211,43 @@ pub(crate) fn registry_len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_batch_that_held_its_cores_weighs_a_whole_batch() {
+        assert_eq!(batch_weight_per_mille(8_000, 8_000), Some(FULL_WEIGHT));
+        assert_eq!(batch_weight_per_mille(4_800, 8_000), Some(600));
+    }
+
+    #[test]
+    fn a_weight_resolves_a_single_part_per_mille() {
+        // The occupancy printed beside a dispatch is in hundredths, so a
+        // weight taken from it would move in steps of ten per mille and
+        // read both of these as zero. One percent of a batch is the
+        // difference between a pool that held its cores and one that did
+        // not, which is the distinction the weight exists to carry.
+        assert_eq!(batch_weight_per_mille(1, 1_000), Some(1));
+        assert_eq!(batch_weight_per_mille(999, 1_000), Some(999));
+    }
+
+    #[test]
+    fn a_boosted_clock_pair_weighs_one_batch_and_not_more() {
+        // On Windows the two counts come from different clocks: executed
+        // cycles against a fixed-rate timestamp counter, so a core above
+        // its base frequency reads over one. A generous host must not
+        // make a batch count for more than a batch.
+        assert_eq!(batch_weight_per_mille(12_000, 8_000), Some(FULL_WEIGHT));
+    }
+
+    #[test]
+    fn an_interval_that_never_elapsed_has_no_weight_rather_than_none_of_one() {
+        // Zero is the weight of a batch that got no core at all. Handing
+        // it back for a pair that measured nothing would make a platform
+        // without the clock read as permanently contended, which is the
+        // defect the ThreadTicks type exists to prevent.
+        assert_eq!(batch_weight_per_mille(0, 0), None);
+        assert_eq!(batch_weight_per_mille(5_000, 0), None);
+        assert_eq!(batch_weight_per_mille(0, 8_000), Some(0));
+    }
 
     #[test]
     fn a_per_item_spread_is_read_at_its_own_value() {
