@@ -715,6 +715,73 @@ impl Sleep {
 mod tests {
     use super::*;
 
+    /// Put the controller in a known state and enable it, so a test
+    /// reads its response rather than whatever an earlier test left.
+    fn arm_controller(window: u32) {
+        spin_init();
+        SPIN_WINDOW.store(window, Ordering::Relaxed);
+        ADAPTIVE.store(true, Ordering::Relaxed);
+        PARK_EVENTS.store(0, Ordering::Relaxed);
+        RESCUE_EVENTS.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_window_that_keeps_being_missed_shrinks_toward_the_floor() {
+        // Parks dominating means the spin ran out before work arrived,
+        // which on a contended host is a worker burning slices a
+        // neighbour could have used.
+        arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
+        PARK_EVENTS.store(300, Ordering::Relaxed);
+        RESCUE_EVENTS.store(4, Ordering::Relaxed);
+        maybe_adapt();
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS / 2);
+
+        for _ in 0..12 {
+            PARK_EVENTS.store(300, Ordering::Relaxed);
+            RESCUE_EVENTS.store(4, Ordering::Relaxed);
+            maybe_adapt();
+        }
+        assert_eq!(spin_window(), FLOOR_SPIN_WINDOW_ROUNDS);
+    }
+
+    #[test]
+    fn a_window_that_keeps_paying_grows_back_but_never_past_the_tuned_default() {
+        // Rescues dominating means work landed inside the window and the
+        // spin saved a park and unpark pair.
+        arm_controller(FLOOR_SPIN_WINDOW_ROUNDS);
+        for _ in 0..64 {
+            PARK_EVENTS.store(4, Ordering::Relaxed);
+            RESCUE_EVENTS.store(300, Ordering::Relaxed);
+            maybe_adapt();
+        }
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
+    }
+
+    #[test]
+    fn one_burst_does_not_move_the_window() {
+        // Below the evidence floor the controller has seen too little to
+        // tell a workload's shape from a moment of it.
+        arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
+        PARK_EVENTS.store(200, Ordering::Relaxed);
+        RESCUE_EVENTS.store(0, Ordering::Relaxed);
+        maybe_adapt();
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
+    }
+
+    #[test]
+    fn the_controller_stays_still_while_it_is_off() {
+        // Off is the shipped default, and the window it holds is the one
+        // tuned across three host classes.
+        spin_init();
+        SPIN_WINDOW.store(DEFAULT_SPIN_WINDOW_ROUNDS, Ordering::Relaxed);
+        ADAPTIVE.store(false, Ordering::Relaxed);
+        PARK_EVENTS.store(1_000, Ordering::Relaxed);
+        RESCUE_EVENTS.store(0, Ordering::Relaxed);
+        maybe_adapt();
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
+        reset_spin_stats();
+    }
+
     #[test]
     fn counters_initial_state_is_zero() {
         let c = AtomicCounters::new();
