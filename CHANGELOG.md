@@ -103,6 +103,54 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   item alongside an explicit per-item cost and `use_smt`. The vector
   classes say nothing the batch size does not and still steer nothing.
   `SchedTier`'s doc now lists what the selection reads.
+- A leaf batch is recorded at the share of its interval the pool spent
+  on a core. Every sum a call site keeps carries that weight as a
+  factor, and so does the count they are divided by, so each statistic
+  is a ratio of weighted totals: the means do not move and only a
+  contended batch's influence does. The recorder already read the thread
+  and elapsed clocks at both ends of every batch and handed the pair to
+  a report, so no path gains a clock read. `leaf_count` stays a count of
+  leaves, because the sample guards and the classifier quantum read it.
+  A batch whose ends did not both carry an on-core reading weighs a
+  whole batch: no reading is not evidence of contention.
+- `JobPlan::effective_use_smt` decides from the window the site's
+  classifier last read rather than from its lifetime cv^2, falling back
+  to the lifetime figure only until a window has been classified. The
+  lifetime figure is an equal-weight average over every leaf a site has
+  ever run, so a contended stretch could be diluted only by running
+  enough later leaves to outweigh it, and an SMT decision resting on it
+  did not come back when the host went quiet. The window is also the
+  quantity `cv2_low_per_mille` bounds when a class is decided.
+- `JobPlan::resolved_workers` caps by the CPUs the process may currently
+  use, through the new `sched::host_width::allowed_parallelism`. The
+  pool is spawned once and its threads outlive a change to the process
+  affinity mask or the cgroup CPU quota, so a host that has narrowed
+  since startup left the arena counting workers that cannot reach a
+  core. `std::thread::available_parallelism` honours both and is re-read
+  at most every 250 ms, because the answer costs a syscall and on Linux
+  a cgroup read. A failed query says so once, naming the error and the
+  width it keeps, and holds the last successful reading: one is a width
+  a genuinely pinned process has, so resolving an error to it would
+  silence the pool wherever the query is unsupported.
+- `CpuCalibration` records the occupancy its draw ran at, and
+  `CALIBRATION` layout version rises from 4 to 5, so the first start on
+  any host after this measures again. The spread a record already
+  carried says whether its samples agreed with each other; it cannot say
+  whether they agreed on the wrong number, which is what a draw taken
+  while a neighbour held half the machine produces - every sample slow,
+  and slow by about the same amount. The figure gates nothing: the share
+  of free cores is a continuous property of a host rather than a state
+  it is in, so no cutoff separates a contended draw from a clean one,
+  and a reader holding two records can prefer the better-drawn one.
+  `OCCUPANCY_UNRECORDED` is distinct from zero, which is the share a
+  thread that never reached a core genuinely reports.
+- `CpuCalibration::new` takes the occupancy as a sixth argument, which
+  is a breaking change for a caller constructing one directly.
+- `OccupancySample::per_mille` reports the same fraction as `percent` at
+  a thousandth rather than a hundredth. Ten per mille is the whole
+  distance between a pool that held its cores and one that lost a
+  hundredth of them, which is what a reader comparing two records is
+  looking at.
 
 ### Fixed
 
