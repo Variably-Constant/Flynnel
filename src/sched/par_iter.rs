@@ -1029,13 +1029,16 @@ fn stored_or_measured() -> HostDispatchProfile {
     // describes whoever picked it.
     let occupancy_window = crate::sched::occupancy::OccupancyWindow::start();
     let (profile, spread) = measure_host_dispatch();
+    // Sampled once and both reported and stored, so the figure a reader
+    // sees on stderr is the one the record carries.
+    let drawn_at = occupancy_window.sample().per_mille();
     if std::env::var_os("FLYNNEL_OCCUPANCY").is_some() {
         // An unmeasured interval is reported as unmeasured. Printing a
         // number for it would tell a reader the calibration ran on a
         // quiet host when what happened is that nobody looked.
-        match occupancy_window.sample().percent() {
-            Some(percent) => eprintln!(
-                "flynnel: host calibration ran at {percent} percent occupancy, \
+        match drawn_at {
+            Some(share) => eprintln!(
+                "flynnel: host calibration ran at {share} per mille occupancy, \
                  spread {spread} per mille",
             ),
             None => eprintln!(
@@ -1054,6 +1057,7 @@ fn stored_or_measured() -> HostDispatchProfile {
                     profile.jec_wake_threshold_ns,
                     spread,
                     SAMPLES as u32,
+                    drawn_at,
                 ),
                 &[],
             );

@@ -59,7 +59,7 @@ pub const CALIBRATION_MAGIC: u64 = 0x464C_4342_0000_0001;
 
 /// Raising this changes every host stamp, so the next start on any host
 /// measures again. Raise it whenever a stored field changes meaning.
-pub const LAYOUT_VERSION: u32 = 4;
+pub const LAYOUT_VERSION: u32 = 5;
 
 /// Devices a table records. A host with more reports the first
 /// [`MAX_ACCEL`] and the rest go unrecorded rather than overflowing.
@@ -196,8 +196,27 @@ pub struct CpuCalibration {
     pub spread_per_mille: u32,
     /// Samples the spread was computed from.
     pub samples: u32,
-    _pad: [u8; 24],
+    /// Share of the measuring thread's interval spent on a core, in
+    /// parts per mille, or [`OCCUPANCY_UNRECORDED`] where the platform
+    /// reports no thread clock.
+    ///
+    /// The spread says whether the samples agreed with each other. It
+    /// cannot say whether they agreed on the wrong number, which is what
+    /// a draw taken while a neighbour held half the machine produces:
+    /// every sample slow, and slow by about the same amount. This is the
+    /// figure that separates those, and it gates nothing - a reader with
+    /// two records can prefer the better-drawn one, which is a
+    /// comparison rather than a cutoff.
+    pub occupancy_per_mille: u32,
+    _pad: [u8; 20],
 }
+
+/// No thread clock on this platform, so nothing was recorded.
+///
+/// Distinct from zero, which is the share a thread that never reached a
+/// core genuinely reports. A record that could not be measured must not
+/// sort as the worst-drawn one.
+pub const OCCUPANCY_UNRECORDED: u32 = u32::MAX;
 
 impl CpuCalibration {
     /// A record stamped with the current time.
@@ -206,12 +225,18 @@ impl CpuCalibration {
     /// [`crate::sched::par_iter::sample_spread_per_mille`] over the
     /// samples the median was taken from, and decides whether this
     /// stands as the host's calibration or as one loaded reading of it.
+    ///
+    /// `occupancy_per_mille` is `None` where the platform reports no
+    /// thread clock, which is stored as [`OCCUPANCY_UNRECORDED`] rather
+    /// than as a share, so a record nobody could measure does not sort
+    /// beneath one measured on a saturated host.
     pub fn new(
         dispatch_cost_ns: u64,
         collapse_threshold_ns: u64,
         jec_wake_threshold_ns: u64,
         spread_per_mille: u32,
         samples: u32,
+        occupancy_per_mille: Option<u32>,
     ) -> Self {
         Self {
             dispatch_cost_ns,
@@ -220,7 +245,17 @@ impl CpuCalibration {
             measured_unix_s: now_unix_s(),
             spread_per_mille,
             samples,
-            _pad: [0; 24],
+            occupancy_per_mille: occupancy_per_mille.unwrap_or(OCCUPANCY_UNRECORDED),
+            _pad: [0; 20],
+        }
+    }
+
+    /// The share of the machine this record's draw actually got, or
+    /// `None` where the platform could not measure it.
+    pub fn occupancy(&self) -> Option<u32> {
+        match self.occupancy_per_mille {
+            OCCUPANCY_UNRECORDED => None,
+            share => Some(share),
         }
     }
 

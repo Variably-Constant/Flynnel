@@ -1114,6 +1114,16 @@ impl JobPlan {
     /// counters. The first call at any site sees no variance
     /// history and pays the SMT cost; subsequent calls converge
     /// within a few samples.
+    ///
+    /// The site's figure is the window its classifier last read, the
+    /// same quantity `cv2_low_per_mille` bounds when a class is
+    /// decided, and it ages: a stretch of spread leaves the window as
+    /// later windows replace it. The site's lifetime cv^2 answers only
+    /// until a window has been classified. That figure is an
+    /// equal-weight average over every leaf the site has ever run, so a
+    /// period of contention can only be diluted by running enough later
+    /// leaves to outweigh it, and a decision resting on it does not come
+    /// back when the host goes quiet.
     #[inline]
     pub fn effective_use_smt(&self) -> bool {
         if !self.use_smt {
@@ -1122,10 +1132,14 @@ impl JobPlan {
         let threshold = crate::sched::adaptive_profile::class_thresholds()
             .cv2_low_per_mille
             .load(core::sync::atomic::Ordering::Relaxed);
-        if let Some(site) = self.site
-            && let Some(cv2) = site.get().cv2_per_mille()
-        {
-            return cv2 >= threshold;
+        if let Some(site) = self.site {
+            let state = site.get();
+            if let Some(cv2) = state
+                .window_cv2_per_mille()
+                .or_else(|| state.cv2_per_mille())
+            {
+                return cv2 >= threshold;
+            }
         }
         let stats = crate::sched::split_observer::snapshot_leaf_stats();
         !matches!(
