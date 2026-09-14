@@ -920,8 +920,37 @@ mod tests {
             measured_unix_s: now_unix_s(),
             spread_per_mille: 41,
             samples: 9,
-            _pad: [0; 24],
+            occupancy_per_mille: 970,
+            _pad: [0; 20],
         }
+    }
+
+    #[test]
+    fn a_record_from_a_platform_with_no_thread_clock_reports_no_occupancy() {
+        // Zero is the share a thread that never reached a core reports,
+        // so an unmeasured record storing zero would sort beneath one
+        // drawn on a saturated host.
+        let unmeasured =
+            CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, None);
+        assert_eq!(unmeasured.occupancy(), None);
+        assert_eq!(unmeasured.occupancy_per_mille, OCCUPANCY_UNRECORDED);
+
+        let starved = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(0));
+        assert_eq!(starved.occupancy(), Some(0));
+    }
+
+    #[test]
+    fn occupancy_is_provenance_and_gates_nothing() {
+        // The share of free cores is a continuous property of the host
+        // rather than a state it is in, so no cutoff separates a
+        // contended draw from a clean one. The figure records what a
+        // draw ran under and decides nothing on its own; a reader
+        // holding two records can prefer the better-drawn one.
+        let quiet = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        let loaded = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(210));
+        assert!(quiet.is_trustworthy());
+        assert!(loaded.is_trustworthy());
+        assert!(quiet.occupancy() > loaded.occupancy());
     }
 
     #[test]
