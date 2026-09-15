@@ -1050,7 +1050,7 @@ fn stored_or_measured() -> HostDispatchProfile {
     match store.try_acquire_writer() {
         Ok(writer) => {
             writer.beat();
-            writer.publish(
+            let outcome = writer.publish_if_better(
                 &CpuCalibration::new(
                     profile.dispatch_cost_ns,
                     profile.collapse_threshold_ns,
@@ -1061,6 +1061,22 @@ fn stored_or_measured() -> HostDispatchProfile {
                 ),
                 &[],
             );
+            // This process still runs on what it measured; only the
+            // table keeps the older record. Said rather than passed
+            // over, because a measurement that was taken and then
+            // discarded is not the same event as one that was stored,
+            // and the two are indistinguishable from the outside.
+            if let crate::sched::calibration_store::PublishOutcome::KeptIncumbent {
+                incumbent,
+                offered,
+            } = outcome
+            {
+                eprintln!(
+                    "flynnel: this host's stored calibration was drawn at {incumbent} per \
+                     mille occupancy and this one at {offered}; the stored record stands \
+                     and this process uses what it measured"
+                );
+            }
         }
         // Another process on this host is measuring the same table. Its
         // record serves the next start; this process keeps the profile

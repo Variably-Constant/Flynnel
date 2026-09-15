@@ -775,6 +775,27 @@ pub struct WriterGuard<'a> {
     store: &'a CalibrationStore,
 }
 
+/// What [`WriterGuard::publish_if_better`] did with the record it was
+/// offered.
+///
+/// A refusal is reported rather than silent. A writer that measured,
+/// found the table already better served and wrote nothing has done
+/// something worth saying; returning unit would make that identical to
+/// having published.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The record was written.
+    Published,
+    /// The table held a record drawn while more of the machine was
+    /// free, and it stands. Both figures are in parts per mille.
+    KeptIncumbent {
+        /// What the stored record was drawn at.
+        incumbent: u32,
+        /// What this draw ran at.
+        offered: u32,
+    },
+}
+
 impl WriterGuard<'_> {
     /// Raise the heartbeat. A writer calls this before each probe so a
     /// starting process can tell a slow measurement from a dead one.
@@ -783,6 +804,50 @@ impl WriterGuard<'_> {
             .header()
             .heartbeat_epoch
             .fetch_add(1, Ordering::Release);
+    }
+
+    /// Publish unless the table already holds a record drawn on a
+    /// quieter host.
+    ///
+    /// This is an ORDERING BETWEEN TWO RECORDS, not a threshold on
+    /// either. No occupancy is called good or bad, and no cutoff
+    /// separates a contended draw from a clean one - the share of free
+    /// cores is a continuous property of a host rather than a state it
+    /// is in, so a cutoff would be a policy about how much of a machine
+    /// a calibration insists on and would have to be argued as one. Two
+    /// records can still be compared without any of that being settled.
+    ///
+    /// The comparison runs only where it can decide something:
+    ///
+    /// - An incumbent whose own samples disagreed is replaced whatever
+    ///   it was drawn at. Its spread already says it does not describe
+    ///   the host, and occupancy cannot rescue it.
+    /// - Where both records carry an occupancy, the better-drawn one
+    ///   stands.
+    /// - Where either lacks one, occupancy cannot order them and the
+    ///   offered record is published, which is the behavior a platform
+    ///   with no thread clock has always had. Absence must not freeze a
+    ///   table against every later measurement.
+    ///
+    /// The spread and the occupancy answer different questions and both
+    /// are needed. Spread says whether a draw's samples agreed with each
+    /// other; it cannot say whether they agreed on the wrong number,
+    /// which is what a neighbour holding half the machine produces -
+    /// every sample slow, and slow by about the same amount.
+    pub fn publish_if_better(
+        &self,
+        cpu: &CpuCalibration,
+        accel: &[AccelCalibration],
+    ) -> PublishOutcome {
+        if let Some((incumbent, _)) = self.store.read()
+            && incumbent.is_trustworthy()
+            && let (Some(held), Some(offered)) = (incumbent.occupancy(), cpu.occupancy())
+            && held > offered
+        {
+            return PublishOutcome::KeptIncumbent { incumbent: held, offered };
+        }
+        self.publish(cpu, accel);
+        PublishOutcome::Published
     }
 
     /// Publish a measurement under the SeqLock.
@@ -951,6 +1016,109 @@ mod tests {
         assert!(quiet.is_trustworthy());
         assert!(loaded.is_trustworthy());
         assert!(quiet.occupancy() > loaded.occupancy());
+    }
+
+    /// Publish `first`, then offer `second`, and report what happened
+    /// along with what the table holds afterward.
+    fn offer_after(
+        tag: &str,
+        first: CpuCalibration,
+        second: CpuCalibration,
+    ) -> (PublishOutcome, CpuCalibration, PathBuf) {
+        let dir = temp_dir(tag);
+        let s = stamp(12, 24);
+        let store = CalibrationStore::open_or_create(&dir, &s).expect("create");
+        {
+            let w = store.try_acquire_writer().expect("no other writer");
+            w.publish(&first, &[]);
+        }
+        let outcome = {
+            let w = store.try_acquire_writer().expect("still the only writer");
+            w.publish_if_better(&second, &[])
+        };
+        let (held, _) = store.read().expect("a record is present either way");
+        (outcome, held, dir)
+    }
+
+    #[test]
+    fn a_draw_on_a_quieter_host_replaces_one_taken_under_load() {
+        let loaded = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
+        let quiet = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        let (outcome, held, dir) = offer_after("better", loaded, quiet);
+        assert_eq!(outcome, PublishOutcome::Published);
+        assert_eq!(held.dispatch_cost_ns, 1_000, "the quieter draw is what stands");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_draw_under_load_does_not_displace_one_taken_on_a_quieter_host() {
+        // The refusal is an ordering between two records, not a cutoff
+        // on either: 210 is not called bad, it is called worse than 990.
+        let quiet = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        let loaded = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
+        let (outcome, held, dir) = offer_after("worse", quiet, loaded);
+        assert_eq!(
+            outcome,
+            PublishOutcome::KeptIncumbent { incumbent: 990, offered: 210 },
+            "the refusal names both figures so a caller can say why"
+        );
+        assert_eq!(held.dispatch_cost_ns, 1_000, "the stored record is untouched");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_record_whose_own_samples_disagreed_is_replaced_however_it_was_drawn() {
+        // Spread and occupancy answer different questions. A record that
+        // cannot describe the host by its own samples is not rescued by
+        // having been drawn on a quiet one.
+        let scattered = CpuCalibration::new(
+            9_000,
+            70_000,
+            40_000,
+            PROVISIONAL_SPREAD_PER_MILLE + 1,
+            9,
+            Some(990),
+        );
+        assert!(!scattered.is_trustworthy(), "the incumbent's samples disagreed");
+        let loaded = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(210));
+        let (outcome, held, dir) = offer_after("spread", scattered, loaded);
+        assert_eq!(outcome, PublishOutcome::Published);
+        assert_eq!(held.dispatch_cost_ns, 1_000);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn an_unmeasured_occupancy_publishes_rather_than_freezing_the_table() {
+        // Where either side lacks a reading the two cannot be ordered,
+        // and the offered record is published. A platform with no thread
+        // clock must not leave the first record ever written standing
+        // against every later measurement.
+        let held_unmeasured = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, None);
+        let offered = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(210));
+        let (outcome, held, dir) = offer_after("no-incumbent-reading", held_unmeasured, offered);
+        assert_eq!(outcome, PublishOutcome::Published);
+        assert_eq!(held.dispatch_cost_ns, 1_000);
+        cleanup(&dir);
+
+        let quiet = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(990));
+        let offered_unmeasured = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, None);
+        let (outcome2, held2, dir2) =
+            offer_after("no-offer-reading", quiet, offered_unmeasured);
+        assert_eq!(outcome2, PublishOutcome::Published);
+        assert_eq!(held2.dispatch_cost_ns, 1_000);
+        cleanup(&dir2);
+    }
+
+    #[test]
+    fn an_equal_draw_publishes_so_a_fresher_measurement_wins_a_tie() {
+        // Equal occupancy orders nothing, and the newer measurement is
+        // the one with the better claim to describe the host now.
+        let first = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(700));
+        let second = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(700));
+        let (outcome, held, dir) = offer_after("tie", first, second);
+        assert_eq!(outcome, PublishOutcome::Published);
+        assert_eq!(held.dispatch_cost_ns, 1_000);
+        cleanup(&dir);
     }
 
     #[test]
