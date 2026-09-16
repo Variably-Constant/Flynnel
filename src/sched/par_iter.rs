@@ -4346,6 +4346,60 @@ mod tests {
     }
 
     #[test]
+    fn the_sampled_path_reaches_the_site_with_an_on_core_reading() {
+        // The mechanism is worthless if it never populates, and a run
+        // that measured nothing would report as a mechanism that did not
+        // help. This asserts the whole chain the sampled path uses:
+        // bracket, thread-local buffer, flush, site.
+        static SITE: crate::sched::call_site::CallSiteState =
+            crate::sched::call_site::CallSiteState::new();
+        let site = crate::sched::call_site::SiteRef::new(&SITE);
+        assert_eq!(SITE.oncore_items(), 0, "a fresh site has taken no reading");
+
+        // Past FLUSH_THRESHOLD so the buffer reaches the site, with work
+        // in each leaf the compiler cannot discard: a body optimized
+        // away would leave a clock delta of zero, which is a reading a
+        // starved thread can genuinely have.
+        let mut sink = 0u64;
+        for i in 0..(LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4) {
+            sink = sink.wrapping_add(record_leaf_on_core(Some(site), 64, || {
+                let mut acc = 0u64;
+                for k in 0..4_096u64 {
+                    acc = acc.wrapping_add(std::hint::black_box(k ^ i as u64));
+                }
+                acc
+            }));
+        }
+        std::hint::black_box(sink);
+
+        // A platform without a thread clock takes no readings at all,
+        // and that is a correct outcome rather than a failure: the
+        // classifier falls back to wall time there. So the assertion is
+        // conditional on the platform reporting one, and says which case
+        // it took rather than passing silently in both.
+        let (thread, _) = crate::sched::occupancy::clock_pair();
+        if thread.ticks().is_some() {
+            assert!(
+                SITE.oncore_items() > 0,
+                "this platform has a thread clock, so the sampled path must have \
+                 carried a reading to the site"
+            );
+            assert!(
+                SITE.per_item_oncore_cv2_per_mille().is_some(),
+                "items were recorded, so a spread is computable from them"
+            );
+        } else {
+            assert_eq!(
+                SITE.oncore_items(),
+                0,
+                "with no thread clock the site must hold no on-core items rather \
+                 than a zero that reads as a measurement"
+            );
+            assert_eq!(SITE.per_item_oncore_cv2_per_mille(), None);
+        }
+    }
+
+    #[test]
     fn host_dispatch_profile_is_measured_and_cached() {
         let t0 = std::time::Instant::now();
         let p = calibrate_host_dispatch();
