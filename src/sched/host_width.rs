@@ -93,16 +93,45 @@ fn report_probe_failure(err: &std::io::Error, keeping: usize) {
 /// alone, so the next call retries rather than waiting out the interval
 /// on a reading that never happened.
 pub fn allowed_parallelism() -> usize {
-    let cached = ALLOWED.load(Ordering::Relaxed);
-    let now = now_ms();
-    if cached != 0 && !is_due(LAST_READ_MS.load(Ordering::Relaxed), now, RECHECK_INTERVAL_MS) {
+    resolve(
+        &ALLOWED,
+        &LAST_READ_MS,
+        now_ms(),
+        RECHECK_INTERVAL_MS,
+        std::thread::available_parallelism,
+    )
+}
+
+/// The cadence and the failure rule, over caller-supplied state and a
+/// caller-supplied probe.
+///
+/// Split out because the behavior worth testing is what happens when
+/// the allowed width CHANGES, and narrowing a live process needs a
+/// platform call this crate makes nowhere else - `SetProcessAffinityMask`
+/// on Windows, `sched_setaffinity` on Linux, a third thing on FreeBSD.
+/// A test that cannot narrow the process can still hand this a probe
+/// that answers differently on successive calls, which is the same
+/// question without three platform arms and a test that skips itself on
+/// two of them.
+fn resolve<P>(
+    allowed: &AtomicUsize,
+    last_read_ms: &AtomicU64,
+    now: u64,
+    interval_ms: u64,
+    probe: P,
+) -> usize
+where
+    P: FnOnce() -> std::io::Result<std::num::NonZeroUsize>,
+{
+    let cached = allowed.load(Ordering::Relaxed);
+    if cached != 0 && !is_due(last_read_ms.load(Ordering::Relaxed), now, interval_ms) {
         return cached;
     }
-    match std::thread::available_parallelism() {
+    match probe() {
         Ok(width) => {
             let width = width.get();
-            ALLOWED.store(width, Ordering::Relaxed);
-            LAST_READ_MS.store(now, Ordering::Relaxed);
+            allowed.store(width, Ordering::Relaxed);
+            last_read_ms.store(now, Ordering::Relaxed);
             width
         }
         Err(err) => {
@@ -119,6 +148,74 @@ pub fn allowed_parallelism() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A probe answering a fixed width, as the OS would after a quota
+    /// change.
+    fn says(n: usize) -> impl FnOnce() -> std::io::Result<std::num::NonZeroUsize> {
+        move || Ok(std::num::NonZeroUsize::new(n).expect("a width is at least one"))
+    }
+
+    /// A probe that cannot answer, as an unsupported host would.
+    fn cannot_answer() -> impl FnOnce() -> std::io::Result<std::num::NonZeroUsize> {
+        || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this host does not report it",
+            ))
+        }
+    }
+
+    #[test]
+    fn a_narrowed_quota_takes_effect_on_the_next_reading() {
+        // The case the lever exists for: the pool was spawned for
+        // sixteen and the process may now use four.
+        let allowed = AtomicUsize::new(0);
+        let last = AtomicU64::new(0);
+        assert_eq!(resolve(&allowed, &last, 1_000, 250, says(16)), 16);
+        // Inside the interval the cached answer stands and the probe is
+        // not consulted, which is what makes this affordable per
+        // dispatch.
+        assert_eq!(resolve(&allowed, &last, 1_100, 250, says(4)), 16);
+        // Past it, the narrower machine is what the caller gets.
+        assert_eq!(resolve(&allowed, &last, 1_400, 250, says(4)), 4);
+    }
+
+    #[test]
+    fn a_widened_quota_takes_effect_too() {
+        // A pool that shrank and could not grow back would be a ratchet
+        // of the kind this project keeps finding.
+        let allowed = AtomicUsize::new(0);
+        let last = AtomicU64::new(0);
+        assert_eq!(resolve(&allowed, &last, 1_000, 250, says(4)), 4);
+        assert_eq!(resolve(&allowed, &last, 1_400, 250, says(16)), 16);
+    }
+
+    #[test]
+    fn a_failed_reading_keeps_the_last_width_and_retries_at_once() {
+        let allowed = AtomicUsize::new(0);
+        let last = AtomicU64::new(0);
+        assert_eq!(resolve(&allowed, &last, 1_000, 250, says(16)), 16);
+        // One is a width a genuinely pinned process has, so an error
+        // must not produce it while a real reading exists.
+        assert_eq!(resolve(&allowed, &last, 1_400, 250, cannot_answer()), 16);
+        // The timestamp was not advanced by the failure, so the very
+        // next call probes again rather than waiting out the interval on
+        // a reading that never happened.
+        assert_eq!(resolve(&allowed, &last, 1_401, 250, says(4)), 4);
+    }
+
+    #[test]
+    fn a_first_reading_that_fails_reports_one_rather_than_zero() {
+        // Zero is the no-reading sentinel and would be read as a width.
+        let allowed = AtomicUsize::new(0);
+        let last = AtomicU64::new(0);
+        assert_eq!(resolve(&allowed, &last, 1_000, 250, cannot_answer()), 1);
+        assert_eq!(
+            allowed.load(Ordering::Relaxed),
+            0,
+            "a failed probe stores nothing, so the next success is still a first reading"
+        );
+    }
 
     #[test]
     fn a_reading_is_due_only_once_the_interval_has_passed() {

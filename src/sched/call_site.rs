@@ -237,6 +237,22 @@ pub struct CallSiteState {
     // the count they divide by; `leaf_count` counts leaves and is what
     // the sample guards and the tick quantum read.
     leaf_weight_sum: AtomicU64,
+    // The same leaves timed on the thread's own clock, which advances
+    // only while the thread is on a core. Kept in raw counter ticks and
+    // never converted: on Windows the thread clock counts executed
+    // cycles against a fixed-rate elapsed counter, so a nanosecond
+    // conversion would carry the achieved-to-base clock ratio into every
+    // figure. A cv^2 is a ratio and a common factor cancels out of it,
+    // so these feed the SPREAD only and the mean stays on wall time,
+    // where the classifier's nanosecond boundaries are stated.
+    //
+    // Populated on the sampled path, where the cost of two extra clock
+    // reads is divided by the stride. A site whose leaves are all
+    // recorded off that path carries zero here and says so by its item
+    // count rather than by a spread of zero.
+    leaf_oncore_items: AtomicU64,
+    leaf_oncore_sum: AtomicU64,
+    leaf_oncore_sumsq_per_item: AtomicU64,
     // Snapshot of the cumulative counters at the previous classifier
     // tick; each tick classifies the delta window since then.
     last_count: AtomicU64,
@@ -245,6 +261,9 @@ pub struct CallSiteState {
     last_items: AtomicU64,
     last_sumsq_per_item: AtomicU64,
     last_weight_sum: AtomicU64,
+    last_oncore_items: AtomicU64,
+    last_oncore_sum: AtomicU64,
+    last_oncore_sumsq_per_item: AtomicU64,
     // Mean leaf time in nanoseconds and cv^2 per mille of the delta
     // window the latest tick classified, and how many windows have been
     // classified.
@@ -361,6 +380,12 @@ impl CallSiteState {
             leaf_items: AtomicU64::new(0),
             leaf_sumsq_per_item: AtomicU64::new(0),
             leaf_weight_sum: AtomicU64::new(0),
+            leaf_oncore_items: AtomicU64::new(0),
+            leaf_oncore_sum: AtomicU64::new(0),
+            leaf_oncore_sumsq_per_item: AtomicU64::new(0),
+            last_oncore_items: AtomicU64::new(0),
+            last_oncore_sum: AtomicU64::new(0),
+            last_oncore_sumsq_per_item: AtomicU64::new(0),
             last_count: AtomicU64::new(0),
             last_sum_ns: AtomicU64::new(0),
             last_sumsq: AtomicU64::new(0),
@@ -638,6 +663,70 @@ impl CallSiteState {
         }
     }
 
+    /// Record a batch of leaves timed on the thread's own clock.
+    ///
+    /// Separate from [`Self::record_batch_weighted`] because these are
+    /// the same leaves measured against a different clock, not more
+    /// leaves: adding them to the leaf count would double it. They carry
+    /// their own item count, so a site that reaches this path for some
+    /// of its leaves and not others divides each figure by the items
+    /// that figure actually covers.
+    ///
+    /// Raw counter ticks, unconverted. See the field comment: only a
+    /// ratio is ever taken of these, and a ratio is what survives the
+    /// unit being different from the elapsed clock's.
+    pub(crate) fn record_oncore_batch(
+        &'static self,
+        oncore_sum: u64,
+        oncore_sumsq_per_item: u64,
+        items: u64,
+    ) {
+        if items == 0 {
+            return;
+        }
+        self.leaf_oncore_sum.fetch_add(oncore_sum, Ordering::Relaxed);
+        self.leaf_oncore_sumsq_per_item
+            .fetch_add(oncore_sumsq_per_item, Ordering::Relaxed);
+        self.leaf_oncore_items.fetch_add(items, Ordering::Relaxed);
+    }
+
+    /// cv^2 per mille of per-item cost measured on the thread's own
+    /// clock, or `None` where no leaf carried an on-core reading.
+    ///
+    /// This is the figure a neighbour cannot move. Wall time rises both
+    /// because the work is irregular and because the thread lost its
+    /// core, and preemption lands on some leaves and not others, so it
+    /// reaches a wall-time spread as variance that is indistinguishable
+    /// from the work's own. A thread's own clock does not advance while
+    /// the thread is off a core, so a preempted leaf reports what it
+    /// cost rather than what it waited.
+    ///
+    /// `None` rather than zero: zero is the spread of perfectly uniform
+    /// work, which is a reading, and a site whose leaves never reached
+    /// the sampled path has no reading at all.
+    pub fn per_item_oncore_cv2_per_mille(&self) -> Option<u64> {
+        let items = self.leaf_oncore_items.load(Ordering::Relaxed);
+        if items == 0 {
+            return None;
+        }
+        let mean = self.leaf_oncore_sum.load(Ordering::Relaxed) / items;
+        if mean == 0 {
+            return None;
+        }
+        let sumsq = self.leaf_oncore_sumsq_per_item.load(Ordering::Relaxed);
+        Some(per_item_cv2(sumsq, mean, items))
+    }
+
+    /// Leaves' worth of items that carried an on-core reading.
+    ///
+    /// Beside [`Self::per_item_oncore_cv2_per_mille`] so a reader can
+    /// weigh how much the spread rests on, and distinct from
+    /// [`Self::leaf_count`], which counts every leaf however it was
+    /// timed.
+    pub fn oncore_items(&self) -> u64 {
+        self.leaf_oncore_items.load(Ordering::Relaxed)
+    }
+
     /// Coefficient-of-variation squared (parts-per-1000) over this
     /// site's cumulative leaf history, or `None` below 4 samples.
     /// Same fixed-point convention as the global
@@ -792,9 +881,43 @@ impl CallSiteState {
         // A window whose samples carried no item count - the heartbeat's
         // serial spans - is classified on its leaf times, which is all
         // such a sample can say.
+        // The window's on-core deltas, taken over the same leaves on the
+        // thread's own clock. A spread computed from these is the work's
+        // own irregularity; the same spread computed from wall time also
+        // carries every leaf that lost its core, because preemption
+        // lands on some leaves and not others and so arrives as variance
+        // rather than as a level shift.
+        let oncore_items = self.leaf_oncore_items.load(Ordering::Relaxed);
+        let oncore_sum = self.leaf_oncore_sum.load(Ordering::Relaxed);
+        let oncore_sumsq = self.leaf_oncore_sumsq_per_item.load(Ordering::Relaxed);
+        let d_oncore_items =
+            oncore_items.saturating_sub(self.last_oncore_items.load(Ordering::Relaxed));
+        let d_oncore_sum =
+            oncore_sum.saturating_sub(self.last_oncore_sum.load(Ordering::Relaxed));
+        let d_oncore_sumsq = oncore_sumsq
+            .saturating_sub(self.last_oncore_sumsq_per_item.load(Ordering::Relaxed));
+        self.last_oncore_items.store(oncore_items, Ordering::Relaxed);
+        self.last_oncore_sum.store(oncore_sum, Ordering::Relaxed);
+        self.last_oncore_sumsq_per_item
+            .store(oncore_sumsq, Ordering::Relaxed);
+
+        // Ticks, not nanoseconds, and only ever a ratio is taken of
+        // them, so the clock's unit never reaches a threshold.
+        let oncore_cv2 = d_oncore_sum
+            .checked_div(d_oncore_items)
+            .filter(|mean| *mean > 0)
+            .map(|mean| per_item_cv2(d_oncore_sumsq, mean, d_oncore_items));
+
         let per_item = dsum.checked_div(ditems);
         let (mean_ns, cv2) = if let Some(mean) = per_item {
-            (mean, per_item_cv2(dsumsq_per_item, mean, ditems))
+            // The mean stays on wall time, where the classifier's
+            // nanosecond boundaries are stated. The spread comes from
+            // the on-core clock where the window carried one, and falls
+            // back to wall time where it did not, which is what a
+            // platform with no thread clock has always had.
+            let spread = oncore_cv2
+                .unwrap_or_else(|| per_item_cv2(dsumsq_per_item, mean, ditems));
+            (mean, spread)
         } else {
             // Divided by the window's summed weight rather than its leaf
             // count, because the sums carry each batch's weight as a

@@ -208,7 +208,53 @@ fn record_leaf<F: FnOnce() -> R, R>(
     crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafEnd, 0);
     LOCAL_LEAF_BUFFER.with(|cell| {
         let mut buf = cell.borrow_mut();
-        buf.add(site, dt, items as u64);
+        buf.add(site, dt, items as u64, None);
+    });
+    out
+}
+
+/// [`record_leaf`] with the thread's own clock read either side as
+/// well, so the leaf carries what it COST beside what it TOOK.
+///
+/// The two differ by whatever the leaf spent off a core, and that
+/// difference is the whole reason a busy host moves the scheduler's
+/// choice rather than only its speed: preemption lands on some leaves
+/// and not others, so it enters a wall-time spread as variance that
+/// cannot be told from the work's own irregularity.
+///
+/// Only the sampled path calls this. Two extra clock reads cost far
+/// more than the two counter reads around them - the per-leaf
+/// instrumentation budget is about 4 ns amortized and a thread-clock
+/// read is an order above that - so it is affordable where the stride
+/// divides it and nowhere else. A leaf recorded off this path carries a
+/// wall time and no on-core reading, and the site divides each figure
+/// by the items that figure covers.
+///
+/// A platform with no thread clock records the wall time alone, which
+/// is what it has always recorded.
+#[inline(always)]
+fn record_leaf_on_core<F: FnOnce() -> R, R>(
+    site: Option<crate::sched::call_site::SiteRef>,
+    items: usize,
+    body: F,
+) -> R {
+    let (thread_before, _) = crate::sched::occupancy::clock_pair();
+    crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafStart, 0);
+    let t0 = read_tsc();
+    let out = body();
+    let dt = read_tsc().wrapping_sub(t0);
+    crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafEnd, 0);
+    let (thread_after, _) = crate::sched::occupancy::clock_pair();
+    // Both ends must have carried a count for the difference to describe
+    // an interval. One end without one leaves it unknowable, and a zero
+    // here would be the reading of a leaf that never reached a core.
+    let on_core = match (thread_before.ticks(), thread_after.ticks()) {
+        (Some(before), Some(after)) => Some(after.saturating_sub(before)),
+        _ => None,
+    };
+    LOCAL_LEAF_BUFFER.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.add(site, dt, items as u64, on_core);
     });
     out
 }
@@ -286,6 +332,13 @@ struct LocalLeafBuffer {
     /// on-core time against it, which would read as total contention.
     site_thread_at_start: crate::sched::occupancy::ThreadTicks,
     site_wall_at_start: u64,
+    /// The same leaves timed on the thread's own clock, in raw ticks,
+    /// for the leaves that carried a reading. Their own item count,
+    /// because a site reaches the sampled path for some leaves and not
+    /// others and each figure divides by the items it covers.
+    site_oncore_sum: u64,
+    site_oncore_sumsq_per_item: u64,
+    site_oncore_items: u64,
     /// Call site the buffered site-half samples belong to; null
     /// when the recent samples carried no site. Site changes are
     /// rare within one worker (only when it steals across
@@ -321,6 +374,9 @@ impl LocalLeafBuffer {
                 crate::sched::occupancy::NoReading::NoClock,
             ),
             site_wall_at_start: 0,
+            site_oncore_sum: 0,
+            site_oncore_sumsq_per_item: 0,
+            site_oncore_items: 0,
             site: core::ptr::null(),
         }
     }
@@ -331,6 +387,7 @@ impl LocalLeafBuffer {
         site: Option<crate::sched::call_site::SiteRef>,
         nanos: u64,
         items: u64,
+        oncore: Option<u64>,
     ) {
         let scaled = nanos >> 8;
         let sq = scaled.saturating_mul(scaled);
@@ -376,6 +433,23 @@ impl LocalLeafBuffer {
             self.site_sumsq_scaled = self.site_sumsq_scaled.saturating_add(sq);
             self.site_items = self.site_items.saturating_add(items);
             self.site_sumsq_per_item = self.site_sumsq_per_item.saturating_add(per_item_sq);
+            // The on-core reading, where this leaf carried one. Kept in
+            // raw ticks and summed the same shape as the wall side, so
+            // the two spreads are computed by the same arithmetic over
+            // different clocks. A leaf without one contributes to the
+            // wall figures and to nothing here, which is why the item
+            // count is separate: the on-core spread is divided by the
+            // items that actually carried a reading.
+            if let Some(ticks) = oncore {
+                let per_item_oncore = (ticks as u128)
+                    .saturating_mul(ticks as u128)
+                    .checked_div((items as u128) << 16)
+                    .unwrap_or(0) as u64;
+                self.site_oncore_sum = self.site_oncore_sum.saturating_add(ticks);
+                self.site_oncore_sumsq_per_item =
+                    self.site_oncore_sumsq_per_item.saturating_add(per_item_oncore);
+                self.site_oncore_items = self.site_oncore_items.saturating_add(items);
+            }
             self.site_count += 1;
             if self.site_count >= Self::FLUSH_THRESHOLD {
                 self.flush_site();
@@ -467,6 +541,16 @@ impl LocalLeafBuffer {
             sumsq_per_item,
             weight,
         );
+        // Unconverted, unlike the wall sums above: these are the thread
+        // clock's own ticks and only a ratio is taken of them.
+        site.record_oncore_batch(
+            self.site_oncore_sum,
+            self.site_oncore_sumsq_per_item,
+            self.site_oncore_items,
+        );
+        self.site_oncore_sum = 0;
+        self.site_oncore_sumsq_per_item = 0;
+        self.site_oncore_items = 0;
         self.site_sum_ns = 0;
         self.site_sumsq_scaled = 0;
         self.site_count = 0;
@@ -2151,7 +2235,7 @@ fn record_leaf_sampled<F: FnOnce() -> R, R>(
         v >= LEAF_SAMPLE_STRIDE
     });
     if should_sample {
-        record_leaf(site, items, body)
+        record_leaf_on_core(site, items, body)
     } else {
         // Unsampled leaves still appear in the trace (one cached
         // load each when tracing is off) so a traced dispatch shows
