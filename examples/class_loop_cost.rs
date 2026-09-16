@@ -671,6 +671,12 @@ fn main() {
         SITE.per_item_ns(),
         SITE.per_item_cv2_per_mille(),
     );
+    // Whether the on-core clock reached this site at all, beside what it
+    // read. Only the sampled path takes those readings, so a routing or
+    // a shape that never goes through it leaves the spread measured on
+    // wall time - and a row that did not say so would report a mechanism
+    // as ineffective when it was never engaged.
+    let oncore_pre = (SITE.oncore_items(), SITE.per_item_oncore_cv2_per_mille());
 
     load_window(
         shape,
@@ -695,9 +701,15 @@ fn main() {
     // from (window mean per-item ns, window cv^2 per mille) and the
     // site's lifetime per-item figures, after each window. A "-" is a
     // figure the site could not yet report.
+    //
+    // The last four are the on-core reading: items carried and per-item
+    // cv^2, before and after. Items of zero means no leaf at this site
+    // went through the sampled path, so the spread beside it was taken
+    // on wall time and reading it as the work's own irregularity would
+    // be wrong.
     let opt = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     println!(
-        "{} {} {:.4} {:.4} {:.4} {} {} {:?} {:?} {:.1} {:.1} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        "{} {} {:.4} {:.4} {:.4} {} {} {:?} {:?} {:.1} {:.1} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
         shape.name(),
         routing.name(),
         pre_ms,
@@ -723,6 +735,10 @@ fn main() {
         opt(SITE.window_cv2_per_mille()),
         opt(SITE.per_item_ns()),
         opt(SITE.per_item_cv2_per_mille()),
+        oncore_pre.0,
+        opt(oncore_pre.1),
+        SITE.oncore_items(),
+        opt(SITE.per_item_oncore_cv2_per_mille()),
     );
     if pre_n == 0 || post_n == 0 {
         eprintln!("the windows ran {pre_n} dispatches before and {post_n} after; raise the window");
