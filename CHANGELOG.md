@@ -103,16 +103,50 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   item alongside an explicit per-item cost and `use_smt`. The vector
   classes say nothing the batch size does not and still steer nothing.
   `SchedTier`'s doc now lists what the selection reads.
+- A call site's classifier takes its per-item SPREAD from the thread's
+  own clock, and keeps its mean on wall time.
+
+  Wall time rises both because the work is irregular and because the
+  thread lost its core, and preemption lands on some leaves and not
+  others, so it reaches a wall-time spread as variance indistinguishable
+  from the work's own. A thread's clock does not advance off a core, so
+  a preempted leaf reports what it cost rather than what it waited. The
+  sampled path brackets each leaf with both clocks; a window that
+  carried no on-core reading is classified on wall time, as every window
+  was before.
+
+  Measured paired inside one process, where the two figures cover the
+  same leaves and differ only in which clock timed them: across a load
+  event the wall spread rose more than the on-core spread in every one
+  of six trials on the gather shape, with the two agreeing on the quiet
+  window either side of it.
+
+  The on-core ticks are never converted to nanoseconds. On Windows that
+  clock counts executed cycles against a fixed-rate elapsed counter, so
+  a conversion would carry the achieved-to-base clock ratio into every
+  figure; a cv^2 is a ratio and a common factor cancels out of it. They
+  carry their own item count, because the sampled path takes a reading
+  for some leaves and not others and each figure divides by the items it
+  covers.
+
+  Two extra clock reads per sampled leaf, which the stride divides. The
+  per-leaf instrumentation budget is about 4 ns amortized and a thread
+  clock read is an order above that, so this is affordable where the
+  stride applies and is not done anywhere else.
 - A leaf batch is recorded at the share of its interval the pool spent
-  on a core. Every sum a call site keeps carries that weight as a
-  factor, and so does the count they are divided by, so each statistic
-  is a ratio of weighted totals: the means do not move and only a
-  contended batch's influence does. The recorder already read the thread
-  and elapsed clocks at both ends of every batch and handed the pair to
-  a report, so no path gains a clock read. `leaf_count` stays a count of
-  leaves, because the sample guards and the classifier quantum read it.
-  A batch whose ends did not both carry an on-core reading weighs a
-  whole batch: no reading is not evidence of contention.
+  on a core, and every sum a call site keeps carries that weight as a
+  factor along with the count they are divided by, so the means do not
+  move and only a contended batch's influence does. `leaf_count` stays a
+  count of leaves, because the sample guards and the classifier quantum
+  read it, and a batch whose ends did not both carry an on-core reading
+  weighs a whole batch: no reading is not evidence of contention.
+
+  This weighting reaches the class through the SPLIT rather than through
+  the figure the classifier reads - the chain runs weight, cv^2, SMT
+  decision, leaf floor, split - so it separated from the baseline on an
+  adaptive routing and on neither pinned one. It is kept because a
+  contended sample counting for less is right on its own terms, and it
+  is not what the spread change above rests on.
 - `JobPlan::effective_use_smt` decides from the window the site's
   classifier last read rather than from its lifetime cv^2, falling back
   to the lifetime figure only until a window has been classified. The
@@ -151,6 +185,27 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   distance between a pool that held its cores and one that lost a
   hundredth of them, which is what a reader comparing two records is
   looking at.
+- A calibration draw no longer displaces one taken on a quieter host.
+  `publish` overwrote whatever the table held, so a process measuring
+  while a neighbor held half the machine replaced a better-drawn record
+  and published its own for every later process to read.
+  `WriterGuard::publish_if_better` compares the two records instead.
+
+  It is an ordering between two records, not a threshold on either. No
+  occupancy is called good or bad: the share of free cores is a
+  continuous property of a host rather than a state it is in, so a
+  cutoff would be a policy about how much of a machine a calibration
+  insists on and would have to be argued as one. Two records can still
+  be compared without settling that.
+
+  The comparison runs only where it can decide. An incumbent whose own
+  samples disagreed is replaced whatever it was drawn at, because its
+  spread already says it does not describe the host. Where either record
+  lacks an occupancy the two cannot be ordered and the offer is
+  published, so a platform with no thread clock cannot freeze the table.
+  A tie publishes, because the fresher draw describes the host now. A
+  refusal returns `PublishOutcome::KeptIncumbent` naming both figures
+  rather than passing silently.
 
 ### Fixed
 
