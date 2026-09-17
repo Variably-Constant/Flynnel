@@ -4545,8 +4545,8 @@ mod tests {
         );
         assert!(
             !stored_record_serves(&fails, None, now),
-            "a record whose samples disagreed is measured over, and IS what the \
-             refusal is offered"
+            "a record whose samples disagreed is measured over, and a record in that \
+             state is the only kind the refusal is ever offered"
         );
     }
 
