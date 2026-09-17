@@ -121,6 +121,26 @@ def pair_gaps_per_mille(values):
     ]
 
 
+def line_buffer_stdout():
+    """Make this script's own output line-buffered.
+
+    Python block-buffers stdout when it is not a terminal, so a run
+    whose output is redirected or piped shows nothing until it exits.
+    Setting it here rather than relying on `-u` puts the fix in the
+    script: a caller who forgets the flag is the common case, and the
+    case where progress matters most is the one where output is being
+    captured.
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        # Older interpreter, or a stdout that cannot be reconfigured.
+        # Reported rather than passed over: the run is still correct,
+        # and the reader should know its progress may arrive in a lump.
+        print("stdout could not be line-buffered; progress may arrive at exit",
+              file=sys.stderr, flush=True)
+
+
 def note(text):
     """One progress line, flushed.
 
@@ -178,6 +198,7 @@ def parse(paths):
 
 
 def main(paths):
+    line_buffer_stdout()
     by_load, repeated = parse(paths)
     if not by_load:
         print("NO DRAWS PARSED")
