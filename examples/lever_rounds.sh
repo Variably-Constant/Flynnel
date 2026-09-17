@@ -60,6 +60,13 @@ unset FLYNNEL_LEVER_BATCH_WEIGHT
 unset FLYNNEL_LEVER_SMT_WINDOW
 unset FLYNNEL_LEVER_ALLOWED_WIDTH
 unset FLYNNEL_LEVER_CALIBRATION_REFUSAL
+# Not one of the five, and the same shape: a runtime switch defaulting
+# off with the same criterion to meet. Its evidence is an outcome the
+# pool already has rather than a load reading, so it is measured here
+# beside them. FLYNNEL_SPIN_WINDOW_ROUNDS would pin the window and turn
+# adaptation off, which is the other arm by accident.
+unset FLYNNEL_ADAPTIVE_SPIN
+unset FLYNNEL_SPIN_WINDOW_ROUNDS
 export FLYNNEL_HOST_PROFILE_NS="$profile"
 
 sh "$HOME/vm_presence.sh" claim $$ "flynnel per-lever throughput A/B, TIMINGS, needs a quiet box, about 20 minutes, Flynnel-Scholar"
@@ -125,7 +132,8 @@ run_arm() {
 for spec in \
     "ONCORE_SPREAD FLYNNEL_LEVER_ONCORE_SPREAD 0 0" \
     "BATCH_WEIGHT FLYNNEL_LEVER_BATCH_WEIGHT 0 $duty_ms" \
-    "SMT_WINDOW FLYNNEL_LEVER_SMT_WINDOW 1 0"
+    "SMT_WINDOW FLYNNEL_LEVER_SMT_WINDOW 1 0" \
+    "ADAPTIVE_SPIN FLYNNEL_ADAPTIVE_SPIN 0 $duty_ms"
 do
     set -- $spec
     lever="$1"

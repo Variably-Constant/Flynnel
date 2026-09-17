@@ -29,7 +29,7 @@ FAILED = re.compile(r"^ARM_FAILED\s+(\S+)\s+load(\d+)\s+t(\d+)\s+exit=(\d+)")
 # The fields a lever acts through. Each is discrete, so a switch that
 # moved none of them across its own arms moved no decision, whatever
 # the dispatch counts did.
-DECISIONS = ("class", "smt", "workers", "allowed")
+DECISIONS = ("class", "smt", "workers", "allowed", "spin_window")
 # The fields those decisions are taken from. Counters and spreads,
 # reported as medians because each arm is one process.
 MEASURES = (
@@ -40,6 +40,7 @@ MEASURES = (
     "cv2_oncore",
     "cv2_window",
     "window_ticks",
+    "idle_yields",
 )
 
 
@@ -127,8 +128,11 @@ def report_engagement(engage, levers, loads):
                 continue
             moved = []
             for field in DECISIONS:
-                off_values = {f.get(field) for f in arms["off"]}
-                on_values = {f.get(field) for f in arms["on"]}
+                # A dash where the log carries no such field, so a
+                # reader can tell a run that predates it from one whose
+                # value happened to be missing.
+                off_values = {f.get(field, "-") for f in arms["off"]}
+                on_values = {f.get(field, "-") for f in arms["on"]}
                 if off_values != on_values:
                     moved.append(f"{field} {sorted(off_values)} -> {sorted(on_values)}")
             # The load shape belongs beside the verdict: a weighting
@@ -142,7 +146,7 @@ def report_engagement(engage, levers, loads):
                     print(f"    moved   {line}")
             else:
                 held = ", ".join(
-                    f"{field}={sorted({f.get(field) for f in arms['off']})}"
+                    f"{field}={sorted({f.get(field, '-') for f in arms['off']})}"
                     for field in DECISIONS
                 )
                 print(f"    no decision moved between its own arms: {held}")

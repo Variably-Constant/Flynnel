@@ -31,10 +31,10 @@
 //! each switch had to work with: how many leaves reached the sampled
 //! on-core path, whether the on-core spread differs from the wall
 //! spread, whether a window has been classified, what the SMT answer
-//! came out as, and how the resolved width compares to the width the
-//! process is allowed. A switch whose figures are identical across its
-//! own on and off arms did not engage, and its throughput row says
-//! nothing about the mechanism.
+//! came out as, how the resolved width compares to the width the
+//! process is allowed, and where the spin window ended up. A switch
+//! whose figures are identical across its own on and off arms did not
+//! engage, and its throughput row says nothing about the mechanism.
 //!
 //! # Why the load can alternate
 //!
@@ -184,7 +184,8 @@ fn engagement(smt_prior: bool, duty_ms: u64) {
     let site = &SITE;
     println!(
         "engagement duty_ms={duty_ms} leaves={} oncore_items={} per_item_ns={} cv2_wall={} \
-         cv2_oncore={} cv2_window={} window_ticks={} class={:?} workers={} allowed={} smt={}",
+         cv2_oncore={} cv2_window={} window_ticks={} class={:?} workers={} allowed={} smt={} \
+         spin_window={} idle_yields={}",
         site.leaf_count(),
         site.oncore_items(),
         reading(site.per_item_ns()),
@@ -196,6 +197,8 @@ fn engagement(smt_prior: bool, duty_ms: u64) {
         plan.resolved_workers(),
         flynnel::sched::host_width::allowed_parallelism(),
         plan.effective_use_smt(),
+        flynnel::sched::spin_window(),
+        flynnel::sched::total_idle_yields(),
     );
 }
 
