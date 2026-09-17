@@ -29,7 +29,7 @@ FAILED = re.compile(r"^ARM_FAILED\s+(\S+)\s+load(\d+)\s+t(\d+)\s+exit=(\d+)")
 # The fields a lever acts through. Each is discrete, so a switch that
 # moved none of them across its own arms moved no decision, whatever
 # the dispatch counts did.
-DECISIONS = ("class", "smt", "workers", "allowed", "spin_window")
+DECISIONS = ("class", "smt", "workers", "allowed", "spin_adaptive", "spin_window")
 # The fields those decisions are taken from. Counters and spreads,
 # reported as medians because each arm is one process.
 MEASURES = (
@@ -139,8 +139,11 @@ def report_engagement(engage, levers, loads):
             # that only bites when batches differ reads as no effect
             # under a load that never lets up, and the duty is the only
             # record of which one this cell ran under.
-            duty = sorted({f.get("duty_ms", "-") for f in arms["off"]})
-            print(f"{lever} load{load} duty_ms={duty}:")
+            shape = ", ".join(
+                f"{k}={sorted({f.get(k, '-') for f in arms['off']})}"
+                for k in ("duty_ms", "reps", "irregular")
+            )
+            print(f"{lever} load{load} {shape}:")
             if moved:
                 for line in moved:
                     print(f"    moved   {line}")

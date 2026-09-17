@@ -30,7 +30,15 @@
 # because it has to be long enough for a batch to fall inside one
 # phase, which depends on the leaf size the workload produces.
 #
-# usage: lever_rounds.sh <tree> <window_s> <trials> <load_threads> <duty_ms> <profile_ns>
+# The workload shape is a parameter for the same kind of reason. Every
+# lever here acts through the call-site classifier, and a workload whose
+# leaves all cost the same gives the classifier a spread of zero and a
+# class nothing can move. `reps` sets the per-item cost and `irregular`
+# varies it deterministically with the index, so the work has a spread
+# of its own for contention to be told apart from.
+#
+# usage: lever_rounds.sh <tree> <window_s> <trials> <load_threads> <duty_ms>
+#                        <reps> <irregular> <profile_ns>
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -39,11 +47,13 @@ window="$2"
 trials="$3"
 load_threads="$4"
 duty_ms="$5"
-profile="$6"
+reps="$6"
+irregular="$7"
+profile="$8"
 
 if [ -z "$tree" ] || [ -z "$window" ] || [ -z "$trials" ] || [ -z "$load_threads" ] \
-    || [ -z "$duty_ms" ] || [ -z "$profile" ]; then
-    echo "usage: $0 <tree> <window_s> <trials> <load_threads> <duty_ms> <profile_ns>" >&2
+    || [ -z "$duty_ms" ] || [ -z "$reps" ] || [ -z "$irregular" ] || [ -z "$profile" ]; then
+    echo "usage: $0 <tree> <window_s> <trials> <load_threads> <duty_ms> <reps> <irregular> <profile_ns>" >&2
     exit 2
 fi
 
@@ -72,7 +82,7 @@ export FLYNNEL_HOST_PROFILE_NS="$profile"
 sh "$HOME/vm_presence.sh" claim $$ "flynnel per-lever throughput A/B, TIMINGS, needs a quiet box, about 20 minutes, Flynnel-Scholar"
 trap 'sh "$HOME/vm_presence.sh" release '"$$" EXIT INT TERM
 
-echo "LEVER_START $(date -u '+%Y-%m-%d %H:%M:%S') tree=$tree window=${window}s trials=$trials load=$load_threads duty_ms=$duty_ms profile=$profile"
+echo "LEVER_START $(date -u '+%Y-%m-%d %H:%M:%S') tree=$tree window=${window}s trials=$trials load=$load_threads duty_ms=$duty_ms reps=$reps irregular=$irregular profile=$profile"
 echo "HOST $(hostname) cores=$(nproc) load=$(cut -d' ' -f1-3 /proc/loadavg)"
 echo "HEAD $(cd "$tree" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
@@ -114,9 +124,9 @@ run_arm() {
     t="$7"
     echo "ARM ${lever}-${arm} load${load} t${t} $(date -u '+%H:%M:%S')"
     if [ "$arm" = on ]; then
-        env "$var=1" "$bin" "$window" "$load" 1 "$smt" "$duty"
+        env "$var=1" "$bin" "$window" "$load" 1 "$smt" "$duty" "$reps" "$irregular"
     else
-        "$bin" "$window" "$load" 1 "$smt" "$duty"
+        "$bin" "$window" "$load" 1 "$smt" "$duty" "$reps" "$irregular"
     fi
     rc=$?
     if [ "$rc" -ne 0 ]; then

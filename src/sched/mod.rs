@@ -96,7 +96,8 @@ pub use adaptive_profile::{
 };
 pub use latch::{CoreLatch, Latch};
 pub use jec_sleep::{
-    reset_spin_stats, set_spin_adaptive, set_spin_window, spin_window, total_idle_yields,
+    reset_spin_stats, set_spin_adaptive, set_spin_window, spin_adaptive, spin_window,
+    total_idle_yields,
 };
 pub use job::NUMA_HINT_ANY;
 pub use arena::{dispatch_trace_snapshot, dispatch_trace_wait_snapshot, join, join_context, join_default};

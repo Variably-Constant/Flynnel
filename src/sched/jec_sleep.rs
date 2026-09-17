@@ -385,6 +385,17 @@ pub fn set_spin_adaptive(on: bool) {
     ADAPTIVE.store(on, Ordering::Relaxed);
 }
 
+/// Whether the adaptive controller is running, after the environment
+/// has been read.
+///
+/// A window still at its default says either that the controller is off
+/// or that it is on and the evidence keeps it there, and a harness
+/// reporting only the window cannot tell those apart.
+pub fn spin_adaptive() -> bool {
+    spin_init();
+    ADAPTIVE.load(Ordering::Relaxed)
+}
+
 /// Per-worker sleep state held inside the global `Sleep` struct.
 ///
 /// `#[repr(align(128))]` so two adjacent workers in the Vec never

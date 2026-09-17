@@ -56,7 +56,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use flynnel::sched::par_iter::for_each_chunk_min_leaf;
+use flynnel::sched::par_iter::for_each_chunk_indexed_min_leaf;
 use flynnel::{CallSiteState, JobPlan, SiteRef};
 
 static SITE: CallSiteState = CallSiteState::new();
@@ -93,16 +93,42 @@ fn plan(smt_prior: bool) -> JobPlan {
     if smt_prior { plan.with_smt() } else { plan }
 }
 
+/// How much work one item costs, at its index.
+///
+/// Uniform gives every item `reps` rounds. Irregular varies them
+/// deterministically with the index, in `1 ..= 2 * reps - 1`, so the
+/// mean is `reps` and the shapes are comparable in total work while
+/// differing in spread.
+///
+/// Irregularity from the index rather than from the slot's value: the
+/// buffer is rewritten by every dispatch, so work derived from it would
+/// drift over a window and differ between two arms that ran different
+/// numbers of dispatches.
+#[inline]
+fn reps_at(index: usize, reps: u32, irregular: bool) -> u32 {
+    if !irregular || reps < 2 {
+        return reps;
+    }
+    let h = (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    1 + (h >> 33) as u32 % (2 * reps - 1)
+}
+
 /// Dispatches completed in `measured`, with whatever else is running.
-fn window(buf: &mut [u64], measured: Duration, smt_prior: bool) -> u64 {
+fn window(
+    buf: &mut [u64],
+    measured: Duration,
+    smt_prior: bool,
+    reps: u32,
+    irregular: bool,
+) -> u64 {
     let start = Instant::now();
     let mut dispatches = 0u64;
     while start.elapsed() < measured {
         let plan = plan(smt_prior);
-        for_each_chunk_min_leaf(&plan, buf, MIN_LEAF, |chunk| {
-            for slot in chunk.iter_mut() {
+        for_each_chunk_indexed_min_leaf(&plan, buf, MIN_LEAF, |start_idx, chunk| {
+            for (offset, slot) in chunk.iter_mut().enumerate() {
                 let mut acc = *slot;
-                for _ in 0..16 {
+                for _ in 0..reps_at(start_idx + offset, reps, irregular) {
                     acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 }
                 *slot = black_box(acc);
@@ -182,13 +208,14 @@ fn reading(value: Option<u64>) -> String {
 /// Read against the same line from the arm the switch was off in. Two
 /// arms whose engagement figures match ran the same code whatever the
 /// throughput rows did.
-fn engagement(smt_prior: bool, duty_ms: u64) {
+fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: bool) {
     let plan = plan(smt_prior);
     let site = &SITE;
     println!(
-        "engagement duty_ms={duty_ms} leaves={} oncore_items={} per_item_ns={} cv2_wall={} \
+        "engagement duty_ms={duty_ms} reps={reps} irregular={irregular} \
+         leaves={} oncore_items={} per_item_ns={} cv2_wall={} \
          cv2_oncore={} cv2_window={} window_ticks={} class={:?} workers={} allowed={} smt={} \
-         spin_window={} idle_yields={}",
+         spin_adaptive={} spin_window={} idle_yields={}",
         site.leaf_count(),
         site.oncore_items(),
         reading(site.per_item_ns()),
@@ -200,6 +227,7 @@ fn engagement(smt_prior: bool, duty_ms: u64) {
         plan.resolved_workers(),
         flynnel::sched::host_width::allowed_parallelism(),
         plan.effective_use_smt(),
+        flynnel::sched::spin_adaptive(),
         flynnel::sched::spin_window(),
         flynnel::sched::total_idle_yields(),
     );
@@ -211,6 +239,13 @@ fn main() {
     let trials: usize = arg(3, 5);
     let smt_prior: bool = arg::<u8>(4, 0) != 0;
     let duty_ms: u64 = arg(5, 0);
+    let reps: u32 = arg(6, 16);
+    let irregular: bool = arg::<u8>(7, 0) != 0;
+
+    if reps == 0 {
+        eprintln!("reps must be at least one, or the leaf body does nothing");
+        std::process::exit(2);
+    }
 
     // Which arm this process is. Printed rather than assumed, because a
     // switch that failed to engage produces rows indistinguishable from
@@ -238,7 +273,7 @@ fn main() {
     // One warm window, discarded: the first dispatches of a process pay
     // pool startup and the site's first classifier ticks, which belong
     // to no arm.
-    let warm = window(&mut buf, Duration::from_secs(1), smt_prior);
+    let warm = window(&mut buf, Duration::from_secs(1), smt_prior, reps, irregular);
     if warm == 0 {
         eprintln!("the warm window ran no dispatches; raise the window length");
         std::process::exit(2);
@@ -252,7 +287,7 @@ fn main() {
         if load.is_some() {
             std::thread::sleep(Duration::from_millis(250));
         }
-        let n = window(&mut buf, measured, smt_prior);
+        let n = window(&mut buf, measured, smt_prior, reps, irregular);
         if let Some(load) = load {
             load.stop();
         }
@@ -260,5 +295,5 @@ fn main() {
         println!("throughput {load_threads} {t} {n} {per_s:.2}");
     }
 
-    engagement(smt_prior, duty_ms);
+    engagement(smt_prior, duty_ms, reps, irregular);
 }
