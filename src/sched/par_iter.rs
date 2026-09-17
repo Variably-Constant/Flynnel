@@ -1479,12 +1479,17 @@ fn measure_host_dispatch() -> (HostDispatchProfile, u32) {
         }
         samples.sort_unstable();
         if std::env::var_os("FLYNNEL_PROFILE_SAMPLES").is_some() {
+            // Both dispersion figures, so a set of draws taken across
+            // known conditions can be compared on either without being
+            // re-run. The spread is what the trust check reads today;
+            // the IQR is the candidate it would be read against.
             eprintln!(
-                "profile sweep: min {} median {} max {} spread {} per mille samples {samples:?}",
+                "profile sweep: min {} median {} max {} spread {} iqr {} per mille samples {samples:?}",
                 samples[0],
                 samples[SAMPLES / 2],
                 samples[SAMPLES - 1],
                 sample_spread_per_mille(&samples),
+                sample_iqr_per_mille(&samples),
             );
         }
         (samples[SAMPLES / 2], sample_spread_per_mille(&samples))
@@ -1559,6 +1564,36 @@ pub fn sample_spread_per_mille(sorted: &[u64]) -> u32 {
     let median = sorted[sorted.len() / 2].max(1);
     let span = sorted[sorted.len() - 1].saturating_sub(sorted[0]);
     (span.saturating_mul(1000) / median).min(u32::MAX as u64) as u32
+}
+
+/// Interquartile range of a sorted sample set, in parts per thousand of
+/// its median.
+///
+/// Reported beside [`sample_spread_per_mille`] because the two describe
+/// different things and the difference decides whether a record is
+/// usable. The full range is defined by the extremes, so a single
+/// scheduling hiccup in nine samples sets it; the median a calibration
+/// keeps is chosen precisely because it survives that sample. Judging
+/// the one by the other refuses records whose medians are reproducible.
+///
+/// Measured on a 99.9-percent idle guest: five independent draws agreed
+/// on their medians to within 8 percent while each reported a range of
+/// 160 to 272 percent. Those cannot both describe the same dispersion.
+///
+/// Reported and not yet acted on. Which statistic should gate a record,
+/// and at what bound, has to be derived from draws taken across known
+/// conditions rather than chosen to make current draws pass.
+pub fn sample_iqr_per_mille(sorted: &[u64]) -> u32 {
+    if sorted.len() < 4 {
+        return 0;
+    }
+    let median = sorted[sorted.len() / 2].max(1);
+    // Nearest-rank quartiles. Exact interpolation would be a choice
+    // about a nine-sample set that the bound derivation should make, not
+    // this function.
+    let q1 = sorted[sorted.len() / 4];
+    let q3 = sorted[(sorted.len() * 3) / 4];
+    (q3.saturating_sub(q1).saturating_mul(1000) / median).min(u32::MAX as u64) as u32
 }
 
 /// True when this dispatch runs its body on the calling thread: the
@@ -4339,6 +4374,39 @@ mod tests {
         for (i, &x) in v.iter().enumerate() {
             assert_eq!(x, i as u32 + 1000, "item {i} processed exactly once");
         }
+    }
+
+    #[test]
+    fn one_outlier_moves_the_range_and_leaves_the_iqr_alone() {
+        // Why the two are reported side by side. Eight samples that
+        // agree and one that does not is the shape a scheduling hiccup
+        // produces, and it is the shape that refuses records whose
+        // medians are reproducible to a few percent.
+        let tight: Vec<u64> = vec![100, 101, 102, 103, 104, 105, 106, 107, 108];
+        assert!(
+            sample_spread_per_mille(&tight) < 100,
+            "samples that agree report a small range"
+        );
+
+        let mut hiccup = tight.clone();
+        hiccup[8] = 900;
+        assert!(
+            sample_spread_per_mille(&hiccup) > 7_000,
+            "one sample nine times the rest sets the whole range"
+        );
+        assert!(
+            sample_iqr_per_mille(&hiccup) < 100,
+            "the middle half is untouched by it, which is what the median keeps"
+        );
+
+        // And the case the range is right about: samples that genuinely
+        // disagree move both figures.
+        let scattered: Vec<u64> = vec![20, 50, 90, 140, 200, 260, 330, 410, 500];
+        assert!(sample_spread_per_mille(&scattered) > 2_000);
+        assert!(
+            sample_iqr_per_mille(&scattered) > 1_000,
+            "a spread that is real reaches the middle half too"
+        );
     }
 
     #[test]
