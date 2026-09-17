@@ -54,6 +54,31 @@ def spread_per_mille(values):
     return (max(values) - min(values)) * 1000.0 / m
 
 
+def pairwise_per_mille(values):
+    """Typical disagreement within a pair of draws, per thousand.
+
+    What a calibration could afford to measure about itself: draw
+    twice, compare the medians, keep nothing else. Pairs are DISJOINT -
+    (1,2), (3,4), (5,6) - so each one is what a single process taking
+    two draws would have seen, and no draw contributes to two of them.
+    Overlapping pairs would share a draw and correlate, which is not
+    the thing being tested.
+
+    The figure is the median over those pairs, so one unlucky pair does
+    not set it - the same reason a draw keeps a median.
+
+    Distinct from the spread over all of them, which needs as many
+    draws as it has and is what this is being tested against.
+    """
+    if len(values) < 2:
+        return None
+    m = median(values)
+    if not m:
+        return None
+    gaps = [abs(values[i + 1] - values[i]) for i in range(0, len(values) - 1, 2)]
+    return median(gaps) * 1000.0 / m
+
+
 def parse(paths):
     by_load = defaultdict(lambda: {"draws": [], "sweeps": []})
     repeated = 0
@@ -176,6 +201,15 @@ def separation(by_load):
         a = spread_per_mille([d[f] for d in by_load[lo]["draws"]])
         b = spread_per_mille([d[f] for d in by_load[hi]["draws"]])
         rows.append((f"across draws, {f}", a, b, ratio(a, b)))
+    # The one candidate a running calibration could afford. Five draws
+    # is not something a process start can pay for; two is. If the
+    # disagreement between one consecutive PAIR tracks the scatter of
+    # all five above, then two draws carry the signal and the extra
+    # three are not buying anything.
+    for f in FIGURES:
+        a = pairwise_per_mille([d[f] for d in by_load[lo]["draws"]])
+        b = pairwise_per_mille([d[f] for d in by_load[hi]["draws"]])
+        rows.append((f"two draws, {f}", a, b, ratio(a, b)))
     for key, label in (("spread", "within a draw, range"), ("iqr", "within a draw, iqr")):
         flat_lo = [s for per in by_load[lo]["sweeps"] for s in per]
         flat_hi = [s for per in by_load[hi]["sweeps"] for s in per]
