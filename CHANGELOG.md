@@ -282,6 +282,18 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   before it starts so a driver can narrow it partway through. It exits 3
   when every window saw one allowed width, because a run the narrowing
   never reached produces the same rows as a switch with no effect.
+- `sched::spin_adaptive` reports whether the park-versus-rescue
+  controller is running, after the environment has been read. The window
+  `sched::spin_window` returns sits at its tuned default both when the
+  controller is off and when it is on and the evidence keeps it there,
+  so a caller reporting only the window cannot tell those apart.
+- `examples/throughput_under_load.rs` takes the per-item cost and
+  whether it varies with the index. A workload whose items all cost the
+  same gives the call-site classifier a per-item spread of zero, and
+  every adaptive mechanism here reads that classifier, so such a
+  workload cannot show any of them doing anything. The irregular shape
+  varies the cost over `1 ..= 2 * reps - 1`, keeping the mean at `reps`
+  so the two shapes are comparable in total work.
 
 ### Fixed
 
