@@ -59,7 +59,15 @@ pub const CALIBRATION_MAGIC: u64 = 0x464C_4342_0000_0001;
 
 /// Raising this changes every host stamp, so the next start on any host
 /// measures again. Raise it whenever a stored field changes meaning.
-pub const LAYOUT_VERSION: u32 = 5;
+///
+/// It is also the only way to displace a record that is standing.
+/// [`CpuCalibration::is_trustworthy`] passing means the reader returns
+/// it and never reaches the branch that would publish a better one, so
+/// a record that clears the check is permanent for its stamp - and the
+/// check is likelier to pass for a draw taken under load, whose samples
+/// agree with each other because they were all slowed together. Two
+/// hosts here were serving such a record for six days.
+pub const LAYOUT_VERSION: u32 = 6;
 
 /// Devices a table records. A host with more reports the first
 /// [`MAX_ACCEL`] and the rest go unrecorded rather than overflowing.

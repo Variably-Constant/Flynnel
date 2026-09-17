@@ -1107,6 +1107,23 @@ fn stored_or_measured() -> HostDispatchProfile {
     if let Some((cpu, _accel)) = store.read()
         && cpu.is_trustworthy()
     {
+        // A read and a measurement produce the same three numbers and
+        // nothing else distinguished them, so a stale record looked
+        // exactly like a host that calibrates consistently. Said under
+        // the same variable that reports a draw, because the question
+        // a reader has is which of the two happened.
+        if std::env::var_os("FLYNNEL_OCCUPANCY").is_some() {
+            eprintln!(
+                "flynnel: host profile {},{},{} READ from the stored record, not \
+                 measured; it was drawn at {} per mille occupancy with spread {} per \
+                 mille and stands until the layout version changes",
+                cpu.dispatch_cost_ns,
+                cpu.collapse_threshold_ns,
+                cpu.jec_wake_threshold_ns,
+                cpu.occupancy().map_or_else(|| "an unrecorded".to_string(), |o| o.to_string()),
+                cpu.spread_per_mille,
+            );
+        }
         return HostDispatchProfile {
             dispatch_cost_ns: cpu.dispatch_cost_ns,
             collapse_threshold_ns: cpu.collapse_threshold_ns,
