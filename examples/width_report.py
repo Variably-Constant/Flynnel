@@ -1,9 +1,12 @@
 """The allowed-width lever, read either side of the narrowing.
 
-Windows up to and including NARROW_AFTER_WINDOW ran on the full
-machine; the ones after ran on the CPUs the process was left with. The
-criterion splits the same way: before the narrowing the switch must not
-be slower, after it the switch must be faster.
+Each window carries the width it was allowed, and the split is made on
+that rather than on the window index: the driver narrows on a schedule
+and a process that starts slowly puts the narrowing inside a window
+rather than between two. NARROW_AFTER_WINDOW is kept as a cross-check
+and a disagreement is reported. The criterion splits the same way:
+before the narrowing the switch must not be slower, after it the switch
+must be faster.
 
 The width and worker columns are the engagement evidence, and they come
 from the same rows. A run whose allowed width never moved narrowed
@@ -70,8 +73,16 @@ def parse(path):
     return split, rows, seen, problems
 
 
-def half(rows, split, after):
-    return [r for r in rows if (r["i"] > split) == after]
+def half(rows, full_width, after):
+    """Split on the width each window actually saw, not on its index.
+
+    The driver narrows on a schedule, and the schedule and the windows
+    drift against each other: a process that starts slowly puts the
+    narrowing inside a window rather than between two. Each row carries
+    the width it was allowed when it ended, so the rows say where the
+    boundary fell and the schedule is only a cross-check.
+    """
+    return [r for r in rows if (r["allowed"] < full_width) == after]
 
 
 def describe(rows, field):
@@ -80,14 +91,18 @@ def describe(rows, field):
 
 def main(path):
     split, rows, seen, problems = parse(path)
-    if split is None:
-        print("NO NARROW_AFTER_WINDOW MARKER - the log cannot be split")
-        return 1
     if not rows:
         print("NO WINDOW ROWS PARSED")
         return 1
 
-    print(f"narrowing applied after window {split}")
+    # The widest reading anywhere is the machine before anything was
+    # taken away. Rows at that width are the before half.
+    full_width = max(r["allowed"] for arm_rows in rows.values() for r in arm_rows)
+    if split is None:
+        print("no NARROW_AFTER_WINDOW marker; splitting on the width alone")
+    else:
+        print(f"narrowing scheduled after window {split}")
+    print(f"full width {full_width}, rows below it are the narrowed half")
     for line in problems:
         print(line)
 
@@ -103,8 +118,17 @@ def main(path):
                 f"  {arm:<5} every run saw one allowed width, so nothing was narrowed "
                 "and these rows measure nothing"
             )
-        before = half(rows[arm], split, False)
-        after = half(rows[arm], split, True)
+        before = half(rows[arm], full_width, False)
+        after = half(rows[arm], full_width, True)
+        # Where the boundary actually fell, against where it was
+        # scheduled. A process that started slowly puts the narrowing
+        # inside a window, and then the schedule names the wrong split.
+        landed = min((r["i"] for r in after), default=None)
+        if split is not None and landed is not None and landed != split + 1:
+            print(
+                f"  {arm:<5} the narrowing was scheduled after window {split} and first "
+                f"shows in window {landed}"
+            )
         print(
             f"  {arm:<5} allowed before {describe(before, 'allowed')} after "
             f"{describe(after, 'allowed')}   workers before "
@@ -117,7 +141,9 @@ def main(path):
     for label, after in (("before the narrowing", False), ("after the narrowing", True)):
         med = {}
         for arm in ("off", "null", "on"):
-            med[arm] = median([r["per_s"] for r in half(rows.get(arm, []), split, after)])
+            med[arm] = median(
+                [r["per_s"] for r in half(rows.get(arm, []), full_width, after)]
+            )
         if not all(med.values()):
             print(f"{label:<22}   incomplete")
             continue
