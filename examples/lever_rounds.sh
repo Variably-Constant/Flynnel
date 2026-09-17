@@ -109,18 +109,19 @@ echo "HEAD $(cd "$tree" && git rev-parse --short HEAD 2>/dev/null || echo unknow
 # Two switches are absent from the table below, and the absences are
 # printed so neither reads as an oversight.
 #
-# CALIBRATION_REFUSAL: the refusal is unreachable by construction, not
-# by anything about this host. Its one production caller sits in the
-# branch that runs when the stored record is absent or failed the trust
-# check, and prefers_incumbent returns None on its first line unless
-# the incumbent passed it. A record that passes is returned earlier and
-# never offered for comparison, so the two conditions cannot both hold.
+# CALIBRATION_REFUSAL: this harness pins the profile with
+# FLYNNEL_HOST_PROFILE_NS, so nothing in it draws a calibration and the
+# publish comparison the switch gates is never reached. That is a
+# property of the harness, not of the code. A rotation that wanted this
+# switch would have to let the calibration run, and would then need a
+# stored record old enough to age out, since a fresh draw with nothing
+# stored has no incumbent to compare against.
 #
 # ALLOWED_WIDTH: the cap comes from available_parallelism, which reads
 # the affinity mask and the cgroup quota. Burner threads move neither,
 # so the pool here is sized against a width that is still correct
 # whatever the load. width_rounds.sh narrows the process instead.
-echo "SKIPPED CALIBRATION_REFUSAL - unreachable by construction: its caller runs only when the stored record failed the trust check, and it returns early for exactly that case"
+echo "SKIPPED CALIBRATION_REFUSAL - this harness pins the profile with FLYNNEL_HOST_PROFILE_NS, so no calibration is drawn and the comparison the switch gates is never reached"
 echo "SKIPPED ALLOWED_WIDTH - load does not move the affinity mask or the cgroup quota; see width_rounds.sh"
 
 order_for() {
