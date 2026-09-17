@@ -40,6 +40,7 @@ exclude = [
     "/examples/analyze_trace.py",
     "/examples/pair_orders.py",
     "/examples/lever_report.py",
+    "/examples/profile_draws_report.py",
     "/examples/lever_rounds.sh",
     "/examples/width_report.py",
     "/examples/width_rounds.sh",
@@ -210,6 +211,9 @@ name = "clock_cost"
 
 [[example]]
 name = "width_narrowing"
+
+[[example]]
+name = "profile_draws"
 
 [[example]]
 name = "smt_wake_cost"
