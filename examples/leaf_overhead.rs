@@ -71,6 +71,13 @@ fn main() {
     let items: usize = arg(1, 1 << 16);
     let reps: u32 = arg(2, 16);
     let entry: String = arg(3, "indexed".to_string());
+    // One dispatch yields only as many gaps as it has leaf boundaries
+    // that happen to be adjacent on a thread, which came to fifteen in
+    // practice. The minimum of a sample rises as the sample shrinks, so
+    // a figure taken from fifteen cannot be compared with one taken from
+    // ten. Tracing many dispatches makes both sides large enough that
+    // the minimum settles and the counts can be matched.
+    let dispatches: usize = arg(4, 100);
 
     let mut buf: Vec<Item> = (0..items).map(|i| Item { reps, acc: i as u64 }).collect();
     let mut aux: Vec<Item> = vec![Item { reps, acc: 0 }; items];
@@ -86,41 +93,44 @@ fn main() {
         }
     });
 
+    if !matches!(entry.as_str(), "plain" | "indexed" | "triple") {
+        eprintln!("entry must be plain, indexed or triple, and was {entry:?}");
+        std::process::exit(2);
+    }
+
     flynnel::sched::trace::reset_current_thread();
 
-    match entry.as_str() {
-        "plain" => {
-            for_each_chunk_min_leaf(&plan, &mut buf, MIN_LEAF, |chunk| {
-                for slot in chunk.iter_mut() {
-                    grind(slot);
-                }
-            });
-        }
-        "indexed" => {
-            for_each_chunk_indexed_min_leaf(&plan, &mut buf, MIN_LEAF, |_start, chunk| {
-                for slot in chunk.iter_mut() {
-                    grind(slot);
-                }
-            });
-        }
-        "triple" => {
-            for_each_chunk_triple_min_leaf(
-                &plan,
-                &mut aux,
-                &buf,
-                &buf,
-                MIN_LEAF,
-                |out, a, _b| {
-                    for i in 0..out.len() {
-                        out[i] = a[i];
-                        grind(&mut out[i]);
+    for _ in 0..dispatches {
+        match entry.as_str() {
+            "plain" => {
+                for_each_chunk_min_leaf(&plan, &mut buf, MIN_LEAF, |chunk| {
+                    for slot in chunk.iter_mut() {
+                        grind(slot);
                     }
-                },
-            );
-        }
-        other => {
-            eprintln!("entry must be plain, indexed or triple, and was {other:?}");
-            std::process::exit(2);
+                });
+            }
+            "indexed" => {
+                for_each_chunk_indexed_min_leaf(&plan, &mut buf, MIN_LEAF, |_start, chunk| {
+                    for slot in chunk.iter_mut() {
+                        grind(slot);
+                    }
+                });
+            }
+            _ => {
+                for_each_chunk_triple_min_leaf(
+                    &plan,
+                    &mut aux,
+                    &buf,
+                    &buf,
+                    MIN_LEAF,
+                    |out, a, _b| {
+                        for i in 0..out.len() {
+                            out[i] = a[i];
+                            grind(&mut out[i]);
+                        }
+                    },
+                );
+            }
         }
     }
 
