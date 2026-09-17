@@ -1582,9 +1582,19 @@ pub fn sample_spread_per_mille(sorted: &[u64]) -> u32 {
 /// on their medians to within 8 percent while each reported a range of
 /// 160 to 272 percent. Those cannot both describe the same dispersion.
 ///
-/// Reported and not yet acted on. Which statistic should gate a record,
-/// and at what bound, has to be derived from draws taken across known
-/// conditions rather than chosen to make current draws pass.
+/// This does not solve that, and neither can any figure taken over one
+/// draw's samples. Across three load levels on two hosts it inverts
+/// exactly as the range does: under saturation every sample is slowed
+/// by about the same factor, so the samples agree with each other
+/// while the medians independent draws produce scatter by thousands of
+/// parts per thousand. On a Zen3 guest this read 128 quiet against 86
+/// saturated while the medians went 83 to 432,299. The property a
+/// bound wants is whether the median reproduces, and that is a
+/// statement about two draws rather than about nine samples.
+///
+/// Reported beside the range because the two together are what show
+/// the inversion belongs to within-draw dispersion rather than to the
+/// range in particular. Nothing gates on either.
 pub fn sample_iqr_per_mille(sorted: &[u64]) -> u32 {
     if sorted.len() < 4 {
         return 0;
