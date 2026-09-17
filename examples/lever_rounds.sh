@@ -89,16 +89,18 @@ echo "HEAD $(cd "$tree" && git rev-parse --short HEAD 2>/dev/null || echo unknow
 # Two switches are absent from the table below, and the absences are
 # printed so neither reads as an oversight.
 #
-# CALIBRATION_REFUSAL: prefers_incumbent returns None unless the
-# incumbent record is trustworthy, trustworthiness needs a sample spread
-# at or under 250 per mille, and no draw taken on this host reports
-# below 1599.
+# CALIBRATION_REFUSAL: the refusal is unreachable by construction, not
+# by anything about this host. Its one production caller sits in the
+# branch that runs when the stored record is absent or failed the trust
+# check, and prefers_incumbent returns None on its first line unless
+# the incumbent passed it. A record that passes is returned earlier and
+# never offered for comparison, so the two conditions cannot both hold.
 #
 # ALLOWED_WIDTH: the cap comes from available_parallelism, which reads
 # the affinity mask and the cgroup quota. Burner threads move neither,
 # so the pool here is sized against a width that is still correct
 # whatever the load. width_rounds.sh narrows the process instead.
-echo "SKIPPED CALIBRATION_REFUSAL - prefers_incumbent cannot fire while no draw clears the trust bound (flynnel-104)"
+echo "SKIPPED CALIBRATION_REFUSAL - unreachable by construction: its caller runs only when the stored record failed the trust check, and it returns early for exactly that case"
 echo "SKIPPED ALLOWED_WIDTH - load does not move the affinity mask or the cgroup quota; see width_rounds.sh"
 
 order_for() {
