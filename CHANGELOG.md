@@ -192,6 +192,13 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   width it keeps, and holds the last successful reading: one is a width
   a genuinely pinned process has, so resolving an error to it would
   silence the pool wherever the query is unsupported.
+
+  The cap binds only where the allowed width has actually narrowed. A
+  busy neighbor does not move the affinity mask or the cgroup quota, so
+  on a merely contended host this switch caps nothing and changes
+  nothing. `examples/width_narrowing.rs` reports the allowed width and
+  the resolved worker count beside each window so a run can say which
+  case it was in.
 - `CpuCalibration` records the occupancy its draw ran at, and
   `CALIBRATION` layout version rises from 4 to 5, so the first start on
   any host after this measures again. The spread a record already
@@ -233,6 +240,36 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   A tie publishes, because the fresher draw describes the host now. A
   refusal returns `PublishOutcome::KeptIncumbent` naming both figures
   rather than passing silently.
+
+  The comparison is reached only when the incumbent clears
+  `CpuCalibration::is_trustworthy`, which needs a sample spread at or
+  under `PROVISIONAL_SPREAD_PER_MILLE`. On the three hosts measured so
+  far no draw clears it - the lowest reported is 1599 against a bound of
+  250 - so the switch selects between two identical behaviors there and
+  a consumer setting it should expect no change until that is addressed.
+  `sample_iqr_per_mille` is reported beside the range under
+  `FLYNNEL_PROFILE_SAMPLES` as the first step toward a bound derived
+  from draws rather than carried over.
+- `sched::par_iter::sample_iqr_per_mille` reports the interquartile
+  range of a sorted sample set over its median, beside the existing
+  `sample_spread_per_mille`, which reports the full range over the same
+  median. The two answer different questions and nothing reads the new
+  one yet: a range is defined by the two samples a median exists to
+  survive, so one scheduling hiccup in nine sets it, while five draws on
+  an idle guest agreed on their medians to 8 percent and each reported a
+  range of 160 to 272 percent.
+- `examples/clock_cost.rs` times what a thread-clock read costs on the
+  running host and what the sampled leaf bracket amortizes to at a given
+  stride, timing each half as the platform runs it -
+  `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` against `Instant::elapsed` on
+  Linux and FreeBSD, `QueryThreadCycleTime` against `rdtsc` on Windows.
+  It refuses to run where there is no thread clock rather than reporting
+  the cost of returning an absence.
+- `examples/width_narrowing.rs` times dispatch throughput while the CPUs
+  the process may use are taken away from under it, printing its pid
+  before it starts so a driver can narrow it partway through. It exits 3
+  when every window saw one allowed width, because a run the narrowing
+  never reached produces the same rows as a switch with no effect.
 
 ### Fixed
 
