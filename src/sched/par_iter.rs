@@ -4558,8 +4558,12 @@ mod tests {
         // A record stamped an hour ago, read under three bounds.
         let drawn_at = 1_000_000u64;
         let now = drawn_at + 3_600;
-        let cpu = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
-        let aged = CpuCalibration { measured_unix_s: drawn_at, ..cpu };
+        // Built and then stamped, rather than through a struct update:
+        // the record carries a private padding field, so a functional
+        // update from outside its own module cannot name everything it
+        // would have to.
+        let mut aged = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        aged.measured_unix_s = drawn_at;
 
         assert!(
             stored_record_serves(&aged, Some(7_200), now),
@@ -4578,7 +4582,8 @@ mod tests {
         // A clock that moved backwards, or a record stamped ahead of
         // this host, must not re-measure at every start until the
         // clock catches up.
-        let future = CpuCalibration { measured_unix_s: now + 10_000, ..cpu };
+        let mut future = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        future.measured_unix_s = now + 10_000;
         assert!(
             stored_record_serves(&future, Some(60), now),
             "a record stamped in the future ages to nothing and stands"
