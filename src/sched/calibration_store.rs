@@ -839,7 +839,8 @@ impl WriterGuard<'_> {
         cpu: &CpuCalibration,
         accel: &[AccelCalibration],
     ) -> PublishOutcome {
-        if let Some((incumbent, _)) = self.store.read()
+        if crate::sched::levers::calibration_refusal()
+            && let Some((incumbent, _)) = self.store.read()
             && incumbent.is_trustworthy()
             && let (Some(held), Some(offered)) = (incumbent.occupancy(), cpu.occupancy())
             && held > offered

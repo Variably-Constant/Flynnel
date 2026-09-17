@@ -122,6 +122,12 @@ fn main() {
     let load_threads: usize = arg(2, 12);
     let trials: usize = arg(3, 5);
 
+    // Which arm this process is. Printed rather than assumed, because a
+    // switch that failed to engage produces rows indistinguishable from
+    // the other arm's, and the driver's label would be the only record
+    // of an intent that did not take effect.
+    eprintln!("levers: {}", flynnel::sched::levers::describe());
+
     let measured = Duration::from_secs(window_s);
     let mut buf: Vec<u64> = (0..ITEMS as u64).collect();
 

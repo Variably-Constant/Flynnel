@@ -65,6 +65,7 @@ pub mod mode_region;
 pub mod io_pool;
 pub mod bg_calibration;
 pub mod host_width;
+pub mod levers;
 pub mod occupancy;
 #[cfg(feature = "persisted-calibration")]
 pub mod calibration_store;

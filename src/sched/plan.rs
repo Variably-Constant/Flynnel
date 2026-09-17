@@ -1134,10 +1134,15 @@ impl JobPlan {
             .load(core::sync::atomic::Ordering::Relaxed);
         if let Some(site) = self.site {
             let state = site.get();
-            if let Some(cv2) = state
-                .window_cv2_per_mille()
-                .or_else(|| state.cv2_per_mille())
-            {
+            // The window ages out and the lifetime figure does not, so
+            // the switch chooses between a decision that can come back
+            // and one that cannot.
+            let cv2 = if crate::sched::levers::smt_from_window() {
+                state.window_cv2_per_mille().or_else(|| state.cv2_per_mille())
+            } else {
+                state.cv2_per_mille()
+            };
+            if let Some(cv2) = cv2 {
                 return cv2 >= threshold;
             }
         }
@@ -1267,8 +1272,15 @@ impl JobPlan {
         } else {
             arena.primary_workers()
         };
-        let allowed = crate::sched::host_width::allowed_parallelism();
-        self.effective_workers(running.min(allowed))
+        // The query is a syscall and a cgroup read, cached on a cadence,
+        // so the switch is what keeps that cost off a quiet host's hot
+        // path until a measurement says it is free.
+        let running = if crate::sched::levers::allowed_width() {
+            running.min(crate::sched::host_width::allowed_parallelism())
+        } else {
+            running
+        };
+        self.effective_workers(running)
     }
 }
 

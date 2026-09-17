@@ -526,7 +526,13 @@ impl LocalLeafBuffer {
             let on_core = end.saturating_sub(start);
             let elapsed = wall.saturating_sub(self.site_wall_at_start);
             site.add_pool_ticks(on_core, elapsed);
-            crate::sched::call_site::batch_weight_per_mille(on_core, elapsed)
+            // The pool ticks are recorded either way - they cost nothing
+            // beyond this pair, which is read regardless. Only the
+            // WEIGHTING is switched, so the occupancy a site reports
+            // does not depend on which arm is running.
+            crate::sched::levers::batch_weight()
+                .then(|| crate::sched::call_site::batch_weight_per_mille(on_core, elapsed))
+                .flatten()
         } else {
             None
         };
@@ -2248,7 +2254,15 @@ fn record_leaf_sampled<F: FnOnce() -> R, R>(
         v >= LEAF_SAMPLE_STRIDE
     });
     if should_sample {
-        record_leaf_on_core(site, items, body)
+        // The on-core bracket is two thread-clock reads on every sampled
+        // leaf, which a dispatch pays once per sampled leaf and not once
+        // per dispatch. Off by default until a measurement says the
+        // spread it buys is worth that.
+        if crate::sched::levers::oncore_spread() {
+            record_leaf_on_core(site, items, body)
+        } else {
+            record_leaf(site, items, body)
+        }
     } else {
         // Unsampled leaves still appear in the trace (one cached
         // load each when tracing is off) so a traced dispatch shows
