@@ -199,6 +199,9 @@ name = "smt_recovery"
 name = "profile_cost"
 
 [[example]]
+name = "throughput_under_load"
+
+[[example]]
 name = "smt_wake_cost"
 
 [[example]]
