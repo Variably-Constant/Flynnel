@@ -11,8 +11,11 @@
 //! # Run it with the sample line on
 //!
 //! ```sh
-//! FLYNNEL_PROFILE_SAMPLES=1 FLYNNEL_OCCUPANCY=1 \
-//!     profile_draws <draws> <load_threads> 2>&1 | tee draws.log
+//! for d in 1 2 3 4 5; do
+//!     FLYNNEL_PROFILE_SAMPLES=1 FLYNNEL_OCCUPANCY=1 \
+//!         FLYNNEL_CALIBRATION_DIR="$tmp/draw_$d" \
+//!         profile_draws 1 <load_threads>
+//! done 2>&1 | tee draws.log
 //! ```
 //!
 //! Each draw prints two `profile sweep:` lines on stderr - one per
@@ -22,13 +25,23 @@
 //! a draw is a sweep pair followed by its profile and the order is
 //! what pairs them.
 //!
-//! # Why it can take several draws in one process
+//! # How many draws belong in one process
 //!
-//! `calibrate_host_dispatch` measures unless a stored record clears the
-//! trust check, and on these hosts none does, so each call is a fresh
-//! measurement. Where a record IS trusted the call returns it without
-//! measuring, and then every draw is the same three numbers. That case
-//! is detected rather than reported as a suspiciously steady host.
+//! `calibrate_host_dispatch` measures only when no stored record clears
+//! the trust check. Where one does, the first call measures and
+//! publishes and every call after reads that back, so several draws in
+//! one process is one measurement and some copies of it.
+//!
+//! Both kinds of host exist on this fleet: a Zen3 Linux guest writes
+//! nothing that passes, and a Ryzen 9 7900X on bare metal does. So the
+//! shape that is safe everywhere is a single draw per process against a
+//! fresh `FLYNNEL_CALIBRATION_DIR`, and asking for several in one
+//! process is a shortcut that works only where records are refused.
+//!
+//! Taking that shortcut on the wrong host is detected rather than
+//! reported as a suspiciously steady one: two measurements never land
+//! on identical nanosecond counts, so identical consecutive draws exit
+//! 3.
 //!
 //! # What it deliberately does not do
 //!
@@ -151,8 +164,11 @@ fn main() {
     if repeats > 0 {
         eprintln!(
             "{repeats} of the {draws} draws returned the previous draw's exact figures, \
-             which is a stored record answering rather than a measurement; clear the \
-             calibration directory before reading these"
+             which is a stored record answering rather than a measurement. This host \
+             writes records that clear the trust check, so the first draw measured and \
+             published and the rest read it back. Take one draw per process against a \
+             fresh FLYNNEL_CALIBRATION_DIR each, rather than clearing the host's store: \
+             that store is what other processes on the machine are reading."
         );
         std::process::exit(3);
     }
