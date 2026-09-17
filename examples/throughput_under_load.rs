@@ -65,7 +65,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use flynnel::sched::par_iter::for_each_chunk_indexed_min_leaf;
+use flynnel::sched::par_iter::for_each_chunk_min_leaf;
 use flynnel::{CallSiteState, JobPlan, SiteRef};
 
 static SITE: CallSiteState = CallSiteState::new();
@@ -102,17 +102,32 @@ fn plan(smt_prior: bool) -> JobPlan {
     if smt_prior { plan.with_smt() } else { plan }
 }
 
-/// How much work one item costs, at its index.
+/// One item: how many rounds it costs, and what it accumulates.
+///
+/// The cost travels alongside the item rather than being derived from
+/// its index, so the leaf body needs no index and the dispatch can go
+/// through `for_each_chunk_min_leaf`. That entry matters: the on-core
+/// bracket is taken by `record_leaf_sampled`, which only the plain
+/// steal-driven bisect calls. The indexed and triple bisects record
+/// every leaf through `record_leaf`, which has no bracket, so a
+/// harness dispatching through them cannot reach the on-core switch at
+/// all.
+///
+/// Deriving it from the accumulator instead would drift: every
+/// dispatch rewrites the buffer, so two arms that completed different
+/// numbers of dispatches would be running different work.
+#[derive(Clone, Copy)]
+struct Item {
+    reps: u32,
+    acc: u64,
+}
+
+/// How much work the item at `index` costs.
 ///
 /// Uniform gives every item `reps` rounds. Irregular varies them
 /// deterministically with the index, in `1 ..= 2 * reps - 1`, so the
 /// mean is `reps` and the shapes are comparable in total work while
 /// differing in spread.
-///
-/// Irregularity from the index rather than from the slot's value: the
-/// buffer is rewritten by every dispatch, so work derived from it would
-/// drift over a window and differ between two arms that ran different
-/// numbers of dispatches.
 #[inline]
 fn reps_at(index: usize, reps: u32, irregular: bool) -> u32 {
     if !irregular || reps < 2 {
@@ -126,24 +141,18 @@ fn reps_at(index: usize, reps: u32, irregular: bool) -> u32 {
 }
 
 /// Dispatches completed in `measured`, with whatever else is running.
-fn window(
-    buf: &mut [u64],
-    measured: Duration,
-    smt_prior: bool,
-    reps: u32,
-    irregular: bool,
-) -> u64 {
+fn window(buf: &mut [Item], measured: Duration, smt_prior: bool) -> u64 {
     let start = Instant::now();
     let mut dispatches = 0u64;
     while start.elapsed() < measured {
         let plan = plan(smt_prior);
-        for_each_chunk_indexed_min_leaf(&plan, buf, MIN_LEAF, |start_idx, chunk| {
-            for (offset, slot) in chunk.iter_mut().enumerate() {
-                let mut acc = *slot;
-                for _ in 0..reps_at(start_idx + offset, reps, irregular) {
+        for_each_chunk_min_leaf(&plan, buf, MIN_LEAF, |chunk| {
+            for slot in chunk.iter_mut() {
+                let mut acc = slot.acc;
+                for _ in 0..slot.reps {
                     acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 }
-                *slot = black_box(acc);
+                slot.acc = black_box(acc);
             }
         });
         dispatches += 1;
@@ -280,12 +289,16 @@ fn main() {
     }
 
     let measured = Duration::from_secs(window_s);
-    let mut buf: Vec<u64> = (0..ITEMS as u64).collect();
+    // The per-item cost is fixed here, once, so every dispatch of every
+    // arm runs the same work whatever order the buffer reaches.
+    let mut buf: Vec<Item> = (0..ITEMS)
+        .map(|i| Item { reps: reps_at(i, reps, irregular), acc: i as u64 })
+        .collect();
 
     // One warm window, discarded: the first dispatches of a process pay
     // pool startup and the site's first classifier ticks, which belong
     // to no arm.
-    let warm = window(&mut buf, Duration::from_secs(1), smt_prior, reps, irregular);
+    let warm = window(&mut buf, Duration::from_secs(1), smt_prior);
     if warm == 0 {
         eprintln!("the warm window ran no dispatches; raise the window length");
         std::process::exit(2);
@@ -320,7 +333,7 @@ fn main() {
         if load.is_some() {
             std::thread::sleep(Duration::from_millis(250));
         }
-        let n = window(&mut buf, measured, smt_prior, reps, irregular);
+        let n = window(&mut buf, measured, smt_prior);
         if let Some(load) = load {
             load.stop();
         }
@@ -329,4 +342,19 @@ fn main() {
     }
 
     engagement(smt_prior, duty_ms, reps, irregular);
+
+    // The on-core switch is read inside record_leaf_sampled, and only
+    // the plain steal-driven bisect calls that. A dispatch entry that
+    // records every leaf through record_leaf takes no bracket, so the
+    // switch is on and nothing happens - and the rows look exactly like
+    // a mechanism that did not help. An arm that asked for it and took
+    // no reading says so rather than being read as a result.
+    if flynnel::sched::levers::oncore_spread() && SITE.oncore_items() == 0 {
+        eprintln!(
+            "the on-core switch is on and no leaf carried an on-core reading, so this \
+             dispatch entry never reached record_leaf_sampled and the switch did \
+             nothing here"
+        );
+        std::process::exit(4);
+    }
 }
