@@ -26,7 +26,7 @@ import sys
 from collections import defaultdict
 
 SIDE = re.compile(
-    r"^SIDE (\w+) load=(\d+) trial=(\d+) reps=(\d+) entry=(\w+)\s*$"
+    r"^SIDE (\w+) load=(\d+) trial=(\d+) reps=(\d+) entry=(\w+) foreign=(\d+)\s*$"
 )
 THROUGHPUT = re.compile(r"^throughput (\d+) (\d+) (\d+) ([\d.]+)\s*$")
 CONTROL = re.compile(r"^control (\d+) (\d+) (\d+) ([\d.]+)\s*$")
@@ -57,7 +57,7 @@ def parse(paths):
     """Rows keyed by (side, load). A SIDE line names who produced the
     rows after it, so a log with no SIDE lines yields nothing rather
     than attributing every row to one tree."""
-    rows = defaultdict(lambda: {"control": [], "loaded": [], "retained": []})
+    rows = defaultdict(lambda: {"control": [], "loaded": [], "retained": [], "foreign": []})
     key = None
     for n, path in enumerate(paths, 1):
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -70,6 +70,7 @@ def parse(paths):
                     # figure that is large at one and small at the other
                     # into one that is true at neither.
                     key = (s.group(1), int(s.group(2)), int(s.group(4)))
+                    rows[key]["foreign"].append(int(s.group(6)))
                     continue
                 if key is None:
                     continue
@@ -152,6 +153,23 @@ def main(paths):
                     f"  reps {reps} load {load}: quiet {quiet:.3f}, worse by "
                     f"{worse_by:.3f} against the base's own quiet spread of {bs:.3f}"
                 )
+
+    # What else was on the box while this ran. The arms alternate, so
+    # background load reaches both trees and does not bias the
+    # comparison; it widens the spread a difference has to clear, which
+    # costs sensitivity. A run with foreign processes throughout and no
+    # regression found has not shown there is none, only that none was
+    # large enough to see through that much noise.
+    foreign = [f for cell in rows.values() for f in cell["foreign"]]
+    if foreign:
+        busy = sum(1 for f in foreign if f > 0)
+        print()
+        print(f"BACKGROUND: {busy} of {len(foreign)} arms started with other build")
+        print(f"  processes running, up to {max(foreign)} at once.")
+        if busy:
+            print("  The comparison survives this because the arms alternate, but")
+            print("  the spread is wider than it would be on a quiet box, so a")
+            print("  small regression could sit under it unseen.")
 
     print()
     if undecided:
