@@ -104,6 +104,7 @@ def main(paths):
     print("-" * 64)
 
     regressions = []
+    undecided = []
     for load in loads:
         b = rows.get(("base", load))
         t = rows.get(("tip", load))
@@ -115,39 +116,65 @@ def main(paths):
         loaded = ratio(median(t["loaded"]), median(b["loaded"]))
         retention = ratio(median(t["retained"]), median(b["retained"]))
 
-        bs = spread(b["control"] + b["loaded"])
-        ts = spread(t["control"] + t["loaded"])
+        # The quiet arm's own variation between trials, and nothing else.
+        # Pooling the control and loaded readings would put the load
+        # effect into the spread, which is the quantity being measured
+        # rather than the noise around it, and at any real load level
+        # that pooled figure is large enough to excuse every regression.
+        bs = spread(b["control"])
+        ts = spread(t["control"])
+        trials = len(t["retained"])
 
         def fmt(x):
             return "-" if x is None else f"{x:.3f}"
 
-        print(f"{load:>5} {len(t['retained']):>3} {fmt(quiet):>8} {fmt(loaded):>8} "
+        print(f"{load:>5} {trials:>3} {fmt(quiet):>8} {fmt(loaded):>8} "
               f"{fmt(retention):>10} {fmt(bs):>12} {fmt(ts):>11}")
 
-        # Flagged, not judged: a figure below one is only a regression if
-        # it sits outside what the same binary varies by between trials.
-        if quiet is not None and bs is not None and quiet < 1.0:
+        # Flagged, not judged, and only where there is something to judge
+        # against. One trial has no spread to speak of: min equals max, so
+        # the estimate is 1.000 and every difference however small clears
+        # it. That is a verdict manufactured from a sample of one.
+        if trials < 2:
+            undecided.append(
+                f"  load {load}: {trials} trial, so the base has no "
+                f"trial-to-trial spread and nothing here can be called noise"
+            )
+        elif quiet is not None and bs is not None and quiet < 1.0:
             worse_by = 1.0 / quiet
             if worse_by > bs:
                 regressions.append(
-                    f"  load {load}: quiet {quiet:.3f}, worse by more than the "
-                    f"base's own spread of {bs:.3f}"
+                    f"  load {load}: quiet {quiet:.3f}, worse by {worse_by:.3f} "
+                    f"against the base's own quiet spread of {bs:.3f}"
                 )
 
     print()
+    if undecided:
+        print("NOT ENOUGH TRIALS TO DECIDE:")
+        for u in undecided:
+            print(u)
+        print()
+
     if regressions:
-        print("SLOWER THAN THE BASE BY MORE THAN ITS OWN SPREAD:")
+        print("SLOWER THAN THE BASE BY MORE THAN ITS OWN QUIET SPREAD:")
         for r in regressions:
             print(r)
         print()
         print("The criterion is never slower. A quiet figure below one that")
         print("also exceeds the base's trial-to-trial spread is a regression")
         print("rather than noise, and it stands whatever the loaded arm did.")
-    else:
+    elif not undecided:
         print("No quiet figure fell below the base by more than the base's own")
         print("trial-to-trial spread. That is the never-slower half. Whether")
         print("the tip is FASTER under load is the retention column, which is")
         print("a separate claim and needs its own reading.")
+
+    # Non-zero where something is wrong or unjudgeable, so a caller that
+    # reads only the code does not take an undecided run for a clean one.
+    if regressions:
+        return 1
+    if undecided:
+        return 3
     return 0
 
 
