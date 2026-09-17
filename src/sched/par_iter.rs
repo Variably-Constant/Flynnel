@@ -1105,8 +1105,7 @@ fn stored_or_measured() -> HostDispatchProfile {
         }
     };
     if let Some((cpu, _accel)) = store.read()
-        && cpu.is_trustworthy()
-        && !stored_record_is_stale(&cpu)
+        && stored_record_serves(&cpu, configured_max_age_s(), now_unix_s())
     {
         // A read and a measurement produce the same three numbers and
         // nothing else distinguished them, so a stale record looked
@@ -1214,67 +1213,84 @@ fn stored_or_measured() -> HostDispatchProfile {
     profile
 }
 
-/// Whether a stored record has stood long enough to be drawn again.
+/// Whether a stored record is returned to the caller, or the host is
+/// measured again.
 ///
-/// The age comes from `FLYNNEL_CALIBRATION_MAX_AGE_S` and has no
-/// default. Unset, a record that clears its trust check stands until
-/// the layout version changes, which is the behavior that shipped. How
-/// long a host may serve one draw is a property of the fleet running
-/// it, not of this code: an hour costs a build box a 10 to 40 ms sweep
-/// per hour, and a day lets a draw taken during someone else's build
-/// route every process for a day.
+/// The decision, separate from the environment and the clock that feed
+/// it, so it can be exercised with any record at any age. What matters
+/// about it cannot be tested otherwise: a record this returns true for
+/// is returned to the caller before the branch that would offer one to
+/// `WriterGuard::publish_if_better`, so that guard's comparison never
+/// sees a record in this state.
 ///
-/// Every way of failing to read the age says which one happened, and
-/// all of them leave the record standing: a mistyped bound must not
-/// silently re-measure on every start.
+/// `max_age_s` of `None` is the shipped behavior: a record that clears
+/// its trust check stands until the layout version changes. A bound of
+/// zero is read as no bound, since re-measuring at every start is what
+/// the store exists to avoid and is not something a caller asks for by
+/// typing a number.
+///
+/// A record stamped in the future is a clock that moved rather than a
+/// fresh draw, so saturating leaves it aged zero and it stands.
 #[cfg(feature = "persisted-calibration")]
-fn stored_record_is_stale(cpu: &crate::sched::calibration_store::CpuCalibration) -> bool {
-    let Some(raw) = std::env::var_os("FLYNNEL_CALIBRATION_MAX_AGE_S") else {
+fn stored_record_serves(
+    cpu: &crate::sched::calibration_store::CpuCalibration,
+    max_age_s: Option<u64>,
+    now_s: u64,
+) -> bool {
+    if !cpu.is_trustworthy() {
         return false;
-    };
+    }
+    match max_age_s {
+        None | Some(0) => true,
+        Some(max) => now_s.saturating_sub(cpu.measured_unix_s) <= max,
+    }
+}
+
+/// The age bound from `FLYNNEL_CALIBRATION_MAX_AGE_S`, or `None`.
+///
+/// Every way of failing to read it says which one happened and yields
+/// `None`, which leaves the record standing: a mistyped bound must not
+/// silently re-measure on every start, and that failure would show up
+/// as the scheduler being slow rather than as a typo.
+#[cfg(feature = "persisted-calibration")]
+fn configured_max_age_s() -> Option<u64> {
+    let raw = std::env::var_os("FLYNNEL_CALIBRATION_MAX_AGE_S")?;
     let Some(text) = raw.to_str() else {
         eprintln!(
             "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S is not valid UTF-8; the stored \
              calibration stands"
         );
-        return false;
+        return None;
     };
-    let max_age_s = match text.trim().parse::<u64>() {
-        Ok(v) => v,
+    match text.trim().parse::<u64>() {
+        Ok(v) => Some(v),
         Err(e) => {
             eprintln!(
                 "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S wants a whole number of \
                  seconds and got {text:?} ({e}); the stored calibration stands"
             );
-            return false;
+            None
         }
-    };
-    if max_age_s == 0 {
-        return false;
     }
-    let now_s = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+}
+
+/// Seconds since the epoch, or zero where the clock reads before it.
+///
+/// Zero ages every record to nothing, so a host whose clock is that
+/// wrong keeps serving what it has rather than re-measuring at every
+/// start off a figure that cannot be trusted.
+#[cfg(feature = "persisted-calibration")]
+fn now_unix_s() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
         Err(e) => {
             eprintln!(
-                "flynnel: this host's clock reads before the epoch ({e}), so the \
-                 stored calibration's age cannot be taken and it stands"
+                "flynnel: this host's clock reads before the epoch ({e}), so a stored \
+                 calibration's age cannot be taken and it stands"
             );
-            return false;
+            0
         }
-    };
-    // A record stamped in the future is a clock that moved rather than
-    // a fresh draw. Saturating leaves it aged zero, so it stands
-    // instead of being re-drawn at every start until the clock catches
-    // up with it.
-    let age_s = now_s.saturating_sub(cpu.measured_unix_s);
-    if age_s > max_age_s {
-        eprintln!(
-            "flynnel: the stored calibration is {age_s} s old against a bound of \
-             {max_age_s} s; measuring this host again"
-        );
-        return true;
     }
-    false
 }
 
 /// The measured profile, with nothing persisted.
@@ -4499,6 +4515,73 @@ mod tests {
         assert!(
             sample_iqr_per_mille(&scattered) > 1_000,
             "a spread that is real reaches the middle half too"
+        );
+    }
+
+    #[cfg(feature = "persisted-calibration")]
+    #[test]
+    fn a_record_that_serves_is_one_the_refusal_will_never_be_offered() {
+        use crate::sched::calibration_store::{CpuCalibration, PROVISIONAL_SPREAD_PER_MILLE};
+
+        // The decision the caller actually takes, which every other
+        // test of this feature skips by building a store and calling
+        // the guard directly. A record that serves is returned before
+        // the branch that offers one for comparison, so the refusal on
+        // the other side of that branch cannot act on it.
+        let now = 1_000_000u64;
+        let passes = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        assert!(
+            stored_record_serves(&passes, None, now),
+            "with no age bound a trustworthy record is returned, so nothing offers it"
+        );
+
+        let fails = CpuCalibration::new(
+            1_000,
+            70_000,
+            40_000,
+            PROVISIONAL_SPREAD_PER_MILLE + 1,
+            9,
+            Some(990),
+        );
+        assert!(
+            !stored_record_serves(&fails, None, now),
+            "a record whose samples disagreed is measured over, and IS what the \
+             refusal is offered"
+        );
+    }
+
+    #[cfg(feature = "persisted-calibration")]
+    #[test]
+    fn an_age_bound_is_what_lets_a_trustworthy_record_be_drawn_again() {
+        use crate::sched::calibration_store::CpuCalibration;
+
+        // A record stamped an hour ago, read under three bounds.
+        let drawn_at = 1_000_000u64;
+        let now = drawn_at + 3_600;
+        let cpu = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        let aged = CpuCalibration { measured_unix_s: drawn_at, ..cpu };
+
+        assert!(
+            stored_record_serves(&aged, Some(7_200), now),
+            "inside the bound it stands"
+        );
+        assert!(
+            !stored_record_serves(&aged, Some(1_800), now),
+            "past the bound it is drawn again, which is the only way a trustworthy \
+             record is ever displaced short of a layout change"
+        );
+        assert!(
+            stored_record_serves(&aged, Some(0), now),
+            "zero is read as no bound rather than as re-measure always"
+        );
+
+        // A clock that moved backwards, or a record stamped ahead of
+        // this host, must not re-measure at every start until the
+        // clock catches up.
+        let future = CpuCalibration { measured_unix_s: now + 10_000, ..cpu };
+        assert!(
+            stored_record_serves(&future, Some(60), now),
+            "a record stamped in the future ages to nothing and stands"
         );
     }
 
