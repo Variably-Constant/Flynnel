@@ -2478,12 +2478,21 @@ fn record_leaf_bracket_sampled<F: FnOnce() -> R, R>(
     thread_local! {
         static BRACKET_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
+    // The switch is read first and the counter only advances behind it.
+    // Both orders pick the same leaves, but the counter is a
+    // thread-local read, modify and write on every leaf of these
+    // entries, and with the switch off that is work the path did not
+    // used to do. Reading the switch first leaves one cached bool on
+    // the default path.
+    if !crate::sched::levers::oncore_spread() {
+        return record_leaf(site, items, body);
+    }
     let bracket = BRACKET_TICK.with(|c| {
         let (next, take) = advance_bracket_tick(c.get());
         c.set(next);
         take
     });
-    if bracket && crate::sched::levers::oncore_spread() {
+    if bracket {
         record_leaf_on_core(site, items, body)
     } else {
         record_leaf(site, items, body)
