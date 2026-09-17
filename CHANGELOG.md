@@ -103,8 +103,29 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   item alongside an explicit per-item cost and `use_smt`. The vector
   classes say nothing the batch size does not and still steer nothing.
   `SchedTier`'s doc now lists what the selection reads.
-- A call site's classifier takes its per-item SPREAD from the thread's
-  own clock, and keeps its mean on wall time.
+- Five noisy-host mechanisms ship behind runtime switches, every one
+  DEFAULTING OFF, read once per process from the environment:
+  `FLYNNEL_LEVER_ONCORE_SPREAD`, `FLYNNEL_LEVER_BATCH_WEIGHT`,
+  `FLYNNEL_LEVER_SMT_WINDOW`, `FLYNNEL_LEVER_ALLOWED_WIDTH` and
+  `FLYNNEL_LEVER_CALIBRATION_REFUSAL`. `sched::levers::describe` reports
+  their state for a harness to print beside a result.
+
+  Off is what shipped before them, so a consumer who sets nothing gets
+  the behavior it already had. Each has to earn its default against the
+  same code without it: never slower on a quiet host, faster on a
+  contended one. A switch is what makes that measurable - one binary
+  runs both arms, so the comparison carries no difference in commit,
+  harness, build or machine.
+
+  Environment rather than cargo features, because a feature is chosen at
+  build time and an A/B across one needs two binaries that differ in
+  more than the feature.
+
+  The entries below describe what each switch does when it is on.
+
+- `FLYNNEL_LEVER_ONCORE_SPREAD`: a call site's classifier takes its
+  per-item SPREAD from the thread's own clock, and keeps its mean on
+  wall time.
 
   Wall time rises both because the work is irregular and because the
   thread lost its core, and preemption lands on some leaves and not
@@ -133,10 +154,13 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   per-leaf instrumentation budget is about 4 ns amortized and a thread
   clock read is an order above that, so this is affordable where the
   stride applies and is not done anywhere else.
-- A leaf batch is recorded at the share of its interval the pool spent
-  on a core, and every sum a call site keeps carries that weight as a
-  factor along with the count they are divided by, so the means do not
-  move and only a contended batch's influence does. `leaf_count` stays a
+- `FLYNNEL_LEVER_BATCH_WEIGHT`: a leaf batch is recorded at the share of
+  its interval the pool spent on a core, and every sum a call site keeps
+  carries that weight as a factor along with the count they are divided
+  by, so the means do not move and only a contended batch's influence
+  does. The pool ticks are recorded either way, because that clock pair
+  is read regardless and a site's reported occupancy should not depend
+  on which arm is running. `leaf_count` stays a
   count of leaves, because the sample guards and the classifier quantum
   read it, and a batch whose ends did not both carry an on-core reading
   weighs a whole batch: no reading is not evidence of contention.
@@ -147,16 +171,18 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   adaptive routing and on neither pinned one. It is kept because a
   contended sample counting for less is right on its own terms, and it
   is not what the spread change above rests on.
-- `JobPlan::effective_use_smt` decides from the window the site's
-  classifier last read rather than from its lifetime cv^2, falling back
+- `FLYNNEL_LEVER_SMT_WINDOW`: `JobPlan::effective_use_smt` decides from
+  the window the site's classifier last read rather than from its
+  lifetime cv^2, falling back
   to the lifetime figure only until a window has been classified. The
   lifetime figure is an equal-weight average over every leaf a site has
   ever run, so a contended stretch could be diluted only by running
   enough later leaves to outweigh it, and an SMT decision resting on it
   did not come back when the host went quiet. The window is also the
   quantity `cv2_low_per_mille` bounds when a class is decided.
-- `JobPlan::resolved_workers` caps by the CPUs the process may currently
-  use, through the new `sched::host_width::allowed_parallelism`. The
+- `FLYNNEL_LEVER_ALLOWED_WIDTH`: `JobPlan::resolved_workers` caps by the
+  CPUs the process may currently use, through the new
+  `sched::host_width::allowed_parallelism`. The
   pool is spawned once and its threads outlive a change to the process
   affinity mask or the cgroup CPU quota, so a host that has narrowed
   since startup left the arena counting workers that cannot reach a
@@ -185,7 +211,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   distance between a pool that held its cores and one that lost a
   hundredth of them, which is what a reader comparing two records is
   looking at.
-- A calibration draw no longer displaces one taken on a quieter host.
+- `FLYNNEL_LEVER_CALIBRATION_REFUSAL`: a calibration draw no longer
+  displaces one taken on a quieter host.
   `publish` overwrote whatever the table held, so a process measuring
   while a neighbor held half the machine replaced a better-drawn record
   and published its own for every later process to read.
