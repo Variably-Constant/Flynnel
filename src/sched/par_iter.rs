@@ -1246,30 +1246,49 @@ fn stored_record_serves(
     }
 }
 
-/// The age bound from `FLYNNEL_CALIBRATION_MAX_AGE_S`, or `None`.
+/// How long a stored calibration serves before a fresh draw is taken.
 ///
-/// Every way of failing to read it says which one happened and yields
-/// `None`, which leaves the record standing: a mistyped bound must not
-/// silently re-measure on every start, and that failure would show up
-/// as the scheduler being slow rather than as a typo.
+/// One day. A record that clears the trust check is otherwise permanent
+/// for its stamp, and that check passes more readily for a draw taken
+/// under load, whose samples agree because they were all slowed
+/// together. This bound is what limits how long such a draw can route.
+///
+/// The cost is one calibration sweep per process start whose record has
+/// aged out, so a day is short enough to cap the exposure and long
+/// enough that repeated starts read the stored record.
+#[cfg(feature = "persisted-calibration")]
+pub const DEFAULT_CALIBRATION_MAX_AGE_S: u64 = 86_400;
+
+/// The age bound: `FLYNNEL_CALIBRATION_MAX_AGE_S` when it parses,
+/// otherwise [`DEFAULT_CALIBRATION_MAX_AGE_S`]. Zero means no bound and
+/// a record then stands until [`crate::sched::calibration_store::LAYOUT_VERSION`]
+/// rises.
+///
+/// Every way of failing to read it says which one happened and falls
+/// back to the default rather than to no bound, so a mistyped value
+/// costs at most one extra sweep a day instead of restoring the
+/// permanence the bound exists to end.
 #[cfg(feature = "persisted-calibration")]
 fn configured_max_age_s() -> Option<u64> {
-    let raw = std::env::var_os("FLYNNEL_CALIBRATION_MAX_AGE_S")?;
+    let Some(raw) = std::env::var_os("FLYNNEL_CALIBRATION_MAX_AGE_S") else {
+        return Some(DEFAULT_CALIBRATION_MAX_AGE_S);
+    };
     let Some(text) = raw.to_str() else {
         eprintln!(
-            "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S is not valid UTF-8; the stored \
-             calibration stands"
+            "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S is not valid UTF-8; using the \
+             default of {DEFAULT_CALIBRATION_MAX_AGE_S}s"
         );
-        return None;
+        return Some(DEFAULT_CALIBRATION_MAX_AGE_S);
     };
     match text.trim().parse::<u64>() {
         Ok(v) => Some(v),
         Err(e) => {
             eprintln!(
                 "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S wants a whole number of \
-                 seconds and got {text:?} ({e}); the stored calibration stands"
+                 seconds and got {text:?} ({e}); using the default of \
+                 {DEFAULT_CALIBRATION_MAX_AGE_S}s"
             );
-            None
+            Some(DEFAULT_CALIBRATION_MAX_AGE_S)
         }
     }
 }
@@ -4600,6 +4619,36 @@ mod tests {
             !stored_record_serves(&fails, None, now),
             "a record whose samples disagreed is measured over, and a record in that \
              state is the only kind the refusal is ever offered"
+        );
+    }
+
+    #[cfg(feature = "persisted-calibration")]
+    #[test]
+    fn the_default_bound_is_a_day_and_the_comparison_includes_it() {
+        use crate::sched::calibration_store::CpuCalibration;
+
+        assert_eq!(
+            DEFAULT_CALIBRATION_MAX_AGE_S,
+            24 * 60 * 60,
+            "this bound is how long a contended draw can keep routing, so a change \
+             to it fails here rather than passing quietly"
+        );
+
+        let now = 2_000_000_000u64;
+        let bound = Some(DEFAULT_CALIBRATION_MAX_AGE_S);
+
+        let mut at_the_bound = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        at_the_bound.measured_unix_s = now - DEFAULT_CALIBRATION_MAX_AGE_S;
+        assert!(
+            stored_record_serves(&at_the_bound, bound, now),
+            "a record exactly the bound's age serves, so the comparison is inclusive"
+        );
+
+        let mut past_it = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        past_it.measured_unix_s = now - DEFAULT_CALIBRATION_MAX_AGE_S - 1;
+        assert!(
+            !stored_record_serves(&past_it, bound, now),
+            "a second past it is drawn again"
         );
     }
 
