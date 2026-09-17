@@ -205,6 +205,9 @@ name = "throughput_under_load"
 name = "clock_cost"
 
 [[example]]
+name = "width_narrowing"
+
+[[example]]
 name = "smt_wake_cost"
 
 [[example]]
