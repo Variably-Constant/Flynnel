@@ -122,16 +122,9 @@ struct Load {
 impl Load {
     /// `duty_ms` of zero burns for the whole window. Any other value
     /// alternates: every burner spins for that many milliseconds and
-    /// sleeps for the same, all of them reading one shared origin so
-    /// they stay in phase.
-    ///
-    /// In phase is the point. Burners staggered against each other
-    /// would sum to a steady load, and a steady load gives every batch
-    /// about the same on-core share. A statistic that weighs batches by
-    /// that share cannot move when they all weigh the same, whatever
-    /// the share is, because every figure it feeds divides a weighted
-    /// total by a weighted count. Alternating is what puts contended
-    /// and quiet batches in one window.
+    /// sleeps for the same, all of them off one shared origin so they
+    /// stay in phase. Staggered burners would sum to a steady load,
+    /// which is the one shape the batch weighting cannot read.
     fn start(n: usize, duty_ms: u64) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let origin = Instant::now();

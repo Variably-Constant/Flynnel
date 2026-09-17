@@ -125,15 +125,14 @@ fn main() {
         eprintln!("{empty} of the {windows} windows ran no dispatches; raise the window length");
     }
 
-    let mut distinct = widths.clone();
-    distinct.sort_unstable();
-    distinct.dedup();
-    println!("widths_seen {}", distinct.len());
-    if distinct.len() < 2 {
+    widths.sort_unstable();
+    widths.dedup();
+    println!("widths_seen {}", widths.len());
+    if widths.len() < 2 {
         eprintln!(
             "the allowed width held at {} for every window, so the narrowing never \
              reached this process and these rows measure nothing",
-            distinct.first().copied().unwrap_or(0)
+            widths.first().copied().unwrap_or(0)
         );
         std::process::exit(3);
     }
