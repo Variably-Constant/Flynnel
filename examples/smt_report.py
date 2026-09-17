@@ -33,6 +33,7 @@ ROW = re.compile(
     r"^smt_recovery\s+(true|false)\s+(true|false)\s+(\d+|-)\s+(\d+)\s+(\d+)\s*$"
 )
 FAILED = re.compile(r"^ARM_FAILED\s+(\S+)\s+t(\d+)\s+exit=(\d+)")
+ENGAGE = re.compile(r"^smt_engagement\s+(.*)$")
 
 
 def main(path):
@@ -41,16 +42,23 @@ def main(path):
 
     pending = None
     rows = defaultdict(list)
+    engage = defaultdict(list)
     failures = []
+    # `pending` guards the row, which must follow its own ARM line.
+    # `arm` outlives it, because the engagement line comes AFTER the
+    # row and would otherwise have nothing to attach to.
+    arm = None
     for line in lines:
         f = FAILED.match(line)
         if f:
             failures.append(line)
             pending = None
+            arm = None
             continue
         m = ARM.match(line)
         if m:
             pending = m.group(2)
+            arm = m.group(2)
             continue
         r = ROW.match(line)
         if r and pending is not None:
@@ -64,6 +72,15 @@ def main(path):
                 }
             )
             pending = None
+            continue
+        e = ENGAGE.match(line)
+        if e and arm is not None:
+            fields = {}
+            for token in e.group(1).split():
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    fields[key] = value
+            engage[arm].append(fields)
 
     if not rows:
         print("NO ROWS PARSED")
@@ -120,6 +137,36 @@ def main(path):
                 "differs from off, so this rotation's floor covers the on/off gap and "
                 "nothing is called."
             )
+
+    if engage:
+        print()
+        print("engagement, from the same arms:")
+        for arm in ("off", "null", "on"):
+            v = engage.get(arm, [])
+            if not v:
+                print(f"  {arm:<5} no engagement line")
+                continue
+            ticks = sorted({f.get("window_ticks", "-") for f in v})
+            win = sorted({f.get("cv2_window", "-") for f in v})
+            life = sorted({f.get("cv2_lifetime", "-") for f in v})
+            sw = sorted({f.get("smt_switch", "-") for f in v})
+            print(f"  {arm:<5} window_ticks={ticks} cv2_window={win}")
+            print(f"        cv2_lifetime={life} smt_switch={sw}")
+        # The switch chooses between the window and the lifetime
+        # figure. With no window classified it falls back to the
+        # lifetime one, which is what the off arm reads anyway, so both
+        # arms consult the same number and agreeing rows say nothing
+        # about the mechanism.
+        on = engage.get("on", [])
+        if on and all(f.get("window_ticks") == "0" for f in on):
+            print()
+            print("  NO WINDOW WAS EVER CLASSIFIED on the on arm, so the switch fell")
+            print("  back to the lifetime figure the off arm already uses. The rows")
+            print("  above are not a reading of this mechanism.")
+        elif on and all(f.get("smt_switch") == "false" for f in on):
+            print()
+            print("  The switch reports itself OFF on the arm labelled on; the driver")
+            print("  did not set it and no row here measures it.")
 
     empties = sum(
         1 for v in rows.values() for x in v if x["pre_n"] == 0 or x["post_n"] == 0

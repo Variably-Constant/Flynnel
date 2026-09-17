@@ -204,4 +204,25 @@ fn main() {
         pre_n,
         post_n,
     );
+
+    // What the switch had to work with. It chooses between the window
+    // the classifier last read and the site's lifetime figure, and
+    // falls back to the lifetime one until a window has been
+    // classified - so with window_ticks at zero both arms read the
+    // same number and the switch cannot have moved anything. A row of
+    // agreeing arms means one thing in that case and another when a
+    // window exists, and the rows alone do not say which.
+    let site = &SITE;
+    let reading = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
+    println!(
+        "smt_engagement window_ticks={} cv2_window={} cv2_lifetime={} leaves={} \
+         per_item_ns={} class={:?} smt_switch={}",
+        site.window_ticks(),
+        reading(site.window_cv2_per_mille()),
+        reading(site.cv2_per_mille()),
+        site.leaf_count(),
+        reading(site.per_item_ns()),
+        site.learned_class(),
+        flynnel::sched::levers::smt_from_window(),
+    );
 }
