@@ -131,7 +131,12 @@ def report_engagement(engage, levers, loads):
                 on_values = {f.get(field) for f in arms["on"]}
                 if off_values != on_values:
                     moved.append(f"{field} {sorted(off_values)} -> {sorted(on_values)}")
-            print(f"{lever} load{load}:")
+            # The load shape belongs beside the verdict: a weighting
+            # that only bites when batches differ reads as no effect
+            # under a load that never lets up, and the duty is the only
+            # record of which one this cell ran under.
+            duty = sorted({f.get("duty_ms", "-") for f in arms["off"]})
+            print(f"{lever} load{load} duty_ms={duty}:")
             if moved:
                 for line in moved:
                     print(f"    moved   {line}")

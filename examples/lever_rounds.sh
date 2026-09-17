@@ -23,7 +23,14 @@
 # channel that tears down takes every row printed after it, while the
 # run carries on and finishes looking exactly the same.
 #
-# usage: lever_rounds.sh <tree> <window_s> <trials> <load_threads> <profile_ns>
+# The batch-weight arm runs its burners on a duty cycle rather than
+# holding them. Every figure that weighting feeds divides a weighted
+# total by a weighted count, so a share common to every batch cancels
+# and steady contention moves nothing. The period is a parameter
+# because it has to be long enough for a batch to fall inside one
+# phase, which depends on the leaf size the workload produces.
+#
+# usage: lever_rounds.sh <tree> <window_s> <trials> <load_threads> <duty_ms> <profile_ns>
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -31,10 +38,12 @@ tree="$1"
 window="$2"
 trials="$3"
 load_threads="$4"
-profile="$5"
+duty_ms="$5"
+profile="$6"
 
-if [ -z "$tree" ] || [ -z "$window" ] || [ -z "$trials" ] || [ -z "$load_threads" ] || [ -z "$profile" ]; then
-    echo "usage: $0 <tree> <window_s> <trials> <load_threads> <profile_ns>" >&2
+if [ -z "$tree" ] || [ -z "$window" ] || [ -z "$trials" ] || [ -z "$load_threads" ] \
+    || [ -z "$duty_ms" ] || [ -z "$profile" ]; then
+    echo "usage: $0 <tree> <window_s> <trials> <load_threads> <duty_ms> <profile_ns>" >&2
     exit 2
 fi
 
@@ -56,7 +65,7 @@ export FLYNNEL_HOST_PROFILE_NS="$profile"
 sh "$HOME/vm_presence.sh" claim $$ "flynnel per-lever throughput A/B, TIMINGS, needs a quiet box, about 20 minutes, Flynnel-Scholar"
 trap 'sh "$HOME/vm_presence.sh" release '"$$" EXIT INT TERM
 
-echo "LEVER_START $(date -u '+%Y-%m-%d %H:%M:%S') tree=$tree window=${window}s trials=$trials load=$load_threads profile=$profile"
+echo "LEVER_START $(date -u '+%Y-%m-%d %H:%M:%S') tree=$tree window=${window}s trials=$trials load=$load_threads duty_ms=$duty_ms profile=$profile"
 echo "HOST $(hostname) cores=$(nproc) load=$(cut -d' ' -f1-3 /proc/loadavg)"
 echo "HEAD $(cd "$tree" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
@@ -92,14 +101,15 @@ run_arm() {
     lever="$1"
     var="$2"
     smt="$3"
-    arm="$4"
-    load="$5"
-    t="$6"
+    duty="$4"
+    arm="$5"
+    load="$6"
+    t="$7"
     echo "ARM ${lever}-${arm} load${load} t${t} $(date -u '+%H:%M:%S')"
     if [ "$arm" = on ]; then
-        env "$var=1" "$bin" "$window" "$load" 1 "$smt"
+        env "$var=1" "$bin" "$window" "$load" 1 "$smt" "$duty"
     else
-        "$bin" "$window" "$load" 1 "$smt"
+        "$bin" "$window" "$load" 1 "$smt" "$duty"
     fi
     rc=$?
     if [ "$rc" -ne 0 ]; then
@@ -108,23 +118,25 @@ run_arm() {
     fi
 }
 
-# name, switch, and whether the plan carries the SMT prior. The prior
-# is what effective_use_smt needs before it reads anything else, so the
-# window switch is unreachable without it.
+# Name, switch, whether the plan carries the SMT prior, and the burner
+# duty period. The prior is what effective_use_smt needs before it
+# reads anything else, so the window switch is unreachable without it.
+# A duty of zero holds the burners for the whole window.
 for spec in \
-    "ONCORE_SPREAD FLYNNEL_LEVER_ONCORE_SPREAD 0" \
-    "BATCH_WEIGHT FLYNNEL_LEVER_BATCH_WEIGHT 0" \
-    "SMT_WINDOW FLYNNEL_LEVER_SMT_WINDOW 1"
+    "ONCORE_SPREAD FLYNNEL_LEVER_ONCORE_SPREAD 0 0" \
+    "BATCH_WEIGHT FLYNNEL_LEVER_BATCH_WEIGHT 0 $duty_ms" \
+    "SMT_WINDOW FLYNNEL_LEVER_SMT_WINDOW 1 0"
 do
     set -- $spec
     lever="$1"
     var="$2"
     smt="$3"
+    duty="$4"
     for load in 0 "$load_threads"; do
         t=1
         while [ "$t" -le "$trials" ]; do
             for arm in $(order_for "$t"); do
-                run_arm "$lever" "$var" "$smt" "$arm" "$load" "$t"
+                run_arm "$lever" "$var" "$smt" "$duty" "$arm" "$load" "$t"
             done
             t=$((t + 1))
         done

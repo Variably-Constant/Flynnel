@@ -36,8 +36,18 @@
 //! own on and off arms did not engage, and its throughput row says
 //! nothing about the mechanism.
 //!
+//! # Why the load can alternate
+//!
+//! `duty_ms` makes the burners spin and sleep in phase rather than burn
+//! throughout. Steady contention gives every batch about the same
+//! on-core share, and a statistic that weighs batches by that share
+//! divides a weighted total by a weighted count, so a share common to
+//! every batch cancels and the figure does not move. Alternating puts
+//! contended and quiet batches in one window, which is the condition
+//! such a weighting exists for.
+//!
 //! ```sh
-//! throughput_under_load <window_s> <load_threads> <trials> [smt_prior]
+//! throughput_under_load <window_s> <load_threads> <trials> [smt_prior] [duty_ms]
 //! ```
 
 use std::env;
@@ -110,14 +120,34 @@ struct Load {
 }
 
 impl Load {
-    fn start(n: usize) -> Self {
+    /// `duty_ms` of zero burns for the whole window. Any other value
+    /// alternates: every burner spins for that many milliseconds and
+    /// sleeps for the same, all of them reading one shared origin so
+    /// they stay in phase.
+    ///
+    /// In phase is the point. Burners staggered against each other
+    /// would sum to a steady load, and a steady load gives every batch
+    /// about the same on-core share. A statistic that weighs batches by
+    /// that share cannot move when they all weigh the same, whatever
+    /// the share is, because every figure it feeds divides a weighted
+    /// total by a weighted count. Alternating is what puts contended
+    /// and quiet batches in one window.
+    fn start(n: usize, duty_ms: u64) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let origin = Instant::now();
         let mut threads = Vec::with_capacity(n);
         for _ in 0..n {
             let stop = Arc::clone(&stop);
             threads.push(std::thread::spawn(move || {
                 let mut acc = 0u64;
                 while !stop.load(Ordering::Relaxed) {
+                    if duty_ms > 0 {
+                        let phase = origin.elapsed().as_millis() as u64 / duty_ms;
+                        if phase % 2 == 1 {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                    }
                     for _ in 0..4_096 {
                         acc = acc.wrapping_mul(2_862_933_555_777_941_757).wrapping_add(3);
                     }
@@ -156,12 +186,12 @@ fn reading(value: Option<u64>) -> String {
 /// Read against the same line from the arm the switch was off in. Two
 /// arms whose engagement figures match ran the same code whatever the
 /// throughput rows did.
-fn engagement(smt_prior: bool) {
+fn engagement(smt_prior: bool, duty_ms: u64) {
     let plan = plan(smt_prior);
     let site = &SITE;
     println!(
-        "engagement leaves={} oncore_items={} per_item_ns={} cv2_wall={} cv2_oncore={} \
-         cv2_window={} window_ticks={} class={:?} workers={} allowed={} smt={}",
+        "engagement duty_ms={duty_ms} leaves={} oncore_items={} per_item_ns={} cv2_wall={} \
+         cv2_oncore={} cv2_window={} window_ticks={} class={:?} workers={} allowed={} smt={}",
         site.leaf_count(),
         site.oncore_items(),
         reading(site.per_item_ns()),
@@ -181,6 +211,7 @@ fn main() {
     let load_threads: usize = arg(2, 12);
     let trials: usize = arg(3, 5);
     let smt_prior: bool = arg::<u8>(4, 0) != 0;
+    let duty_ms: u64 = arg(5, 0);
 
     // Which arm this process is. Printed rather than assumed, because a
     // switch that failed to engage produces rows indistinguishable from
@@ -215,7 +246,7 @@ fn main() {
     }
 
     for t in 1..=trials {
-        let load = (load_threads > 0).then(|| Load::start(load_threads));
+        let load = (load_threads > 0).then(|| Load::start(load_threads, duty_ms));
         // Let the burners actually reach the cores before timing, or the
         // early part of the window is measured with less load than the
         // row claims.
@@ -230,5 +261,5 @@ fn main() {
         println!("throughput {load_threads} {t} {n} {per_s:.2}");
     }
 
-    engagement(smt_prior);
+    engagement(smt_prior, duty_ms);
 }
