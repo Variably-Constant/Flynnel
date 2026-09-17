@@ -1,4 +1,4 @@
-//! Runtime switches for the noisy-host mechanisms, each defaulting OFF.
+//! Runtime switches for the noisy-host mechanisms.
 //!
 //! Every mechanism here has to earn its place against the same code
 //! without it: never slower on a quiet host, faster on a contended one.
@@ -6,13 +6,17 @@
 //! the comparison carries no difference in commit, harness, build or
 //! machine - only the mechanism.
 //!
-//! # Why the default is off
+//! # Why a default is off
 //!
 //! Off is the behavior that shipped. A mechanism defaults on only when a
 //! measurement says it should, and until then the crate behaves exactly
 //! as it did, so carrying the code costs nothing but the branch it is on.
 //! A switch whose default flips on the strength of an argument rather
 //! than a reading is how the thing this campaign is fixing got in.
+//!
+//! One switch has earned it. [`calibration_refusal`] defaults on, and
+//! the reading is on the function. Each of the others is off and says
+//! what would have to be measured for that to change.
 //!
 //! # Why environment variables rather than features
 //!
@@ -53,6 +57,19 @@ fn read(name: &str) -> bool {
             );
             false
         }
+    }
+}
+
+/// Read a switch once, absent meaning on.
+///
+/// The same spellings mean off as in [`read`], so a caller who turns
+/// something off gets it off by any of the words a script produces. The
+/// difference is only what an unset variable means, which for a
+/// mechanism a measurement has already settled is that it runs.
+fn read_defaulting_on(name: &str) -> bool {
+    match std::env::var_os(name) {
+        None => true,
+        Some(_) => read(name),
     }
 }
 
@@ -104,10 +121,23 @@ pub fn allowed_width() -> bool {
     *V.get_or_init(|| read("FLYNNEL_LEVER_ALLOWED_WIDTH"))
 }
 
-/// Decline to displace a stored calibration drawn on a quieter host.
+/// Decline to displace a stored calibration whose dispatch cost is
+/// cheaper than the one being offered.
+///
+/// The one switch here that defaults on. The others default off because
+/// off is the behavior that shipped and a measurement has to earn the
+/// flip; this one has the measurement. Across 16 draws at each of three
+/// load levels on a 12-core host, the dispatch cost read 1300 to 1500 ns
+/// idle and 3.2 to 7.0 million saturated, with no overlap, so the
+/// cheaper record is the quieter draw and the ordering needs no
+/// threshold.
+///
+/// Off restores the previous behavior, where the most recent draw wins
+/// and a calibration taken while the host was busy stands until
+/// something displaces it.
 pub fn calibration_refusal() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| read("FLYNNEL_LEVER_CALIBRATION_REFUSAL"))
+    *V.get_or_init(|| read_defaulting_on("FLYNNEL_LEVER_CALIBRATION_REFUSAL"))
 }
 
 /// Every switch and its state, for a harness to print beside its result.

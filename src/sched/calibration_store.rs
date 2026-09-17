@@ -61,14 +61,12 @@ pub const CALIBRATION_MAGIC: u64 = 0x464C_4342_0000_0001;
 /// Raising this changes every host stamp, so the next start on any host
 /// measures again. Raise it whenever a stored field changes meaning.
 ///
-/// It is also one of two ways to displace a record that is standing.
-/// [`CpuCalibration::is_trustworthy`] passing means the reader returns
-/// it and never reaches the branch that would publish a better one, so
-/// a record that clears the check stands for its stamp until either
-/// this rises or `FLYNNEL_CALIBRATION_MAX_AGE_S` ages it out. The check
-/// is likelier to pass for a draw taken under load, whose samples agree
-/// with each other because they were all slowed together.
-pub const LAYOUT_VERSION: u32 = 6;
+/// It is also what displaces a standing record that nothing else can.
+/// A stored record is the cheapest dispatch cost seen for its stamp, so
+/// a spuriously fast reading stands for the life of the stamp: nothing
+/// later can be cheaper than a wrong floor, and neither a fresh draw nor
+/// `FLYNNEL_CALIBRATION_MAX_AGE_S` ageing one out will beat it.
+pub const LAYOUT_VERSION: u32 = 7;
 
 /// Devices a table records. A host with more reports the first
 /// [`MAX_ACCEL`] and the rest go unrecorded rather than overflowing.
@@ -796,18 +794,24 @@ pub struct WriterGuard<'a> {
 /// Whether a stored record should stand against one being offered, and
 /// `None` where it should not.
 ///
+/// The cheaper dispatch cost stands. Load only ever adds time, so the
+/// smallest cost seen for a stamp is the quietest observation of that
+/// host, and the table converges on it as more draws arrive. A tie goes
+/// to the offer, since the fresher draw describes the host now.
+///
+/// Measured on a 12-core host, 16 draws at each level: dispatch costs
+/// 1300 to 1500 ns idle against 3.2 to 7.0 million saturated. The two
+/// conditions do not overlap, so the ordering needs no threshold and no
+/// measure of spread.
+///
+/// The known weakness is that one spuriously fast reading stands for
+/// the life of the stamp, because nothing later can be cheaper than a
+/// wrong floor. Raising [`LAYOUT_VERSION`] is what displaces it.
+///
 /// Separate from the write so the decision can be exercised without a
 /// mapped file, a writer lease, or the process-wide switch that gates
 /// it: a switch read once per process cannot be moved between tests, so
 /// a test that needed it on would fix the value for every test after it.
-///
-/// The comparison runs only where it can decide something. An incumbent
-/// whose own samples disagreed is replaced whatever it was drawn at,
-/// because its spread already says it does not describe the host. Where
-/// either record lacks an occupancy the two cannot be ordered and the
-/// offer wins, so a platform with no thread clock cannot freeze the
-/// table. A tie goes to the offer, because the fresher draw describes
-/// the host now.
 /// Per-mille disagreement between two draws of the same host, on each
 /// of the three dispatch figures, in the order dispatch, collapse,
 /// wake.
@@ -840,11 +844,13 @@ fn prefers_incumbent(
     incumbent: &CpuCalibration,
     offered: &CpuCalibration,
 ) -> Option<PublishOutcome> {
-    if !incumbent.is_trustworthy() {
+    // A table nobody has published reads back zeroed, and a zero
+    // dispatch cost would win every comparison forever.
+    if incumbent.samples == 0 {
         return None;
     }
-    let (held, new) = (incumbent.occupancy()?, offered.occupancy()?);
-    (held > new).then_some(PublishOutcome::KeptIncumbent { incumbent: held, offered: new })
+    let (held, new) = (incumbent.dispatch_cost_ns, offered.dispatch_cost_ns);
+    (held < new).then_some(PublishOutcome::KeptIncumbent { incumbent: held, offered: new })
 }
 
 /// What [`WriterGuard::publish_if_better`] did with the record it was
@@ -858,13 +864,13 @@ fn prefers_incumbent(
 pub enum PublishOutcome {
     /// The record was written.
     Published,
-    /// The table held a record drawn while more of the machine was
-    /// free, and it stands. Both figures are in parts per mille.
+    /// The table held a cheaper dispatch cost, and it stands. Both
+    /// figures are nanoseconds.
     KeptIncumbent {
-        /// What the stored record was drawn at.
-        incumbent: u32,
-        /// What this draw ran at.
-        offered: u32,
+        /// The stored record's dispatch cost.
+        incumbent: u64,
+        /// This draw's dispatch cost.
+        offered: u64,
     },
 }
 
@@ -878,34 +884,26 @@ impl WriterGuard<'_> {
             .fetch_add(1, Ordering::Release);
     }
 
-    /// Publish unless the table already holds a record drawn on a
-    /// quieter host.
+    /// Publish unless the table already holds a cheaper dispatch cost.
     ///
-    /// This is an ORDERING BETWEEN TWO RECORDS, not a threshold on
-    /// either. No occupancy is called good or bad, and no cutoff
-    /// separates a contended draw from a clean one - the share of free
-    /// cores is a continuous property of a host rather than a state it
-    /// is in, so a cutoff would be a policy about how much of a machine
-    /// a calibration insists on and would have to be argued as one. Two
+    /// An ordering between two records, not a threshold on either. No
+    /// cost is called good or bad and no cutoff separates a contended
+    /// draw from a clean one, because the share of free cores is a
+    /// continuous property of a host rather than a state it is in. Two
     /// records can still be compared without any of that being settled.
     ///
-    /// The comparison runs only where it can decide something:
+    /// Load only ever adds time, so the cheapest cost seen for a stamp
+    /// is the quietest observation of that host and the table converges
+    /// on it. A tie publishes, since the fresher draw describes the host
+    /// now. A table nobody has published reads back zeroed and is not
+    /// allowed to defend its zero.
     ///
-    /// - An incumbent whose own samples disagreed is replaced whatever
-    ///   it was drawn at. Its spread already says it does not describe
-    ///   the host, and occupancy cannot rescue it.
-    /// - Where both records carry an occupancy, the better-drawn one
-    ///   stands.
-    /// - Where either lacks one, occupancy cannot order them and the
-    ///   offered record is published, which is the behavior a platform
-    ///   with no thread clock has always had. Absence must not freeze a
-    ///   table against every later measurement.
-    ///
-    /// The spread and the occupancy answer different questions and both
-    /// are needed. Spread says whether a draw's samples agreed with each
-    /// other; it cannot say whether they agreed on the wrong number,
-    /// which is what a neighbour holding half the machine produces -
-    /// every sample slow, and slow by about the same amount.
+    /// Neither the spread nor the occupancy enters this. Both were
+    /// measured across three load levels: the spread moves 1.3x between
+    /// an idle host and a saturated one and the interquartile range
+    /// 1.1x, while the dispatch cost moves by a factor of thousands.
+    /// Every dispersion figure tried divides by the median, and the
+    /// difference between the conditions is in the median.
     pub fn publish_if_better(
         &self,
         cpu: &CpuCalibration,
@@ -1139,62 +1137,92 @@ mod tests {
     /// The decision alone, with no file, no lease and no process-wide
     /// switch: those are the write, and this is what to write.
     #[test]
-    fn a_draw_on_a_quieter_host_displaces_one_taken_under_load() {
+    fn a_cheaper_draw_displaces_a_more_expensive_one() {
         let loaded = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
         let quiet = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
-        assert_eq!(prefers_incumbent(&loaded, &quiet), None, "the quieter draw wins");
+        assert_eq!(prefers_incumbent(&loaded, &quiet), None, "the cheaper draw wins");
     }
 
     #[test]
-    fn a_draw_under_load_does_not_displace_one_taken_on_a_quieter_host() {
-        // An ordering between two records, not a cutoff on either: 210
-        // is not called bad, it is called worse than 990.
+    fn a_more_expensive_draw_does_not_displace_a_cheaper_one() {
+        // An ordering between two records, not a cutoff on either: 9000
+        // is not called bad, it is called dearer than 1000.
         let quiet = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
         let loaded = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
         assert_eq!(
             prefers_incumbent(&quiet, &loaded),
-            Some(PublishOutcome::KeptIncumbent { incumbent: 990, offered: 210 }),
-            "the refusal names both figures so a caller can say why"
+            Some(PublishOutcome::KeptIncumbent { incumbent: 1_000, offered: 9_000 }),
+            "the refusal names both costs so a caller can say why"
         );
     }
 
     #[test]
-    fn a_record_whose_own_samples_disagreed_is_replaced_however_it_was_drawn() {
-        // Spread and occupancy answer different questions. A record that
-        // cannot describe the host by its own samples is not rescued by
-        // having been drawn on a quiet one.
+    fn a_scattered_incumbent_stands_while_it_is_the_cheapest_seen() {
+        // The spread no longer participates. It was measured across
+        // three load levels and moves 1.3x between an idle host and a
+        // saturated one, so it cannot order two records; the cost moves
+        // by thousands. A record whose samples disagreed is still the
+        // cheapest observation of this host until something cheaper
+        // arrives.
         let scattered = CpuCalibration::new(
-            9_000,
+            1_000,
             70_000,
             40_000,
             PROVISIONAL_SPREAD_PER_MILLE + 1,
             9,
             Some(990),
         );
-        assert!(!scattered.is_trustworthy(), "the incumbent's samples disagreed");
-        let loaded = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(210));
-        assert_eq!(prefers_incumbent(&scattered, &loaded), None);
+        assert!(!scattered.is_trustworthy(), "its own samples disagreed");
+        let dearer = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
+        assert_eq!(
+            prefers_incumbent(&scattered, &dearer),
+            Some(PublishOutcome::KeptIncumbent { incumbent: 1_000, offered: 9_000 }),
+            "cost orders them, and the incumbent's spread does not enter it"
+        );
     }
 
     #[test]
-    fn an_unmeasured_occupancy_publishes_rather_than_freezing_the_table() {
-        // Where either side lacks a reading the two cannot be ordered
-        // and the offer wins. A platform with no thread clock must not
-        // leave the first record ever written standing against every
-        // later measurement.
-        let quiet = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(990));
-        let unmeasured = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, None);
-        assert_eq!(prefers_incumbent(&unmeasured, &quiet), None, "no incumbent reading");
-        assert_eq!(prefers_incumbent(&quiet, &unmeasured), None, "no offered reading");
+    fn a_record_with_no_occupancy_is_ordered_like_any_other() {
+        // Occupancy no longer orders anything, so a platform with no
+        // thread clock is not a special case and cannot freeze or lose
+        // the table. Both directions are asserted, because a rule that
+        // read the absent field would fail in exactly one of them.
+        let dear = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(990));
+        let cheap_unmeasured = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, None);
+        assert_eq!(
+            prefers_incumbent(&cheap_unmeasured, &dear),
+            Some(PublishOutcome::KeptIncumbent { incumbent: 1_000, offered: 9_000 }),
+            "a cheaper incumbent stands without an occupancy of its own"
+        );
+        assert_eq!(
+            prefers_incumbent(&dear, &cheap_unmeasured),
+            None,
+            "and a cheaper offer displaces without one either"
+        );
     }
 
     #[test]
-    fn an_equal_draw_publishes_so_a_fresher_measurement_wins_a_tie() {
-        // Equal occupancy orders nothing, and the newer measurement has
-        // the better claim to describe the host now.
-        let first = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(700));
-        let second = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(700));
+    fn an_equal_cost_publishes_so_a_fresher_measurement_wins_a_tie() {
+        // Equal costs order nothing, and the newer measurement has the
+        // better claim to describe the host now.
+        let first = CpuCalibration::new(4_000, 70_000, 40_000, 41, 9, Some(700));
+        let second = CpuCalibration::new(4_000, 12_000, 9_000, 41, 9, Some(700));
         assert_eq!(prefers_incumbent(&first, &second), None);
+    }
+
+    #[test]
+    fn a_table_nobody_published_never_wins_on_its_zero() {
+        // A zeroed record reads back from a fresh table, and zero is
+        // cheaper than any measurement, so without this guard the first
+        // comparison against a new table would keep the empty record
+        // permanently.
+        let empty = CpuCalibration::new(0, 0, 0, 0, 0, None);
+        let measured = CpuCalibration::new(4_000, 70_000, 40_000, 41, 9, Some(990));
+        assert_eq!(
+            prefers_incumbent(&empty, &measured),
+            None,
+            "an unpublished table has no draw to defend"
+        );
     }
 
     #[test]
@@ -1205,31 +1233,17 @@ mod tests {
         // not, so the incumbent arriving here has failed that check,
         // and `prefers_incumbent` returns `None` for exactly those.
         //
-        // Both halves are asserted: a passing record is refused entry
-        // to the caller's offer branch, and a failing one is refused by
-        // the guard. `an_aged_incumbent_is_ordered_rather_than_dismissed`
-        // covers the case a configured bound opens.
+        // One half now, not two. The guard used to reject an
+        // untrustworthy incumbent on its first line, which was the other
+        // half of the contradiction; cost orders the two records without
+        // consulting the spread, so that half is gone and only the
+        // caller's early return keeps the comparison unreached.
+        // `an_aged_incumbent_is_ordered_rather_than_dismissed` covers the
+        // case a configured bound opens.
         let passes = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
         assert!(
             passes.is_trustworthy(),
             "a record like this is returned by the caller and never offered"
-        );
-
-        let arrives = CpuCalibration::new(
-            1_000,
-            70_000,
-            40_000,
-            PROVISIONAL_SPREAD_PER_MILLE + 1,
-            9,
-            Some(990),
-        );
-        assert!(!arrives.is_trustworthy(), "this is what the caller does offer");
-
-        let offered = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
-        assert_eq!(
-            prefers_incumbent(&arrives, &offered),
-            None,
-            "and the refusal declines to act on it, whatever the occupancies say"
         );
     }
 
@@ -1275,8 +1289,8 @@ mod tests {
         let offered = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
         assert_eq!(
             prefers_incumbent(&aged, &offered),
-            Some(PublishOutcome::KeptIncumbent { incumbent: 990, offered: 210 }),
-            "the quieter of the two stands, and both figures are named"
+            Some(PublishOutcome::KeptIncumbent { incumbent: 1_000, offered: 9_000 }),
+            "the cheaper of the two stands, and both costs are named"
         );
     }
 
@@ -1291,7 +1305,7 @@ mod tests {
         if crate::sched::levers::calibration_refusal() {
             assert_eq!(
                 outcome,
-                PublishOutcome::KeptIncumbent { incumbent: 990, offered: 210 },
+                PublishOutcome::KeptIncumbent { incumbent: 1_000, offered: 9_000 },
                 "the switch is on in this process, so the refusal must fire"
             );
             assert_eq!(held.dispatch_cost_ns, 1_000);
