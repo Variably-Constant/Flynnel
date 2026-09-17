@@ -136,12 +136,64 @@ def main(paths):
         print(f"{load:>5} {len(flat):>7} {rng:>10.0f} {iqr:>10.0f} {ratio:>10}")
     print("medians over every sweep at that load, in parts per thousand.")
 
+    separation(by_load)
+
     print()
     print("READ IT THIS WAY. A statistic worth gating on is small where")
     print("the across-draw figures are small and grows with them. One")
     print("that is large at every load separates no condition, and a")
     print("bound on it refuses every record or none.")
     return 0
+
+
+def separation(by_load):
+    """How far each candidate moves between the quietest and busiest draws.
+
+    The question is not which statistic looks reasonable but which one
+    TRACKS. A bound exists to protect the reproducibility of the median,
+    so the figure to match is how far independent medians fall apart;
+    a statistic that barely moves while that figure moves a lot cannot
+    tell the two conditions apart at any bound.
+
+    Reported as a ratio between the extreme load levels, which needs at
+    least two of them. Nothing is chosen here and no bound is proposed.
+    """
+    loads = sorted(by_load)
+    print()
+    print("SEPARATION between the quietest and busiest draws:")
+    if len(loads) < 2:
+        print("  one load level only; a separation needs at least two.")
+        return
+    lo, hi = loads[0], loads[-1]
+
+    def ratio(a, b):
+        if a is None or b is None or not a:
+            return None
+        return b / a
+
+    rows = []
+    for f in FIGURES:
+        a = spread_per_mille([d[f] for d in by_load[lo]["draws"]])
+        b = spread_per_mille([d[f] for d in by_load[hi]["draws"]])
+        rows.append((f"across draws, {f}", a, b, ratio(a, b)))
+    for key, label in (("spread", "within a draw, range"), ("iqr", "within a draw, iqr")):
+        flat_lo = [s for per in by_load[lo]["sweeps"] for s in per]
+        flat_hi = [s for per in by_load[hi]["sweeps"] for s in per]
+        a = median([s[key] for s in flat_lo]) if flat_lo else None
+        b = median([s[key] for s in flat_hi]) if flat_hi else None
+        rows.append((label, a, b, ratio(a, b)))
+
+    print(f"{'figure':<26} {f'load {lo}':>10} {f'load {hi}':>10} {'ratio':>8}")
+    print("-" * 58)
+    for label, a, b, r in rows:
+        at = "-" if a is None else f"{a:>10.0f}"
+        bt = "-" if b is None else f"{b:>10.0f}"
+        rt = "-" if r is None else f"{r:>8.1f}"
+        print(f"{label:<26} {at} {bt} {rt}")
+    print()
+    print("The top rows are what a bound is FOR. A candidate below them")
+    print("whose ratio is near 1 does not separate these conditions and")
+    print("cannot be made to by choosing a bound.")
 
 
 if __name__ == "__main__":
