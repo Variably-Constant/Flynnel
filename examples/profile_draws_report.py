@@ -160,6 +160,10 @@ def main(paths):
         ratio = "-" if not iqr else f"{rng / iqr:>10.1f}"
         print(f"{load:>5} {len(flat):>7} {rng:>10.0f} {iqr:>10.0f} {ratio:>10}")
     print("medians over every sweep at that load, in parts per thousand.")
+    print("These are the two crossover sweeps, which is what the trust")
+    print("check reads: it keeps the larger of the collapse and wake")
+    print("spreads. The dispatch cost's own samples print under a")
+    print("different label, carry no spread or iqr, and gate nothing.")
 
     separation(by_load)
 
@@ -192,9 +196,20 @@ def separation(by_load):
     lo, hi = loads[0], loads[-1]
 
     def ratio(a, b):
-        if a is None or b is None or not a:
-            return None
-        return b / a
+        """The separation, or why there is not one.
+
+        A quiet figure of zero is not missing data: it is the pairs
+        agreeing exactly, which is the strongest separation a figure
+        can show and must not render the same as a column nobody
+        filled. Returned as a string so the two cases stay apart in the
+        table, since that collapse is the defect this whole exercise
+        keeps turning up.
+        """
+        if a is None or b is None:
+            return "-"
+        if a == 0:
+            return "exact" if b == 0 else "0 -> nonzero"
+        return f"{b / a:.1f}"
 
     rows = []
     for f in FIGURES:
@@ -217,13 +232,17 @@ def separation(by_load):
         b = median([s[key] for s in flat_hi]) if flat_hi else None
         rows.append((label, a, b, ratio(a, b)))
 
-    print(f"{'figure':<26} {f'load {lo}':>10} {f'load {hi}':>10} {'ratio':>8}")
-    print("-" * 58)
+    print(f"{'figure':<26} {f'load {lo}':>10} {f'load {hi}':>10} {'ratio':>14}")
+    print("-" * 64)
     for label, a, b, r in rows:
         at = "-" if a is None else f"{a:>10.0f}"
         bt = "-" if b is None else f"{b:>10.0f}"
-        rt = "-" if r is None else f"{r:>8.1f}"
-        print(f"{label:<26} {at} {bt} {rt}")
+        print(f"{label:<26} {at} {bt} {r:>14}")
+    print()
+    print("'0 -> nonzero' is a figure that was exactly zero on the quiet")
+    print("host and is not on the busy one: the pairs agreed to the")
+    print("nanosecond and then stopped. That is the widest separation a")
+    print("column can show, and a dash would have hidden it.")
     print()
     print("The top rows are what a bound is FOR. A candidate below them")
     print("whose ratio is near 1 does not separate these conditions and")

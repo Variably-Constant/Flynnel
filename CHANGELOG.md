@@ -298,11 +298,25 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 - `sched::par_iter::sample_iqr_per_mille` reports the interquartile
   range of a sorted sample set over its median, beside the existing
   `sample_spread_per_mille`, which reports the full range over the same
-  median. The two answer different questions and nothing reads the new
-  one yet: a range is defined by the two samples a median exists to
-  survive, so one scheduling hiccup in nine sets it, while five draws on
-  an idle guest agreed on their medians to 8 percent and each reported a
-  range of 160 to 272 percent.
+  median. Nothing reads either, and the pair is reported together
+  because having both is what showed neither can serve.
+
+  A range is defined by the two samples a median exists to survive, so
+  one scheduling hiccup in nine sets it. The interquartile range fixes
+  that and does not fix the thing that matters: measured across three
+  load levels on two hosts, both INVERT. Under saturation every sample
+  in a draw is slowed by about the same factor, so the samples agree
+  with each other while the medians independent draws produce scatter
+  enormously. On a Zen3 guest the interquartile range read 128 per
+  mille quiet against 86 saturated, while the medians of independent
+  draws went from 83 to 432,299.
+
+  The consequence for a caller: a dispersion figure taken over one
+  draw's samples does not say whether that draw's median is
+  reproducible, and under load it says the opposite. The figure that
+  does is the disagreement between two draws, which on the same data
+  separated those conditions by 14,149 times where the samples' own
+  spread separated them by 2.4.
 - `examples/clock_cost.rs` times what a thread-clock read costs on the
   running host and what the sampled leaf bracket amortizes to at a given
   stride, timing each half as the platform runs it -
