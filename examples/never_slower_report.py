@@ -141,10 +141,30 @@ def main(paths):
         # against. One trial has no spread to speak of: min equals max, so
         # the estimate is 1.000 and every difference however small clears
         # it. That is a verdict manufactured from a sample of one.
+        # A spread wider than the difference it is meant to judge decides
+        # nothing. The test "is the shortfall bigger than the noise"
+        # passes automatically once the noise is large, so a cell like
+        # that is not evidence of no regression; it is evidence that this
+        # run could not have seen one. Derived from the data rather than
+        # set: the comparison is the cell's own spread against the
+        # cell's own deviation from parity.
+        deviation = None if quiet is None else abs(1.0 - quiet)
+        blind = (
+            bs is not None
+            and deviation is not None
+            and (bs - 1.0) > max(deviation, 0.0)
+        )
+
         if trials < 2:
             undecided.append(
                 f"  reps {reps} load {load}: {trials} trial, so the base has no "
                 f"trial-to-trial spread and nothing here can be called noise"
+            )
+        elif blind:
+            undecided.append(
+                f"  reps {reps} load {load}: base varies by {bs:.3f} between its own "
+                f"trials while the tip differs by {deviation:.3f}, so the noise is "
+                f"larger than the effect and this cell decides nothing"
             )
         elif quiet is not None and bs is not None and quiet < 1.0:
             worse_by = 1.0 / quiet
@@ -173,7 +193,7 @@ def main(paths):
 
     print()
     if undecided:
-        print("NOT ENOUGH TRIALS TO DECIDE:")
+        print("CELLS THAT DECIDE NOTHING:")
         for u in undecided:
             print(u)
         print()
@@ -188,9 +208,15 @@ def main(paths):
         print("rather than noise, and it stands whatever the loaded arm did.")
     elif not undecided:
         print("No quiet figure fell below the base by more than the base's own")
-        print("trial-to-trial spread. That is the never-slower half. Whether")
-        print("the tip is FASTER under load is the retention column, which is")
-        print("a separate claim and needs its own reading.")
+        print("trial-to-trial spread, and no cell was too noisy to decide. That")
+        print("is the never-slower half. Whether the tip is FASTER under load is")
+        print("the retention column, which is a separate claim and needs its own")
+        print("reading.")
+    else:
+        print("NOTHING IS CONCLUDED ABOUT THE UNDECIDED CELLS ABOVE. A cell whose")
+        print("noise exceeds the effect passes the never-slower test for the wrong")
+        print("reason, and counting that as a pass is how a run that could not")
+        print("have seen a regression gets reported as one that found none.")
 
     # Non-zero where something is wrong or unjudgeable, so a caller that
     # reads only the code does not take an undecided run for a clean one.
