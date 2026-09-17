@@ -110,7 +110,10 @@ fn reps_at(index: usize, reps: u32, irregular: bool) -> u32 {
         return reps;
     }
     let h = (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    1 + (h >> 33) as u32 % (2 * reps - 1)
+    // Saturating, so a reps above half of u32 yields a narrower span
+    // rather than wrapping to a small one in release.
+    let span = reps.saturating_mul(2).saturating_sub(1).max(1);
+    1 + (h >> 33) as u32 % span
 }
 
 /// Dispatches completed in `measured`, with whatever else is running.
