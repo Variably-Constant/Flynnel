@@ -286,15 +286,25 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   refusal returns `PublishOutcome::KeptIncumbent` naming both figures
   rather than passing silently.
 
-  The comparison is reached only when the incumbent clears
-  `CpuCalibration::is_trustworthy`, which needs a sample spread at or
-  under `PROVISIONAL_SPREAD_PER_MILLE`. On the three hosts measured so
-  far no draw clears it - the lowest reported is 1599 against a bound of
-  250 - so the switch selects between two identical behaviors there and
-  a consumer setting it should expect no change until that is addressed.
-  `sample_iqr_per_mille` is reported beside the range under
-  `FLYNNEL_PROFILE_SAMPLES` as the first step toward a bound derived
-  from draws rather than carried over.
+  THE COMPARISON IS UNREACHABLE AND THE SWITCH CHANGES NOTHING, on any
+  host. A consumer setting it should expect no behavior change until
+  that is fixed.
+
+  `publish_if_better` has one caller: the branch `stored_or_measured`
+  takes when the stored record is absent or FAILED
+  `CpuCalibration::is_trustworthy`. `prefers_incumbent` returns `None`
+  on its first line unless the incumbent PASSED the same check. A record
+  that passes is returned before that branch is reached and is never
+  offered for comparison, so the two conditions cannot both hold.
+
+  The unit tests build a `CalibrationStore` directly and call the guard
+  with an incumbent of their choosing, which is why they pass while the
+  path a process takes is never exercised.
+
+  Making a stored record something a fresh draw can displace is what
+  would deliver an incumbent to the comparison. Until then
+  `CpuCalibration::occupancy` is provenance a reader can inspect and
+  nothing acts on.
 - `sched::par_iter::sample_iqr_per_mille` reports the interquartile
   range of a sorted sample set over its median, beside the existing
   `sample_spread_per_mille`, which reports the full range over the same
