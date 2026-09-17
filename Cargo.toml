@@ -202,6 +202,9 @@ name = "profile_cost"
 name = "throughput_under_load"
 
 [[example]]
+name = "clock_cost"
+
+[[example]]
 name = "smt_wake_cost"
 
 [[example]]

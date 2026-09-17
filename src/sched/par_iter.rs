@@ -214,7 +214,7 @@ fn record_leaf<F: FnOnce() -> R, R>(
 }
 
 /// [`record_leaf`] with the thread's own clock read either side as
-/// well, so the leaf carries what it COST beside what it TOOK.
+/// well, so the leaf carries its on-core time beside its wall time.
 ///
 /// The two differ by whatever the leaf spent off a core, and that
 /// difference is the whole reason a busy host moves the scheduler's
@@ -222,13 +222,15 @@ fn record_leaf<F: FnOnce() -> R, R>(
 /// and not others, so it enters a wall-time spread as variance that
 /// cannot be told from the work's own irregularity.
 ///
-/// Only the sampled path calls this. Two extra clock reads cost far
-/// more than the two counter reads around them - the per-leaf
-/// instrumentation budget is about 4 ns amortized and a thread-clock
-/// read is an order above that - so it is affordable where the stride
-/// divides it and nowhere else. A leaf recorded off this path carries a
-/// wall time and no on-core reading, and the site divides each figure
-/// by the items that figure covers.
+/// Only the sampled path calls this, and only while
+/// [`crate::sched::levers::oncore_spread`] is on. Two clock pairs are
+/// added to the two counter reads the leaf already pays; on Linux and
+/// FreeBSD the thread-clock half of a pair is a syscall, since the vDSO
+/// serves the monotonic clocks and refuses the per-thread CPU clock.
+/// `examples/clock_cost.rs` reports what a pair costs on a host and
+/// what the bracket amortizes to at the sample stride. A leaf recorded
+/// off this path carries a wall time and no on-core reading, and the
+/// site divides each figure by the items that figure covers.
 ///
 /// A platform with no thread clock records the wall time alone, which
 /// is what it has always recorded.
