@@ -21,7 +21,12 @@ import re
 import sys
 from collections import defaultdict
 
-ARM = re.compile(r"^ARM\s+([A-Z_]+)-(off|null|on)\s+load(\d+)\s+t(\d+)")
+# The pass is optional so a log taken before levels were visited twice
+# still parses; those rows read as pass 1 and their cells report one
+# visit, which is what they were.
+ARM = re.compile(
+    r"^ARM\s+([A-Z_]+)-(off|null|on)\s+load(\d+)(?:\s+p(\d+))?\s+t(\d+)"
+)
 ROW = re.compile(r"^throughput\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)\s*$")
 ENGAGE = re.compile(r"^engagement\s+(.*)$")
 FAILED = re.compile(r"^ARM_FAILED\s+(\S+)\s+load(\d+)\s+t(\d+)\s+exit=(\d+)")
@@ -70,6 +75,7 @@ def parse(path):
 
     pending = None
     cells = defaultdict(list)
+    per_visit = defaultdict(list)
     engage = defaultdict(list)
     failures = []
     skipped = []
@@ -87,11 +93,17 @@ def parse(path):
             continue
         m = ARM.match(line)
         if m:
-            pending = (m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+            pending = (
+                m.group(1),
+                m.group(2),
+                int(m.group(3)),
+                int(m.group(4) or 1),
+                int(m.group(5)),
+            )
             continue
         e = ENGAGE.match(line)
         if e and pending is not None:
-            lever, arm, load, _ = pending
+            lever, arm, load, _pass, _trial = pending
             fields = {}
             for token in e.group(1).split():
                 if "=" in token:
@@ -101,17 +113,18 @@ def parse(path):
             continue
         r = ROW.match(line)
         if r and pending is not None:
-            lever, arm, load, trial = pending
+            lever, arm, load, visit, trial = pending
             if int(r.group(1)) != load:
                 raise SystemExit(
                     f"MISMATCH: label load{load}, row load {r.group(1)}"
                 )
             value = float(r.group(4))
             cells[(lever, load, arm)].append(value)
-            key = (lever, load, trial)
+            per_visit[(lever, load, visit, arm)].append(value)
+            key = (lever, load, visit, trial)
             seen_in_trial[key] += 1
             by_position[(load, seen_in_trial[key])].append(value)
-    return cells, engage, failures, skipped, by_position
+    return cells, per_visit, engage, failures, skipped, by_position
 
 
 def report_engagement(engage, levers, loads):
@@ -169,8 +182,55 @@ def report_engagement(engage, levers, loads):
             print()
 
 
+def repeatability(per_visit, levers, loads):
+    """Does a cell's on/off ratio survive being visited somewhere else.
+
+    Each load level is measured twice with the levels rotated between
+    passes, so a level that came early in one pass comes later in the
+    other. A ratio that reproduces across those two visits is following
+    the load; one that does not was following whatever else the box was
+    doing while that stretch of the run happened.
+
+    This is the test the shape of the curve cannot do. A lever that
+    genuinely helps only when cores are free and an artefact of an
+    unloaded box BOTH give a ratio that moves with load, so a moving
+    ratio is not evidence either way. Reproducing under a changed
+    visiting order is.
+    """
+    visits = sorted({k[2] for k in per_visit})
+    if len(visits) < 2:
+        return
+    print()
+    print("REPEATABILITY, the same cell visited twice in different positions:")
+    print(f"{'lever':<22} {'load':>5} {'visit 1':>9} {'visit 2':>9} {'agree':>8}")
+    print("-" * 60)
+    for lever in levers:
+        for load in loads:
+            ratios = []
+            for v in visits[:2]:
+                off = median(per_visit.get((lever, load, v, "off"), []))
+                on = median(per_visit.get((lever, load, v, "on"), []))
+                ratios.append(on / off if off and on else None)
+            a, b = ratios[0], ratios[1]
+            if a is None or b is None:
+                print(f"{lever:<22} {load:>5}   one visit only")
+                continue
+            # The gap between the two visits, against how far the
+            # smaller of them sits from 1. A cell whose two readings
+            # disagree by more than the effect either one claims has
+            # not measured an effect.
+            gap = abs(b - a)
+            claim = min(abs(a - 1.0), abs(b - 1.0))
+            verdict = "repeats" if gap <= claim else "DOES NOT REPEAT"
+            print(f"{lever:<22} {load:>5} {a:>9.3f} {b:>9.3f} {verdict:>8}")
+    print()
+    print("A cell marked DOES NOT REPEAT differs between its two visits")
+    print("by more than the effect either visit claims, so the reading is")
+    print("about when it ran rather than about the switch.")
+
+
 def main(path):
-    cells, engage, failures, skipped, by_position = parse(path)
+    cells, per_visit, engage, failures, skipped, by_position = parse(path)
 
     if not cells:
         print("NO ROWS PARSED")
@@ -217,6 +277,8 @@ def main(path):
             else:
                 verdict = "SLOWER under load" if effect < 0 else "faster under load"
             print(f"{lever:<22} {load:>5} {r_on:>8.3f} {r_null:>9.3f} {verdict:<28}")
+
+    repeatability(per_visit, levers, loads)
 
     # Position, read before the levers are believed. If throughput
     # drifts with position within a rotation then position is a variable

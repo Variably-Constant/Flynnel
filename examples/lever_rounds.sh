@@ -37,23 +37,43 @@
 # varies it deterministically with the index, so the work has a spread
 # of its own for contention to be told apart from.
 #
-# usage: lever_rounds.sh <tree> <window_s> <trials> <load_threads> <duty_ms>
-#                        <reps> <irregular> <profile_ns>
+# Each load level is visited twice, with the levels rotated between the
+# two passes so every one lands at a different position. A cell whose
+# on/off ratio does not reproduce between its two visits was following
+# the box rather than the load: an effect that tracks contention
+# repeats wherever in the run the level is measured, and one that
+# tracks drift does not.
+#
+# The curve's shape discriminates nothing on its own. A lever that
+# genuinely helps only when cores are free and an artefact of an
+# unloaded box both produce a ratio that moves with load.
+# Repeatability under a changed visiting order is what separates them.
+#
+# usage: lever_rounds.sh <tree> <window_s> <trials> '<load levels>'
+#                        <duty_ms> <reps> <irregular> <profile_ns>
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
 tree="$1"
 window="$2"
 trials="$3"
-load_threads="$4"
+levels="$4"
 duty_ms="$5"
 reps="$6"
 irregular="$7"
 profile="$8"
 
-if [ -z "$tree" ] || [ -z "$window" ] || [ -z "$trials" ] || [ -z "$load_threads" ] \
+if [ -z "$tree" ] || [ -z "$window" ] || [ -z "$trials" ] || [ -z "$levels" ] \
     || [ -z "$duty_ms" ] || [ -z "$reps" ] || [ -z "$irregular" ] || [ -z "$profile" ]; then
-    echo "usage: $0 <tree> <window_s> <trials> <load_threads> <duty_ms> <reps> <irregular> <profile_ns>" >&2
+    echo "usage: $0 <tree> <window_s> <trials> '<load levels>' <duty_ms> <reps> <irregular> <profile_ns>" >&2
+    exit 2
+fi
+
+# Three or more levels, so the on/off ratio traces a curve rather than
+# joining two points. Quoted as one argument: '0 6 12'.
+set -- $levels
+if [ $# -lt 3 ]; then
+    echo "give at least three load levels; two visited once each cannot show whether a ratio repeats" >&2
     exit 2
 fi
 
@@ -82,7 +102,7 @@ export FLYNNEL_HOST_PROFILE_NS="$profile"
 sh "$HOME/vm_presence.sh" claim $$ "flynnel per-lever throughput A/B, TIMINGS, needs a quiet box, about 20 minutes, Flynnel-Scholar"
 trap 'sh "$HOME/vm_presence.sh" release '"$$" EXIT INT TERM
 
-echo "LEVER_START $(date -u '+%Y-%m-%d %H:%M:%S') tree=$tree window=${window}s trials=$trials load=$load_threads duty_ms=$duty_ms reps=$reps irregular=$irregular profile=$profile"
+echo "LEVER_START $(date -u '+%Y-%m-%d %H:%M:%S') tree=$tree window=${window}s trials=$trials levels='$levels' duty_ms=$duty_ms reps=$reps irregular=$irregular profile=$profile"
 echo "HOST $(hostname) cores=$(nproc) load=$(cut -d' ' -f1-3 /proc/loadavg)"
 echo "HEAD $(cd "$tree" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
@@ -116,6 +136,37 @@ order_for() {
 
 failed=0
 
+# The load levels for one pass, rotated by the pass number so every
+# level is visited at a different position on the second pass.
+#
+# Two levels visited once each give one ratio per level and no way to
+# tell a curve from two points that happen to differ. Adding levels
+# without varying the sequence they are walked in does not help either:
+# a box that drifts over the run produces a monotone curve for free
+# when the levels always come in the same succession. Rotating means an
+# effect that follows the box does not reproduce when a level is
+# visited at a different position, while one that follows the load
+# does.
+#
+# Rotation rather than reversal, because reversing leaves a middle
+# level at the same position in both passes.
+levels_for() {
+    pass="$1"
+    shift
+    n=$#
+    skip=$(( (pass - 1) % n ))
+    i=0
+    for lv in "$@"; do
+        [ "$i" -ge "$skip" ] && echo "$lv"
+        i=$((i + 1))
+    done
+    i=0
+    for lv in "$@"; do
+        [ "$i" -lt "$skip" ] && echo "$lv"
+        i=$((i + 1))
+    done
+}
+
 run_arm() {
     lever="$1"
     var="$2"
@@ -124,7 +175,8 @@ run_arm() {
     arm="$5"
     load="$6"
     t="$7"
-    echo "ARM ${lever}-${arm} load${load} t${t} $(date -u '+%H:%M:%S')"
+    pass="$8"
+    echo "ARM ${lever}-${arm} load${load} p${pass} t${t} $(date -u '+%H:%M:%S')"
     if [ "$arm" = on ]; then
         env "$var=1" "$bin" "$window" "$load" 1 "$smt" "$duty" "$reps" "$irregular"
     else
@@ -132,7 +184,7 @@ run_arm() {
     fi
     rc=$?
     if [ "$rc" -ne 0 ]; then
-        echo "ARM_FAILED ${lever}-${arm} load${load} t${t} exit=$rc"
+        echo "ARM_FAILED ${lever}-${arm} load${load} p${pass} t${t} exit=$rc"
         failed=$((failed + 1))
     fi
 }
@@ -152,14 +204,18 @@ do
     var="$2"
     smt="$3"
     duty="$4"
-    for load in 0 "$load_threads"; do
+    pass=1
+    while [ "$pass" -le 2 ]; do
+      for load in $(levels_for "$pass" $levels); do
         t=1
         while [ "$t" -le "$trials" ]; do
             for arm in $(order_for "$t"); do
-                run_arm "$lever" "$var" "$smt" "$duty" "$arm" "$load" "$t"
+                run_arm "$lever" "$var" "$smt" "$duty" "$arm" "$load" "$t" "$pass"
             done
             t=$((t + 1))
         done
+      done
+      pass=$((pass + 1))
     done
 done
 
