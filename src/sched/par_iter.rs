@@ -4497,6 +4497,51 @@ mod tests {
     }
 
     #[test]
+    fn the_indexed_path_records_leaves_and_never_brackets_them() {
+        // The on-core bracket is taken by `record_leaf_sampled`, and
+        // only `bisect_lazy_steal_driven` calls that. Every other bisect
+        // records through `record_leaf`, which has no bracket, so
+        // `levers::oncore_spread` changes nothing on an indexed or
+        // triple entry.
+        //
+        // Both halves are asserted. A dispatch that recorded no leaves
+        // at all would satisfy the second on its own, and would be a
+        // broken recorder rather than the asymmetry this pins.
+        static SITE: crate::sched::call_site::CallSiteState =
+            crate::sched::call_site::CallSiteState::new();
+        let site = crate::sched::call_site::SiteRef::new(&SITE);
+
+        // Past the buffer's flush threshold so the counts reach the
+        // site, with work in each leaf the compiler cannot discard.
+        let n = 4 * MIN_LEAF_ITEMS;
+        let mut v: Vec<u64> = (0..n as u64).collect();
+        for _ in 0..(LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4) {
+            let plan = JobPlan::new(0, n as u32).with_site(site);
+            for_each_chunk_indexed_min_leaf(&plan, &mut v, MIN_LEAF_ITEMS, |_start, chunk| {
+                for slot in chunk.iter_mut() {
+                    let mut acc = *slot;
+                    for _ in 0..64 {
+                        acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    }
+                    *slot = std::hint::black_box(acc);
+                }
+            });
+        }
+
+        assert!(
+            SITE.leaf_count() > 0,
+            "the indexed entry records every leaf, so the site must have counts"
+        );
+        assert_eq!(
+            SITE.oncore_items(),
+            0,
+            "the indexed entry takes no on-core bracket; if this starts failing the \
+             switch has gained an effect its own documentation denies"
+        );
+        assert_eq!(SITE.per_item_oncore_cv2_per_mille(), None);
+    }
+
+    #[test]
     fn host_dispatch_profile_is_measured_and_cached() {
         let t0 = std::time::Instant::now();
         let p = calibrate_host_dispatch();
