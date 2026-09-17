@@ -1120,6 +1120,19 @@ fn stored_or_measured() -> HostDispatchProfile {
         // An unmeasured interval is reported as unmeasured. Printing a
         // number for it would tell a reader the calibration ran on a
         // quiet host when what happened is that nobody looked.
+        // The three figures are printed in the form
+        // FLYNNEL_HOST_PROFILE_NS takes, so a draw taken under known
+        // conditions can be pinned into a later process and compared
+        // against another draw. Without this the occupancy beside a
+        // draw is readable and the draw itself is not, so two draws
+        // cannot be told apart by anything except the line that says
+        // what they ran under.
+        eprintln!(
+            "flynnel: host profile {},{},{}",
+            profile.dispatch_cost_ns,
+            profile.collapse_threshold_ns,
+            profile.jec_wake_threshold_ns,
+        );
         match drawn_at {
             Some(share) => eprintln!(
                 "flynnel: host calibration ran at {share} per mille occupancy, \

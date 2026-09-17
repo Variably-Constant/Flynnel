@@ -196,6 +196,9 @@ name = "class_loop_cost"
 name = "smt_recovery"
 
 [[example]]
+name = "profile_cost"
+
+[[example]]
 name = "smt_wake_cost"
 
 [[example]]
