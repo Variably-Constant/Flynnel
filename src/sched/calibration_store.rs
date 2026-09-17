@@ -60,13 +60,13 @@ pub const CALIBRATION_MAGIC: u64 = 0x464C_4342_0000_0001;
 /// Raising this changes every host stamp, so the next start on any host
 /// measures again. Raise it whenever a stored field changes meaning.
 ///
-/// It is also the only way to displace a record that is standing.
+/// It is also one of two ways to displace a record that is standing.
 /// [`CpuCalibration::is_trustworthy`] passing means the reader returns
 /// it and never reaches the branch that would publish a better one, so
-/// a record that clears the check is permanent for its stamp - and the
-/// check is likelier to pass for a draw taken under load, whose samples
-/// agree with each other because they were all slowed together. Two
-/// hosts here were serving such a record for six days.
+/// a record that clears the check stands for its stamp until either
+/// this rises or `FLYNNEL_CALIBRATION_MAX_AGE_S` ages it out. The check
+/// is likelier to pass for a draw taken under load, whose samples agree
+/// with each other because they were all slowed together.
 pub const LAYOUT_VERSION: u32 = 6;
 
 /// Devices a table records. A host with more reports the first
@@ -1136,18 +1136,16 @@ mod tests {
 
     #[test]
     fn the_only_incumbent_the_caller_delivers_is_one_the_refusal_declines() {
-        // Every other test here builds a store and calls the guard with
-        // an incumbent of its choosing, which is a case nothing
-        // reaches. The caller in par_iter returns the stored record
-        // whenever it clears `is_trustworthy` and only measures and
-        // offers when it does not, so the incumbent that arrives here
-        // has always failed that check - and `prefers_incumbent`
-        // returns `None` for exactly those. The two conditions cannot
-        // both hold and the refusal cannot fire.
+        // Holds at the shipped default of no age bound. The caller in
+        // par_iter returns the stored record whenever it clears
+        // `is_trustworthy` and only measures and offers when it does
+        // not, so the incumbent arriving here has failed that check,
+        // and `prefers_incumbent` returns `None` for exactly those.
         //
-        // Both halves are asserted, because the contradiction needs
-        // both: a passing record is refused entry to the caller's offer
-        // branch, and a failing one is refused by the guard.
+        // Both halves are asserted: a passing record is refused entry
+        // to the caller's offer branch, and a failing one is refused by
+        // the guard. `an_aged_incumbent_is_ordered_rather_than_dismissed`
+        // covers the case a configured bound opens.
         let passes = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
         assert!(
             passes.is_trustworthy(),
@@ -1169,6 +1167,28 @@ mod tests {
             prefers_incumbent(&arrives, &offered),
             None,
             "and the refusal declines to act on it, whatever the occupancies say"
+        );
+    }
+
+    #[test]
+    fn an_aged_incumbent_is_ordered_rather_than_dismissed() {
+        // With `FLYNNEL_CALIBRATION_MAX_AGE_S` set, a record that clears
+        // `is_trustworthy` but is older than the bound falls past the
+        // caller's early return, so the incumbent reaching the guard is
+        // trustworthy. The guard's first line stops discarding it and
+        // the ordering it implements decides.
+        //
+        // Asserted against the same pair as the default case, so the
+        // difference between the two tests is the incumbent's trust and
+        // nothing else.
+        let aged = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        assert!(aged.is_trustworthy(), "an aged record is drawn again, not distrusted");
+
+        let offered = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
+        assert_eq!(
+            prefers_incumbent(&aged, &offered),
+            Some(PublishOutcome::KeptIncumbent { incumbent: 990, offered: 210 }),
+            "the quieter of the two stands, and both figures are named"
         );
     }
 
