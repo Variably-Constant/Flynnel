@@ -35,6 +35,13 @@ SWEEP = re.compile(
 )
 DRAW = re.compile(r"^draw\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+load=(\d+)\s*$")
 REPEATED = re.compile(r"^repeated_draws\s+(\d+)\s*$")
+# The same quantity as a pair gap above, reported by a running process
+# at the publish comparison, which is the one place a live process holds
+# two draws of its host at once. It carries no load label, because
+# nothing at that site knows what else the box was doing.
+FIELD = re.compile(
+    r"^flynnel: two draws of this host disagree by (\d+),(\d+),(\d+) per mille"
+)
 FIGURES = ("dispatch", "collapse", "wake")
 
 
@@ -187,7 +194,8 @@ def main(paths):
     print("different label, carry no spread or iqr, and gate nothing.")
 
     separation(by_load)
-    candidate_bound(by_load)
+    admitted = candidate_bound(by_load) or {}
+    field_gaps(paths, admitted)
 
     print()
     print("READ IT THIS WAY. A statistic worth gating on is small where")
@@ -295,12 +303,13 @@ def candidate_bound(by_load):
     few pairs, so a bound resting on two of them prints the same as one
     resting on fifty and only the count says which it is.
     """
+    admitted = {}
     loads = sorted(by_load)
     print()
     print("CANDIDATE BOUND on two-draw disagreement:")
     if len(loads) < 2:
         print("  one load level only; a bound needs a quiet side and a busy one.")
-        return
+        return admitted
     lo, hi = loads[0], loads[-1]
 
     print(
@@ -322,8 +331,10 @@ def candidate_bound(by_load):
             # rather than be dragged by the larger one.
             pick = (worst_quiet * best_busy) ** 0.5 if worst_quiet > 0 else best_busy / 2.0
             admits = f"{worst_quiet:.0f} < b <= {best_busy:.0f}, try {pick:.0f}"
+            admitted[f] = (worst_quiet, best_busy, pick)
         else:
             admits = f"overlap by {worst_quiet - best_busy:.0f}"
+            admitted[f] = (worst_quiet, best_busy, None)
         print(
             f"{f:<14} {len(quiet):>11} {worst_quiet:>12.0f} "
             f"{len(busy):>11} {best_busy:>11.0f} {admits:>22}"
@@ -334,6 +345,62 @@ def candidate_bound(by_load):
     print("no bound tells them apart and the figure cannot carry the")
     print("refusal however it is tuned. A figure that admits an interval")
     print("is one where a bound is a reading rather than a preference.")
+    return admitted
+
+
+def field_gaps(paths, admitted):
+    """The same quantity as reported by running processes, and how a
+    candidate bound would have fallen against it.
+
+    These carry no load label: the publish comparison knows what the two
+    draws were, not what else the box was doing. So they cannot be split
+    into a quiet side and a busy one and cannot derive a bound. What
+    they can say is how often a bound derived above would have fired on
+    traffic that actually happened, which is the question the derivation
+    cannot answer about itself.
+
+    A bound that fires on almost everything or on almost nothing is one
+    whose interval was set by the sweep's conditions rather than by the
+    host, and neither the interval nor its width shows that.
+    """
+    seen = {f: [] for f in FIGURES}
+    for path in paths:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                m = FIELD.match(raw.strip())
+                if m:
+                    for f, g in zip(FIGURES, m.groups()):
+                        seen[f].append(int(g))
+
+    total = sum(len(v) for v in seen.values())
+    print()
+    print("FIELD GAPS reported by running processes:")
+    if total == 0:
+        print("  none in these logs. The publish comparison reports only")
+        print("  under FLYNNEL_OCCUPANCY, and only where a record was")
+        print("  already stored for this host, so an empty section is a")
+        print("  run that never met an incumbent rather than a run whose")
+        print("  draws agreed.")
+        return
+
+    print(f"{'figure':<10} {'n':>5} {'min':>8} {'median':>8} {'max':>8} {'vs bound':>22}")
+    print("-" * 66)
+    for f in FIGURES:
+        values = seen[f]
+        if not values:
+            print(f"{f:<10} {0:>5} {'-':>8} {'-':>8} {'-':>8} {'-':>22}")
+            continue
+        band = admitted.get(f)
+        if band is None or band[2] is None:
+            verdict = "no bound derived"
+        else:
+            pick = band[2]
+            over = sum(1 for v in values if v > pick)
+            verdict = f"{over}/{len(values)} over {pick:.0f}"
+        print(
+            f"{f:<10} {len(values):>5} {min(values):>8} "
+            f"{median(values):>8.0f} {max(values):>8} {verdict:>22}"
+        )
 
 
 if __name__ == "__main__":
