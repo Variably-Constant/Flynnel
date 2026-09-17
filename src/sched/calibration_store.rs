@@ -775,6 +775,32 @@ pub struct WriterGuard<'a> {
     store: &'a CalibrationStore,
 }
 
+/// Whether a stored record should stand against one being offered, and
+/// `None` where it should not.
+///
+/// Separate from the write so the decision can be exercised without a
+/// mapped file, a writer lease, or the process-wide switch that gates
+/// it: a switch read once per process cannot be moved between tests, so
+/// a test that needed it on would fix the value for every test after it.
+///
+/// The comparison runs only where it can decide something. An incumbent
+/// whose own samples disagreed is replaced whatever it was drawn at,
+/// because its spread already says it does not describe the host. Where
+/// either record lacks an occupancy the two cannot be ordered and the
+/// offer wins, so a platform with no thread clock cannot freeze the
+/// table. A tie goes to the offer, because the fresher draw describes
+/// the host now.
+fn prefers_incumbent(
+    incumbent: &CpuCalibration,
+    offered: &CpuCalibration,
+) -> Option<PublishOutcome> {
+    if !incumbent.is_trustworthy() {
+        return None;
+    }
+    let (held, new) = (incumbent.occupancy()?, offered.occupancy()?);
+    (held > new).then_some(PublishOutcome::KeptIncumbent { incumbent: held, offered: new })
+}
+
 /// What [`WriterGuard::publish_if_better`] did with the record it was
 /// offered.
 ///
@@ -841,11 +867,9 @@ impl WriterGuard<'_> {
     ) -> PublishOutcome {
         if crate::sched::levers::calibration_refusal()
             && let Some((incumbent, _)) = self.store.read()
-            && incumbent.is_trustworthy()
-            && let (Some(held), Some(offered)) = (incumbent.occupancy(), cpu.occupancy())
-            && held > offered
+            && let Some(kept) = prefers_incumbent(&incumbent, cpu)
         {
-            return PublishOutcome::KeptIncumbent { incumbent: held, offered };
+            return kept;
         }
         self.publish(cpu, accel);
         PublishOutcome::Published
@@ -1041,30 +1065,26 @@ mod tests {
         (outcome, held, dir)
     }
 
+    /// The decision alone, with no file, no lease and no process-wide
+    /// switch: those are the write, and this is what to write.
     #[test]
-    fn a_draw_on_a_quieter_host_replaces_one_taken_under_load() {
+    fn a_draw_on_a_quieter_host_displaces_one_taken_under_load() {
         let loaded = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
         let quiet = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
-        let (outcome, held, dir) = offer_after("better", loaded, quiet);
-        assert_eq!(outcome, PublishOutcome::Published);
-        assert_eq!(held.dispatch_cost_ns, 1_000, "the quieter draw is what stands");
-        cleanup(&dir);
+        assert_eq!(prefers_incumbent(&loaded, &quiet), None, "the quieter draw wins");
     }
 
     #[test]
     fn a_draw_under_load_does_not_displace_one_taken_on_a_quieter_host() {
-        // The refusal is an ordering between two records, not a cutoff
-        // on either: 210 is not called bad, it is called worse than 990.
+        // An ordering between two records, not a cutoff on either: 210
+        // is not called bad, it is called worse than 990.
         let quiet = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
         let loaded = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
-        let (outcome, held, dir) = offer_after("worse", quiet, loaded);
         assert_eq!(
-            outcome,
-            PublishOutcome::KeptIncumbent { incumbent: 990, offered: 210 },
+            prefers_incumbent(&quiet, &loaded),
+            Some(PublishOutcome::KeptIncumbent { incumbent: 990, offered: 210 }),
             "the refusal names both figures so a caller can say why"
         );
-        assert_eq!(held.dispatch_cost_ns, 1_000, "the stored record is untouched");
-        cleanup(&dir);
     }
 
     #[test]
@@ -1082,43 +1102,49 @@ mod tests {
         );
         assert!(!scattered.is_trustworthy(), "the incumbent's samples disagreed");
         let loaded = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(210));
-        let (outcome, held, dir) = offer_after("spread", scattered, loaded);
-        assert_eq!(outcome, PublishOutcome::Published);
-        assert_eq!(held.dispatch_cost_ns, 1_000);
-        cleanup(&dir);
+        assert_eq!(prefers_incumbent(&scattered, &loaded), None);
     }
 
     #[test]
     fn an_unmeasured_occupancy_publishes_rather_than_freezing_the_table() {
-        // Where either side lacks a reading the two cannot be ordered,
-        // and the offered record is published. A platform with no thread
-        // clock must not leave the first record ever written standing
-        // against every later measurement.
-        let held_unmeasured = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, None);
-        let offered = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(210));
-        let (outcome, held, dir) = offer_after("no-incumbent-reading", held_unmeasured, offered);
-        assert_eq!(outcome, PublishOutcome::Published);
-        assert_eq!(held.dispatch_cost_ns, 1_000);
-        cleanup(&dir);
-
+        // Where either side lacks a reading the two cannot be ordered
+        // and the offer wins. A platform with no thread clock must not
+        // leave the first record ever written standing against every
+        // later measurement.
         let quiet = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(990));
-        let offered_unmeasured = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, None);
-        let (outcome2, held2, dir2) =
-            offer_after("no-offer-reading", quiet, offered_unmeasured);
-        assert_eq!(outcome2, PublishOutcome::Published);
-        assert_eq!(held2.dispatch_cost_ns, 1_000);
-        cleanup(&dir2);
+        let unmeasured = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, None);
+        assert_eq!(prefers_incumbent(&unmeasured, &quiet), None, "no incumbent reading");
+        assert_eq!(prefers_incumbent(&quiet, &unmeasured), None, "no offered reading");
     }
 
     #[test]
     fn an_equal_draw_publishes_so_a_fresher_measurement_wins_a_tie() {
-        // Equal occupancy orders nothing, and the newer measurement is
-        // the one with the better claim to describe the host now.
+        // Equal occupancy orders nothing, and the newer measurement has
+        // the better claim to describe the host now.
         let first = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(700));
         let second = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(700));
-        let (outcome, held, dir) = offer_after("tie", first, second);
-        assert_eq!(outcome, PublishOutcome::Published);
-        assert_eq!(held.dispatch_cost_ns, 1_000);
+        assert_eq!(prefers_incumbent(&first, &second), None);
+    }
+
+    #[test]
+    fn the_write_path_publishes_while_the_switch_is_off() {
+        // The shipped default. The decision above is exercised directly;
+        // this checks the path that gates it, so a switch left on by a
+        // careless edit fails a test rather than a release.
+        let quiet = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        let loaded = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
+        let (outcome, held, dir) = offer_after("switch-off", quiet, loaded);
+        if crate::sched::levers::calibration_refusal() {
+            assert_eq!(
+                outcome,
+                PublishOutcome::KeptIncumbent { incumbent: 990, offered: 210 },
+                "the switch is on in this process, so the refusal must fire"
+            );
+            assert_eq!(held.dispatch_cost_ns, 1_000);
+        } else {
+            assert_eq!(outcome, PublishOutcome::Published, "off publishes unconditionally");
+            assert_eq!(held.dispatch_cost_ns, 9_000, "the offer is what stands");
+        }
         cleanup(&dir);
     }
 
