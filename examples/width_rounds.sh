@@ -108,7 +108,18 @@ run_arm() {
     if [ "$said" != "$child" ]; then
         echo "PID_MISMATCH shell=$child said=${said:-none} - the narrowing may have missed the run"
     fi
-    taskset -acp "$cpus" "$child" || echo "TASKSET_FAILED pid=$child"
+    # A count of the threads re-pinned rather than taskset's line per
+    # thread. The count is the evidence that the narrowing reached the
+    # whole pool and not just the main thread; the raw lines are forty
+    # per arm and say the same thing. On failure they are printed,
+    # because then which thread refused is the question.
+    pinned=$(taskset -acp "$cpus" "$child" 2>&1)
+    prc=$?
+    echo "NARROWED threads=$(printf '%s\n' "$pinned" | grep -c 'new affinity list') exit=$prc"
+    if [ "$prc" -ne 0 ]; then
+        printf '%s\n' "$pinned"
+        echo "TASKSET_FAILED pid=$child"
+    fi
     wait "$child"
     rc=$?
     cat "$out"

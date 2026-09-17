@@ -25,6 +25,7 @@ SPLIT = re.compile(r"^NARROW_AFTER_WINDOW\s+(\d+)\s*$")
 SEEN = re.compile(r"^widths_seen\s+(\d+)\s*$")
 FAILED = re.compile(r"^ARM_FAILED\s+(\S+)\s+t(\d+)\s+exit=(\d+)")
 MISMATCH = re.compile(r"^PID_MISMATCH\s")
+NARROWED = re.compile(r"^NARROWED\s+threads=(\d+)\s+exit=(\d+)\s*$")
 
 
 def median(v):
@@ -51,6 +52,13 @@ def parse(path):
             continue
         if FAILED.match(line) or MISMATCH.match(line) or line.startswith("TASKSET_FAILED"):
             problems.append(line)
+            continue
+        # A narrowing that reached one thread is not a narrowing: the
+        # pool's workers each carry their own mask, and the main thread
+        # is not one of them.
+        n = NARROWED.match(line)
+        if n and (int(n.group(1)) < 2 or n.group(2) != "0"):
+            problems.append(f"{line}  - the narrowing did not reach the pool")
             continue
         a = ARM.match(line)
         if a:
