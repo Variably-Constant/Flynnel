@@ -24,8 +24,20 @@
 //! library and in nothing else. A harness that reads accessors only one
 //! side carries cannot span the comparison it exists to make.
 //!
+//! # The engagement line
+//!
+//! A mechanism that never ran produces the same clean uniform rows as
+//! one that ran and did not help. The last line of a run reports what
+//! each switch had to work with: how many leaves reached the sampled
+//! on-core path, whether the on-core spread differs from the wall
+//! spread, whether a window has been classified, what the SMT answer
+//! came out as, and how the resolved width compares to the width the
+//! process is allowed. A switch whose figures are identical across its
+//! own on and off arms did not engage, and its throughput row says
+//! nothing about the mechanism.
+//!
 //! ```sh
-//! throughput_under_load <window_s> <load_threads> <trials>
+//! throughput_under_load <window_s> <load_threads> <trials> [smt_prior]
 //! ```
 
 use std::env;
@@ -59,12 +71,24 @@ where
     }
 }
 
+/// The plan every dispatch here runs under.
+///
+/// `smt_prior` asks for the SMT prior that `effective_use_smt` needs
+/// before it consults anything: with the prior false the method returns
+/// on its first line and the variance switch is never read. The shape
+/// `(0, 1 << 16)` classifies as `Streaming`, whose profile parks
+/// siblings, so the prior is false unless a caller sets it.
+fn plan(smt_prior: bool) -> JobPlan {
+    let plan = JobPlan::new(0, ITEMS as u32).with_site(SiteRef::new(&SITE));
+    if smt_prior { plan.with_smt() } else { plan }
+}
+
 /// Dispatches completed in `measured`, with whatever else is running.
-fn window(buf: &mut [u64], measured: Duration) -> u64 {
+fn window(buf: &mut [u64], measured: Duration, smt_prior: bool) -> u64 {
     let start = Instant::now();
     let mut dispatches = 0u64;
     while start.elapsed() < measured {
-        let plan = JobPlan::new(0, ITEMS as u32).with_site(SiteRef::new(&SITE));
+        let plan = plan(smt_prior);
         for_each_chunk_min_leaf(&plan, buf, MIN_LEAF, |chunk| {
             for slot in chunk.iter_mut() {
                 let mut acc = *slot;
@@ -117,10 +141,46 @@ impl Load {
     }
 }
 
+/// A figure that may not have been measured, printed so the two cases
+/// are distinguishable. A dash is no reading; zero is a reading of
+/// zero, which for a spread means perfectly uniform work.
+fn reading(value: Option<u64>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// What each switch had to work with by the end of the run.
+///
+/// Read against the same line from the arm the switch was off in. Two
+/// arms whose engagement figures match ran the same code whatever the
+/// throughput rows did.
+fn engagement(smt_prior: bool) {
+    let plan = plan(smt_prior);
+    let site = &SITE;
+    println!(
+        "engagement leaves={} oncore_items={} per_item_ns={} cv2_wall={} cv2_oncore={} \
+         cv2_window={} window_ticks={} class={:?} workers={} allowed={} smt={}",
+        site.leaf_count(),
+        site.oncore_items(),
+        reading(site.per_item_ns()),
+        reading(site.per_item_cv2_per_mille()),
+        reading(site.per_item_oncore_cv2_per_mille()),
+        reading(site.window_cv2_per_mille()),
+        site.window_ticks(),
+        site.learned_class(),
+        plan.resolved_workers(),
+        flynnel::sched::host_width::allowed_parallelism(),
+        plan.effective_use_smt(),
+    );
+}
+
 fn main() {
     let window_s: u64 = arg(1, 5);
     let load_threads: usize = arg(2, 12);
     let trials: usize = arg(3, 5);
+    let smt_prior: bool = arg::<u8>(4, 0) != 0;
 
     // Which arm this process is. Printed rather than assumed, because a
     // switch that failed to engage produces rows indistinguishable from
@@ -128,13 +188,27 @@ fn main() {
     // of an intent that did not take effect.
     eprintln!("levers: {}", flynnel::sched::levers::describe());
 
+    // The SMT switch is read inside `effective_use_smt`, past a return
+    // that fires when the plan's prior is false. Asking for the prior
+    // and not getting it leaves a run that cannot reach the switch,
+    // and whose rows would look exactly like a switch that did not
+    // help.
+    if smt_prior && !plan(true).use_smt {
+        eprintln!(
+            "the SMT prior was asked for and the plan does not carry it, so \
+             effective_use_smt short-circuits and no arm here can reach the \
+             window switch; nothing is measured"
+        );
+        std::process::exit(2);
+    }
+
     let measured = Duration::from_secs(window_s);
     let mut buf: Vec<u64> = (0..ITEMS as u64).collect();
 
     // One warm window, discarded: the first dispatches of a process pay
     // pool startup and the site's first classifier ticks, which belong
     // to no arm.
-    let warm = window(&mut buf, Duration::from_secs(1));
+    let warm = window(&mut buf, Duration::from_secs(1), smt_prior);
     if warm == 0 {
         eprintln!("the warm window ran no dispatches; raise the window length");
         std::process::exit(2);
@@ -148,11 +222,13 @@ fn main() {
         if load.is_some() {
             std::thread::sleep(Duration::from_millis(250));
         }
-        let n = window(&mut buf, measured);
+        let n = window(&mut buf, measured, smt_prior);
         if let Some(load) = load {
             load.stop();
         }
         let per_s = n as f64 / window_s as f64;
         println!("throughput {load_threads} {t} {n} {per_s:.2}");
     }
+
+    engagement(smt_prior);
 }
