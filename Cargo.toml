@@ -224,6 +224,10 @@ name = "calibration_dump"
 required-features = ["persisted-calibration"]
 
 [[example]]
+name = "calibration_cost"
+required-features = ["persisted-calibration"]
+
+[[example]]
 name = "audit_real_workloads_routing"
 
 [[example]]
