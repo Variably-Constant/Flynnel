@@ -1127,6 +1127,44 @@ mod tests {
     }
 
     #[test]
+    fn the_only_incumbent_the_caller_delivers_is_one_the_refusal_declines() {
+        // Every other test here builds a store and calls the guard with
+        // an incumbent of its choosing, which is a case nothing
+        // reaches. The caller in par_iter returns the stored record
+        // whenever it clears `is_trustworthy` and only measures and
+        // offers when it does not, so the incumbent that arrives here
+        // has always failed that check - and `prefers_incumbent`
+        // returns `None` for exactly those. The two conditions cannot
+        // both hold and the refusal cannot fire.
+        //
+        // Both halves are asserted, because the contradiction needs
+        // both: a passing record is refused entry to the caller's offer
+        // branch, and a failing one is refused by the guard.
+        let passes = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        assert!(
+            passes.is_trustworthy(),
+            "a record like this is returned by the caller and never offered"
+        );
+
+        let arrives = CpuCalibration::new(
+            1_000,
+            70_000,
+            40_000,
+            PROVISIONAL_SPREAD_PER_MILLE + 1,
+            9,
+            Some(990),
+        );
+        assert!(!arrives.is_trustworthy(), "this is what the caller does offer");
+
+        let offered = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
+        assert_eq!(
+            prefers_incumbent(&arrives, &offered),
+            None,
+            "and the refusal declines to act on it, whatever the occupancies say"
+        );
+    }
+
+    #[test]
     fn the_write_path_publishes_while_the_switch_is_off() {
         // The shipped default. The decision above is exercised directly;
         // this checks the path that gates it, so a switch left on by a
