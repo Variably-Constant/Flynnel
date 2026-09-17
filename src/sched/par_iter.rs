@@ -1106,6 +1106,7 @@ fn stored_or_measured() -> HostDispatchProfile {
     };
     if let Some((cpu, _accel)) = store.read()
         && cpu.is_trustworthy()
+        && !stored_record_is_stale(&cpu)
     {
         // A read and a measurement produce the same three numbers and
         // nothing else distinguished them, so a stale record looked
@@ -1211,6 +1212,69 @@ fn stored_or_measured() -> HostDispatchProfile {
         ),
     }
     profile
+}
+
+/// Whether a stored record has stood long enough to be drawn again.
+///
+/// The age comes from `FLYNNEL_CALIBRATION_MAX_AGE_S` and has no
+/// default. Unset, a record that clears its trust check stands until
+/// the layout version changes, which is the behavior that shipped. How
+/// long a host may serve one draw is a property of the fleet running
+/// it, not of this code: an hour costs a build box a 10 to 40 ms sweep
+/// per hour, and a day lets a draw taken during someone else's build
+/// route every process for a day.
+///
+/// Every way of failing to read the age says which one happened, and
+/// all of them leave the record standing: a mistyped bound must not
+/// silently re-measure on every start.
+#[cfg(feature = "persisted-calibration")]
+fn stored_record_is_stale(cpu: &crate::sched::calibration_store::CpuCalibration) -> bool {
+    let Some(raw) = std::env::var_os("FLYNNEL_CALIBRATION_MAX_AGE_S") else {
+        return false;
+    };
+    let Some(text) = raw.to_str() else {
+        eprintln!(
+            "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S is not valid UTF-8; the stored \
+             calibration stands"
+        );
+        return false;
+    };
+    let max_age_s = match text.trim().parse::<u64>() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S wants a whole number of \
+                 seconds and got {text:?} ({e}); the stored calibration stands"
+            );
+            return false;
+        }
+    };
+    if max_age_s == 0 {
+        return false;
+    }
+    let now_s = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(e) => {
+            eprintln!(
+                "flynnel: this host's clock reads before the epoch ({e}), so the \
+                 stored calibration's age cannot be taken and it stands"
+            );
+            return false;
+        }
+    };
+    // A record stamped in the future is a clock that moved rather than
+    // a fresh draw. Saturating leaves it aged zero, so it stands
+    // instead of being re-drawn at every start until the clock catches
+    // up with it.
+    let age_s = now_s.saturating_sub(cpu.measured_unix_s);
+    if age_s > max_age_s {
+        eprintln!(
+            "flynnel: the stored calibration is {age_s} s old against a bound of \
+             {max_age_s} s; measuring this host again"
+        );
+        return true;
+    }
+    false
 }
 
 /// The measured profile, with nothing persisted.
