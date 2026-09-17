@@ -915,8 +915,15 @@ impl WriterGuard<'_> {
         // only point in a running process where two draws of one host
         // are both in hand. Reporting only when the refusal fires would
         // sample the half where the incumbent already won.
+        // `samples > 0` because a table that has never been published
+        // reads back zeroed, and a zeroed incumbent is not a draw. The
+        // gap against it is the formula's maximum on every figure, so a
+        // run against fresh directories reported 2000 per mille
+        // forty-eight times and looked like a host that agrees with
+        // itself about nothing.
         if std::env::var_os("FLYNNEL_OCCUPANCY").is_some()
             && let Some((incumbent, _)) = self.store.read()
+            && incumbent.samples > 0
         {
             let [dispatch, collapse, wake] = two_draw_disagreement_per_mille(&incumbent, cpu);
             eprintln!(
