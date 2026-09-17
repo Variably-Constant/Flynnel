@@ -61,9 +61,16 @@ where
     }
 }
 
-/// A plan carrying the site, built the way a production caller would.
+/// A plan carrying the site, with the SMT prior ON.
+///
+/// The prior has to be true or there is nothing to measure:
+/// `effective_use_smt` returns false immediately when the plan says
+/// false, before it consults any variance, so a plan built with the
+/// default prior never reaches the code under test and every row reads
+/// `false false 1` on both commits. That is a mechanism that never
+/// engaged, and it looks exactly like two commits that agree.
 fn plan() -> JobPlan {
-    JobPlan::new(0, ITEMS as u32).with_site(SiteRef::new(&SITE))
+    JobPlan::new(0, ITEMS as u32).with_smt().with_site(SiteRef::new(&SITE))
 }
 
 /// Dispatch uniform work for `measured`, and report how many dispatches
@@ -133,6 +140,18 @@ fn main() {
 
     let measured = Duration::from_secs(window_s);
     let mut buf: Vec<u64> = (0..ITEMS as u64).collect();
+
+    // Before anything is timed: can the answer move at all? A site with
+    // too few samples, or a prior of false, pins effective_use_smt to
+    // one value whatever the host does, and a row from such a run says
+    // nothing while looking like a clean negative.
+    if !plan().use_smt {
+        eprintln!(
+            "the plan's SMT prior is false, so effective_use_smt short-circuits and this \
+             run cannot observe the decision moving; nothing is measured"
+        );
+        std::process::exit(2);
+    }
 
     let pre_n = window(&mut buf, measured);
     let smt_pre = plan().effective_use_smt();
