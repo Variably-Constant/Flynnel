@@ -217,6 +217,9 @@ name = "width_narrowing"
 name = "profile_draws"
 
 [[example]]
+name = "oncore_reach"
+
+[[example]]
 name = "smt_wake_cost"
 
 [[example]]
