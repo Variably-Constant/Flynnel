@@ -79,6 +79,27 @@ def pairwise_per_mille(values):
     return median(gaps) * 1000.0 / m
 
 
+def pair_gaps_per_mille(values):
+    """Every disjoint pair's disagreement, per thousand, not their median.
+
+    `pairwise_per_mille` answers what a typical pair looks like, which
+    is the right figure for a separation table. A bound is set by the
+    ends instead: the worst pair a quiet host produces is what it has
+    to sit above, and the best pair a busy host produces is what it has
+    to sit below. A median hides both ends, which are the whole of the
+    question.
+    """
+    if len(values) < 2:
+        return []
+    m = median(values)
+    if not m:
+        return []
+    return [
+        abs(values[i + 1] - values[i]) * 1000.0 / m
+        for i in range(0, len(values) - 1, 2)
+    ]
+
+
 def parse(paths):
     by_load = defaultdict(lambda: {"draws": [], "sweeps": []})
     repeated = 0
@@ -166,6 +187,7 @@ def main(paths):
     print("different label, carry no spread or iqr, and gate nothing.")
 
     separation(by_load)
+    candidate_bound(by_load)
 
     print()
     print("READ IT THIS WAY. A statistic worth gating on is small where")
@@ -247,6 +269,71 @@ def separation(by_load):
     print("The top rows are what a bound is FOR. A candidate below them")
     print("whose ratio is near 1 does not separate these conditions and")
     print("cannot be made to by choosing a bound.")
+
+
+def candidate_bound(by_load):
+    """What bound the data admits, if it admits one.
+
+    A bound on two-draw disagreement has to clear two things at once.
+    It has to sit above every gap the quiet host produced, or a quiet
+    host has its calibration refused and re-measures forever. It has to
+    sit at or below every gap the busy host produced, or a contended
+    draw is accepted and, because a passing record is permanent per
+    stamp, stays accepted.
+
+    So the data admits a bound exactly when the worst quiet pair is
+    smaller than the best busy pair, and the admissible bounds are the
+    interval between them. When those ranges overlap no number is
+    proposed, because none exists: an overlap says the two conditions
+    produce the same disagreement, and a bound picked anyway would
+    refuse quiet hosts and accept busy ones at whatever rate the
+    overlap dictates, while looking like a threshold someone chose.
+
+    The pair counts print alongside, because an interval between two
+    extremes is set by exactly one observation at each end. Read them
+    before reading the interval: nothing here is refused for having too
+    few pairs, so a bound resting on two of them prints the same as one
+    resting on fifty and only the count says which it is.
+    """
+    loads = sorted(by_load)
+    print()
+    print("CANDIDATE BOUND on two-draw disagreement:")
+    if len(loads) < 2:
+        print("  one load level only; a bound needs a quiet side and a busy one.")
+        return
+    lo, hi = loads[0], loads[-1]
+
+    print(
+        f"{'figure':<14} {'quiet pairs':>11} {'worst quiet':>12} "
+        f"{'busy pairs':>11} {'best busy':>11} {'admits':>22}"
+    )
+    print("-" * 86)
+    for f in FIGURES:
+        quiet = pair_gaps_per_mille([d[f] for d in by_load[lo]["draws"]])
+        busy = pair_gaps_per_mille([d[f] for d in by_load[hi]["draws"]])
+        if not quiet or not busy:
+            print(f"{f:<14} {len(quiet):>11} {'-':>12} {len(busy):>11} {'-':>11} {'no pairs':>22}")
+            continue
+        worst_quiet = max(quiet)
+        best_busy = min(busy)
+        if worst_quiet < best_busy:
+            # Geometric rather than arithmetic: these are ratios, so a
+            # midpoint should sit proportionally between the ends
+            # rather than be dragged by the larger one.
+            pick = (worst_quiet * best_busy) ** 0.5 if worst_quiet > 0 else best_busy / 2.0
+            admits = f"{worst_quiet:.0f} < b <= {best_busy:.0f}, try {pick:.0f}"
+        else:
+            admits = f"overlap by {worst_quiet - best_busy:.0f}"
+        print(
+            f"{f:<14} {len(quiet):>11} {worst_quiet:>12.0f} "
+            f"{len(busy):>11} {best_busy:>11.0f} {admits:>22}"
+        )
+    print()
+    print("'overlap by N' is the answer that matters: the quiet host's")
+    print("worst pair disagreed by N more than the busy host's best, so")
+    print("no bound tells them apart and the figure cannot carry the")
+    print("refusal however it is tuned. A figure that admits an interval")
+    print("is one where a bound is a reading rather than a preference.")
 
 
 if __name__ == "__main__":
