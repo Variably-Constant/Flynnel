@@ -12,7 +12,8 @@
 //! The directory is `FLYNNEL_CALIBRATION_DIR` when set, otherwise
 //! `%LOCALAPPDATA%\flynnel\calibration` on Windows and
 //! `$XDG_CACHE_HOME/flynnel/calibration` or `~/.cache/flynnel/calibration`
-//! elsewhere.
+//! elsewhere. A run that measures while the host is busy sets it to a
+//! throwaway path; see [`calibration_dir`].
 //!
 //! # Layout
 //!
@@ -574,6 +575,15 @@ impl From<io::Error> for StoreError {
 
 /// The calibration directory, from `FLYNNEL_CALIBRATION_DIR` or the
 /// per-user cache location. Not created here.
+///
+/// A test suite, a gate or anything else running while the host is busy
+/// should point this at a throwaway path of its own. Such a run
+/// measures under its own load, and the trust check passes more readily
+/// for a contended draw, whose samples agree because they were all
+/// slowed together, so the draw likeliest to be published is the one
+/// least worth publishing. A directory per run keeps it out of the
+/// shared table, and the record it leaves behind is what that run
+/// routed on.
 pub fn calibration_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("FLYNNEL_CALIBRATION_DIR") {
         return Some(PathBuf::from(dir));
