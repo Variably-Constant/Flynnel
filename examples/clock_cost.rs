@@ -66,7 +66,10 @@ const ELAPSED_CALL: &str = "rdtsc";
 const ELAPSED_CALL: &str = "instant_elapsed";
 
 fn median(v: &mut [f64]) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).expect("no timing is NaN"));
+    // A total order rather than a partial one: an elapsed time cannot
+    // be NaN, and sorting on a comparison that can fail would put the
+    // panic on a path nothing here can reach.
+    v.sort_by(f64::total_cmp);
     v[v.len() / 2]
 }
 

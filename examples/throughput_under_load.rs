@@ -128,14 +128,17 @@ impl Load {
     fn start(n: usize, duty_ms: u64) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let origin = Instant::now();
+        // The period as a type that cannot be zero, so the burner loop
+        // divides without a guard beside it.
+        let period = std::num::NonZeroU64::new(duty_ms);
         let mut threads = Vec::with_capacity(n);
         for _ in 0..n {
             let stop = Arc::clone(&stop);
             threads.push(std::thread::spawn(move || {
                 let mut acc = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    if duty_ms > 0 {
-                        let phase = origin.elapsed().as_millis() as u64 / duty_ms;
+                    if let Some(period) = period {
+                        let phase = origin.elapsed().as_millis() as u64 / period.get();
                         if phase % 2 == 1 {
                             std::thread::sleep(Duration::from_millis(1));
                             continue;
