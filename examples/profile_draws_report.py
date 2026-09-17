@@ -53,7 +53,8 @@ REPEATED = re.compile(r"^repeated_draws\s+(\d+)\s*$")
 # draws of its host at once. It carries no load label, because nothing
 # at that site knows what else the box was doing.
 FIELD = re.compile(
-    r"^flynnel: two draws of this host disagree by (\d+),(\d+),(\d+) per mille"
+    r"^flynnel: this draw costs ([\d.]+)x the cheapest seen .*?"
+    r"disagree by (\d+),(\d+),(\d+) per mille"
 )
 FIGURES = ("dispatch", "collapse", "wake")
 
@@ -391,14 +392,32 @@ def field_gaps(paths, admitted):
     host, and neither the interval nor its width shows that.
     """
     seen = {f: [] for f in FIGURES}
+    floors = []
     for n, path in enumerate(paths, 1):
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for raw in fh:
                 m = FIELD.match(raw.strip())
                 if m:
-                    for f, g in zip(FIGURES, m.groups()):
+                    floors.append(float(m.group(1)))
+                    for f, g in zip(FIGURES, m.groups()[1:]):
                         seen[f].append(int(g))
-        note(f"scanned {n}/{len(paths)} {path} for field gaps: {len(seen['dispatch'])} so far")
+        note(f"scanned {n}/{len(paths)} {path} for field gaps: {len(floors)} so far")
+
+    # Reported first because it needs no bound and the rest do. The
+    # incumbent is the cheapest cost seen for the stamp, so this is what
+    # a run cost against its host's own floor, and the conditions are
+    # orders of magnitude apart in it.
+    if floors:
+        floors.sort()
+        print()
+        print("COST AGAINST THE STAMP'S FLOOR, from running processes:")
+        print(f"  n={len(floors)}  min={floors[0]:.1f}x  "
+              f"median={median(floors):.1f}x  max={floors[-1]:.1f}x")
+        print("  1.0x is a draw that matched the cheapest ever seen for")
+        print("  this host. A figure far above it is a draw taken while")
+        print("  something else had the machine, and it says so without")
+        print("  a threshold, which is what every spread statistic here")
+        print("  failed to do.")
 
     total = sum(len(v) for v in seen.values())
     print()

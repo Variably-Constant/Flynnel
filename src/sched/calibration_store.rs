@@ -924,10 +924,26 @@ impl WriterGuard<'_> {
             && incumbent.samples > 0
         {
             let [dispatch, collapse, wake] = two_draw_disagreement_per_mille(&incumbent, cpu);
+            // The incumbent is the cheapest cost seen for this stamp, so
+            // it is the host's known floor rather than merely another
+            // draw, and what this run cost against that floor is the
+            // load reading the campaign spent its length looking for. It
+            // needs no bound: on a 12-core host a saturated draw reads
+            // some thousands of times its own floor.
+            //
+            // The symmetric figure stays beside it because that is what
+            // profile_draws_report computes over arbitrary pairs, and a
+            // production line that cannot be read against the sweep is
+            // two numbers rather than one measurement.
+            let floor = incumbent.dispatch_cost_ns.max(1);
+            let times_floor = cpu.dispatch_cost_ns as f64 / floor as f64;
             eprintln!(
-                "flynnel: two draws of this host disagree by {dispatch},{collapse},{wake} \
-                 per mille on dispatch,collapse,wake; incumbent spread {} occupancy {:?}, \
+                "flynnel: this draw costs {times_floor:.1}x the cheapest seen for this stamp \
+                 ({} against {} ns); two draws disagree by {dispatch},{collapse},{wake} per \
+                 mille on dispatch,collapse,wake; incumbent spread {} occupancy {:?}, \
                  offered spread {} occupancy {:?}",
+                cpu.dispatch_cost_ns,
+                incumbent.dispatch_cost_ns,
                 incumbent.spread_per_mille,
                 incumbent.occupancy(),
                 cpu.spread_per_mille,
