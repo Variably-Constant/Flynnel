@@ -36,6 +36,15 @@
 //! whose figures are identical across its own on and off arms did not
 //! engage, and its throughput row says nothing about the mechanism.
 //!
+//! # Why the per-item cost has to be large
+//!
+//! `classify_observed` returns on the mean alone below `port_heavy_ns`
+//! and never reads the variance. So a workload cheaper than that per
+//! item cannot show ANY spread-driven mechanism doing anything,
+//! however irregular it is: the branch that would read the spread is
+//! not taken. The run says so after its warm window rather than
+//! producing rows that read as a mechanism with no effect.
+//!
 //! # Why the load can alternate
 //!
 //! `duty_ms` makes the burners spin and sleep in phase rather than burn
@@ -280,6 +289,27 @@ fn main() {
     if warm == 0 {
         eprintln!("the warm window ran no dispatches; raise the window length");
         std::process::exit(2);
+    }
+
+    // classify_observed returns on the mean alone below port_heavy_ns
+    // and never reads the variance. Every switch here that acts on a
+    // spread is therefore unreachable at a per-item cost under that
+    // threshold, whatever the spread is, and a run below it produces
+    // rows that look exactly like a mechanism that did not help.
+    let heavy = flynnel::sched::adaptive_profile::class_thresholds()
+        .port_heavy_ns
+        .load(std::sync::atomic::Ordering::Relaxed);
+    match SITE.per_item_ns() {
+        Some(ns) if ns < heavy => eprintln!(
+            "this workload costs {ns} ns an item and classify_observed reads the \
+             variance only at {heavy} and above, so no spread-driven switch can \
+             change a class here; raise reps"
+        ),
+        Some(_) => {}
+        None => eprintln!(
+            "the site reported no per-item cost after the warm window, so whether \
+             the variance branch is reachable is unknown"
+        ),
     }
 
     for t in 1..=trials {
