@@ -4542,6 +4542,54 @@ mod tests {
     }
 
     #[test]
+    fn the_triple_path_records_leaves_and_never_brackets_them() {
+        // The same asymmetry as the indexed entry, asserted separately
+        // so a failure names which of the two changed. The triple
+        // bisect is what the slice ops route through, so this covers
+        // the other half of the production call sites the on-core
+        // switch does not reach.
+        static SITE: crate::sched::call_site::CallSiteState =
+            crate::sched::call_site::CallSiteState::new();
+        let site = crate::sched::call_site::SiteRef::new(&SITE);
+
+        let n = 4 * MIN_LEAF_ITEMS;
+        let a: Vec<u64> = (0..n as u64).collect();
+        let b: Vec<u64> = (0..n as u64).map(|x| x ^ 0x5DEE_CE66).collect();
+        let mut out: Vec<u64> = vec![0; n];
+        for _ in 0..(LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4) {
+            let plan = JobPlan::new(0, n as u32).with_site(site);
+            for_each_chunk_triple_min_leaf(
+                &plan,
+                &mut out,
+                &a,
+                &b,
+                MIN_LEAF_ITEMS,
+                |out, a, b| {
+                    for i in 0..out.len() {
+                        let mut acc = a[i] ^ b[i];
+                        for _ in 0..64 {
+                            acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        }
+                        out[i] = std::hint::black_box(acc);
+                    }
+                },
+            );
+        }
+
+        assert!(
+            SITE.leaf_count() > 0,
+            "the triple entry records every leaf, so the site must have counts"
+        );
+        assert_eq!(
+            SITE.oncore_items(),
+            0,
+            "the triple entry takes no on-core bracket; if this starts failing the \
+             switch has gained an effect its own documentation denies"
+        );
+        assert_eq!(SITE.per_item_oncore_cv2_per_mille(), None);
+    }
+
+    #[test]
     fn host_dispatch_profile_is_measured_and_cached() {
         let t0 = std::time::Instant::now();
         let p = calibrate_host_dispatch();
