@@ -25,7 +25,9 @@ import re
 import sys
 from collections import defaultdict
 
-SIDE = re.compile(r"^SIDE (\w+) load=(\d+) trial=(\d+)\s*$")
+SIDE = re.compile(
+    r"^SIDE (\w+) load=(\d+) trial=(\d+) reps=(\d+) entry=(\w+)\s*$"
+)
 THROUGHPUT = re.compile(r"^throughput (\d+) (\d+) (\d+) ([\d.]+)\s*$")
 CONTROL = re.compile(r"^control (\d+) (\d+) (\d+) ([\d.]+)\s*$")
 RETAINED = re.compile(r"^retained (\d+) (\d+) ([\d.]+) control_first=(\w+)\s*$")
@@ -56,30 +58,33 @@ def parse(paths):
     rows after it, so a log with no SIDE lines yields nothing rather
     than attributing every row to one tree."""
     rows = defaultdict(lambda: {"control": [], "loaded": [], "retained": []})
-    side = None
-    load = None
+    key = None
     for n, path in enumerate(paths, 1):
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for raw in fh:
                 line = raw.strip()
                 s = SIDE.match(line)
                 if s:
-                    side, load = s.group(1), int(s.group(2))
+                    # Keyed on reps as well as load: two per-item costs
+                    # are two workloads, and pooling them would average a
+                    # figure that is large at one and small at the other
+                    # into one that is true at neither.
+                    key = (s.group(1), int(s.group(2)), int(s.group(4)))
                     continue
-                if side is None:
+                if key is None:
                     continue
                 c = CONTROL.match(line)
                 if c:
-                    rows[(side, load)]["control"].append(int(c.group(3)))
+                    rows[key]["control"].append(int(c.group(3)))
                     continue
                 t = THROUGHPUT.match(line)
                 if t:
-                    rows[(side, load)]["loaded"].append(int(t.group(3)))
+                    rows[key]["loaded"].append(int(t.group(3)))
                     continue
                 r = RETAINED.match(line)
                 if r:
-                    rows[(side, load)]["retained"].append(float(r.group(3)))
-        note(f"parsed {n}/{len(paths)} {path}: {len(rows)} side/load cells")
+                    rows[key]["retained"].append(float(r.group(3)))
+        note(f"parsed {n}/{len(paths)} {path}: {len(rows)} side/load/reps cells")
     return rows
 
 
@@ -96,20 +101,20 @@ def main(paths):
         print("can be attributed to either tree.")
         return 1
 
-    loads = sorted({load for (_, load) in rows})
+    cells = sorted({(load, reps) for (_, load, reps) in rows})
     print()
-    print("TIP AGAINST BASE, per load level. Above 1.00 is the tip doing more.")
-    print(f"{'load':>5} {'n':>3} {'quiet':>8} {'loaded':>8} {'retention':>10} "
-          f"{'base spread':>12} {'tip spread':>11}")
-    print("-" * 64)
+    print("TIP AGAINST BASE. Above 1.00 is the tip doing more.")
+    print(f"{'reps':>6} {'load':>5} {'n':>3} {'quiet':>8} {'loaded':>8} "
+          f"{'retention':>10} {'base spread':>12} {'tip spread':>11}")
+    print("-" * 71)
 
     regressions = []
     undecided = []
-    for load in loads:
-        b = rows.get(("base", load))
-        t = rows.get(("tip", load))
+    for (load, reps) in cells:
+        b = rows.get(("base", load, reps))
+        t = rows.get(("tip", load, reps))
         if not b or not t:
-            print(f"{load:>5} {'-':>3} {'one side missing':>40}")
+            print(f"{reps:>6} {load:>5} {'-':>3} {'one side missing':>40}")
             continue
 
         quiet = ratio(median(t["control"]), median(b["control"]))
@@ -128,7 +133,7 @@ def main(paths):
         def fmt(x):
             return "-" if x is None else f"{x:.3f}"
 
-        print(f"{load:>5} {trials:>3} {fmt(quiet):>8} {fmt(loaded):>8} "
+        print(f"{reps:>6} {load:>5} {trials:>3} {fmt(quiet):>8} {fmt(loaded):>8} "
               f"{fmt(retention):>10} {fmt(bs):>12} {fmt(ts):>11}")
 
         # Flagged, not judged, and only where there is something to judge
@@ -137,15 +142,15 @@ def main(paths):
         # it. That is a verdict manufactured from a sample of one.
         if trials < 2:
             undecided.append(
-                f"  load {load}: {trials} trial, so the base has no "
+                f"  reps {reps} load {load}: {trials} trial, so the base has no "
                 f"trial-to-trial spread and nothing here can be called noise"
             )
         elif quiet is not None and bs is not None and quiet < 1.0:
             worse_by = 1.0 / quiet
             if worse_by > bs:
                 regressions.append(
-                    f"  load {load}: quiet {quiet:.3f}, worse by {worse_by:.3f} "
-                    f"against the base's own quiet spread of {bs:.3f}"
+                    f"  reps {reps} load {load}: quiet {quiet:.3f}, worse by "
+                    f"{worse_by:.3f} against the base's own quiet spread of {bs:.3f}"
                 )
 
     print()

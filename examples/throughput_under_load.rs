@@ -67,8 +67,16 @@
 //! and the machine's state at that moment are common to both arms
 //! instead of dividing one process by another.
 //!
+//! The last argument picks the dispatch entry: `plain` (the default),
+//! `indexed` or `triple`. They do not share a leaf recorder, so a figure
+//! taken through one says nothing about the others. `plain` reaches
+//! `record_leaf_sampled`; the other two reach
+//! `record_leaf_bracket_sampled`, which is the only path where the
+//! on-core bracket's cost can be weighed.
+//!
 //! ```sh
-//! throughput_under_load <window_s> <load_threads> <trials> [smt_prior] [duty_ms]
+//! throughput_under_load <window_s> <load_threads> <trials> [smt_prior] \
+//!     [duty_ms] [reps] [irregular] [entry]
 //! ```
 
 use std::env;
@@ -77,7 +85,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use flynnel::sched::par_iter::for_each_chunk_min_leaf;
+use flynnel::sched::par_iter::{
+    for_each_chunk_indexed_min_leaf, for_each_chunk_min_leaf, for_each_chunk_triple_min_leaf,
+};
 use flynnel::{CallSiteState, JobPlan, SiteRef};
 
 static SITE: CallSiteState = CallSiteState::new();
@@ -152,21 +162,92 @@ fn reps_at(index: usize, reps: u32, irregular: bool) -> u32 {
     1 + (h >> 33) as u32 % span
 }
 
+/// Which dispatch entry a run measures.
+///
+/// The entries do not share a leaf recorder, so a figure taken through
+/// one says nothing about the others. `Plain` reaches
+/// `record_leaf_sampled`; `Indexed` and `Triple` reach
+/// `record_leaf_bracket_sampled`, which times every leaf and brackets
+/// one in the stride. A run that means to weigh the bracket has to ask
+/// for an entry that can reach it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Entry {
+    Plain,
+    Indexed,
+    Triple,
+}
+
+impl Entry {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "plain" => Some(Self::Plain),
+            "indexed" => Some(Self::Indexed),
+            "triple" => Some(Self::Triple),
+            _ => None,
+        }
+    }
+}
+
+#[inline]
+fn grind(slot: &mut Item) {
+    let mut acc = slot.acc;
+    for _ in 0..slot.reps {
+        acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+    }
+    slot.acc = black_box(acc);
+}
+
 /// Dispatches completed in `measured`, with whatever else is running.
-fn window(buf: &mut [Item], measured: Duration, smt_prior: bool) -> u64 {
+///
+/// Every entry runs the same per-item body over the same buffer, so a
+/// difference between two entries is the dispatch path and not the work.
+fn window(
+    buf: &mut [Item],
+    aux: &mut [Item],
+    measured: Duration,
+    smt_prior: bool,
+    entry: Entry,
+) -> u64 {
     let start = Instant::now();
     let mut dispatches = 0u64;
     while start.elapsed() < measured {
         let plan = plan(smt_prior);
-        for_each_chunk_min_leaf(&plan, buf, MIN_LEAF, |chunk| {
-            for slot in chunk.iter_mut() {
-                let mut acc = slot.acc;
-                for _ in 0..slot.reps {
-                    acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                }
-                slot.acc = black_box(acc);
+        match entry {
+            Entry::Plain => {
+                for_each_chunk_min_leaf(&plan, buf, MIN_LEAF, |chunk| {
+                    for slot in chunk.iter_mut() {
+                        grind(slot);
+                    }
+                });
             }
-        });
+            Entry::Indexed => {
+                for_each_chunk_indexed_min_leaf(&plan, buf, MIN_LEAF, |_start, chunk| {
+                    for slot in chunk.iter_mut() {
+                        grind(slot);
+                    }
+                });
+            }
+            Entry::Triple => {
+                // The triple entry writes `out` from two reads, so the
+                // body differs in shape from the others by necessity.
+                // The rounds per item are the same, which is what the
+                // per-item cost is made of.
+                for_each_chunk_triple_min_leaf(
+                    &plan,
+                    aux,
+                    buf,
+                    buf,
+                    MIN_LEAF,
+                    |out, a, _b| {
+                        for i in 0..out.len() {
+                            out[i].reps = a[i].reps;
+                            out[i].acc = a[i].acc;
+                            grind(&mut out[i]);
+                        }
+                    },
+                );
+            }
+        }
         dispatches += 1;
     }
     dispatches
@@ -274,6 +355,11 @@ fn main() {
     let duty_ms: u64 = arg(5, 0);
     let reps: u32 = arg(6, 16);
     let irregular: bool = arg::<u8>(7, 0) != 0;
+    let entry_name: String = arg(8, "plain".to_string());
+    let Some(entry) = Entry::parse(&entry_name) else {
+        eprintln!("entry must be plain, indexed or triple, and was {entry_name:?}");
+        std::process::exit(2);
+    };
 
     if reps == 0 {
         eprintln!("reps must be at least one, or the leaf body does nothing");
@@ -285,6 +371,12 @@ fn main() {
     // the other arm's, and the driver's label would be the only record
     // of an intent that did not take effect.
     eprintln!("levers: {}", flynnel::sched::levers::describe());
+    // The entries do not share a leaf recorder, so a row means nothing
+    // without knowing which one produced it. Printed on both streams
+    // because the rows go to stdout and the switches to stderr, and a
+    // reader may have only one of them.
+    eprintln!("entry {entry_name}");
+    println!("entry {entry_name}");
 
     // The SMT switch is read inside `effective_use_smt`, past a return
     // that fires when the plan's prior is false. Asking for the prior
@@ -306,11 +398,16 @@ fn main() {
     let mut buf: Vec<Item> = (0..ITEMS)
         .map(|i| Item { reps: reps_at(i, reps, irregular), acc: i as u64 })
         .collect();
+    // The triple entry needs somewhere to write. Allocated for every
+    // entry so the process's memory is the same whichever one runs, and
+    // a comparison between entries is not also a comparison between
+    // allocations.
+    let mut aux: Vec<Item> = vec![Item { reps: 1, acc: 0 }; ITEMS];
 
     // One warm window, discarded: the first dispatches of a process pay
     // pool startup and the site's first classifier ticks, which belong
     // to no arm.
-    let warm = window(&mut buf, Duration::from_secs(1), smt_prior);
+    let warm = window(&mut buf, &mut aux, Duration::from_secs(1), smt_prior, entry);
     if warm == 0 {
         eprintln!("the warm window ran no dispatches; raise the window length");
         std::process::exit(2);
@@ -355,7 +452,7 @@ fn main() {
         for half in 0..2 {
             let run_control = (half == 0) == control_first;
             if run_control {
-                control = window(&mut buf, measured, smt_prior);
+                control = window(&mut buf, &mut aux, measured, smt_prior, entry);
             } else {
                 let load = (load_threads > 0).then(|| Load::start(load_threads, duty_ms));
                 // Let the burners reach the cores before timing, or the
@@ -364,7 +461,7 @@ fn main() {
                 if load.is_some() {
                     std::thread::sleep(Duration::from_millis(250));
                 }
-                loaded = window(&mut buf, measured, smt_prior);
+                loaded = window(&mut buf, &mut aux, measured, smt_prior, entry);
                 if let Some(load) = load {
                     load.stop();
                 }
@@ -395,9 +492,9 @@ fn main() {
     // no reading says so rather than being read as a result.
     if flynnel::sched::levers::oncore_spread() && SITE.oncore_items() == 0 {
         eprintln!(
-            "the on-core switch is on and no leaf carried an on-core reading, so this \
-             dispatch entry never reached record_leaf_sampled and the switch did \
-             nothing here"
+            "the on-core switch is on and no leaf carried an on-core reading, so the \
+             {entry_name} entry never reached a recorder that brackets and the switch \
+             did nothing here"
         );
         std::process::exit(4);
     }
