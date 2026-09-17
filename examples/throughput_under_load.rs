@@ -55,6 +55,18 @@
 //! contended and quiet batches in one window, which is the condition
 //! such a weighting exists for.
 //!
+//! Each trial measures twice in this process: a control window with the
+//! burners off and a loaded window with them on. It prints a
+//! `throughput` row for the loaded window, a `control` row for the quiet
+//! one, and a `retained` row giving loaded dispatches as a share of
+//! quiet ones. A trial therefore takes twice `window_s` plus the
+//! burners' settling time.
+//!
+//! `retained` is the figure a change has to hold or improve, and it is a
+//! ratio taken inside one process, so pool startup, the calibration draw
+//! and the machine's state at that moment are common to both arms
+//! instead of dividing one process by another.
+//!
 //! ```sh
 //! throughput_under_load <window_s> <load_threads> <trials> [smt_prior] [duty_ms]
 //! ```
@@ -325,20 +337,52 @@ fn main() {
         ),
     }
 
+    // Each trial measures both arms in this process: a control window
+    // with the burners off and a loaded window with them on. Two
+    // processes would carry their own pool startup, their own
+    // calibration draw and their own place in the machine's day, and a
+    // ratio between them would divide by all of it.
+    //
+    // The arms alternate by trial so neither always runs first. A window
+    // is worth a few per cent more in one position than the other, and
+    // an order held fixed would put that difference in the ratio.
     for t in 1..=trials {
-        let load = (load_threads > 0).then(|| Load::start(load_threads, duty_ms));
-        // Let the burners actually reach the cores before timing, or the
-        // early part of the window is measured with less load than the
-        // row claims.
-        if load.is_some() {
-            std::thread::sleep(Duration::from_millis(250));
+        let control_first = t % 2 == 1;
+
+        let mut control = 0u64;
+        let mut loaded = 0u64;
+
+        for half in 0..2 {
+            let run_control = (half == 0) == control_first;
+            if run_control {
+                control = window(&mut buf, measured, smt_prior);
+            } else {
+                let load = (load_threads > 0).then(|| Load::start(load_threads, duty_ms));
+                // Let the burners reach the cores before timing, or the
+                // early part of the window carries less load than the
+                // row claims.
+                if load.is_some() {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                loaded = window(&mut buf, measured, smt_prior);
+                if let Some(load) = load {
+                    load.stop();
+                }
+            }
         }
-        let n = window(&mut buf, measured, smt_prior);
-        if let Some(load) = load {
-            load.stop();
-        }
-        let per_s = n as f64 / window_s as f64;
-        println!("throughput {load_threads} {t} {n} {per_s:.2}");
+
+        let control_per_s = control as f64 / window_s as f64;
+        let loaded_per_s = loaded as f64 / window_s as f64;
+        // Dispatches under load as a share of dispatches quiet. This is
+        // what a change has to hold or improve, and it is a ratio within
+        // one process rather than across two.
+        let retained = if control > 0 { loaded as f64 / control as f64 } else { 0.0 };
+
+        println!("throughput {load_threads} {t} {loaded} {loaded_per_s:.2}");
+        println!("control {load_threads} {t} {control} {control_per_s:.2}");
+        println!(
+            "retained {load_threads} {t} {retained:.4} control_first={control_first}"
+        );
     }
 
     engagement(smt_prior, duty_ms, reps, irregular);
