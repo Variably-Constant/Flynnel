@@ -107,11 +107,23 @@ def pair_gaps_per_mille(values):
     ]
 
 
+def note(text):
+    """One progress line, flushed.
+
+    Flushed here rather than left to the caller passing `-u`: a reader
+    pointed at a rotation's worth of logs is the case where progress
+    matters, and that is also the case where it is redirected to a file
+    and held in a buffer until the end. A script that reports only its
+    result cannot be asked where it is while it runs.
+    """
+    print(text, file=sys.stderr, flush=True)
+
+
 def parse(paths):
     by_load = defaultdict(lambda: {"draws": [], "sweeps": []})
     repeated = 0
     pending = []
-    for path in paths:
+    for n, path in enumerate(paths, 1):
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for raw in fh:
                 line = raw.strip()
@@ -146,6 +158,8 @@ def parse(paths):
                     # without, so it is reported rather than filled in.
                     by_load[load]["sweeps"].append(pending)
                     pending = []
+        drawn = sum(len(v["draws"]) for v in by_load.values())
+        note(f"parsed {n}/{len(paths)} {path}: {drawn} draws so far")
     return by_load, repeated
 
 
@@ -364,13 +378,14 @@ def field_gaps(paths, admitted):
     host, and neither the interval nor its width shows that.
     """
     seen = {f: [] for f in FIGURES}
-    for path in paths:
+    for n, path in enumerate(paths, 1):
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for raw in fh:
                 m = FIELD.match(raw.strip())
                 if m:
                     for f, g in zip(FIGURES, m.groups()):
                         seen[f].append(int(g))
+        note(f"scanned {n}/{len(paths)} {path} for field gaps: {len(seen['dispatch'])} so far")
 
     total = sum(len(v) for v in seen.values())
     print()
