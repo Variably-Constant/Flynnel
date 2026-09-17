@@ -29,16 +29,29 @@ import re
 import sys
 from collections import defaultdict
 
+# Each pattern is coupled to one format string and nothing enforces the
+# coupling, so the producer is named beside it. A pattern whose producer
+# has been reworded matches nothing and reports a clean empty section,
+# which is the same output as a run that measured nothing.
+#
+# src/sched/par_iter.rs, the crossover sweep under FLYNNEL_PROFILE_SAMPLES.
+# The dispatch cost's own samples print as "profile point:" instead,
+# carry no spread or iqr, and gate nothing, so they are not read here.
 SWEEP = re.compile(
     r"^profile sweep:\s+min\s+(\d+)\s+median\s+(\d+)\s+max\s+(\d+)\s+"
     r"spread\s+(\d+)\s+iqr\s+(\d+)\s+per mille\s+samples\s+\[([0-9,\s]+)\]\s*$"
 )
+# examples/profile_draws.rs, one line per draw on stdout.
 DRAW = re.compile(r"^draw\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+load=(\d+)\s*$")
+# examples/profile_draws.rs, once per process. Nonzero means the stored
+# record was handed back rather than measured, which a reader cannot
+# tell from a steady host.
 REPEATED = re.compile(r"^repeated_draws\s+(\d+)\s*$")
-# The same quantity as a pair gap above, reported by a running process
-# at the publish comparison, which is the one place a live process holds
-# two draws of its host at once. It carries no load label, because
-# nothing at that site knows what else the box was doing.
+# src/sched/calibration_store.rs, at the publish comparison, under
+# FLYNNEL_OCCUPANCY. The same quantity as a pair gap above, reported by
+# a running process, which is the one place a live process holds two
+# draws of its host at once. It carries no load label, because nothing
+# at that site knows what else the box was doing.
 FIELD = re.compile(
     r"^flynnel: two draws of this host disagree by (\d+),(\d+),(\d+) per mille"
 )
