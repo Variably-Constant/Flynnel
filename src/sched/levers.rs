@@ -64,6 +64,13 @@ fn read(name: &str) -> bool {
 /// others, so it reaches a wall-time spread as variance indistinguishable
 /// from the work's own. Costs two thread-clock reads on each sampled
 /// leaf, which is why it is a switch rather than simply the behavior.
+///
+/// Read only by `record_leaf_sampled`, which only the plain
+/// steal-driven bisect calls. A dispatch through an indexed or triple
+/// entry times every leaf with a recorder that takes no bracket, so
+/// this switch changes nothing there;
+/// [`crate::sched::call_site::CallSiteState::oncore_items`] stays at
+/// zero when no leaf was bracketed.
 pub fn oncore_spread() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| read("FLYNNEL_LEVER_ONCORE_SPREAD"))

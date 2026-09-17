@@ -136,6 +136,17 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   carried no on-core reading is classified on wall time, as every window
   was before.
 
+  WHICH DISPATCH ENTRIES IT REACHES. The bracket is taken by the
+  sampled leaf recorder, and only the plain steal-driven bisect calls
+  that, so the switch changes what `for_each_chunk` and
+  `for_each_chunk_min_leaf` record and nothing else. The indexed and
+  triple bisects time every leaf through a recorder with no bracket, so
+  a site dispatching through `for_each_chunk_indexed`,
+  `for_each_chunk_indexed_min_leaf` or `for_each_chunk_triple_min_leaf`
+  takes no on-core reading whatever this switch is set to. A caller can
+  tell which case it is in from `CallSiteState::oncore_items`, which
+  stays at zero when no leaf was bracketed.
+
   Measured paired inside one process, where the two figures cover the
   same leaves and differ only in which clock timed them: across a load
   event the wall spread rose more than the on-core spread in every one
