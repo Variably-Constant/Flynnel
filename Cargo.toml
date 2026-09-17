@@ -220,6 +220,27 @@ name = "profile_draws"
 name = "oncore_reach"
 
 [[example]]
+name = "audit_real_workloads_routing"
+
+[[example]]
+name = "classifier_audit"
+
+[[example]]
+name = "migrate_observability"
+
+[[example]]
+name = "observe_grep"
+
+[[example]]
+name = "observe_workloads"
+
+[[example]]
+name = "probe_k_gating"
+
+[[example]]
+name = "trace_real_grep"
+
+[[example]]
 name = "smt_wake_cost"
 
 [[example]]
