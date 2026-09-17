@@ -150,14 +150,36 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   for some leaves and not others and each figure divides by the items it
   covers.
 
-  Two clock pairs per sampled leaf, taken only on the sampled path. The
-  cost is not a constant across targets: on Linux and FreeBSD the
-  thread-clock half is `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, which
-  the vDSO does not serve, so it enters the kernel. Each worker pays it
-  for its own sampled leaves, so what a dispatch adds is that cost times
-  the sampled leaves ONE worker ran, not times the whole dispatch's.
-  `examples/clock_cost.rs` reports both halves on the running host and
-  what they amortize to at the stride.
+  Two clock pairs per sampled leaf, taken only on the sampled path.
+  Each worker pays for its own sampled leaves, so what a dispatch adds
+  is that cost times the sampled leaves ONE worker ran, not times the
+  whole dispatch's.
+
+  The cost is not a constant, and not a constant per target either.
+  Measured with `examples/clock_cost.rs`, in nanoseconds, where the
+  bracket is two pairs and the last column is that amortized at the
+  sample stride:
+
+  | host | thread clock | elapsed | bracket | per leaf |
+  |---|---|---|---|---|
+  | Ryzen 9 7900X, Windows, quiet | 206.8 | 6.1 | 425.7 | 53.2 |
+  | Zen3 Linux guest | 670.6 | 28.6 | 1398.4 | 174.8 |
+  | Zen3 Linux guest, busier | 973.4 | 38.1 | 2022.8 | 252.9 |
+
+  On Linux and FreeBSD the thread-clock half is
+  `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, which the vDSO fast path
+  refuses, so it enters the kernel; on Windows it is
+  `QueryThreadCycleTime` against `rdtsc`. Two readings on one guest
+  differ by 1.45x, so the machine and what runs on it vary more than the
+  target does. A caller sizing anything against this figure should read
+  it on the host rather than assume one.
+
+  What it is against: at a per-item cost of 1 ns a 256-item leaf is
+  256 ns, and the bracket is most of it. At 2 us an item the same leaf
+  is 512 us and the bracket is a fraction of a percent. The switch is
+  also only consultable in the second regime, because
+  `classify_observed` returns on the mean alone below `port_heavy_ns`
+  and never reads the spread this improves.
 - `FLYNNEL_LEVER_BATCH_WEIGHT`: a leaf batch is recorded at the share of
   its interval the pool spent on a core, and every sum a call site keeps
   carries that weight as a factor along with the count they are divided
