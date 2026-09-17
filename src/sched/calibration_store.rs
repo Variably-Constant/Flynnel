@@ -808,6 +808,34 @@ pub struct WriterGuard<'a> {
 /// offer wins, so a platform with no thread clock cannot freeze the
 /// table. A tie goes to the offer, because the fresher draw describes
 /// the host now.
+/// Per-mille disagreement between two draws of the same host, on each
+/// of the three dispatch figures, in the order dispatch, collapse,
+/// wake.
+///
+/// Taken against the pair's mean rather than against either record, so
+/// the figure does not depend on which of the two is called the
+/// incumbent. A figure both draws report as zero disagrees by zero.
+///
+/// Reported, never acted on. What separates a contended draw from a
+/// quiet one is how far two draws of the same host fall apart, and no
+/// statistic taken within a single draw does it. The bound that would
+/// turn this into a decision has to come from draws taken across known
+/// conditions, so until there is one this only prints.
+fn two_draw_disagreement_per_mille(a: &CpuCalibration, b: &CpuCalibration) -> [u64; 3] {
+    fn gap(x: u64, y: u64) -> u64 {
+        let sum = x.saturating_add(y);
+        if sum == 0 {
+            return 0;
+        }
+        x.abs_diff(y).saturating_mul(2_000) / sum
+    }
+    [
+        gap(a.dispatch_cost_ns, b.dispatch_cost_ns),
+        gap(a.collapse_threshold_ns, b.collapse_threshold_ns),
+        gap(a.jec_wake_threshold_ns, b.jec_wake_threshold_ns),
+    ]
+}
+
 fn prefers_incumbent(
     incumbent: &CpuCalibration,
     offered: &CpuCalibration,
@@ -883,6 +911,24 @@ impl WriterGuard<'_> {
         cpu: &CpuCalibration,
         accel: &[AccelCalibration],
     ) -> PublishOutcome {
+        // Reported whether or not the refusal is on, because this is the
+        // only point in a running process where two draws of one host
+        // are both in hand. Reporting only when the refusal fires would
+        // sample the half where the incumbent already won.
+        if std::env::var_os("FLYNNEL_OCCUPANCY").is_some()
+            && let Some((incumbent, _)) = self.store.read()
+        {
+            let [dispatch, collapse, wake] = two_draw_disagreement_per_mille(&incumbent, cpu);
+            eprintln!(
+                "flynnel: two draws of this host disagree by {dispatch},{collapse},{wake} \
+                 per mille on dispatch,collapse,wake; incumbent spread {} occupancy {:?}, \
+                 offered spread {} occupancy {:?}",
+                incumbent.spread_per_mille,
+                incumbent.occupancy(),
+                cpu.spread_per_mille,
+                cpu.occupancy(),
+            );
+        }
         if crate::sched::levers::calibration_refusal()
             && let Some((incumbent, _)) = self.store.read()
             && let Some(kept) = prefers_incumbent(&incumbent, cpu)
@@ -1178,6 +1224,31 @@ mod tests {
             None,
             "and the refusal declines to act on it, whatever the occupancies say"
         );
+    }
+
+    #[test]
+    fn two_draws_disagree_by_one_figure_whichever_is_called_the_incumbent() {
+        // Symmetry is the property that makes this reportable at the
+        // publish site: the pair there is ordered by which draw happened
+        // to be stored first, and a figure that changed with that order
+        // would describe the order rather than the host.
+        let quiet = CpuCalibration::new(1_000, 4_000, 4_200, 41, 9, Some(990));
+        let loaded = CpuCalibration::new(2_000, 20_000, 6_500, 41, 9, Some(660));
+
+        let forward = two_draw_disagreement_per_mille(&quiet, &loaded);
+        let backward = two_draw_disagreement_per_mille(&loaded, &quiet);
+        assert_eq!(forward, backward, "the figure must not depend on the argument order");
+
+        // Against the pair's mean: 1000 apart on a mean of 1500 is 666,
+        // 16000 on 12000 is 1333, 2300 on 5350 is 429.
+        assert_eq!(forward, [666, 1333, 429]);
+
+        let same = two_draw_disagreement_per_mille(&quiet, &quiet);
+        assert_eq!(same, [0, 0, 0], "a draw against itself disagrees by nothing");
+
+        // Both figures zero is agreement, not a division this cannot do.
+        let empty = CpuCalibration::new(0, 0, 0, 41, 9, Some(990));
+        assert_eq!(two_draw_disagreement_per_mille(&empty, &empty), [0, 0, 0]);
     }
 
     #[test]
