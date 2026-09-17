@@ -2418,6 +2418,59 @@ fn record_leaf_sampled<F: FnOnce() -> R, R>(
     }
 }
 
+/// Advance a stride counter and say whether this call is the one in
+/// [`LEAF_SAMPLE_STRIDE`] that takes the bracket.
+///
+/// Separate from [`record_leaf_bracket_sampled`] because the cadence is
+/// the whole of what that recorder adds, and the switch it also
+/// consults is read once per process and cached. A test driving the
+/// recorder could only ever observe whichever arm the process started
+/// in, so the cadence would go unasserted while looking covered.
+#[inline(always)]
+fn advance_bracket_tick(prev: u32) -> (u32, bool) {
+    let v = prev.wrapping_add(1);
+    let take = v >= LEAF_SAMPLE_STRIDE;
+    (if take { 0 } else { v }, take)
+}
+
+/// Leaf recorder for the entries that time every leaf: the wall
+/// reading is taken on every call, the on-core bracket on one call in
+/// [`LEAF_SAMPLE_STRIDE`].
+///
+/// Those entries decline to sample for a reason that is about the wall
+/// cadence alone. The observer needs a reading from every leaf to
+/// converge on a workload's shape within the first few iterations, and
+/// a strided sample never accumulates enough flushes for
+/// auto-migration to fire on small-N workloads. That argument says
+/// nothing about how often a leaf is bracketed, so the two cadences
+/// can differ, and without a recorder that lets them differ these
+/// entries cannot reach the bracket at all.
+///
+/// [`record_leaf`] and [`record_leaf_on_core`] differ only by the
+/// bracket, which is two thread-clock reads and enters the kernel on
+/// Linux and FreeBSD. It is taken only while
+/// [`crate::sched::levers::oncore_spread`] is on.
+#[inline]
+fn record_leaf_bracket_sampled<F: FnOnce() -> R, R>(
+    site: Option<crate::sched::call_site::SiteRef>,
+    items: usize,
+    body: F,
+) -> R {
+    thread_local! {
+        static BRACKET_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let bracket = BRACKET_TICK.with(|c| {
+        let (next, take) = advance_bracket_tick(c.get());
+        c.set(next);
+        take
+    });
+    if bracket && crate::sched::levers::oncore_spread() {
+        record_leaf_on_core(site, items, body)
+    } else {
+        record_leaf(site, items, body)
+    }
+}
+
 /// Direction B: continuation-steal lazy bisect.
 ///
 /// Splits only when this worker observes that someone has stolen from
@@ -2657,7 +2710,7 @@ where
     F: Fn(&mut [T1], &[T2], &[T3]) + Sync,
 {
     if out.len() <= min_leaf {
-        record_leaf(plan.site, out.len(), || op(out, a, b));
+        record_leaf_bracket_sampled(plan.site, out.len(), || op(out, a, b));
         return;
     }
     let cur_splits = if migrated { max_budget } else { splits };
@@ -2665,7 +2718,7 @@ where
     // splitting at cur_splits=1 emits two children each holding
     // 0 budget, both immediately leaf, doubling leaf count.
     if cur_splits <= 1 {
-        record_leaf(plan.site, out.len(), || op(out, a, b));
+        record_leaf_bracket_sampled(plan.site, out.len(), || op(out, a, b));
         return;
     }
     let mid = out.len() >> 1;
@@ -3004,14 +3057,14 @@ where
     F: Fn(usize, &mut [T]) + Sync,
 {
     if items.len() <= min_leaf {
-        // record_leaf rather than _sampled: the closing-loop auto-classifier
-        // observer needs every leaf timed so it can converge on the
-        // workload's shape (mean_ns + cv^2) within the first few
-        // iterations of a real workload, not after thousands. The
-        // sampled variant rate-limited to 1-in-8, which never
-        // accumulated enough flushes for the auto-migration to fire
-        // on realistic small-N workloads (e.g. 16-chunk grep).
-        record_leaf(plan.site, items.len(), || op(start, items));
+        // Every leaf is wall-timed here: the closing-loop auto-classifier
+        // observer converges on the workload's shape (mean_ns + cv^2)
+        // within the first few iterations only if it sees them all, and
+        // on a small-N workload such as a 16-chunk grep a strided sample
+        // never accumulates enough flushes for auto-migration to fire.
+        // The on-core bracket rides a stride of its own inside the
+        // recorder, which that requirement does not constrain.
+        record_leaf_bracket_sampled(plan.site, items.len(), || op(start, items));
         return;
     }
     let ctx_ptr = crate::sched::arena_local::current_worker_ctx();
@@ -3041,7 +3094,7 @@ where
         // No steal pressure observed, so the entire remaining slice
         // runs inline as one leaf rather than splitting further. This is the rayon continuation-stealing
         // pattern: only fork further when somebody is starving.
-        record_leaf(plan.site, items.len(), || op(start, items));
+        record_leaf_bracket_sampled(plan.site, items.len(), || op(start, items));
         return;
     }
     let mid = items.len() / 2;
@@ -3071,13 +3124,13 @@ where
     F: Fn(usize, &mut [T]) + Sync,
 {
     if items.len() <= min_leaf {
-        record_leaf(plan.site, items.len(), || op(start, items));
+        record_leaf_bracket_sampled(plan.site, items.len(), || op(start, items));
         return;
     }
     let cur_splits = if migrated { max_budget } else { splits };
     // Leaf at `<= 1` (see `bisect` for the doubling-bug rationale).
     if cur_splits <= 1 {
-        record_leaf(plan.site, items.len(), || op(start, items));
+        record_leaf_bracket_sampled(plan.site, items.len(), || op(start, items));
         return;
     }
     let mid = items.len() >> 1;
@@ -4676,16 +4729,55 @@ mod tests {
     }
 
     #[test]
-    fn the_indexed_path_records_leaves_and_never_brackets_them() {
-        // The on-core bracket is taken by `record_leaf_sampled`, and
-        // only `bisect_lazy_steal_driven` calls that. Every other bisect
-        // records through `record_leaf`, which has no bracket, so
-        // `levers::oncore_spread` changes nothing on an indexed or
-        // triple entry.
+    fn one_call_in_the_stride_takes_the_bracket_and_the_rest_do_not() {
+        // Both halves of "one in N" are asserted: how many calls take
+        // the bracket, and how far apart they are. A counter that reset
+        // on every call would take all of them; one that never reset
+        // would take every call after the first N. The count alone
+        // separates neither from a correct stride, because a run long
+        // enough for the second to be wrong is also long enough for its
+        // count to look plausible.
+        let rounds = LEAF_SAMPLE_STRIDE as usize * 10;
+        let mut tick = 0u32;
+        let mut taken_at = Vec::new();
+        for call in 0..rounds {
+            let (next, take) = advance_bracket_tick(tick);
+            tick = next;
+            if take {
+                taken_at.push(call);
+            }
+        }
+
+        assert_eq!(
+            taken_at.len(),
+            10,
+            "one call in {LEAF_SAMPLE_STRIDE} over {rounds} calls is 10 brackets, \
+             got {} at {taken_at:?}",
+            taken_at.len()
+        );
+        for pair in taken_at.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                LEAF_SAMPLE_STRIDE as usize,
+                "brackets at {taken_at:?} are not one stride apart"
+            );
+        }
+    }
+
+    #[test]
+    fn the_indexed_path_times_every_leaf_and_leaves_the_bracket_to_the_switch() {
+        // The indexed entry records through `record_leaf_bracket_sampled`,
+        // which times every leaf and takes the bracket at the stride only
+        // while `levers::oncore_spread` is on. That switch is read once
+        // per process, and a test binary runs with it off, so what is
+        // assertable here is that the bracket stays behind it.
         //
         // Both halves are asserted. A dispatch that recorded no leaves
         // at all would satisfy the second on its own, and would be a
-        // broken recorder rather than the asymmetry this pins.
+        // broken recorder rather than the arrangement this pins. The
+        // cadence itself is asserted by
+        // `one_call_in_the_stride_takes_the_bracket_and_the_rest_do_not`,
+        // which can reach it without the switch.
         static SITE: crate::sched::call_site::CallSiteState =
             crate::sched::call_site::CallSiteState::new();
         let site = crate::sched::call_site::SiteRef::new(&SITE);
@@ -4714,19 +4806,19 @@ mod tests {
         assert_eq!(
             SITE.oncore_items(),
             0,
-            "the indexed entry takes no on-core bracket; if this starts failing the \
-             switch has gained an effect its own documentation denies"
+            "the indexed entry's bracket is behind `oncore_spread`, which is off in a \
+             test binary; a count here means the recorder takes it unconditionally"
         );
         assert_eq!(SITE.per_item_oncore_cv2_per_mille(), None);
     }
 
     #[test]
-    fn the_triple_path_records_leaves_and_never_brackets_them() {
-        // The same asymmetry as the indexed entry, asserted separately
+    fn the_triple_path_times_every_leaf_and_leaves_the_bracket_to_the_switch() {
+        // The same arrangement as the indexed entry, asserted separately
         // so a failure names which of the two changed. The triple
         // bisect is what the slice ops route through, so this covers
-        // the other half of the production call sites the on-core
-        // switch does not reach.
+        // the other half of the production call sites that reach the
+        // on-core switch.
         static SITE: crate::sched::call_site::CallSiteState =
             crate::sched::call_site::CallSiteState::new();
         let site = crate::sched::call_site::SiteRef::new(&SITE);
@@ -4762,8 +4854,8 @@ mod tests {
         assert_eq!(
             SITE.oncore_items(),
             0,
-            "the triple entry takes no on-core bracket; if this starts failing the \
-             switch has gained an effect its own documentation denies"
+            "the triple entry's bracket is behind `oncore_spread`, which is off in a \
+             test binary; a count here means the recorder takes it unconditionally"
         );
         assert_eq!(SITE.per_item_oncore_cv2_per_mille(), None);
     }

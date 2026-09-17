@@ -65,12 +65,18 @@ fn read(name: &str) -> bool {
 /// from the work's own. Costs two thread-clock reads on each sampled
 /// leaf, which is why it is a switch rather than simply the behavior.
 ///
-/// Read only by `record_leaf_sampled`, which only the plain
-/// steal-driven bisect calls. A dispatch through an indexed or triple
-/// entry times every leaf with a recorder that takes no bracket, so
-/// this switch changes nothing there;
+/// Read by two recorders, which between them cover the dispatch
+/// entries. `record_leaf_sampled` serves the plain steal-driven bisect,
+/// where one leaf in the stride is both wall-timed and bracketed.
+/// `record_leaf_bracket_sampled` serves the indexed and triple entries,
+/// which time every leaf and bracket one in the same stride. The two
+/// cadences differ because those entries need a reading from every leaf
+/// to converge, and that requirement is about the wall clock alone.
+///
 /// [`crate::sched::call_site::CallSiteState::oncore_items`] stays at
-/// zero when no leaf was bracketed.
+/// zero when no leaf was bracketed, so it reports whether this switch
+/// reached the dispatch under measurement rather than leaving a switch
+/// that never engaged to look like one that did not help.
 pub fn oncore_spread() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| read("FLYNNEL_LEVER_ONCORE_SPREAD"))
