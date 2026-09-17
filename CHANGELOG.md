@@ -150,10 +150,14 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   for some leaves and not others and each figure divides by the items it
   covers.
 
-  Two extra clock reads per sampled leaf, which the stride divides. The
-  per-leaf instrumentation budget is about 4 ns amortized and a thread
-  clock read is an order above that, so this is affordable where the
-  stride applies and is not done anywhere else.
+  Two clock pairs per sampled leaf, taken only on the sampled path. The
+  cost is not a constant across targets: on Linux and FreeBSD the
+  thread-clock half is `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, which
+  the vDSO does not serve, so it enters the kernel. Each worker pays it
+  for its own sampled leaves, so what a dispatch adds is that cost times
+  the sampled leaves ONE worker ran, not times the whole dispatch's.
+  `examples/clock_cost.rs` reports both halves on the running host and
+  what they amortize to at the stride.
 - `FLYNNEL_LEVER_BATCH_WEIGHT`: a leaf batch is recorded at the share of
   its interval the pool spent on a core, and every sum a call site keeps
   carries that weight as a factor along with the count they are divided
@@ -171,6 +175,14 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   adaptive routing and on neither pinned one. It is kept because a
   contended sample counting for less is right on its own terms, and it
   is not what the spread change above rests on.
+
+  It changes a figure only where batches DIFFER in the share they held.
+  Each statistic divides a weighted total by a weighted count, so a
+  share every batch in the window shares cancels exactly: a host that is
+  contended steadily moves nothing here however contended it is. What
+  the weighting is for is a window carrying contended batches and quiet
+  ones together, which is what `examples/throughput_under_load.rs` makes
+  with its `duty_ms` argument.
 - `FLYNNEL_LEVER_SMT_WINDOW`: `JobPlan::effective_use_smt` decides from
   the window the site's classifier last read rather than from its
   lifetime cv^2, falling back
