@@ -1275,9 +1275,11 @@ impl JobPlan {
         // The query is a syscall and a cgroup read, cached on a cadence,
         // so the switch is what keeps that cost off a quiet host's hot
         // path until a measurement says it is free.
-        let running = capped_by_allowed_width(running, crate::sched::levers::allowed_width(), || {
-            crate::sched::host_width::allowed_parallelism()
-        });
+        let running = capped_by_allowed_width(
+            running,
+            crate::sched::levers::allowed_width(),
+            crate::sched::host_width::allowed_parallelism,
+        );
         self.effective_workers(running)
     }
 }
