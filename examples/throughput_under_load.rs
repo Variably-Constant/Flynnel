@@ -146,21 +146,44 @@ struct Item {
 
 /// How much work the item at `index` costs.
 ///
-/// Uniform gives every item `reps` rounds. Irregular varies them
+/// Mode 0 gives every item `reps` rounds. Mode 1 varies them
 /// deterministically with the index, in `1 ..= 2 * reps - 1`, so the
 /// mean is `reps` and the shapes are comparable in total work while
-/// differing in spread.
+/// differing in spread. Mode 2 draws the same way but once per block of
+/// [`BLOCK_ITEMS`], so every item in a block costs alike.
+///
+/// The classifier reads leaf times over a tick's window, and both scales
+/// average. A leaf averages its items, so mode 1's per-item cv^2 near
+/// 333 per mille reaches the window as about nothing: measured
+/// cv2_window 0 at reps 8192. A block larger than the window averages
+/// the other way, since a window holding one block sees uniform work:
+/// measured cv2_window 3 at a 2048-item block, against a wall cv^2 of
+/// 351. The block has to sit between the two.
 #[inline]
-fn reps_at(index: usize, reps: u32, irregular: bool) -> u32 {
-    if !irregular || reps < 2 {
+fn reps_at(index: usize, reps: u32, irregular: u8) -> u32 {
+    if irregular == 0 || reps < 2 {
         return reps;
     }
-    let h = (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let key = if irregular >= 2 { index / BLOCK_ITEMS } else { index };
+    let h = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     // Saturating, so a reps above half of u32 yields a narrower span
     // rather than wrapping to a small one in release.
     let span = reps.saturating_mul(2).saturating_sub(1).max(1);
     1 + (h >> 33) as u32 % span
 }
+
+/// Items sharing one draw in mode 2.
+///
+/// Measured on a 24-thread host at reps 8192, mode 2, reading
+/// cv2_window off the engagement line:
+///
+/// - 256 items: 40, under the 50 the classifier calls uniform
+/// - 512 items: 51, and the class moves to MemoryBound
+/// - 2048 items: 3, the window holding one block and seeing it flat
+///
+/// So 512 is the only one of the three that puts a cell in the regime
+/// where a spread-driven mechanism is consulted at all.
+const BLOCK_ITEMS: usize = 512;
 
 /// Which dispatch entry a run measures.
 ///
@@ -322,7 +345,7 @@ fn reading(value: Option<u64>) -> String {
 /// Read against the same line from the arm the switch was off in. Two
 /// arms whose engagement figures match ran the same code whatever the
 /// throughput rows did.
-fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: bool) {
+fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8) {
     let plan = plan(smt_prior);
     let site = &SITE;
     println!(
@@ -354,7 +377,7 @@ fn main() {
     let smt_prior: bool = arg::<u8>(4, 0) != 0;
     let duty_ms: u64 = arg(5, 0);
     let reps: u32 = arg(6, 16);
-    let irregular: bool = arg::<u8>(7, 0) != 0;
+    let irregular: u8 = arg::<u8>(7, 0);
     let entry_name: String = arg(8, "plain".to_string());
     let Some(entry) = Entry::parse(&entry_name) else {
         eprintln!("entry must be plain, indexed or triple, and was {entry_name:?}");
