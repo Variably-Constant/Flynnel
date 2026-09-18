@@ -98,6 +98,13 @@ for t in $(seq 1 "$TRIALS"); do
             export FLYNNEL_CALIBRATION_DIR="$fresh"
         fi
         busy=$(settle)
+        # A name list, indicative only. It answers who is present, never
+        # whether anything is running, and -x demands an exact match, so
+        # cargo-flamegraph does not match cargo and any binary not named
+        # here counts as nothing. busy_cores is the reading that gates a
+        # trial, because it measures the cpu rather than the roster.
+        # foreign=0 means none of these four, not a quiet box.
+        #
         # Counted by wc rather than pgrep -c, which prints its count and
         # also exits non-zero when nothing matches, so `|| echo 0`
         # appends a second count and embeds a newline. That split the ARM
