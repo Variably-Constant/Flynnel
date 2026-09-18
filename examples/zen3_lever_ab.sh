@@ -69,8 +69,8 @@ busy_cores() {
                  printf "%.2f", n * (1 - (bi - ai) / dt) }'
 }
 
-echo "LEVER_START $(date -Is) tree=$tree lever=$lever trials=$trials window=${window_s}s load=$load reps=$reps irregular=$irregular duty_ms=$duty_ms entry=$entry smt_prior=$smt_prior profile=${profile:-unpinned}"
-echo "HOST $(uname -sr) ncpu=$ncpu $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+echo "LEVER_START $(date -u '+%Y-%m-%dT%H:%M:%SZ') tree=$tree lever=$lever trials=$trials window=${window_s}s load=$load reps=$reps irregular=$irregular duty_ms=$duty_ms entry=$entry smt_prior=$smt_prior profile=${profile:-unpinned}"
+echo "HOST $(uname -sr) ncpu=$ncpu $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- || sysctl -n hw.model 2>/dev/null)"
 echo "HEAD $(git -C "$tree" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 export FLYNNEL_OCCUPANCY=1
@@ -94,7 +94,9 @@ for t in $(seq 1 "$trials"); do
         # Counted by wc rather than pgrep -c, which prints its count and
         # also exits non-zero when nothing matches, so a `|| echo 0`
         # appends a second count and embeds a newline in the line below.
-        foreign=$(pgrep -x 'cargo|rustc|cc|ld' 2>/dev/null | wc -l)
+        # wc pads its count with spaces on FreeBSD, and the shared arm
+        # format wants digits straight after the equals sign.
+        foreign=$(pgrep -x 'cargo|rustc|cc|ld' 2>/dev/null | wc -l | tr -d ' ')
         echo "ARM $short=$arm trial=$t position=$pos foreign=$foreign busy_cores=$busy"
         env "$lever=$arm" FLYNNEL_CALIBRATION_DIR="$cal" \
             "$bin" "$window_s" "$load" 1 "$smt_prior" "$duty_ms" "$reps" "$irregular" "$entry" 2>&1
