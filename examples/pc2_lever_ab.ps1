@@ -22,6 +22,12 @@ param(
     [int]$Load = 12,
     [int]$Reps = 512,
     [string]$Entry = 'indexed',
+    # Per-item work and whether it varies. A lever that improves a
+    # spread is not consulted where classify_observed returns on the
+    # mean alone, and uniform work has a spread of zero, so the light
+    # uniform point prices the instrument in a regime that never reads
+    # what it produces.
+    [int]$Irregular = 0,
     [double]$SettleCores = 1.4,
     [int]$SettleTries = 12,
     [string]$Tag = ''
@@ -86,7 +92,7 @@ foreach ($t in 1..$Trials) {
         "ARM $short=$arm trial=$t position=$([array]::IndexOf($order, $arm) + 1) foreign=$foreign busy_cores=$busy" |
             Add-Content -Path $log
 
-        & $exe $WindowS $Load 1 0 0 $Reps 0 $Entry *>&1 | Add-Content -Path $log
+        & $exe $WindowS $Load 1 0 0 $Reps $Irregular $Entry *>&1 | Add-Content -Path $log
         if ($LASTEXITCODE -ne 0) {
             "ARM_FAILED $short=$arm trial=$t exit=$LASTEXITCODE" | Add-Content -Path $log
         }
