@@ -30,7 +30,13 @@ param(
     [int]$Seeds = 3,
     [int]$WindowS = 2,
     [int]$Load = 12,
-    [int]$Reps = 512
+    [int]$Reps = 512,
+    # Busy-core ceiling the box must fall under after the seeding runs
+    # before an arm is measured, and how many polls to spend waiting.
+    # The ceiling matches the one the report filters on, so a trial the
+    # harness accepts is one the report will keep.
+    [double]$SettleCores = 1.4,
+    [int]$SettleTries = 12
 )
 
 $ErrorActionPreference = 'Continue'
@@ -89,8 +95,23 @@ foreach ($t in 1..$Trials) {
             & $exe 1 2 1 0 0 64 0 indexed *>&1 | Add-Content -Path $log
         }
 
+        # The seeding runs above load the box and their threads are not
+        # reclaimed the instant each process returns, so an arm sampled
+        # straight after them reads the seeds rather than the host. A
+        # first run of this harness kept 5 trials of 20 on that account.
+        # Waited out rather than slept through: the box is polled until
+        # it settles or the patience runs out, and the figure that
+        # decided is written either way.
+        $settle = 0
+        do {
+            Start-Sleep -Milliseconds 700
+            $busy = Get-BusyCores
+            $settle++
+        } while ($busy -gt $SettleCores -and $settle -lt $SettleTries)
+        "SETTLED after $settle polls at $busy busy cores" | Add-Content -Path $log
+
         $foreign = @(Get-Process -Name cargo,rustc,cl,link -ErrorAction SilentlyContinue).Count
-        "ARM refusal=$refusal trial=$t position=$([array]::IndexOf($order, $refusal) + 1) foreign=$foreign busy_cores=$(Get-BusyCores)" |
+        "ARM refusal=$refusal trial=$t position=$([array]::IndexOf($order, $refusal) + 1) foreign=$foreign busy_cores=$busy" |
             Add-Content -Path $log
         & $exe $WindowS $Load 1 0 0 $Reps 0 indexed *>&1 | Add-Content -Path $log
         if ($LASTEXITCODE -ne 0) {
