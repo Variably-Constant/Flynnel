@@ -1237,7 +1237,7 @@ fn stored_record_serves(
     max_age_s: Option<u64>,
     now_s: u64,
 ) -> bool {
-    if !cpu.is_trustworthy() {
+    if !crate::sched::levers::serve_policy().admits(cpu) {
         return false;
     }
     match max_age_s {

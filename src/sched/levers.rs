@@ -60,6 +60,150 @@ fn read(name: &str) -> bool {
     }
 }
 
+/// What a stored calibration has to satisfy before it is served.
+///
+/// Four arms rather than one, because which of them is right has not
+/// been measured and the campaign has twice adopted a statistic on an
+/// argument that later data refuted.
+///
+/// The shape they are judged on has two halves. A process that serves a
+/// record skips a draw, measured at about 15 ms on a 12-core host. It
+/// also routes on that record's thresholds rather than on a fresh
+/// draw's, so an arm can win on start cost and lose on routing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ServePolicy {
+    /// The spread of the draw's own samples against
+    /// [`crate::sched::calibration_store::PROVISIONAL_SPREAD_PER_MILLE`].
+    ///
+    /// On the host measured so far this admits nothing: draws taken at
+    /// occupancy 998 to 999 carry spreads of 807 to 2245 against a
+    /// bound of 250, so every process re-measures.
+    Spread,
+    /// Anything that was actually measured. The cheapest-cost ordering
+    /// decides which record stands, and load only adds time, so a draw
+    /// taken on a busy host cannot win it.
+    Any,
+    /// The share of its interval the measuring thread held a core,
+    /// against [`occupancy_floor_per_mille`]. Reads 998 to 999 on a
+    /// quiet draw here and 664 to 799 on a loaded one.
+    Occupancy,
+    /// The spread again, against a bound the caller supplies rather
+    /// than the shipped one.
+    SpreadAt(u32),
+}
+
+impl ServePolicy {
+    /// Whether this record may be served.
+    ///
+    /// A record with no samples is refused by every arm: a table nobody
+    /// has published reads back zeroed, and zero is not a measurement.
+    pub fn admits(self, cpu: &crate::sched::calibration_store::CpuCalibration) -> bool {
+        if cpu.samples == 0 {
+            return false;
+        }
+        match self {
+            Self::Spread => cpu.is_trustworthy(),
+            Self::Any => true,
+            Self::Occupancy => match cpu.occupancy() {
+                // No thread clock means no reading, and a platform that
+                // cannot measure occupancy must not be frozen out of
+                // its own store by an arm that needs one.
+                None => true,
+                Some(share) => share >= occupancy_floor_per_mille(),
+            },
+            Self::SpreadAt(bound) => cpu.spread_per_mille <= bound,
+        }
+    }
+}
+
+/// The raw text of a variable, or `None` where it is genuinely unset.
+///
+/// A value that is not UTF-8 is reported and read as unset, rather than
+/// dropped: an arm that failed to take effect produces rows that look
+/// exactly like the arm that did.
+fn raw(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(text) => Some(text),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            eprintln!(
+                "flynnel: {name} is set to something that is not UTF-8 ({value:?}); \
+                 treating it as unset, which may not be the arm you asked for"
+            );
+            None
+        }
+    }
+}
+
+/// Which arm [`stored_record_serves`] applies, from
+/// `FLYNNEL_SERVE_POLICY`: `spread` (the shipped behavior and the
+/// default), `any`, `occupancy`, or `spread:<per-mille>`.
+///
+/// An unreadable value reports itself and falls back to the shipped
+/// arm, because a rotation that silently ran the default while its log
+/// claimed another arm is the failure this campaign exists to stop.
+///
+/// [`stored_record_serves`]: crate::sched::par_iter
+pub fn serve_policy() -> ServePolicy {
+    static V: OnceLock<ServePolicy> = OnceLock::new();
+    *V.get_or_init(|| {
+        let Some(text) = raw("FLYNNEL_SERVE_POLICY") else {
+            return ServePolicy::Spread;
+        };
+        let v = text.trim().to_ascii_lowercase();
+        if let Some(rest) = v.strip_prefix("spread:") {
+            return match rest.parse::<u32>() {
+                Ok(bound) => ServePolicy::SpreadAt(bound),
+                Err(e) => {
+                    eprintln!(
+                        "flynnel: FLYNNEL_SERVE_POLICY spread: wants a whole number of \
+                         parts per mille and got {rest:?} ({e}); running the shipped arm"
+                    );
+                    ServePolicy::Spread
+                }
+            };
+        }
+        match v.as_str() {
+            "" | "spread" => ServePolicy::Spread,
+            "any" => ServePolicy::Any,
+            "occupancy" => ServePolicy::Occupancy,
+            other => {
+                eprintln!(
+                    "flynnel: FLYNNEL_SERVE_POLICY is {other:?}, which is not spread, any, \
+                     occupancy or spread:<per-mille>; running the shipped arm"
+                );
+                ServePolicy::Spread
+            }
+        }
+    })
+}
+
+/// The floor [`ServePolicy::Occupancy`] admits at, from
+/// `FLYNNEL_OCCUPANCY_FLOOR_PER_MILLE`.
+///
+/// 900 by default, which sits between the 998 to 999 a quiet draw reads
+/// on the host measured and the 664 to 799 a loaded one reads. A
+/// starting point for a rotation rather than a derived value, and the
+/// rotation is what it exists for.
+pub fn occupancy_floor_per_mille() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        let Some(text) = raw("FLYNNEL_OCCUPANCY_FLOOR_PER_MILLE") else {
+            return 900;
+        };
+        match text.trim().parse::<u32>() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "flynnel: FLYNNEL_OCCUPANCY_FLOOR_PER_MILLE wants a whole number and \
+                     got {text:?} ({e}); using 900"
+                );
+                900
+            }
+        }
+    })
+}
+
 /// Read a switch once, absent meaning on.
 ///
 /// The same spellings mean off as in [`read`], so a caller who turns
@@ -148,12 +292,14 @@ pub fn calibration_refusal() -> bool {
 pub fn describe() -> String {
     format!(
         "oncore_spread={} batch_weight={} smt_window={} allowed_width={} \
-         calibration_refusal={}",
+         calibration_refusal={} serve_policy={:?} occupancy_floor={}",
         oncore_spread(),
         batch_weight(),
         smt_from_window(),
         allowed_width(),
         calibration_refusal(),
+        serve_policy(),
+        occupancy_floor_per_mille(),
     )
 }
 
