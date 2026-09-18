@@ -9,6 +9,22 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- `examples/zen3_lever_ab.sh` runs a lever A/B paired by trial on Linux,
+  and `examples/paired_arms_report.py` takes an optional field to split
+  its pairs on. The three-arm rotation compares arms that ran at
+  different times, so drift between them lands in the ratio: its null
+  read 11 per cent on a quiet 16-core guest where the paired shape reads
+  0.61 per cent on ten pairs on a busier host. Every speed lever here is
+  smaller than the first figure and larger than the second.
+
+  The split exists because a mechanism can fire in one run and not the
+  next at identical settings. The adaptive spin controller leaves its
+  window at the tuned default in about three runs in four, so one median
+  over every trial averages the trials where it acted with the trials
+  where it did not and reports neither. Split, the trials where it held
+  are a control for the ones where it moved, from the same rotation on
+  the same box.
+
 - All three rotation readers assert engagement themselves rather than
   leaving it to whoever reads the log.
   `examples/paired_arms_report.py` lists which decisions differ between
