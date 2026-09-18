@@ -92,10 +92,15 @@ run_arm() {
     : > "$out"
     : > "$err"
     echo "ARM ALLOWED_WIDTH-$arm t$t $(date -u '+%H:%M:%S')"
+    # Both arms name the value. An arm whose meaning is the switch state
+    # cannot express that state by leaving the switch unset: it then
+    # takes whatever the crate defaults to, and a lever that later ships
+    # on makes every arm the same arm. This lever is a candidate to ship
+    # on, which is what the rotation is for.
     if [ "$arm" = on ]; then
         ( exec env FLYNNEL_LEVER_ALLOWED_WIDTH=1 "$bin" "$window" "$windows" > "$out" 2> "$err" ) &
     else
-        ( exec "$bin" "$window" "$windows" > "$out" 2> "$err" ) &
+        ( exec env FLYNNEL_LEVER_ALLOWED_WIDTH=0 "$bin" "$window" "$windows" > "$out" 2> "$err" ) &
     fi
     child=$!
     sleep "$narrow_at"
