@@ -288,6 +288,14 @@ static RESCUE_EVENTS: AtomicU32 = AtomicU32::new(0);
 /// Total idle `yield_now` rounds, exposed for observability. This is
 /// the quantity a flamegraph attributes to `sched_yield`.
 static TOTAL_YIELDS: AtomicU64 = AtomicU64::new(0);
+/// Times [`maybe_adapt`] carried enough evidence to reach its
+/// comparison, counted after the event gate and before the decision.
+///
+/// The window alone cannot report this. A rescue-dominated workload
+/// grows the window and is clamped to the default it started at, so a
+/// controller that ran every time and one that never reached the gate
+/// both leave it reading 500. This separates them.
+static ADAPT_DECISIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the env once: a fixed `FLYNNEL_SPIN_WINDOW_ROUNDS` pins the
 /// window (adaptation off); `FLYNNEL_ADAPTIVE_SPIN=0` pins the
@@ -334,6 +342,7 @@ fn maybe_adapt() {
     if park + rescue < 256 {
         return;
     }
+    ADAPT_DECISIONS.fetch_add(1, Ordering::Relaxed);
     let cur = SPIN_WINDOW.load(Ordering::Relaxed);
     let new = if park > rescue.saturating_mul(3) {
         (cur / 2).max(FLOOR_SPIN_WINDOW_ROUNDS)
@@ -360,12 +369,23 @@ pub fn total_idle_yields() -> u64 {
     TOTAL_YIELDS.load(Ordering::Relaxed)
 }
 
+/// Times the adaptive controller reached a decision, so a run can say
+/// whether the mechanism ran as well as whether it was switched on.
+/// Zero with [`set_spin_adaptive`] on means the workload never parked
+/// often enough to gather the evidence, which is a different
+/// observation from a controller that ran and left the window where it
+/// found it.
+pub fn spin_adapt_decisions() -> u64 {
+    ADAPT_DECISIONS.load(Ordering::Relaxed)
+}
+
 /// Reset the yield and controller-evidence counters (for measuring a
 /// specific phase).
 pub fn reset_spin_stats() {
     TOTAL_YIELDS.store(0, Ordering::Relaxed);
     PARK_EVENTS.store(0, Ordering::Relaxed);
     RESCUE_EVENTS.store(0, Ordering::Relaxed);
+    ADAPT_DECISIONS.store(0, Ordering::Relaxed);
 }
 
 /// Force the spin window to `rounds` and stop the adaptive
@@ -777,6 +797,31 @@ mod tests {
         RESCUE_EVENTS.store(0, Ordering::Relaxed);
         maybe_adapt();
         assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
+    }
+
+    #[test]
+    fn a_held_window_tells_a_controller_that_ran_from_one_that_never_reached_the_gate() {
+        // Both leave the window at the tuned default, so the window
+        // alone cannot say which happened: a rescue-dominated workload
+        // grows and is clamped back to where it started. The decision
+        // count is what separates them, and a run that reads only the
+        // window reports a mechanism it never observed.
+        //
+        // Read as deltas, since the counter is process-wide and other
+        // tests reach the same controller.
+        arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
+        let before = spin_adapt_decisions();
+        PARK_EVENTS.store(200, Ordering::Relaxed);
+        RESCUE_EVENTS.store(0, Ordering::Relaxed);
+        maybe_adapt();
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
+        assert_eq!(spin_adapt_decisions(), before, "below the gate it never decided");
+
+        PARK_EVENTS.store(4, Ordering::Relaxed);
+        RESCUE_EVENTS.store(300, Ordering::Relaxed);
+        maybe_adapt();
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS, "clamped to where it began");
+        assert_eq!(spin_adapt_decisions(), before + 1, "and this is how a run can tell");
     }
 
     #[test]

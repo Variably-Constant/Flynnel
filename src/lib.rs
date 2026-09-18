@@ -94,7 +94,8 @@ pub use sched::cooperative::cooperative_join_n;
 pub use sched::call_site::{CallSiteState, Placement, SiteRef, caller_site, site_for_location};
 pub use sched::cat::{CatCapability, CatError, L3Reservation};
 pub use sched::{
-    reset_spin_stats, set_spin_adaptive, set_spin_window, spin_window, total_idle_yields,
+    reset_spin_stats, set_spin_adaptive, set_spin_window, spin_adapt_decisions, spin_window,
+    total_idle_yields,
 };
 pub use sched::hybrid::{
     SplitReport, hybrid_auto, hybrid_auto_split, hybrid_auto_split_ranges, hybrid_pipeline,

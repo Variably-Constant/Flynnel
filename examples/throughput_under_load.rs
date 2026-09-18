@@ -127,13 +127,10 @@ fn plan(smt_prior: bool) -> JobPlan {
 /// One item: how many rounds it costs, and what it accumulates.
 ///
 /// The cost travels alongside the item rather than being derived from
-/// its index, so the leaf body needs no index and the dispatch can go
-/// through `for_each_chunk_min_leaf`. That entry matters: the on-core
-/// bracket is taken by `record_leaf_sampled`, which only the plain
-/// steal-driven bisect calls. The indexed and triple bisects record
-/// every leaf through `record_leaf`, which has no bracket, so a
-/// harness dispatching through them cannot reach the on-core switch at
-/// all.
+/// its index, so the leaf body needs no index and any of the three
+/// entries can carry the same work. Which one a run picks decides how
+/// its leaves are recorded, and so which counters the engagement line
+/// can report: see [`Entry`] for what each reaches.
 ///
 /// Deriving it from the accumulator instead would drift: every
 /// dispatch rewrites the buffer, so two arms that completed different
@@ -352,7 +349,7 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8) {
         "engagement duty_ms={duty_ms} reps={reps} irregular={irregular} \
          leaves={} oncore_items={} per_item_ns={} cv2_wall={} \
          cv2_oncore={} cv2_window={} window_ticks={} class={:?} workers={} allowed={} smt={} \
-         spin_adaptive={} spin_window={} idle_yields={}",
+         spin_adaptive={} spin_window={} spin_adapts={} idle_yields={}",
         site.leaf_count(),
         site.oncore_items(),
         reading(site.per_item_ns()),
@@ -366,6 +363,7 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8) {
         plan.effective_use_smt(),
         flynnel::sched::spin_adaptive(),
         flynnel::sched::spin_window(),
+        flynnel::sched::spin_adapt_decisions(),
         flynnel::sched::total_idle_yields(),
     );
 }
