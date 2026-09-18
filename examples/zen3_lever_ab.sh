@@ -75,7 +75,11 @@ for t in $(seq 1 "$trials"); do
         cal="/tmp/leverab_${short}_${stamp}_t${t}_${arm}"
         mkdir -p "$cal"
         busy=$(busy_cores)
-        echo "ARM $short=$arm trial=$t position=$pos busy_cores=$busy"
+        # Counted by wc rather than pgrep -c, which prints its count and
+        # also exits non-zero when nothing matches, so a `|| echo 0`
+        # appends a second count and embeds a newline in the line below.
+        foreign=$(pgrep -x 'cargo|rustc|cc|ld' 2>/dev/null | wc -l)
+        echo "ARM $short=$arm trial=$t position=$pos foreign=$foreign busy_cores=$busy"
         env "$lever=$arm" FLYNNEL_CALIBRATION_DIR="$cal" \
             "$bin" "$window_s" "$load" 1 0 "$duty_ms" "$reps" "$irregular" "$entry" 2>&1
         # Settled before the exit reading so it measures the box rather
