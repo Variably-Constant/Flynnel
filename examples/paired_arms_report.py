@@ -152,7 +152,7 @@ def split_on(per, under_test, reference, field):
     return moved, held, unknown
 
 
-def report(per, under_test, reference, max_busy=None):
+def report(per, under_test, reference, max_busy=None, counters=()):
     report_engagement(per, under_test, reference)
     print()
     print(f"{under_test} against {reference}, per trial. Above 1.000 means "
@@ -182,11 +182,32 @@ def report(per, under_test, reference, max_busy=None):
           f"{'wins':>6} {'resolvable':>11}")
     print("-" * 62)
 
-    for key, label in (("thr", "loaded"), ("ret", "retained"), ("ctl", "control")):
+    # A counter from the engagement line is comparable the same way and
+    # is sometimes the only thing that reads. A count covers the whole
+    # run where throughput is a rate over one window, so where the load
+    # is duty-cycled the window carries the load's phase and the count
+    # does not.
+    metrics = [("thr", "loaded"), ("ret", "retained"), ("ctl", "control")]
+    metrics += [("engage:" + f, f) for f in counters]
+
+    for key, label in metrics:
         ratios = []
         for _, arms in sorted(per.items()):
             a, b = arms.get(under_test), arms.get(reference)
-            if not a or not b or key not in a or key not in b or not b[key]:
+            if not a or not b:
+                continue
+            if key.startswith("engage:"):
+                f = key.split(":", 1)[1]
+                try:
+                    av = float(a.get("engage", {})[f])
+                    bv = float(b.get("engage", {})[f])
+                except (KeyError, ValueError):
+                    continue
+                if not bv:
+                    continue
+                ratios.append(av / bv)
+                continue
+            if key not in a or key not in b or not b[key]:
                 continue
             ratios.append(a[key] / b[key])
         if not ratios:
@@ -222,8 +243,9 @@ if __name__ == "__main__":
         sys.exit(1)
     bound = float(sys.argv[4]) if len(sys.argv) > 4 else None
     field = sys.argv[5] if len(sys.argv) > 5 else None
+    counters = sys.argv[6].split(",") if len(sys.argv) > 6 else ()
     if field is None:
-        report(data, sys.argv[2], sys.argv[3], bound)
+        report(data, sys.argv[2], sys.argv[3], bound, counters)
     else:
         moved, held, unknown = split_on(data, sys.argv[2], sys.argv[3], field)
         print(f"Split on {field}: {len(moved)} trial(s) where it differs "
@@ -237,6 +259,6 @@ if __name__ == "__main__":
             print()
             print(f"===== trials where {field} {label} =====")
             if group:
-                report(group, sys.argv[2], sys.argv[3], bound)
+                report(group, sys.argv[2], sys.argv[3], bound, counters)
             else:
                 print("no trials in this group")
