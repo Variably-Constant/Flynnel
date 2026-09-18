@@ -22,10 +22,18 @@ on, and is what the refusal is checked against:
         oncore_spread=1 oncore_spread=0 1.4
 
 An arm that pins a state rather than flipping a switch names a width
-the `levers:` line does not carry, so its label cannot be checked
-there. That is reported as unverified rather than failed: the pin shows
-up in the decisions section instead, and refusing the table on it would
-discard a sound run.
+the `levers:` line does not carry. Its value is read from the
+engagement line under the same name and compared literally, so an arm
+labelled `spin_window=500` whose pin did not take is caught the same
+way a lever arm is. `paired_pinstate_defect_sample.log` carries one arm
+that took and one that did not:
+
+    python paired_arms_report.py paired_pinstate_defect_sample.log \
+        spin_window=500 spin_window=8 1.4
+
+A label naming a field neither line reports is reported as unverified
+rather than failed: the pin shows up in the decisions section instead,
+and refusing the table on it would discard a sound run.
 """
 
 import re
@@ -144,19 +152,32 @@ def report_arm_states(per, arms):
             print(f"  {name:<28} label names no value; cannot be checked")
             unchecked += 1
             continue
-        lever, want = name.split("=", 1)
-        want = "true" if want.strip() == "1" else "false"
-        seen = sorted({a[name]["levers"][lever]
+        field, raw = name.split("=", 1)
+        raw = raw.strip()
+        want = "true" if raw == "1" else "false"
+        where = "levers"
+        seen = sorted({a[name]["levers"][field]
                        for a in per.values()
-                       if name in a and lever in a.get(name, {}).get("levers", {})})
+                       if field in a.get(name, {}).get("levers", {})})
         if not seen:
-            print(f"  {name:<28} no levers line reports {lever}; not checkable here")
+            # A pinned-state arm names a width rather than a switch. The
+            # levers line carries booleans only, so the value is read
+            # from the engagement line under the same name and compared
+            # literally.
+            seen = sorted({a[name]["engage"][field]
+                           for a in per.values()
+                           if field in a.get(name, {}).get("engage", {})})
+            want = raw
+            where = "engagement"
+        if not seen:
+            print(f"  {name:<28} neither line reports {field}; not checkable here")
             unchecked += 1
         elif seen != [want]:
-            print(f"  {name:<28} {lever}={seen}, and this arm means {want}")
+            print(f"  {name:<28} {field}={seen} on the {where} line, "
+                  f"and this arm means {want}")
             wrong += 1
         else:
-            print(f"  {name:<28} {lever}={seen}, as labelled")
+            print(f"  {name:<28} {field}={seen} on the {where} line, as labelled")
     if wrong:
         print(f"{wrong} arm(s) did not run the switch their label claims. Their "
               "pairs compare something with itself; do not read the table below.")
@@ -167,7 +188,7 @@ def report_arm_states(per, arms):
         # refusing the table on it discards a sound run. The section
         # below reads the state the arms actually ran, so the check moves
         # there rather than being skipped.
-        print(f"{unchecked} arm label(s) name nothing the levers line reports. "
+        print(f"{unchecked} arm label(s) name nothing either line reports. "
               "That is unverified, not failed: confirm the arms differ from "
               "the decisions section below before reading the table.")
 

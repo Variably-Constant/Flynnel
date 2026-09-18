@@ -1,0 +1,31 @@
+LEVER_START sample, hand-written, not a measurement
+HOST sample ncpu=16
+ARM spin_window=8 trial=1 position=1 foreign=0 busy_cores=0.10
+levers: oncore_spread=true batch_weight=false smt_window=false allowed_width=false calibration_refusal=true
+engagement class=Some(Streaming) smt=false workers=8 allowed=8 spin_window=8 oncore_items=418223
+throughput 12 1 163 81.50
+control 12 1 247 123.50
+retained 12 1 0.9800
+ARM_END spin_window=8 trial=1 busy_cores=0.10
+ARM spin_window=500 trial=1 position=2 foreign=0 busy_cores=0.10
+levers: oncore_spread=true batch_weight=false smt_window=false allowed_width=false calibration_refusal=true
+engagement class=Some(Streaming) smt=false workers=8 allowed=8 spin_window=8 oncore_items=417996
+throughput 12 1 162 81.00
+control 12 1 246 123.00
+retained 12 1 0.9790
+ARM_END spin_window=500 trial=1 busy_cores=0.10
+ARM spin_window=500 trial=2 position=1 foreign=0 busy_cores=0.10
+levers: oncore_spread=true batch_weight=false smt_window=false allowed_width=false calibration_refusal=true
+engagement class=Some(Streaming) smt=false workers=8 allowed=8 spin_window=8 oncore_items=418104
+throughput 12 2 164 82.00
+control 12 2 248 124.00
+retained 12 2 0.9805
+ARM_END spin_window=500 trial=2 busy_cores=0.10
+ARM spin_window=8 trial=2 position=2 foreign=0 busy_cores=0.10
+levers: oncore_spread=true batch_weight=false smt_window=false allowed_width=false calibration_refusal=true
+engagement class=Some(Streaming) smt=false workers=8 allowed=8 spin_window=8 oncore_items=418310
+throughput 12 2 163 81.50
+control 12 2 247 123.50
+retained 12 2 0.9795
+ARM_END spin_window=8 trial=2 busy_cores=0.10
+LEVER_DONE sample
