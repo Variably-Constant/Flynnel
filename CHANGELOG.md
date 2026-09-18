@@ -61,6 +61,16 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   mismatched cells by name. A log written before its harness reported
   lever states is described as unrecorded rather than treated as a pass.
 
+  An arm label naming a value neither line reports is described as
+  unverified rather than counted as a mismatch, because refusing the
+  table on it discards a sound run: an arm that pins a width rather than
+  flipping a switch names something the levers line does not carry. That
+  width is read from the engagement line under the same name and
+  compared literally, so a pin that did not take is caught the way a
+  lever arm is. `examples/paired_armstate_defect_sample.log` and
+  `examples/paired_pinstate_defect_sample.log` are what the two refusals
+  are checked against.
+
   Two levers now ship on, so an arm that expressed "off" by leaving its
   variable unset ran the lever on: all three arms of a rotation became
   one arm, with a tight null, because two identical arms agree. The
