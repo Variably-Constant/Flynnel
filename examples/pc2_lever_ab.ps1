@@ -82,7 +82,11 @@ if (-not (Test-Path $tree)) {
 }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-"LEVER_START $(Get-Date -Format o) tree=$tree lever=$Lever trials=$Trials window=${WindowS}s load=$Load reps=$Reps entry=$Entry" |
+# Every argument that decides the cell, including the ones a reader
+# would otherwise have to take from the command line that launched it.
+# irregular and duty_ms are what put a lever in the regime it was built
+# for, and a log naming neither cannot say which regime it measured.
+"LEVER_START $(Get-Date -Format o) tree=$tree lever=$Lever trials=$Trials window=${WindowS}s load=$Load reps=$Reps entry=$Entry irregular=$Irregular duty_ms=$DutyMs smt_prior=$SmtPrior settle_cores=$SettleCores read_pattern=$ReadPattern acted_pattern=$ActedPattern" |
     Out-File -FilePath $log
 
 Set-Location $tree
