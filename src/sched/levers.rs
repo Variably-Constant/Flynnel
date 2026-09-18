@@ -244,6 +244,16 @@ fn read_defaulting_on(name: &str) -> bool {
 /// forty paired trials read 1.0033, 1.0000 and 1.0019 against the same
 /// code with it off, at bounds of 0.64, 0.22 and 0.31 per cent with
 /// controls resolving to 0.19 and tighter.
+/// Measured again on three hosts, paired by trial, at 4096 reps of
+/// uniform work: 0.9964 at a 1.90 per cent bound on a 24-thread Windows
+/// bare-metal box whose control resolves to 0.24, 0.9922 at 4.79 on a
+/// 16-core Linux guest, 0.9917 at 11.15 on a 16-core FreeBSD guest.
+/// Not slower on any, no speed-up claimed on any.
+///
+/// The bracket is taken in all three - oncore_items reads zero on the
+/// arm without the lever and millions on the arm with it - and on the
+/// bare-metal run no class moves, so 1.90 per cent is what the
+/// instrumentation costs when nothing downstream changes.
 pub fn oncore_spread() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| read_defaulting_on("FLYNNEL_LEVER_ONCORE_SPREAD"))
