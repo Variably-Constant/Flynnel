@@ -22,7 +22,10 @@ from collections import defaultdict
 # starts recording one more thing about its conditions must not turn
 # every row into an unparsed line, which reads the same as a run that
 # produced none.
-ARM = re.compile(r"^ARM (\S+) trial=(\d+) position=(\d+) foreign=(\d+)")
+ARM = re.compile(
+    r"^ARM (\S+) trial=(\d+) position=(\d+) foreign=(\d+)"
+    r"(?:\s+busy_cores=([\d.-]+))?"
+)
 ROWS = {
     "ctl": re.compile(r"^control (\d+) (\d+) (\d+) ([\d.]+)\s*$"),
     "thr": re.compile(r"^throughput (\d+) (\d+) (\d+) ([\d.]+)\s*$"),
@@ -47,6 +50,10 @@ def parse(path):
             m = ARM.match(line)
             if m:
                 cur = (m.group(1), int(m.group(2)))
+                if m.group(5) is not None:
+                    per[int(m.group(2))].setdefault(m.group(1), {})["busy"] = float(
+                        m.group(5)
+                    )
                 continue
             if cur is None:
                 continue
@@ -61,10 +68,22 @@ def parse(path):
     return per
 
 
-def report(per, under_test, reference):
+def report(per, under_test, reference, max_busy=None):
     print()
     print(f"{under_test} against {reference}, per trial. Above 1.000 means "
           f"{under_test} was faster.")
+    if max_busy is not None:
+        kept = {t: a for t, a in per.items()
+                if all(a.get(n, {}).get("busy", 1e9) <= max_busy
+                       for n in (under_test, reference))}
+        print(f"Trials where either arm started above {max_busy} busy cores are "
+              f"dropped: {len(per) - len(kept)} of {len(per)} gone.")
+        print("A quiet gate is checked at entry and says nothing about the rest")
+        print("of the run, so a trial can begin clear and be measured through a")
+        print("storm. This is the same voiding a neighbour's bench does on its")
+        print("own regions, applied here after the fact because the harness")
+        print("records the figure per arm but does not yet act on it.")
+        per = kept
     print()
     print(f"{'metric':<10} {'pairs':>5} {'median':>8} {'min':>8} {'max':>8} "
           f"{'wins':>6} {'resolvable':>11}")
@@ -100,12 +119,13 @@ def report(per, under_test, reference):
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:
-        print(f"usage: {sys.argv[0]} <log> <arm_under_test> <reference_arm>",
-              file=sys.stderr)
+        print(f"usage: {sys.argv[0]} <log> <arm_under_test> <reference_arm> "
+              f"[max_busy_cores]", file=sys.stderr)
         sys.exit(2)
     data = parse(sys.argv[1])
     if not data:
         print("NO ARM LINES PARSED. A log from a run that died before its")
         print("first arm reads the same as one that never wrote them.")
         sys.exit(1)
-    report(data, sys.argv[2], sys.argv[3])
+    bound = float(sys.argv[4]) if len(sys.argv) > 4 else None
+    report(data, sys.argv[2], sys.argv[3], bound)
