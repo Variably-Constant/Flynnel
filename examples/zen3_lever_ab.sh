@@ -31,6 +31,10 @@ irregular="${7:-1}"
 duty_ms="${8:-50}"
 entry="${9:-indexed}"
 profile="${10:-}"
+# The SMT prior the plan carries. effective_use_smt returns on its first
+# line when this is false, so a lever deciding SMT from the classifier's
+# window is never consulted and its two arms are the same arm.
+smt_prior="${11:-0}"
 
 bin="$tree/target/release/examples/throughput_under_load"
 [ -x "$bin" ] || { echo "MISSING_BINARY $bin"; exit 9; }
@@ -65,7 +69,7 @@ busy_cores() {
                  printf "%.2f", n * (1 - (bi - ai) / dt) }'
 }
 
-echo "LEVER_START $(date -Is) tree=$tree lever=$lever trials=$trials window=${window_s}s load=$load reps=$reps irregular=$irregular duty_ms=$duty_ms entry=$entry profile=${profile:-unpinned}"
+echo "LEVER_START $(date -Is) tree=$tree lever=$lever trials=$trials window=${window_s}s load=$load reps=$reps irregular=$irregular duty_ms=$duty_ms entry=$entry smt_prior=$smt_prior profile=${profile:-unpinned}"
 echo "HOST $(uname -sr) ncpu=$ncpu $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
 echo "HEAD $(git -C "$tree" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
@@ -93,7 +97,7 @@ for t in $(seq 1 "$trials"); do
         foreign=$(pgrep -x 'cargo|rustc|cc|ld' 2>/dev/null | wc -l)
         echo "ARM $short=$arm trial=$t position=$pos foreign=$foreign busy_cores=$busy"
         env "$lever=$arm" FLYNNEL_CALIBRATION_DIR="$cal" \
-            "$bin" "$window_s" "$load" 1 0 "$duty_ms" "$reps" "$irregular" "$entry" 2>&1
+            "$bin" "$window_s" "$load" 1 "$smt_prior" "$duty_ms" "$reps" "$irregular" "$entry" 2>&1
         # Settled before the exit reading so it measures the box rather
         # than this arm's own threads being reclaimed.
         sleep 0.6
