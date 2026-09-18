@@ -88,9 +88,18 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   uniform edge at 50 and the high-variance edge at 500. So one reading
   cannot say which regimes a run passed through, and a maximum below the
   uniform edge is what says a spread-driven mechanism was never consulted
-  in its own regime. `examples/throughput_under_load` prints it as
-  `cv2_window_range`, and takes the mode-2 block size as a ninth argument
-  because the block that clears the edge differs by host.
+  in its own regime. `examples/throughput_under_load` and
+  `examples/smt_recovery` print it as `cv2_window_min` and
+  `cv2_window_max`, `examples/class_migration_under_load` as a
+  `window_cv2_range` column, and `examples/lever_report.py` and
+  `examples/smt_report.py` carry them through.
+  `throughput_under_load` also takes the mode-2 block size as a ninth
+  argument, because the block that clears the edge differs by host.
+
+  The dispatch path is unchanged. `JobPlan::effective_use_smt` reads the
+  latest tick deliberately: it is consulted per dispatch and wants the
+  classification current at that moment, which ages as later windows
+  replace it. Only the reporting was wrong.
 
 - `spin_adapt_decisions()` reports how many times the adaptive spin
   controller passed its 256-event gate and reached a decision. The
