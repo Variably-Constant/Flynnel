@@ -1,0 +1,24 @@
+LEVER_START sample, hand-written, not a measurement
+HOST sample cores=16 load=0.00 0.00 0.00
+ARM ONCORE_SPREAD-off load12 p1 t1 00:00:01
+levers: oncore_spread=true batch_weight=false smt_window=false allowed_width=false calibration_refusal=true
+engagement duty_ms=0 reps=8192 irregular=0 block_items=512 leaves=1 oncore_items=1 per_item_ns=784 cv2_wall=6 cv2_oncore=0 cv2_window=0 cv2_window_min=0 cv2_window_max=7846 window_ticks=10 class=Some(Streaming) workers=16 allowed=16 smt=false smt_declined=0 smt_allowed=0 spin_adaptive=false spin_window=500 spin_adapts=0 idle_yields=99
+throughput 12 1 100 50.00
+ARM ONCORE_SPREAD-null load12 p1 t1 00:00:02
+levers: oncore_spread=true batch_weight=false smt_window=false allowed_width=false calibration_refusal=true
+engagement duty_ms=0 reps=8192 irregular=0 block_items=512 leaves=1 oncore_items=1 per_item_ns=784 cv2_wall=6 cv2_oncore=0 cv2_window=0 cv2_window_min=0 cv2_window_max=7846 window_ticks=10 class=Some(Streaming) workers=16 allowed=16 smt=false smt_declined=0 smt_allowed=0 spin_adaptive=false spin_window=500 spin_adapts=0 idle_yields=99
+throughput 12 1 101 50.50
+ARM ONCORE_SPREAD-on load12 p1 t1 00:00:03
+levers: oncore_spread=true batch_weight=false smt_window=false allowed_width=false calibration_refusal=true
+engagement duty_ms=0 reps=8192 irregular=0 block_items=512 leaves=1 oncore_items=1 per_item_ns=784 cv2_wall=6 cv2_oncore=0 cv2_window=0 cv2_window_min=0 cv2_window_max=7846 window_ticks=10 class=Some(Streaming) workers=16 allowed=16 smt=false smt_declined=0 smt_allowed=0 spin_adaptive=false spin_window=500 spin_adapts=0 idle_yields=99
+throughput 12 1 102 51.00
+ARM BATCH_WEIGHT-off load12 p1 t1 00:00:04
+levers: oncore_spread=true batch_weight=false smt_window=false allowed_width=false calibration_refusal=true
+throughput 12 1 100 50.00
+ARM BATCH_WEIGHT-null load12 p1 t1 00:00:05
+levers: oncore_spread=true batch_weight=false smt_window=false allowed_width=false calibration_refusal=true
+throughput 12 1 100 50.10
+ARM BATCH_WEIGHT-on load12 p1 t1 00:00:06
+levers: oncore_spread=true batch_weight=true smt_window=false allowed_width=false calibration_refusal=true
+throughput 12 1 100 52.00
+LEVER_DONE sample failed_arms=0

@@ -15,6 +15,16 @@ The engagement section is read before the throughput table. A switch
 that never reached its mechanism produces the same clean null as one
 that reached it and did not help, and the difference is not visible in
 a dispatch count.
+
+The arm-state block above it answers a different question: whether each
+arm ran the switch its label claims. `armstate_defect_sample.log` beside
+this file is a hand-written log where the off and null arms report the
+lever on, which is what a rotation produces when an arm expresses "off"
+by leaving the variable unset and the lever ships on. Running this
+report over it must name those two arms and refuse their cells, and must
+pass the lever whose arms differ:
+
+    python examples/lever_report.py examples/armstate_defect_sample.log
 """
 
 import re
