@@ -74,7 +74,16 @@ echo "HOST $(uname -sr) ncpu=$ncpu $(grep -m1 'model name' /proc/cpuinfo 2>/dev/
 echo "HEAD $(git -C "$tree" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 export FLYNNEL_OCCUPANCY=1
-if [ -n "$profile" ]; then export FLYNNEL_HOST_PROFILE_NS="$profile"; else unset FLYNNEL_HOST_PROFILE_NS; fi
+if [ -n "$profile" ]; then
+    export FLYNNEL_HOST_PROFILE_NS="$profile"
+else
+    unset FLYNNEL_HOST_PROFILE_NS
+    # Each process then takes its own calibration draw, and the draw
+    # sets the dispatch cost and collapse threshold that decide the
+    # routing throughput measures. That variance sits on top of the
+    # lever's and is not separable afterwards, so the row says it.
+    echo "UNPINNED_PROFILE every arm draws its own calibration; the draw's variance is in every ratio below and cannot be told from the lever's"
+fi
 
 sh "$HOME/vm_presence.sh" claim $$ "flynnel paired lever A/B on $short, TIMINGS, needs a quiet box, Flynnel-Scholar" 2>/dev/null
 trap 'sh "$HOME/vm_presence.sh" release '"$$"' 2>/dev/null' EXIT INT TERM

@@ -62,9 +62,13 @@ def median(v):
 def parse(path):
     per = defaultdict(dict)
     cur = None
+    unpinned = False
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             line = raw.strip()
+            if line.startswith("UNPINNED_PROFILE"):
+                unpinned = True
+                continue
             m = ARM.match(line)
             if m:
                 cur = (m.group(1), int(m.group(2)))
@@ -106,7 +110,7 @@ def parse(path):
                 value = float(m.group(3))
                 per[trial].setdefault(arm, {})[key] = value
                 break
-    return per
+    return per, unpinned
 
 
 def report_arm_states(per, arms):
@@ -195,7 +199,11 @@ def split_on(per, under_test, reference, field):
     return moved, held, unknown
 
 
-def report(per, under_test, reference, max_busy=None, counters=()):
+def report(per, under_test, reference, max_busy=None, counters=(), unpinned=False):
+    if unpinned:
+        print("UNPINNED: every arm drew its own calibration, and the draw sets")
+        print("the routing this measures. That variance is in every ratio below")
+        print("and cannot be separated from the lever's afterwards.")
     print("ARM STATES, read before anything else:")
     report_arm_states(per, (under_test, reference))
     report_engagement(per, under_test, reference)
@@ -281,7 +289,7 @@ if __name__ == "__main__":
         print(f"usage: {sys.argv[0]} <log> <arm_under_test> <reference_arm> "
               f"[max_busy_cores] [split_on_field]", file=sys.stderr)
         sys.exit(2)
-    data = parse(sys.argv[1])
+    data, unpinned = parse(sys.argv[1])
     if not data:
         print("NO ARM LINES PARSED. A log from a run that died before its")
         print("first arm reads the same as one that never wrote them.")
@@ -290,7 +298,7 @@ if __name__ == "__main__":
     field = sys.argv[5] if len(sys.argv) > 5 else None
     counters = sys.argv[6].split(",") if len(sys.argv) > 6 else ()
     if field is None:
-        report(data, sys.argv[2], sys.argv[3], bound, counters)
+        report(data, sys.argv[2], sys.argv[3], bound, counters, unpinned)
     else:
         moved, held, unknown = split_on(data, sys.argv[2], sys.argv[3], field)
         print(f"Split on {field}: {len(moved)} trial(s) where it differs "
@@ -304,6 +312,6 @@ if __name__ == "__main__":
             print()
             print(f"===== trials where {field} {label} =====")
             if group:
-                report(group, sys.argv[2], sys.argv[3], bound, counters)
+                report(group, sys.argv[2], sys.argv[3], bound, counters, unpinned)
             else:
                 print("no trials in this group")
