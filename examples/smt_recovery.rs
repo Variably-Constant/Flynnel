@@ -215,10 +215,13 @@ fn main() {
     let site = &SITE;
     let reading = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     println!(
-        "smt_engagement window_ticks={} cv2_window={} cv2_lifetime={} leaves={} \
+        "smt_engagement window_ticks={} cv2_window={} cv2_window_min={} \
+         cv2_window_max={} cv2_lifetime={} leaves={} \
          per_item_ns={} class={:?} smt_switch={}",
         site.window_ticks(),
         reading(site.window_cv2_per_mille()),
+        reading(site.window_cv2_range_per_mille().map(|(lo, _)| lo)),
+        reading(site.window_cv2_range_per_mille().map(|(_, hi)| hi)),
         reading(site.cv2_per_mille()),
         site.leaf_count(),
         reading(site.per_item_ns()),

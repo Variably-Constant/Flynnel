@@ -148,9 +148,16 @@ def main(path):
                 continue
             ticks = sorted({f.get("window_ticks", "-") for f in v})
             win = sorted({f.get("cv2_window", "-") for f in v})
+            # cv2_window is the latest of the ticks counted in
+            # window_ticks, and within one run that figure spans the
+            # whole range the classifier can express. The extremes are
+            # what say which regimes the switch was consulted across.
+            lo = sorted({f.get("cv2_window_min", "-") for f in v})
+            hi = sorted({f.get("cv2_window_max", "-") for f in v})
             life = sorted({f.get("cv2_lifetime", "-") for f in v})
             sw = sorted({f.get("smt_switch", "-") for f in v})
             print(f"  {arm:<5} window_ticks={ticks} cv2_window={win}")
+            print(f"        cv2_window_min={lo} cv2_window_max={hi}")
             print(f"        cv2_lifetime={life} smt_switch={sw}")
         # The switch chooses between the window and the lifetime
         # figure. With no window classified it falls back to the
