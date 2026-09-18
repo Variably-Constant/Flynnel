@@ -35,8 +35,13 @@ import re
 import sys
 from collections import defaultdict
 
+# Trailing fields are tolerated rather than anchored out. A harness that
+# starts recording one more thing about its conditions must not turn
+# every row into an unparsed line, which reads the same as a run that
+# produced none.
 ARM = re.compile(
-    r"^ARM (\S+) trial=(\d+) position=(\d+) foreign=(\d+)\s*$"
+    r"^ARM (\S+) trial=(\d+) position=(\d+) foreign=(\d+)"
+    r"(?:\s+busy_cores=([\d.-]+))?"
 )
 CONTROL = re.compile(r"^control (\d+) (\d+) (\d+) ([\d.]+)\s*$")
 THROUGHPUT = re.compile(r"^throughput (\d+) (\d+) (\d+) ([\d.]+)\s*$")
@@ -64,7 +69,7 @@ def median(v):
 
 def parse(paths):
     arms = defaultdict(
-        lambda: {"ctl": [], "thr": [], "ret": [], "pos": [], "foreign": []}
+        lambda: {"ctl": [], "thr": [], "ret": [], "pos": [], "foreign": [], "busy": []}
     )
     by_trial = defaultdict(lambda: defaultdict(dict))
     cur = None
@@ -77,6 +82,8 @@ def parse(paths):
                     cur = (m.group(1), int(m.group(2)))
                     arms[m.group(1)]["pos"].append(int(m.group(3)))
                     arms[m.group(1)]["foreign"].append(int(m.group(4)))
+                    if m.group(5) is not None:
+                        arms[m.group(1)]["busy"].append(float(m.group(5)))
                     continue
                 if cur is None:
                     continue
@@ -174,6 +181,22 @@ def main(paths):
         print()
         print(f"BACKGROUND: {busy} of {len(foreign)} arms started with other")
         print(f"build processes running, up to {max(foreign)} at once.")
+
+    # The figure that says whether a run got the box it claims. The count
+    # above names four processes and reads near zero on a host saturated
+    # by anything else; this one is derived from idle time and counts
+    # everything.
+    cores = [c for d in arms.values() for c in d["busy"]]
+    if cores:
+        cores.sort()
+        print()
+        print(f"BUSY CORES at arm start: median {cores[len(cores) // 2]:.2f}, "
+              f"min {cores[0]:.2f}, max {cores[-1]:.2f} over {len(cores)} arms.")
+    else:
+        print()
+        print("BUSY CORES not recorded. The process count above cannot say")
+        print("whether the box was quiet, so a quiet-host claim from this log")
+        print("rests on nothing.")
     return 0
 
 

@@ -18,7 +18,11 @@ import re
 import sys
 from collections import defaultdict
 
-ARM = re.compile(r"^ARM (\S+) trial=(\d+) position=(\d+) foreign=(\d+)\s*$")
+# Trailing fields are tolerated rather than anchored out. A harness that
+# starts recording one more thing about its conditions must not turn
+# every row into an unparsed line, which reads the same as a run that
+# produced none.
+ARM = re.compile(r"^ARM (\S+) trial=(\d+) position=(\d+) foreign=(\d+)")
 ROWS = {
     "ctl": re.compile(r"^control (\d+) (\d+) (\d+) ([\d.]+)\s*$"),
     "thr": re.compile(r"^throughput (\d+) (\d+) (\d+) ([\d.]+)\s*$"),
