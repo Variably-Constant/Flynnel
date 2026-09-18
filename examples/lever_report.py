@@ -44,10 +44,20 @@ LEVER_STATE = {
 }
 FAILED = re.compile(r"^ARM_FAILED\s+(\S+)\s+load(\d+)\s+t(\d+)\s+exit=(\d+)")
 
-# The fields a lever acts through. Each is discrete, so a switch that
-# moved none of them across its own arms moved no decision, whatever
+# Behavior the lever changes, never the switch itself. A switch that
+# moved none of these across its own arms moved no decision, whatever
 # the dispatch counts did.
-DECISIONS = ("class", "smt", "workers", "allowed", "spin_adaptive", "spin_window")
+#
+# spin_adaptive is excluded because it IS the switch: it differs between
+# the arms by construction, so including it makes this test pass for
+# every rotation of that lever whatever the controller went on to do.
+# The arm-state block reads it instead.
+#
+# class is the weakest member. It is decided from the per-window cv^2,
+# which is one classifier tick and spans its whole range within a run,
+# so class differing between two arms is as likely to be that flapping
+# as anything the lever did. Treat class alone as no evidence.
+DECISIONS = ("class", "smt", "workers", "allowed", "spin_window")
 # The fields those decisions are taken from. Counters and spreads,
 # reported as medians because each arm is one process.
 MEASURES = (

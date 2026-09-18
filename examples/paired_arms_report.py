@@ -46,7 +46,6 @@ DECISIONS = {
     "smt",
     "workers",
     "allowed",
-    "spin_adaptive",
     "spin_window",
 }
 
