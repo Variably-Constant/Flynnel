@@ -9,6 +9,24 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- The adaptive spin controller is measured on what it does rather than
+  on throughput. Where it shrinks the window, idle yields fall to
+  between 0.22 and 0.51 of the arm without it; where it does not, they
+  read 1.000 to 1.019. Four rotations, two hosts, two operating systems,
+  with the unshrunk trials of each rotation as its own control.
+
+  No throughput effect survives a change of host or load. Pinning the
+  window directly with `FLYNNEL_SPIN_WINDOW_ROUNDS` - 8 against 500,
+  the controller out of the comparison and every trial usable - gives
+  1.0250 and 1.0271 on a Linux guest at half and full load, and 0.9980
+  and 1.0655 on a FreeBSD guest, at bounds of 3.9 to 9.0 per cent. The
+  ratio is flat across load, so the lever cannot show faster-under-load
+  whatever its size: there is nothing for load to change.
+
+  How often the controller shrinks at all is a host property, not a
+  setting: 1, 17, 18 and 21 arms in 40 on one guest and 39 in 40 on the
+  other, at identical settings.
+
 - `examples/zen3_lever_ab.sh` runs on FreeBSD as well as Linux. It takes
   busy cores from `kern.cp_time` where `/proc/stat` is absent, the core
   count from `hw.ncpu` where `nproc` is, and it strips the padding
