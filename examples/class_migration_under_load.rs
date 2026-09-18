@@ -247,6 +247,11 @@ struct SiteView {
     cv2: Option<u64>,
     window_mean_ns: Option<u64>,
     window_cv2: Option<u64>,
+    /// Extremes of the window cv^2 over every tick. `window_cv2` is the
+    /// latest tick of what is often thousands, and that figure does not
+    /// reproduce between runs of one configuration, so a row carrying
+    /// only it cannot say which regimes the interval covered.
+    window_cv2_range: Option<(u64, u64)>,
     learned: Option<WorkloadClass>,
 }
 
@@ -256,6 +261,7 @@ fn read_site(state: &CallSiteState) -> SiteView {
         cv2: state.cv2_per_mille(),
         window_mean_ns: state.window_mean_ns(),
         window_cv2: state.window_cv2_per_mille(),
+        window_cv2_range: state.window_cv2_range_per_mille(),
         learned: state.learned_class(),
     }
 }
@@ -659,7 +665,8 @@ fn main() {
     // looks.
     println!(
         "elapsed_s  phase   dispatches  sampled_leaves  cv2_per_mille  window_mean_ns  window_cv2  \
-         site_class  global_class  last_ms  box_cores  own_cores  foreign_cores  leaf_sizes"
+         window_cv2_range  site_class  global_class  last_ms  box_cores  own_cores  foreign_cores  \
+         leaf_sizes"
     );
 
     let site = SiteRef::new(&SITE);
@@ -752,6 +759,10 @@ fn main() {
                 Some(v) => v.to_string(),
                 None => "none".to_string(),
             };
+            let window_cv2_range = match view.window_cv2_range {
+                Some((lo, hi)) => format!("{lo}..{hi}"),
+                None => "none".to_string(),
+            };
             let learned = match view.learned {
                 Some(c) => format!("{c:?}"),
                 None => "none".to_string(),
@@ -766,7 +777,7 @@ fn main() {
                 }
             };
             println!(
-                "{:9.1}  {:6}  {:10}  {:>14}  {:>13}  {:>17}  {:>10}  {:>12}  {:>12}  {:7.2}  {:>11}  {:>11}  {:>13}  {}",
+                "{:9.1}  {:6}  {:10}  {:>14}  {:>13}  {:>17}  {:>10}  {:>16}  {:>12}  {:>12}  {:7.2}  {:>11}  {:>11}  {:>13}  {}",
                 elapsed_s,
                 phase.name(),
                 dispatches,
@@ -774,6 +785,7 @@ fn main() {
                 cv2,
                 window_mean,
                 window_cv2,
+                window_cv2_range,
                 learned,
                 format!("{:?}", active_workload_class()),
                 last_ms,
