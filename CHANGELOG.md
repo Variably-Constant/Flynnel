@@ -69,6 +69,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- `spin_adapt_decisions()` reports how many times the adaptive spin
+  controller passed its 256-event gate and reached a decision. The
+  window alone cannot answer whether the controller ran: a
+  rescue-dominated workload grows the window and is clamped to the
+  tuned default it started from, so `spin_window()` reads 500 whether
+  the controller decided on every park or never gathered the evidence.
+  Probed on a 24-thread host with `FLYNNEL_ADAPTIVE_SPIN=1`, a
+  `Streaming` shape at 8192 reps and a `FineGrain` shape at 512 both
+  reported a window of 500, and which of the two had happened was not
+  recoverable from any published figure.
+  `examples/throughput_under_load` prints it as `spin_adapts` beside
+  `spin_window`.
+
 - `JobPlan::optimal_chunk_count_for(workers, n)` sizes the Tiny-Tasks
   model over an item count the caller names, where
   `optimal_chunk_count` sizes it over the plan's own `batch_size`. The
