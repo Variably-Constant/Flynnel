@@ -26,6 +26,15 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   `examples/class_migration_under_load.rs` print the resolved states the
   way `throughput_under_load` already did.
 
+  A switch's own flag is not counted as a decision it made. Including
+  `spin_adaptive`, which differs between the arms by construction, made
+  the moved-decision test pass for every rotation of the spin lever
+  whatever the controller went on to do: a 432-arm run has it deciding
+  36 to 50 times per process and leaving the window at the tuned default
+  on both arms, which that test called engaged. A lever can be read,
+  then decide, and still change nothing, and only the third says a
+  throughput row is a reading of it.
+
 - `examples/pc2_lever_ab.ps1` takes the engagement markers from its
   caller as `-ReadPattern` and `-ActedPattern`, and reports them as two
   figures rather than one. It counted `oncore_items`, which is one
