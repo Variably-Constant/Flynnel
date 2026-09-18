@@ -9,6 +9,23 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- All three rotation readers assert engagement themselves rather than
+  leaving it to whoever reads the log.
+  `examples/paired_arms_report.py` lists which decisions differ between
+  the two arms before printing any ratio, and says so plainly when none
+  does; `examples/lever_report.py` and `examples/smt_report.py` compare
+  each arm's resolved switch state against its label and refuse
+  mismatched cells by name. A log written before its harness reported
+  lever states is described as unrecorded rather than treated as a pass.
+
+  Two levers now ship on, so an arm that expressed "off" by leaving its
+  variable unset ran the lever on: all three arms of a rotation became
+  one arm, with a tight null, because two identical arms agree. The
+  rotations at `examples/lever_rounds.sh` and `examples/width_rounds.sh`
+  now name the value on both arms, and `examples/smt_recovery.rs` and
+  `examples/class_migration_under_load.rs` print the resolved states the
+  way `throughput_under_load` already did.
+
 - `examples/pc2_lever_ab.ps1` takes the engagement markers from its
   caller as `-ReadPattern` and `-ActedPattern`, and reports them as two
   figures rather than one. It counted `oncore_items`, which is one
