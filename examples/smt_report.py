@@ -34,6 +34,7 @@ ROW = re.compile(
 )
 FAILED = re.compile(r"^ARM_FAILED\s+(\S+)\s+t(\d+)\s+exit=(\d+)")
 ENGAGE = re.compile(r"^smt_engagement\s+(.*)$")
+LEVERS = re.compile(r"^levers:\s+(.*)$")
 
 
 def main(path):
@@ -43,6 +44,7 @@ def main(path):
     pending = None
     rows = defaultdict(list)
     engage = defaultdict(list)
+    switches = defaultdict(set)
     failures = []
     # `pending` guards the row, which must follow its own ARM line.
     # `arm` outlives it, because the engagement line comes AFTER the
@@ -59,6 +61,12 @@ def main(path):
         if m:
             pending = m.group(2)
             arm = m.group(2)
+            continue
+        s = LEVERS.match(line)
+        if s and arm is not None:
+            for token in s.group(1).split():
+                if token.startswith("smt_window="):
+                    switches[arm].add(token.split("=", 1)[1])
             continue
         r = ROW.match(line)
         if r and pending is not None:
@@ -139,6 +147,24 @@ def main(path):
             )
 
     if engage:
+        print()
+        # Whether each arm ran the switch its label claims. An off arm
+        # that leaves the variable unset takes the crate's default, and
+        # two levers ship on, so a rotation can compare an arm with
+        # itself and still produce a clean null.
+        print("arm states:")
+        if not switches:
+            print("  no levers line in this log; what each arm ran is unrecorded")
+        else:
+            for arm_name, want in (("off", "false"), ("null", "false"), ("on", "true")):
+                seen = sorted(switches.get(arm_name, []))
+                if not seen:
+                    print(f"  {arm_name:<5} no smt_window reported")
+                elif seen != [want]:
+                    print(f"  {arm_name:<5} smt_window={seen}, and this arm means {want}"
+                          f" - do not read its rows")
+                else:
+                    print(f"  {arm_name:<5} smt_window={seen}, as labelled")
         print()
         print("engagement, from the same arms:")
         for arm in ("off", "null", "on"):
