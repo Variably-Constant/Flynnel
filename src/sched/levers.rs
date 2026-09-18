@@ -258,6 +258,19 @@ pub fn batch_weight() -> bool {
 
 /// Decide SMT from the window the site's classifier last read rather
 /// than from its lifetime cv^2, which never decays.
+///
+/// Engaged and not slower on three hosts, paired by trial against the
+/// same code with it off: a 24-thread Windows bare-metal box reads
+/// 1.0012 at a 0.61 per cent bound over ten pairs, a 16-core Linux
+/// guest sits inside its null at all three loads, and a 16-core FreeBSD
+/// guest reads 1.0639 at 9.37 per cent over forty. The arms differ on
+/// every host - off resolves SMT true, on resolves it false - and no
+/// speed-up is claimed anywhere.
+///
+/// The bound tracks the host rather than the method. The guest controls
+/// span 0.33 to 1.32 where bare metal spans 0.99 to 1.02, because a
+/// guest cannot see its own vCPU being descheduled, so neither its
+/// clocks nor its controls subtract it.
 pub fn smt_from_window() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| read("FLYNNEL_LEVER_SMT_WINDOW"))
