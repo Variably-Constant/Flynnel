@@ -29,6 +29,19 @@ ARM = re.compile(
 )
 ROW = re.compile(r"^throughput\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)\s*$")
 ENGAGE = re.compile(r"^engagement\s+(.*)$")
+LEVERS = re.compile(r"^levers:\s+(.*)$")
+
+# Where each lever's resolved state is reported, and under what name.
+# Four are switches the crate describes; the spin controller is not one
+# of them and states itself on the engagement line instead.
+LEVER_STATE = {
+    "ONCORE_SPREAD": ("levers", "oncore_spread"),
+    "BATCH_WEIGHT": ("levers", "batch_weight"),
+    "SMT_WINDOW": ("levers", "smt_window"),
+    "ALLOWED_WIDTH": ("levers", "allowed_width"),
+    "CALIBRATION_REFUSAL": ("levers", "calibration_refusal"),
+    "ADAPTIVE_SPIN": ("engage", "spin_adaptive"),
+}
 FAILED = re.compile(r"^ARM_FAILED\s+(\S+)\s+load(\d+)\s+t(\d+)\s+exit=(\d+)")
 
 # The fields a lever acts through. Each is discrete, so a switch that
@@ -94,6 +107,7 @@ def parse(path):
     cells = defaultdict(list)
     per_visit = defaultdict(list)
     engage = defaultdict(list)
+    switches = defaultdict(list)
     failures = []
     skipped = []
     by_position = defaultdict(list)
@@ -128,6 +142,16 @@ def parse(path):
                     fields[key] = value
             engage[(lever, load, arm)].append(fields)
             continue
+        s = LEVERS.match(line)
+        if s and pending is not None:
+            lever, arm, load, _pass, _trial = pending
+            fields = {}
+            for token in s.group(1).split():
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    fields[key] = value
+            switches[(lever, load, arm)].append(fields)
+            continue
         r = ROW.match(line)
         if r and pending is not None:
             lever, arm, load, visit, trial = pending
@@ -141,7 +165,46 @@ def parse(path):
             key = (lever, load, visit, trial)
             seen_in_trial[key] += 1
             by_position[(load, seen_in_trial[key])].append(value)
-    return cells, per_visit, engage, failures, skipped, by_position
+    return cells, per_visit, engage, switches, failures, skipped, by_position
+
+
+def report_arm_states(switches, engage, levers, loads):
+    """Whether each arm ran the switch its label claims.
+
+    An off arm that leaves the variable unset takes whatever the crate
+    defaults to, and two levers ship on, so a rotation can compare an arm
+    with itself and produce a clean null while doing it. This reads the
+    state each process reported and says when it contradicts the label.
+    """
+    print()
+    print("ARM STATES, read before anything else:")
+    print("-" * 78)
+    wrong = 0
+    for lever in levers:
+        where = LEVER_STATE.get(lever)
+        if where is None:
+            print(f"  {lever:<20} no state field known; the label is all there is")
+            continue
+        source, key = where
+        table = switches if source == "levers" else engage
+        for arm, want in (("off", "false"), ("null", "false"), ("on", "true")):
+            seen = sorted(
+                {f.get(key, "-") for load in loads for f in table.get((lever, load, arm), [])}
+            )
+            if not seen:
+                print(f"  {lever:<20} {arm:<5} no {key} reported; cannot tell what ran")
+                wrong += 1
+            elif seen != [want]:
+                print(f"  {lever:<20} {arm:<5} {key}={seen}, and this arm means {want}")
+                wrong += 1
+    if wrong:
+        print()
+        print(
+            f"{wrong} arm(s) did not run the switch their label claims. Their cells "
+            "compare something with itself; do not read them."
+        )
+    else:
+        print("  every arm ran the switch its label claims")
 
 
 def report_engagement(engage, levers, loads):
@@ -247,7 +310,7 @@ def repeatability(per_visit, levers, loads):
 
 
 def main(path):
-    cells, per_visit, engage, failures, skipped, by_position = parse(path)
+    cells, per_visit, engage, switches, failures, skipped, by_position = parse(path)
 
     if not cells:
         print("NO ROWS PARSED")
@@ -268,6 +331,7 @@ def main(path):
     levers = sorted({k[0] for k in cells})
     loads = sorted({k[1] for k in cells})
 
+    report_arm_states(switches, engage, levers, loads)
     report_engagement(engage, levers, loads)
 
     print()
