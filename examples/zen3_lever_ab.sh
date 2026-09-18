@@ -36,16 +36,28 @@ bin="$tree/target/release/examples/throughput_under_load"
 [ -x "$bin" ] || { echo "MISSING_BINARY $bin"; exit 9; }
 
 short=$(echo "$lever" | sed 's/^FLYNNEL_LEVER_//' | tr 'A-Z' 'a-z')
-ncpu=$(nproc)
+ncpu=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
-# Busy cores over a short interval from the aggregate cpu line, counting
-# every process rather than a name list. Fields after the label are user
-# nice system idle iowait irq softirq steal.
+# Total and idle counter ticks, summed over every CPU. Linux carries
+# them on /proc/stat's aggregate line as user nice system idle iowait
+# irq softirq steal; FreeBSD has no /proc/stat and reports the same
+# quantities through kern.cp_time as user nice sys intr idle.
+cpu_ticks() {
+    if [ -r /proc/stat ]; then
+        awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6; exit}' /proc/stat
+    else
+        sysctl -n kern.cp_time | awk '{print $1+$2+$3+$4+$5, $5}'
+    fi
+}
+
+# Busy cores over a short interval, counting every process rather than a
+# name list. Answers -1 when the interval carried no ticks, so a failed
+# sample is distinguishable from a quiet box.
 busy_cores() {
     local a b ai bi at bt
-    a=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6}' /proc/stat)
+    a=$(cpu_ticks)
     sleep 0.25
-    b=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6}' /proc/stat)
+    b=$(cpu_ticks)
     at=${a% *}; ai=${a#* }
     bt=${b% *}; bi=${b#* }
     awk -v at="$at" -v ai="$ai" -v bt="$bt" -v bi="$bi" -v n="$ncpu" \
