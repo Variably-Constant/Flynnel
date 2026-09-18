@@ -213,6 +213,12 @@ fn main() {
     // agreeing arms means one thing in that case and another when a
     // window exists, and the rows alone do not say which.
     let site = &SITE;
+    // What every switch resolved to, beside what the run measured. Two
+    // levers ship on, so an arm that expresses "off" by leaving its
+    // variable unset gets the lever on and produces rows that read as a
+    // clean null. This line is what tells a row labelled off from an
+    // arm that was off.
+    eprintln!("levers: {}", flynnel::sched::levers::describe());
     let reading = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     println!(
         "smt_engagement window_ticks={} cv2_window={} cv2_window_min={} \
