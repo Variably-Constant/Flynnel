@@ -130,6 +130,28 @@ def report_engagement(per, under_test, reference):
               "something with itself.")
 
 
+def split_on(per, under_test, reference, field):
+    """Trials partitioned by whether `field` differs between the arms.
+
+    Some mechanisms fire in a run and not in the next one at identical
+    settings: the adaptive spin controller leaves its window at the
+    default in about three runs in four. A median over every trial then
+    averages the trials where the mechanism acted with the trials where
+    it did not, and reports neither.
+    """
+    moved, held, unknown = {}, {}, {}
+    for trial, arms in per.items():
+        a = arms.get(under_test, {}).get("engage", {}).get(field)
+        b = arms.get(reference, {}).get("engage", {}).get(field)
+        if a is None or b is None:
+            unknown[trial] = arms
+        elif a != b:
+            moved[trial] = arms
+        else:
+            held[trial] = arms
+    return moved, held, unknown
+
+
 def report(per, under_test, reference, max_busy=None):
     report_engagement(per, under_test, reference)
     print()
@@ -183,7 +205,7 @@ def report(per, under_test, reference, max_busy=None):
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print(f"usage: {sys.argv[0]} <log> <arm_under_test> <reference_arm> "
-              f"[max_busy_cores]", file=sys.stderr)
+              f"[max_busy_cores] [split_on_field]", file=sys.stderr)
         sys.exit(2)
     data = parse(sys.argv[1])
     if not data:
@@ -191,4 +213,22 @@ if __name__ == "__main__":
         print("first arm reads the same as one that never wrote them.")
         sys.exit(1)
     bound = float(sys.argv[4]) if len(sys.argv) > 4 else None
-    report(data, sys.argv[2], sys.argv[3], bound)
+    field = sys.argv[5] if len(sys.argv) > 5 else None
+    if field is None:
+        report(data, sys.argv[2], sys.argv[3], bound)
+    else:
+        moved, held, unknown = split_on(data, sys.argv[2], sys.argv[3], field)
+        print(f"Split on {field}: {len(moved)} trial(s) where it differs "
+              f"between the arms, {len(held)} where it does not, "
+              f"{len(unknown)} where one arm did not report it.")
+        print("A mechanism that fires in some runs and not others makes one")
+        print("median over every trial a average of two populations. The")
+        print("trials where it did not fire are a control for the ones where")
+        print("it did, taken on the same box in the same rotation.")
+        for label, group in (("MOVED", moved), ("HELD", held)):
+            print()
+            print(f"===== trials where {field} {label} =====")
+            if group:
+                report(group, sys.argv[2], sys.argv[3], bound)
+            else:
+                print("no trials in this group")
