@@ -394,6 +394,51 @@ fn schedule_next_sample() {
     });
 }
 
+/// Events a sampled window needs before its steal rate is read.
+const MIN_WINDOW_EVENTS: u64 = 100;
+
+/// The multiplier a sampled window implies.
+///
+/// `cv2` is the leaf spread in parts per mille, absent when fewer than
+/// four leaves were timed. A window carrying fewer than
+/// `MIN_WINDOW_EVENTS` events returns `current` unchanged.
+fn multiplier_for_window(
+    total_pops: u64,
+    total_steals: u64,
+    cv2: Option<u64>,
+    current: u32,
+) -> u32 {
+    let total = total_pops.saturating_add(total_steals);
+    if total < MIN_WINDOW_EVENTS {
+        return current;
+    }
+    // Steal rate in fixed-point parts per 1000, keeping float out of
+    // the observer hot path.
+    let steal_per_mille: u64 = (total_steals * 1000) / total;
+    let from_steal = if steal_per_mille >= 300 {
+        4u32
+    } else if steal_per_mille >= 50 {
+        2u32
+    } else {
+        1u32
+    };
+
+    // Per-leaf variance is an orthogonal signal: some leaves take much
+    // longer than others even where the steal rate reads low because
+    // workers are individually busy. More leaves let steals rebalance
+    // the long ones onto idle workers.
+    let from_variance = match cv2 {
+        Some(cv2) if cv2 >= 500 => 4u32,
+        Some(cv2) if cv2 >= 50 => 2u32,
+        Some(_) => 1u32,
+        None => from_steal,
+    };
+
+    // The max of the two signals, so a high reading on either axis
+    // bumps the multiplier. Capped at 8 to bound the budget.
+    from_steal.max(from_variance).min(8)
+}
+
 /// One sampling pass. Reads counters, computes steal rate,
 /// derives the new multiplier. Public for testing.
 pub fn sample_and_compute() -> u32 {
@@ -408,42 +453,16 @@ pub fn sample_and_compute() -> u32 {
             stats.peer_steal_hits.load(Ordering::Relaxed),
         );
     }
-    let total = total_pops.saturating_add(total_steals);
-    if total < 100 {
-        // Insufficient data: keep current multiplier.
-        return SPLIT_MULTIPLIER.load(Ordering::Relaxed);
+    let current = SPLIT_MULTIPLIER.load(Ordering::Relaxed);
+    if total_pops.saturating_add(total_steals) < MIN_WINDOW_EVENTS {
+        return current;
     }
-    // Compute steal_rate in fixed-point (parts per 1000 to avoid
-    // float in the observer hot path).
-    let steal_per_mille: u64 = (total_steals * 1000) / total;
-    let from_steal = if steal_per_mille >= 300 {
-        4u32
-    } else if steal_per_mille >= 50 {
-        2u32
-    } else {
-        1u32
-    };
-
-    // Per-leaf variance: orthogonal signal. High variance means
-    // some leaves take much longer than others, even if the
-    // steal-rate looks low because workers are individually busy.
-    // Bumping the multiplier here gives more leaves, which lets
-    // steals rebalance the long ones onto idle workers.
-    let stats = snapshot_leaf_stats();
-    let from_variance = match leaf_cv_squared_per_mille(stats) {
-        Some(cv2) if cv2 >= 500 => 4u32,
-        Some(cv2) if cv2 >= 50 => 2u32,
-        Some(_) => 1u32,
-        None => from_steal,
-    };
-
-    // Reset for the next sample window so we don't double-count.
+    let cv2 = leaf_cv_squared_per_mille(snapshot_leaf_stats());
+    let mult = multiplier_for_window(total_pops, total_steals, cv2, current);
+    // Reset for the next sample window so the next reading does not
+    // count these leaves again.
     reset_leaf_stats();
-
-    // Combine: take the max of the two signals so a high reading
-    // on either axis triggers a bump. Cap at 8 to keep the budget
-    // bounded.
-    from_steal.max(from_variance).min(8)
+    mult
 }
 
 // ---------------------------------------------------------------------------
@@ -548,20 +567,24 @@ mod tests {
     }
 
     #[test]
-    fn sample_returns_current_multiplier_when_no_data() {
-        // Reset the global arena's per-worker counters first so we
-        // genuinely have <100 total events at sample time. Earlier
-        // parallel tests in the suite leave non-zero counters
-        // behind otherwise (the arena is process-global), which
-        // would push total past the <100 short-circuit.
-        for stats in global_local_arena().iter_worker_stats() {
-            stats.local_pops.store(0, Ordering::Relaxed);
-            stats.peer_steal_hits.store(0, Ordering::Relaxed);
-            stats.peer_steal_misses.store(0, Ordering::Relaxed);
-        }
-        set_split_multiplier(3);
-        let computed = sample_and_compute();
-        assert_eq!(computed, 3);
-        set_split_multiplier(2);
+    fn a_window_too_sparse_to_read_keeps_the_current_multiplier() {
+        assert_eq!(multiplier_for_window(40, 9, None, 3), 3);
+        assert_eq!(multiplier_for_window(40, 9, Some(900), 3), 3);
+    }
+
+    #[test]
+    fn the_window_multiplier_takes_the_higher_of_its_two_signals() {
+        // No steals, wide leaves: the variance axis carries it.
+        assert_eq!(multiplier_for_window(1000, 0, Some(900), 1), 4);
+        // Half the events stolen, even leaves: the steal axis does.
+        assert_eq!(multiplier_for_window(500, 500, Some(0), 1), 4);
+        // Neither axis reads high.
+        assert_eq!(multiplier_for_window(1000, 0, Some(0), 1), 1);
+    }
+
+    #[test]
+    fn a_window_with_no_timed_leaves_reads_its_steal_rate_alone() {
+        assert_eq!(multiplier_for_window(500, 500, None, 1), 4);
+        assert_eq!(multiplier_for_window(1000, 0, None, 1), 1);
     }
 }
