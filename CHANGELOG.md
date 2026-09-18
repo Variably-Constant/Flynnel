@@ -9,6 +9,17 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- `examples/pc2_lever_ab.ps1` takes the engagement markers from its
+  caller as `-ReadPattern` and `-ActedPattern`, and reports them as two
+  figures rather than one. It counted `oncore_items`, which is one
+  lever's marker, so every other lever's rotation passed the check
+  without the switch having reached anything: a 40-trial run of the SMT
+  window lever reported 80 engaged rows of 80 on a counter its
+  mechanism never touches. A caller naming no pattern gets the word
+  `unjudged` instead of a zero, and a run whose read pattern never
+  matches exits non-zero rather than reporting a comparison between two
+  arms that were the same arm.
+
 - A stored calibration is served once an independent draw has agreed
   with it, where before it was served if the spread across its own nine
   samples sat under `PROVISIONAL_SPREAD_PER_MILLE`. `CpuCalibration`
