@@ -9,6 +9,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- The split multiplier is decided from the window passed to it rather
+  than from the globals the sampler reads. `sample_and_compute` summed
+  process-global arena counters and then asserted against them, so the
+  test covering its sparse-window short-circuit raced every other test
+  in the binary: a concurrent dispatch could push those counters back
+  over the floor between the test's reset and its assert. It failed once
+  in a gate and passed five times on re-run, which is the shape that
+  gets a gate ignored. The decision now takes the window as arguments
+  and the wrapper reads the globals, so the three tests replacing it are
+  deterministic. The early return still skips `reset_leaf_stats`, which
+  is what lets a window too sparse to read accumulate its leaves into
+  the next one.
+
 - The adaptive spin controller is measured on what it does rather than
   on throughput. Where it shrinks the window, idle yields fall to
   between 0.22 and 0.51 of the arm without it; where it does not, they
@@ -129,6 +142,30 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   count, and `KeptIncumbent`'s two figures are dispatch costs in
   nanoseconds. The line reporting them named them parts per mille of
   occupancy, which cannot exceed 1000.
+
+### Added
+
+- `tests/affinity_follows_process_mask.rs` holds what
+  `FLYNNEL_LEVER_ALLOWED_WIDTH` does. It starts the arena at full width,
+  narrows the process affinity mask to two CPUs, and asserts that
+  `allowed_parallelism` follows, that `resolved_workers` caps by it, and
+  that both come back when the mask widens - so it measures a pool that
+  outlived the change rather than one sized after it. The behavior was
+  measured from outside on a guest before this, which left a ratchet
+  here silent.
+
+  It occupies its own test binary because the mask is process-wide: a
+  test running beside it would be narrowed by it and timed through a
+  mask it did not set. A host that cannot narrow, or allows fewer than
+  four CPUs, fails rather than returning early, because `eprintln` in a
+  test binary is captured and a skip reports the same green as a run. It
+  polls for the width instead of sleeping the re-read cadence, so it
+  carries no second copy of `RECHECK_INTERVAL_MS`.
+
+  `libc` joins the dev-dependencies for the Linux and FreeBSD arms,
+  whose affinity calls differ in name, arguments and set type. The
+  Windows arm declares the two kernel32 symbols it calls, so no binding
+  crate is added for it.
 
 ## 0.6.0 - 2026-09-13
 
