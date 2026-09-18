@@ -37,6 +37,7 @@ ROWS = {
     "ret": re.compile(r"^retained (\d+) (\d+) ([\d.]+)"),
 }
 ENGAGE = re.compile(r"^engagement\s+(.*)$")
+LEVERS = re.compile(r"^levers:\s+(.*)$")
 
 # Fields that are decisions rather than measurements. A switch that
 # moved none of these across its own arms moved no decision, and the
@@ -80,6 +81,15 @@ def parse(path):
             if cur is None:
                 continue
             arm, trial = cur
+            s = LEVERS.match(line)
+            if s:
+                fields = {}
+                for token in s.group(1).split():
+                    if "=" in token:
+                        key, value = token.split("=", 1)
+                        fields[key] = value
+                per[trial].setdefault(arm, {})["levers"] = fields
+                continue
             e = ENGAGE.match(line)
             if e:
                 fields = {}
@@ -97,6 +107,39 @@ def parse(path):
                 per[trial].setdefault(arm, {})[key] = value
                 break
     return per
+
+
+def report_arm_states(per, arms):
+    """Whether each arm ran the switch its own label names.
+
+    These labels carry the value: `oncore_spread=1` is an arm that has
+    to run that lever on. An arm expressing off by leaving the switch
+    unset takes whatever the crate defaults to, and two levers default
+    on, so a rotation can compare an arm with itself and still produce
+    a clean paired null.
+    """
+    print()
+    wrong = 0
+    for name in arms:
+        if "=" not in name:
+            print(f"  {name:<28} label names no value; cannot be checked")
+            continue
+        lever, want = name.split("=", 1)
+        want = "true" if want.strip() == "1" else "false"
+        seen = sorted({a[name]["levers"][lever]
+                       for a in per.values()
+                       if name in a and lever in a.get(name, {}).get("levers", {})})
+        if not seen:
+            print(f"  {name:<28} no levers line reports {lever}; what ran is unrecorded")
+            wrong += 1
+        elif seen != [want]:
+            print(f"  {name:<28} {lever}={seen}, and this arm means {want}")
+            wrong += 1
+        else:
+            print(f"  {name:<28} {lever}={seen}, as labelled")
+    if wrong:
+        print(f"{wrong} arm(s) did not run the switch their label claims. Their "
+              "pairs compare something with itself; do not read the table below.")
 
 
 def report_engagement(per, under_test, reference):
@@ -153,6 +196,8 @@ def split_on(per, under_test, reference, field):
 
 
 def report(per, under_test, reference, max_busy=None, counters=()):
+    print("ARM STATES, read before anything else:")
+    report_arm_states(per, (under_test, reference))
     report_engagement(per, under_test, reference)
     print()
     print(f"{under_test} against {reference}, per trial. Above 1.000 means "
