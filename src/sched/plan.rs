@@ -1275,13 +1275,26 @@ impl JobPlan {
         // The query is a syscall and a cgroup read, cached on a cadence,
         // so the switch is what keeps that cost off a quiet host's hot
         // path until a measurement says it is free.
-        let running = if crate::sched::levers::allowed_width() {
-            running.min(crate::sched::host_width::allowed_parallelism())
-        } else {
-            running
-        };
+        let running = capped_by_allowed_width(running, crate::sched::levers::allowed_width(), || {
+            crate::sched::host_width::allowed_parallelism()
+        });
         self.effective_workers(running)
     }
+}
+
+/// `running` narrowed to the CPUs the process may currently use.
+///
+/// The probe is a closure so the switch short-circuits it: with the
+/// lever off the syscall and cgroup read never happen.
+///
+/// Narrows only. The arena's threads are spawned once, so a width above
+/// the spawned count names threads that do not exist and the pool
+/// cannot grow into it.
+fn capped_by_allowed_width<P>(running: usize, lever_on: bool, allowed: P) -> usize
+where
+    P: FnOnce() -> usize,
+{
+    if lever_on { running.min(allowed()) } else { running }
 }
 
 /// Integer square root for u64. Used by `optimal_chunk_count` to
@@ -1676,6 +1689,42 @@ mod tests {
         assert!(HwClass::AmxFp16.is_matrix_extension());
         assert!(HwClass::TensorCoreHopper.is_matrix_extension());
         assert!(HwClass::TensorCoreBlackwell.is_matrix_extension());
+    }
+
+    #[test]
+    fn a_narrowed_process_chunks_for_the_cpus_it_still_has() {
+        // The case the lever exists for: the arena spawned sixteen and
+        // the process may now use four.
+        assert_eq!(capped_by_allowed_width(16, true, || 4), 4);
+        assert_eq!(
+            capped_by_allowed_width(16, false, || 4),
+            16,
+            "with the switch off the shipped width stands whatever the host allows"
+        );
+    }
+
+    #[test]
+    fn the_cap_narrows_and_never_widens_past_the_spawned_pool() {
+        // A quota raised above the count the arena was spawned with
+        // names threads that do not exist. host_width tracks the
+        // widening; the pool cannot grow into it, and the minimum is
+        // what keeps a dispatch from chunking for absent workers.
+        assert_eq!(capped_by_allowed_width(16, true, || 64), 16);
+        assert_eq!(capped_by_allowed_width(16, true, || 16), 16);
+    }
+
+    #[test]
+    fn the_switch_short_circuits_the_probe() {
+        // The probe is a syscall and a cgroup read. With the lever off
+        // it must not run at all, which is what keeps the cost off a
+        // host that never asked for the lever.
+        let mut probed = false;
+        let width = capped_by_allowed_width(16, false, || {
+            probed = true;
+            4
+        });
+        assert_eq!(width, 16);
+        assert!(!probed, "the lever is off, so the host was never asked");
     }
 
     #[test]
