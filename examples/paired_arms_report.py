@@ -36,6 +36,19 @@ ROWS = {
     "thr": re.compile(r"^throughput (\d+) (\d+) (\d+) ([\d.]+)\s*$"),
     "ret": re.compile(r"^retained (\d+) (\d+) ([\d.]+)"),
 }
+ENGAGE = re.compile(r"^engagement\s+(.*)$")
+
+# Fields that are decisions rather than measurements. A switch that
+# moved none of these across its own arms moved no decision, and the
+# ratio below is then a comparison of one arm with itself.
+DECISIONS = {
+    "class",
+    "smt",
+    "workers",
+    "allowed",
+    "spin_adaptive",
+    "spin_window",
+}
 
 
 def median(v):
@@ -68,6 +81,15 @@ def parse(path):
             if cur is None:
                 continue
             arm, trial = cur
+            e = ENGAGE.match(line)
+            if e:
+                fields = {}
+                for token in e.group(1).split():
+                    if "=" in token:
+                        key, value = token.split("=", 1)
+                        fields[key] = value
+                per[trial].setdefault(arm, {})["engage"] = fields
+                continue
             for key, pattern in ROWS.items():
                 m = pattern.match(line)
                 if not m:
@@ -78,7 +100,39 @@ def parse(path):
     return per
 
 
+def report_engagement(per, under_test, reference):
+    """Which decisions moved between the two arms, before any ratio.
+
+    A mechanism that never ran produces the same clean rows as one that
+    ran and did not help, so a ratio is only a reading of a switch once
+    something the switch controls is seen to differ.
+    """
+    seen = defaultdict(lambda: defaultdict(set))
+    for arms in per.values():
+        for name in (under_test, reference):
+            for key, value in arms.get(name, {}).get("engage", {}).items():
+                seen[name][key].add(value)
+    if not seen:
+        print("no engagement line in this log; what the switch had to work "
+              "with is unrecorded and the ratio below is unattributable")
+        return
+    moved = [k for k in sorted(DECISIONS)
+             if seen[under_test].get(k) != seen[reference].get(k)
+             and (seen[under_test].get(k) or seen[reference].get(k))]
+    print()
+    if moved:
+        print("decisions that differ between the arms:")
+        for k in moved:
+            print(f"  {k:<14} {under_test}={sorted(seen[under_test].get(k, []))} "
+                  f"{reference}={sorted(seen[reference].get(k, []))}")
+    else:
+        print("NO DECISION MOVED between these arms. Every field the switch "
+              "controls reads alike on both, so the table below compares "
+              "something with itself.")
+
+
 def report(per, under_test, reference, max_busy=None):
+    report_engagement(per, under_test, reference)
     print()
     print(f"{under_test} against {reference}, per trial. Above 1.000 means "
           f"{under_test} was faster.")
