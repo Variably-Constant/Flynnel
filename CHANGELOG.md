@@ -15,12 +15,14 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   test covering its sparse-window short-circuit raced every other test
   in the binary: a concurrent dispatch could push those counters back
   over the floor between the test's reset and its assert. It failed once
-  in a gate and passed five times on re-run, which is the shape that
-  gets a gate ignored. The decision now takes the window as arguments
-  and the wrapper reads the globals, so the three tests replacing it are
-  deterministic. The early return still skips `reset_leaf_stats`, which
-  is what lets a window too sparse to read accumulate its leaves into
-  the next one.
+  in a gate and passed five times on re-run - alone, in the full
+  parallel suite and single-threaded - which is the shape that gets a
+  gate ignored. The decision now takes the window as arguments and the
+  wrapper reads the globals, so the three tests replacing it are
+  deterministic: nine consecutive suite runs on the guest that caught it
+  read 749 passed and none failed. The early return still skips
+  `reset_leaf_stats`, which is what lets a window too sparse to read
+  accumulate its leaves into the next one.
 
 - The adaptive spin controller is measured on what it does rather than
   on throughput. Where it shrinks the window, idle yields fall to
