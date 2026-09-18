@@ -66,7 +66,7 @@ pub const CALIBRATION_MAGIC: u64 = 0x464C_4342_0000_0001;
 /// a spuriously fast reading stands for the life of the stamp: nothing
 /// later can be cheaper than a wrong floor, and neither a fresh draw nor
 /// `FLYNNEL_CALIBRATION_MAX_AGE_S` ageing one out will beat it.
-pub const LAYOUT_VERSION: u32 = 7;
+pub const LAYOUT_VERSION: u32 = 8;
 
 /// Devices a table records. A host with more reports the first
 /// [`MAX_ACCEL`] and the rest go unrecorded rather than overflowing.
@@ -81,14 +81,13 @@ pub const LEASE_GRACE_EPOCHS: u64 = 2;
 /// No process holds the writer lease.
 pub const NO_WRITER: u32 = 0;
 
-/// Spread across the calibration's own samples, in parts per thousand
-/// of the median, above which a record is provisional: the host was
-/// busy enough that the numbers describe the load as much as the
-/// machine. A later start on a quieter host overwrites it.
+/// Disagreement between two draws of one host, in parts per thousand of
+/// their mean dispatch median, above which they have not confirmed each
+/// other and the stored record stays provisional.
 ///
-/// The calibration already takes nine samples and keeps their median,
-/// so the spread costs nothing to compute and is the sharpest signal
-/// available for whether the host was quiet.
+/// On a quiet 12-core host, twenty pairs: dispatch medians 0 to 206
+/// apart, median 74. The within-draw spread over those same forty draws
+/// ran 273 to 7429, median 1136.
 pub const PROVISIONAL_SPREAD_PER_MILLE: u32 = 250;
 
 /// FNV-1a over bytes. The stamp hashes a short canonical string, so the
@@ -215,7 +214,14 @@ pub struct CpuCalibration {
     /// two records can prefer the better-drawn one, which is a
     /// comparison rather than a cutoff.
     pub occupancy_per_mille: u32,
-    _pad: [u8; 20],
+    /// Independent draws of this host whose dispatch median agreed with
+    /// this record's, to within [`PROVISIONAL_SPREAD_PER_MILLE`].
+    ///
+    /// Zero makes the record provisional: stored, so the next draw has
+    /// something to agree with, and not served, because one draw cannot
+    /// say whether its own median reproduces.
+    pub confirmations: u32,
+    _pad: [u8; 16],
 }
 
 /// No thread clock on this platform, so nothing was recorded.
@@ -253,7 +259,9 @@ impl CpuCalibration {
             spread_per_mille,
             samples,
             occupancy_per_mille: occupancy_per_mille.unwrap_or(OCCUPANCY_UNRECORDED),
-            _pad: [0; 20],
+            // Raised only where two records are in hand.
+            confirmations: 0,
+            _pad: [0; 16],
         }
     }
 
@@ -266,10 +274,15 @@ impl CpuCalibration {
         }
     }
 
-    /// Whether the host was quiet enough for this to stand as the
-    /// host's calibration rather than as one loaded reading of it.
+    /// Whether this record reproduces well enough to stand as the
+    /// host's calibration rather than as one reading of it.
+    ///
+    /// Reproducibility is a property of two draws. No statistic over a
+    /// single draw's samples substitutes: `spread_per_mille` is the
+    /// range of nine, which one scheduling hiccup sets, and it falls
+    /// under load as every sample slows together.
     pub fn is_trustworthy(&self) -> bool {
-        self.samples > 0 && self.spread_per_mille <= PROVISIONAL_SPREAD_PER_MILLE
+        self.samples > 0 && self.confirmations > 0
     }
 }
 
@@ -820,11 +833,9 @@ pub struct WriterGuard<'a> {
 /// the figure does not depend on which of the two is called the
 /// incumbent. A figure both draws report as zero disagrees by zero.
 ///
-/// Reported, never acted on. What separates a contended draw from a
-/// quiet one is how far two draws of the same host fall apart, and no
-/// statistic taken within a single draw does it. The bound that would
-/// turn this into a decision has to come from draws taken across known
-/// conditions, so until there is one this only prints.
+/// [`confirmations_after`] decides on the dispatch figure. The other
+/// two are reported beside it, so a pair that agrees on dispatch and
+/// parts company on the thresholds derived from it stays visible.
 fn two_draw_disagreement_per_mille(a: &CpuCalibration, b: &CpuCalibration) -> [u64; 3] {
     fn gap(x: u64, y: u64) -> u64 {
         let sum = x.saturating_add(y);
@@ -840,6 +851,27 @@ fn two_draw_disagreement_per_mille(a: &CpuCalibration, b: &CpuCalibration) -> [u
     ]
 }
 
+/// Agreements the record that ends up stored should carry.
+///
+/// Medians within [`PROVISIONAL_SPREAD_PER_MILLE`] raise the count,
+/// whichever record is kept. Otherwise a dearer offer leaves the count
+/// alone, since load only adds time, and a cheaper one resets it to
+/// zero. A zeroed table is not a draw to agree with.
+fn confirmations_after(incumbent: &CpuCalibration, offered: &CpuCalibration) -> u32 {
+    if incumbent.samples == 0 {
+        return 0;
+    }
+    let agreed = two_draw_disagreement_per_mille(incumbent, offered)[0]
+        <= PROVISIONAL_SPREAD_PER_MILLE as u64;
+    if agreed {
+        incumbent.confirmations.saturating_add(1)
+    } else if incumbent.dispatch_cost_ns < offered.dispatch_cost_ns {
+        incumbent.confirmations
+    } else {
+        0
+    }
+}
+
 fn prefers_incumbent(
     incumbent: &CpuCalibration,
     offered: &CpuCalibration,
@@ -850,7 +882,11 @@ fn prefers_incumbent(
         return None;
     }
     let (held, new) = (incumbent.dispatch_cost_ns, offered.dispatch_cost_ns);
-    (held < new).then_some(PublishOutcome::KeptIncumbent { incumbent: held, offered: new })
+    (held < new).then_some(PublishOutcome::KeptIncumbent {
+        incumbent: held,
+        offered: new,
+        confirmations: confirmations_after(incumbent, offered),
+    })
 }
 
 /// What [`WriterGuard::publish_if_better`] did with the record it was
@@ -863,7 +899,11 @@ fn prefers_incumbent(
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PublishOutcome {
     /// The record was written.
-    Published,
+    Published {
+        /// Agreements it carries. Zero is a provisional record: stored
+        /// for the next draw to agree with, and not served.
+        confirmations: u32,
+    },
     /// The table held a cheaper dispatch cost, and it stands. Both
     /// figures are nanoseconds.
     KeptIncumbent {
@@ -871,6 +911,9 @@ pub enum PublishOutcome {
         incumbent: u64,
         /// This draw's dispatch cost.
         offered: u64,
+        /// Agreements the stored record carries once this draw is
+        /// counted. A draw that is refused on cost can still confirm.
+        confirmations: u32,
     },
 }
 
@@ -951,13 +994,32 @@ impl WriterGuard<'_> {
             );
         }
         if crate::sched::levers::calibration_refusal()
-            && let Some((incumbent, _)) = self.store.read()
-            && let Some(kept) = prefers_incumbent(&incumbent, cpu)
+            && let Some((held, held_accel)) = self.store.read()
+            && let Some(kept) = prefers_incumbent(&held, cpu)
         {
+            // A draw refused on cost can still confirm, so a raised
+            // count is written back. It carries the stored record's own
+            // accelerators: `publish` takes the device count from what
+            // it is handed.
+            if let PublishOutcome::KeptIncumbent { confirmations, .. } = kept
+                && confirmations != held.confirmations
+            {
+                let mut raised = held;
+                raised.confirmations = confirmations;
+                self.publish(&raised, &held_accel);
+            }
             return kept;
         }
-        self.publish(cpu, accel);
-        PublishOutcome::Published
+        // Computed whether or not the refusal is on: that lever decides
+        // which record stands, this decides whether it has been seen to
+        // reproduce.
+        let mut record = *cpu;
+        record.confirmations = match self.store.read() {
+            Some((held, _)) => confirmations_after(&held, cpu),
+            None => 0,
+        };
+        self.publish(&record, accel);
+        PublishOutcome::Published { confirmations: record.confirmations }
     }
 
     /// Publish a measurement under the SeqLock.
@@ -1096,8 +1158,15 @@ mod tests {
             spread_per_mille: 41,
             samples: 9,
             occupancy_per_mille: 970,
-            _pad: [0; 20],
+            confirmations: 1,
+            _pad: [0; 16],
         }
+    }
+
+    /// A draw another draw has already agreed with.
+    fn confirmed(mut cpu: CpuCalibration) -> CpuCalibration {
+        cpu.confirmations = 1;
+        cpu
     }
 
     #[test]
@@ -1121,8 +1190,8 @@ mod tests {
         // contended draw from a clean one. The figure records what a
         // draw ran under and decides nothing on its own; a reader
         // holding two records can prefer the better-drawn one.
-        let quiet = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
-        let loaded = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(210));
+        let quiet = confirmed(CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990)));
+        let loaded = confirmed(CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(210)));
         assert!(quiet.is_trustworthy());
         assert!(loaded.is_trustworthy());
         assert!(quiet.occupancy() > loaded.occupancy());
@@ -1167,7 +1236,11 @@ mod tests {
         let loaded = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
         assert_eq!(
             prefers_incumbent(&quiet, &loaded),
-            Some(PublishOutcome::KeptIncumbent { incumbent: 1_000, offered: 9_000 }),
+            Some(PublishOutcome::KeptIncumbent {
+                incumbent: 1_000,
+                offered: 9_000,
+                confirmations: 0,
+            }),
             "the refusal names both costs so a caller can say why"
         );
     }
@@ -1188,11 +1261,15 @@ mod tests {
             9,
             Some(990),
         );
-        assert!(!scattered.is_trustworthy(), "its own samples disagreed");
+        assert!(!scattered.is_trustworthy(), "nothing has agreed with it");
         let dearer = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
         assert_eq!(
             prefers_incumbent(&scattered, &dearer),
-            Some(PublishOutcome::KeptIncumbent { incumbent: 1_000, offered: 9_000 }),
+            Some(PublishOutcome::KeptIncumbent {
+                incumbent: 1_000,
+                offered: 9_000,
+                confirmations: 0,
+            }),
             "cost orders them, and the incumbent's spread does not enter it"
         );
     }
@@ -1207,7 +1284,11 @@ mod tests {
         let cheap_unmeasured = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, None);
         assert_eq!(
             prefers_incumbent(&cheap_unmeasured, &dear),
-            Some(PublishOutcome::KeptIncumbent { incumbent: 1_000, offered: 9_000 }),
+            Some(PublishOutcome::KeptIncumbent {
+                incumbent: 1_000,
+                offered: 9_000,
+                confirmations: 0,
+            }),
             "a cheaper incumbent stands without an occupancy of its own"
         );
         assert_eq!(
@@ -1256,7 +1337,7 @@ mod tests {
         // caller's early return keeps the comparison unreached.
         // `an_aged_incumbent_is_ordered_rather_than_dismissed` covers the
         // case a configured bound opens.
-        let passes = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        let passes = confirmed(CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990)));
         assert!(
             passes.is_trustworthy(),
             "a record like this is returned by the caller and never offered"
@@ -1299,14 +1380,18 @@ mod tests {
         // Asserted against the same pair as the default case, so the
         // difference between the two tests is the incumbent's trust and
         // nothing else.
-        let aged = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        let aged = confirmed(CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990)));
         assert!(aged.is_trustworthy(), "an aged record is drawn again, not distrusted");
 
         let offered = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
         assert_eq!(
             prefers_incumbent(&aged, &offered),
-            Some(PublishOutcome::KeptIncumbent { incumbent: 1_000, offered: 9_000 }),
-            "the cheaper of the two stands, and both costs are named"
+            Some(PublishOutcome::KeptIncumbent {
+                incumbent: 1_000,
+                offered: 9_000,
+                confirmations: 1,
+            }),
+            "the cheaper of the two stands, keeping its agreement against a dearer offer"
         );
     }
 
@@ -1321,12 +1406,20 @@ mod tests {
         if crate::sched::levers::calibration_refusal() {
             assert_eq!(
                 outcome,
-                PublishOutcome::KeptIncumbent { incumbent: 1_000, offered: 9_000 },
+                PublishOutcome::KeptIncumbent {
+                    incumbent: 1_000,
+                    offered: 9_000,
+                    confirmations: 0,
+                },
                 "the switch is on in this process, so the refusal must fire"
             );
             assert_eq!(held.dispatch_cost_ns, 1_000);
         } else {
-            assert_eq!(outcome, PublishOutcome::Published, "off publishes unconditionally");
+            assert_eq!(
+                outcome,
+                PublishOutcome::Published { confirmations: 0 },
+                "off publishes unconditionally, and the two costs did not agree"
+            );
             assert_eq!(held.dispatch_cost_ns, 9_000, "the offer is what stands");
         }
         cleanup(&dir);
@@ -1511,12 +1604,50 @@ mod tests {
     }
 
     #[test]
-    fn a_loaded_measurement_is_not_trustworthy() {
-        let mut cpu = sample_cpu();
-        cpu.spread_per_mille = PROVISIONAL_SPREAD_PER_MILLE + 1;
+    fn trust_follows_agreement_between_draws_not_the_spread_within_one() {
+        // Both directions, because a rule reading the spread would pass
+        // one of them on its own.
+        let mut scattered = sample_cpu();
+        scattered.spread_per_mille = PROVISIONAL_SPREAD_PER_MILLE * 20;
         assert!(
-            !cpu.is_trustworthy(),
-            "a record measured under load must not stand as the host's calibration"
+            scattered.is_trustworthy(),
+            "a confirmed record stands however far its own nine samples scattered"
+        );
+
+        let mut tight = sample_cpu();
+        tight.spread_per_mille = 0;
+        tight.confirmations = 0;
+        assert!(
+            !tight.is_trustworthy(),
+            "and one nothing has agreed with does not, however tightly it sampled"
+        );
+    }
+
+    #[test]
+    fn a_draw_confirms_the_stored_record_when_their_medians_agree() {
+        let held = CpuCalibration::new(1_300, 70_000, 40_000, 41, 9, Some(990));
+        // 1300 against 1400 is 74 per mille apart, the median of twenty
+        // pairs measured on a quiet 12-core host.
+        let near = CpuCalibration::new(1_400, 70_000, 40_000, 41, 9, Some(990));
+        assert_eq!(confirmations_after(&held, &near), 1);
+
+        let far = CpuCalibration::new(9_000, 70_000, 40_000, 41, 9, Some(210));
+        assert_eq!(
+            confirmations_after(&held, &far),
+            0,
+            "a dearer draw that disagrees leaves the count where it was"
+        );
+
+        let cheaper_and_apart = CpuCalibration::new(200, 70_000, 40_000, 41, 9, Some(990));
+        assert_eq!(
+            confirmations_after(&confirmed(held), &cheaper_and_apart),
+            0,
+            "a cheaper draw that disagrees replaces and starts over"
+        );
+        assert_eq!(
+            confirmations_after(&confirmed(held), &far),
+            1,
+            "while a dearer one keeps the agreement already earned"
         );
     }
 }

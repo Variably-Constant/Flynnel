@@ -918,8 +918,9 @@ fn adaptive_min_leaf(plan: &JobPlan, caller_floor: usize) -> usize {
 /// Every value is in nanoseconds and was measured, never assumed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostDispatchProfile {
-    /// The pool's cost of one dispatch: one join over two leaves of
-    /// a compute-bound body, dispatched minus serial.
+    /// The pool's cost of one dispatch: the wall time of one join whose
+    /// two halves are a single item each, median of `DIRECT_SAMPLES`.
+    /// Observed, not a difference between two larger timings.
     pub dispatch_cost_ns: u64,
     /// Total work below which a body runs faster on the calling
     /// thread than dispatched: the serial time at the crossover of
@@ -1188,16 +1189,30 @@ fn stored_or_measured() -> HostDispatchProfile {
             // over, because a measurement that was taken and then
             // discarded is not the same event as one that was stored,
             // and the two are indistinguishable from the outside.
-            if let crate::sched::calibration_store::PublishOutcome::KeptIncumbent {
-                incumbent,
-                offered,
-            } = outcome
-            {
-                eprintln!(
-                    "flynnel: this host's stored calibration dispatches in {incumbent} ns \
-                     and this one in {offered}; the cheaper record stands and this process \
-                     uses what it measured"
-                );
+            use crate::sched::calibration_store::PublishOutcome;
+            match outcome {
+                PublishOutcome::KeptIncumbent { incumbent, offered, confirmations } => {
+                    eprintln!(
+                        "flynnel: this host's stored calibration dispatches in {incumbent} \
+                         ns and this one in {offered}; the cheaper record stands and this \
+                         process uses what it measured. It carries {confirmations} \
+                         agreeing draw(s){}",
+                        if confirmations == 0 {
+                            ", so it stays provisional and the next start measures again"
+                        } else {
+                            " and serves the next start"
+                        }
+                    );
+                }
+                PublishOutcome::Published { confirmations: 0 } => eprintln!(
+                    "flynnel: this draw is stored and provisional; nothing has agreed \
+                     with it yet, so the next start measures again and the two are \
+                     compared"
+                ),
+                PublishOutcome::Published { confirmations } => eprintln!(
+                    "flynnel: this draw is stored with {confirmations} agreeing draw(s) \
+                     and serves the next start"
+                ),
             }
         }
         // Another process on this host is measuring the same table. Its
@@ -4602,7 +4617,7 @@ mod tests {
     #[cfg(feature = "persisted-calibration")]
     #[test]
     fn a_record_that_serves_is_one_the_refusal_will_never_be_offered() {
-        use crate::sched::calibration_store::{CpuCalibration, PROVISIONAL_SPREAD_PER_MILLE};
+        use crate::sched::calibration_store::CpuCalibration;
 
         // The decision the caller actually takes, which every other
         // test of this feature skips by building a store and calling
@@ -4610,23 +4625,17 @@ mod tests {
         // the branch that offers one for comparison, so the refusal on
         // the other side of that branch cannot act on it.
         let now = 1_000_000u64;
-        let passes = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        let mut passes = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        passes.confirmations = 1;
         assert!(
             stored_record_serves(&passes, None, now),
             "with no age bound a trustworthy record is returned, so nothing offers it"
         );
 
-        let fails = CpuCalibration::new(
-            1_000,
-            70_000,
-            40_000,
-            PROVISIONAL_SPREAD_PER_MILLE + 1,
-            9,
-            Some(990),
-        );
+        let provisional = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
         assert!(
-            !stored_record_serves(&fails, None, now),
-            "a record whose samples disagreed is measured over, and a record in that \
+            !stored_record_serves(&provisional, None, now),
+            "a record nothing has agreed with is measured over, and a record in that \
              state is the only kind the refusal is ever offered"
         );
     }
@@ -4648,6 +4657,7 @@ mod tests {
 
         let mut at_the_bound = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
         at_the_bound.measured_unix_s = now - DEFAULT_CALIBRATION_MAX_AGE_S;
+        at_the_bound.confirmations = 1;
         assert!(
             stored_record_serves(&at_the_bound, bound, now),
             "a record exactly the bound's age serves, so the comparison is inclusive"
@@ -4655,6 +4665,7 @@ mod tests {
 
         let mut past_it = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
         past_it.measured_unix_s = now - DEFAULT_CALIBRATION_MAX_AGE_S - 1;
+        past_it.confirmations = 1;
         assert!(
             !stored_record_serves(&past_it, bound, now),
             "a second past it is drawn again"
@@ -4675,6 +4686,7 @@ mod tests {
         // would have to.
         let mut aged = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
         aged.measured_unix_s = drawn_at;
+        aged.confirmations = 1;
 
         assert!(
             stored_record_serves(&aged, Some(7_200), now),
@@ -4695,6 +4707,7 @@ mod tests {
         // clock catches up.
         let mut future = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
         future.measured_unix_s = now + 10_000;
+        future.confirmations = 1;
         assert!(
             stored_record_serves(&future, Some(60), now),
             "a record stamped in the future ages to nothing and stands"

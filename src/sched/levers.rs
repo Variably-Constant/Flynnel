@@ -72,12 +72,13 @@ fn read(name: &str) -> bool {
 /// draw's, so an arm can win on start cost and lose on routing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ServePolicy {
-    /// The spread of the draw's own samples against
-    /// [`crate::sched::calibration_store::PROVISIONAL_SPREAD_PER_MILLE`].
+    /// The shipped arm: whatever
+    /// [`crate::sched::calibration_store::CpuCalibration::is_trustworthy`]
+    /// admits, which is a record some other draw has agreed with.
     ///
-    /// On the host measured so far this admits nothing: draws taken at
-    /// occupancy 998 to 999 carry spreads of 807 to 2245 against a
-    /// bound of 250, so every process re-measures.
+    /// A fresh stamp therefore serves from its third start: the first
+    /// stores a provisional record, the second agrees with it and
+    /// confirms, and the rest read.
     Spread,
     /// Anything that was actually measured. The cheapest-cost ordering
     /// decides which record stands, and load only adds time, so a draw
