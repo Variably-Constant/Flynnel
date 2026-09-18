@@ -13,6 +13,13 @@ something that happened to the box. Reading collapses per arm without
 that check attributed them to the serving policies once, and the arm
 that serves nothing collapsed at the same index.
 
+A collapse counts when EITHER window falls, the control or the loaded
+one. They fail independently: a build storm arriving inside the loaded
+window leaves the control untouched, so judging on the control alone
+scores that arm clean and hands the trial to whichever arms happened to
+be running when the storm also caught their control. That reads as a
+policy difference and is a clock.
+
 POSITION, because a window measured first in its trial is worth a few
 per cent more than one measured last. The rotation exists to cancel
 that, and this says whether it did: an arm that drew position one more
@@ -32,7 +39,15 @@ ARM = re.compile(
     r"^ARM (\S+) trial=(\d+) position=(\d+) foreign=(\d+)\s*$"
 )
 CONTROL = re.compile(r"^control (\d+) (\d+) (\d+) ([\d.]+)\s*$")
+THROUGHPUT = re.compile(r"^throughput (\d+) (\d+) (\d+) ([\d.]+)\s*$")
 RETAINED = re.compile(r"^retained (\d+) (\d+) ([\d.]+)")
+
+# Which series a collapse is judged against, and the fraction of an
+# arm's own median a window has to fall below to count as one. Judged
+# per series against that series' median so an arm whose loaded window
+# is legitimately half its control is not scored as collapsing.
+SERIES = ("ctl", "thr")
+COLLAPSE_FRACTION = 0.5
 
 
 def note(text):
@@ -48,8 +63,10 @@ def median(v):
 
 
 def parse(paths):
-    arms = defaultdict(lambda: {"ctl": [], "ret": [], "pos": [], "foreign": []})
-    by_trial = defaultdict(dict)
+    arms = defaultdict(
+        lambda: {"ctl": [], "thr": [], "ret": [], "pos": [], "foreign": []}
+    )
+    by_trial = defaultdict(lambda: defaultdict(dict))
     cur = None
     for n, path in enumerate(paths, 1):
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -64,15 +81,17 @@ def parse(paths):
                 if cur is None:
                     continue
                 arm, trial = cur
-                m = CONTROL.match(line)
-                if m:
-                    value = int(m.group(3))
-                    arms[arm]["ctl"].append(value)
-                    by_trial[trial][arm] = value
-                    continue
-                m = RETAINED.match(line)
-                if m:
-                    arms[arm]["ret"].append(float(m.group(3)))
+                for key, pattern in (("ctl", CONTROL), ("thr", THROUGHPUT)):
+                    m = pattern.match(line)
+                    if m:
+                        value = int(m.group(3))
+                        arms[arm][key].append(value)
+                        by_trial[trial][arm][key] = value
+                        break
+                else:
+                    m = RETAINED.match(line)
+                    if m:
+                        arms[arm]["ret"].append(float(m.group(3)))
         note(f"parsed {n}/{len(paths)} {path}: {len(arms)} arms")
     return arms, by_trial
 
@@ -86,28 +105,47 @@ def main(paths):
         return 1
 
     print()
-    print(f"{'arm':<20} {'n':>3} {'ctl med':>9} {'ctl min':>9} {'ctl max':>9} "
-          f"{'range%':>7} {'ret med':>8} {'pos avg':>8}")
-    print("-" * 80)
+    # The loaded window sits beside the control because the criterion is
+    # about throughput under load; the control is what says whether a
+    # difference in it belongs to the arm or to the box.
+    print(f"{'arm':<20} {'n':>3} {'ctl med':>9} {'thr med':>9} {'ctl min':>9} "
+          f"{'thr min':>9} {'range%':>7} {'ret med':>8} {'pos avg':>8}")
+    print("-" * 90)
     for arm in sorted(arms):
         d = arms[arm]
         if not d["ctl"]:
             print(f"{arm:<20} {'no control rows':>20}")
             continue
         m = median(d["ctl"])
+        tm = median(d["thr"])
         rng = 100.0 * (max(d["ctl"]) - min(d["ctl"])) / m if m else 0.0
         ret = median(d["ret"])
         pos = sum(d["pos"]) / len(d["pos"]) if d["pos"] else 0.0
-        print(f"{arm:<20} {len(d['ctl']):>3} {int(m):>9} {min(d['ctl']):>9} "
-              f"{max(d['ctl']):>9} {rng:>7.1f} "
+        print(f"{arm:<20} {len(d['ctl']):>3} {int(m):>9} "
+              f"{'-' if tm is None else int(tm):>9} {min(d['ctl']):>9} "
+              f"{'-' if not d['thr'] else min(d['thr']):>9} {rng:>7.1f} "
               f"{'-' if ret is None else round(ret, 4):>8} {pos:>8.2f}")
 
-    # A collapse is judged against the arm's own median, so an arm that
-    # is slower throughout is not counted as collapsing.
-    meds = {a: median(d["ctl"]) for a, d in arms.items() if d["ctl"]}
+    # A collapse is judged against the arm's own median for the same
+    # series, so an arm that is slower throughout is not counted as
+    # collapsing, and a loaded window that always sits near half its
+    # control is not either.
+    meds = {
+        key: {a: median(d[key]) for a, d in arms.items() if d[key]}
+        for key in SERIES
+    }
     shared, lone = [], []
     for trial, per_arm in sorted(by_trial.items()):
-        low = [a for a, v in per_arm.items() if meds.get(a) and v < meds[a] * 0.5]
+        low = []
+        for arm, windows in per_arm.items():
+            fell = [
+                key
+                for key, value in windows.items()
+                if meds[key].get(arm)
+                and value < meds[key][arm] * COLLAPSE_FRACTION
+            ]
+            if fell:
+                low.append((arm, sorted(fell)))
         if not low:
             continue
         if len(low) == len(per_arm) and len(per_arm) > 1:
@@ -123,7 +161,8 @@ def main(paths):
     if lone:
         print("COLLAPSED ON SOME ARMS ONLY:")
         for trial, who in lone:
-            print(f"  trial {trial}: {', '.join(who)}")
+            named = ", ".join(f"{arm} ({'+'.join(fell)})" for arm, fell in who)
+            print(f"  trial {trial}: {named}")
         print("  One of these is one observation. Two arms differ only when")
         print("  the rate differs over enough trials to be a rate.")
     if not shared and not lone:
