@@ -44,7 +44,19 @@ MEASURES = (
     "cv2_wall",
     "cv2_oncore",
     "cv2_window",
+    # The extremes over every classifier tick. cv2_window is the latest
+    # tick of what is often thousands and does not reproduce between
+    # runs of one configuration, so a maximum below the uniform edge is
+    # what says a spread-driven lever was never consulted in its own
+    # regime.
+    "cv2_window_min",
+    "cv2_window_max",
     "window_ticks",
+    # Decisions the adaptive spin controller reached. Zero with
+    # spin_adaptive true means it never gathered the evidence, which
+    # spin_window alone cannot say because a rescue-dominated window
+    # grows and clamps to the default it started from.
+    "spin_adapts",
     "idle_yields",
 )
 

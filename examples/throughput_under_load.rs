@@ -352,7 +352,7 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
         "engagement duty_ms={duty_ms} reps={reps} irregular={irregular} \
          block_items={block_items} \
          leaves={} oncore_items={} per_item_ns={} cv2_wall={} \
-         cv2_oncore={} cv2_window={} cv2_window_range={} window_ticks={} class={:?} workers={} allowed={} smt={} \
+         cv2_oncore={} cv2_window={} cv2_window_min={} cv2_window_max={} window_ticks={} class={:?} workers={} allowed={} smt={} \
          spin_adaptive={} spin_window={} spin_adapts={} idle_yields={}",
         site.leaf_count(),
         site.oncore_items(),
@@ -360,8 +360,8 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
         reading(site.per_item_cv2_per_mille()),
         reading(site.per_item_oncore_cv2_per_mille()),
         reading(site.window_cv2_per_mille()),
-        site.window_cv2_range_per_mille()
-            .map_or_else(|| "-".to_string(), |(lo, hi)| format!("{lo}..{hi}")),
+        reading(site.window_cv2_range_per_mille().map(|(lo, _)| lo)),
+        reading(site.window_cv2_range_per_mille().map(|(_, hi)| hi)),
         site.window_ticks(),
         site.learned_class(),
         plan.resolved_workers(),
