@@ -1306,6 +1306,34 @@ fn integer_sqrt(n: u64) -> u64 {
     x
 }
 
+/// Whether a declared tile class promotes out of Inline on its item
+/// count alone.
+///
+/// A matrix-extension class says the item is a tile operation, and the
+/// smallest AMX or tensor-core tile is a multiply-accumulate over a
+/// 16x16 block. One tile never promotes: one item is one leaf, so there
+/// is nothing to split and a dispatch can only add its own cost.
+///
+/// Above one tile the count is a poor proxy. A consumer sweep at depth
+/// 16 has a 2x2 grid at 0.94x and a 4x4 at 2.71x, so some count between
+/// four and sixteen tiles is the crossing. A caller that declares what
+/// an item costs does not need it located: `estimated_per_item_ns`
+/// times the batch, against this host's own collapse threshold, is the
+/// same question asked in work rather than in tiles, and it yields a
+/// different tile count on every host. So the count only decides for a
+/// caller who declared no cost.
+///
+/// `explicit_estimate` is the caller's own figure rather than a
+/// classifier default, which is a routing hint and not a claim about
+/// this item.
+pub fn promotes_on_tile_count(
+    is_matrix_extension: bool,
+    batch_size: u32,
+    explicit_estimate: bool,
+) -> bool {
+    is_matrix_extension && batch_size > 1 && !explicit_estimate
+}
+
 /// Classify a K_outer into its tier band before considering
 /// batch-size or NUMA topology. Returns the tier the job would land
 /// at if batch_size and topology were "typical."
@@ -1428,10 +1456,17 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
     // an AMX-emulating strip a one-tile grid measures 2,388 ns serial
     // against 2,827 ns dispatched.
     //
-    // Above one tile this is still too eager. The same sweep has a
-    // 2x2 grid at 0.94x and a 4x4 at 2.71x, so the crossover lies
-    // between 4 and 16 tiles and is not yet measured.
-    let tile_override = plan.hw_class.is_matrix_extension() && plan.batch_size > 1;
+    // Above one tile the count alone is too eager: the same sweep has a
+    // 2x2 grid at 0.94x and a 4x4 at 2.71x. Where the caller has
+    // declared what an item costs, `heavy_override` above already
+    // decides that on measured work against this host's own collapse
+    // threshold, so the count steps aside and the crossover is a
+    // relation rather than a constant to locate.
+    let tile_override = promotes_on_tile_count(
+        plan.hw_class.is_matrix_extension(),
+        plan.batch_size,
+        plan.estimated_per_item_ns_explicit,
+    );
 
     let base = kband_for(plan.k_outer);
     match base {
@@ -1641,6 +1676,30 @@ mod tests {
         assert!(HwClass::AmxFp16.is_matrix_extension());
         assert!(HwClass::TensorCoreHopper.is_matrix_extension());
         assert!(HwClass::TensorCoreBlackwell.is_matrix_extension());
+    }
+
+    #[test]
+    fn a_declared_cost_takes_the_tile_count_out_of_the_decision() {
+        // Pure, so the host's own collapse threshold is not needed to
+        // assert it. What happens once the count steps aside is
+        // `heavy_override`'s, which reads that threshold and cannot be
+        // pinned from inside a test.
+        assert!(
+            promotes_on_tile_count(true, 4, false),
+            "four tiles and no declared cost: the count is all there is"
+        );
+        assert!(
+            !promotes_on_tile_count(true, 4, true),
+            "four tiles with a declared cost: the work decides, not the count"
+        );
+        assert!(
+            !promotes_on_tile_count(true, 1, false),
+            "one item is one leaf, so there is nothing to split"
+        );
+        assert!(
+            !promotes_on_tile_count(false, 64, false),
+            "a vector class says nothing a batch size does not already say"
+        );
     }
 
     #[test]
