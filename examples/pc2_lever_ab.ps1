@@ -28,6 +28,12 @@ param(
     # uniform point prices the instrument in a regime that never reads
     # what it produces.
     [int]$Irregular = 0,
+    # Burners spin and sleep in phase rather than burning throughout.
+    # A lever that weighs a batch by its on-core share reads nothing
+    # under steady contention, because a share common to every batch
+    # divides out of a weighted total over a weighted count. Alternating
+    # puts contended and quiet batches in one window.
+    [int]$DutyMs = 0,
     [double]$SettleCores = 1.4,
     [int]$SettleTries = 12,
     [string]$Tag = ''
@@ -92,7 +98,7 @@ foreach ($t in 1..$Trials) {
         "ARM $short=$arm trial=$t position=$([array]::IndexOf($order, $arm) + 1) foreign=$foreign busy_cores=$busy" |
             Add-Content -Path $log
 
-        & $exe $WindowS $Load 1 0 0 $Reps $Irregular $Entry *>&1 | Add-Content -Path $log
+        & $exe $WindowS $Load 1 0 $DutyMs $Reps $Irregular $Entry *>&1 | Add-Content -Path $log
         if ($LASTEXITCODE -ne 0) {
             "ARM_FAILED $short=$arm trial=$t exit=$LASTEXITCODE" | Add-Content -Path $log
         }
