@@ -239,9 +239,14 @@ fn read_defaulting_on(name: &str) -> bool {
 /// zero when no leaf was bracketed, so it reports whether this switch
 /// reached the dispatch under measurement rather than leaving a switch
 /// that never engaged to look like one that did not help.
+/// On unless the variable turns it off. The bracket costs nothing
+/// measurable: on a 24-thread host, three workload shapes each over
+/// forty paired trials read 1.0033, 1.0000 and 1.0019 against the same
+/// code with it off, at bounds of 0.64, 0.22 and 0.31 per cent with
+/// controls resolving to 0.19 and tighter.
 pub fn oncore_spread() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| read("FLYNNEL_LEVER_ONCORE_SPREAD"))
+    *V.get_or_init(|| read_defaulting_on("FLYNNEL_LEVER_ONCORE_SPREAD"))
 }
 
 /// Weight a leaf batch by the share of its interval the pool spent on a

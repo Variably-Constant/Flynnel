@@ -4874,13 +4874,17 @@ mod tests {
             SITE.leaf_count() > 0,
             "the indexed entry records every leaf, so the site must have counts"
         );
-        assert_eq!(
-            SITE.oncore_items(),
-            0,
-            "the indexed entry's bracket is behind `oncore_spread`, which is off in a \
-             test binary; a count here means the recorder takes it unconditionally"
+        assert!(
+            SITE.oncore_items() > 0,
+            "the indexed entry reaches the bracket, which `oncore_spread` leaves on by \
+             default; a zero here means the recorder never takes it"
         );
-        assert_eq!(SITE.per_item_oncore_cv2_per_mille(), None);
+        // That the bracket is gated by the switch rather than taken
+        // unconditionally is asserted by
+        // `one_call_in_the_stride_takes_the_bracket_and_the_rest_do_not` over
+        // `advance_bracket_tick`. The switch is a process-wide OnceLock, so a
+        // test binary sees one arm of it and cannot drive both.
+        assert!(SITE.per_item_oncore_cv2_per_mille().is_some());
     }
 
     #[test]
@@ -4922,13 +4926,12 @@ mod tests {
             SITE.leaf_count() > 0,
             "the triple entry records every leaf, so the site must have counts"
         );
-        assert_eq!(
-            SITE.oncore_items(),
-            0,
-            "the triple entry's bracket is behind `oncore_spread`, which is off in a \
-             test binary; a count here means the recorder takes it unconditionally"
+        assert!(
+            SITE.oncore_items() > 0,
+            "the triple entry reaches the bracket, which `oncore_spread` leaves on by \
+             default; a zero here means the recorder never takes it"
         );
-        assert_eq!(SITE.per_item_oncore_cv2_per_mille(), None);
+        assert!(SITE.per_item_oncore_cv2_per_mille().is_some());
     }
 
     #[test]
