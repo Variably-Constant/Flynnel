@@ -5,6 +5,41 @@ measurements from `benches/` and `tests/` on the two bench hosts, an
 RTX 3070 with a Ryzen 7 2700 (16 threads) and an RTX 5070 with a
 Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
+## Unreleased
+
+### Changed
+
+- A stored calibration is served once an independent draw has agreed
+  with it, where before it was served if the spread across its own nine
+  samples sat under `PROVISIONAL_SPREAD_PER_MILLE`. `CpuCalibration`
+  carries a `confirmations` count, raised when another draw's dispatch,
+  collapse and wake figures all land within that bound;
+  `is_trustworthy` reads the count. A record with none is stored and not
+  served, so a fresh stamp serves from its third start.
+
+  On a 12-core host with at most two other processes running, 40 draws
+  gave within-draw spreads of 273 to 7429, median 1136, and not one met
+  the bound of 250. The same draws, paired, disagreed on their dispatch
+  medians by 0 to 206, median 74. So nothing served on that host and
+  every process paid a 13.9 to 23.1 ms draw, while the figure the draws
+  agreed on went unread.
+
+  All three figures must agree because all three are served. Over 42
+  consecutive pairs there, dispatch agreed 40 times, collapse 38 and
+  wake 37; a pair agreeing on dispatch alone published a collapse of
+  29183 against a 10733 median of the same 43 draws.
+
+  `LAYOUT_VERSION` 7 to 8, which invalidates stored tables by stamp.
+
+  Against the never-slower criterion, both halves on that host: serving
+  removes the draw at start, and routing shows no difference at 1.05 per
+  cent resolution over 14 paired trials whose control resolves to 0.24.
+
+- `PublishOutcome::Published` and `KeptIncumbent` carry the agreement
+  count, and `KeptIncumbent`'s two figures are dispatch costs in
+  nanoseconds. The line reporting them named them parts per mille of
+  occupancy, which cannot exceed 1000.
+
 ## 0.6.0 - 2026-09-13
 
 ### Removed
