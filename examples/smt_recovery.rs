@@ -214,10 +214,8 @@ fn main() {
     // window exists, and the rows alone do not say which.
     let site = &SITE;
     // What every switch resolved to, beside what the run measured. Two
-    // levers ship on, so an arm that expresses "off" by leaving its
-    // variable unset gets the lever on and produces rows that read as a
-    // clean null. This line is what tells a row labelled off from an
-    // arm that was off.
+    // of them default on, so an arm that leaves its variable unset runs
+    // with the lever on whatever its label says.
     eprintln!("levers: {}", flynnel::sched::levers::describe());
     let reading = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     println!(

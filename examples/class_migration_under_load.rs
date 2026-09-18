@@ -663,9 +663,8 @@ fn main() {
     // own variance is near zero, and a run whose leaves came out at mixed
     // or few-item sizes cannot answer it however clean the class column
     // looks.
-    // Every switch's resolved state, so a row can be told from a row
-    // taken with a lever the caller believed was off. Two of them ship
-    // on, and an arm that leaves its variable unset gets the default.
+    // Every switch's resolved state. Two of them default on, so a row
+    // taken with a variable left unset carries that lever on.
     eprintln!("levers: {}", flynnel::sched::levers::describe());
     println!(
         "elapsed_s  phase   dispatches  sampled_leaves  cv2_per_mille  window_mean_ns  window_cv2  \
