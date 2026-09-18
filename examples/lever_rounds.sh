@@ -178,10 +178,15 @@ run_arm() {
     t="$7"
     pass="$8"
     echo "ARM ${lever}-${arm} load${load} p${pass} t${t} $(date -u '+%H:%M:%S')"
+    # Both arms name the value. An off arm that merely leaves the switch
+    # unset inherits whatever the crate defaults to, so a lever that
+    # later ships on turns every one of its three arms into the same arm
+    # and the rotation compares a thing with itself. oncore_spread
+    # defaults on, and the binary's own `levers:` line is what shows it.
     if [ "$arm" = on ]; then
         env "$var=1" "$bin" "$window" "$load" 1 "$smt" "$duty" "$reps" "$irregular"
     else
-        "$bin" "$window" "$load" 1 "$smt" "$duty" "$reps" "$irregular"
+        env "$var=0" "$bin" "$window" "$load" 1 "$smt" "$duty" "$reps" "$irregular"
     fi
     rc=$?
     if [ "$rc" -ne 0 ]; then
