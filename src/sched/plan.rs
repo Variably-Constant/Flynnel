@@ -1137,13 +1137,24 @@ impl JobPlan {
             // The window ages out and the lifetime figure does not, so
             // the switch chooses between a decision that can come back
             // and one that cannot.
-            let cv2 = if crate::sched::levers::smt_from_window() {
+            let from_window = crate::sched::levers::smt_from_window();
+            let cv2 = if from_window {
                 state.window_cv2_per_mille().or_else(|| state.cv2_per_mille())
             } else {
                 state.cv2_per_mille()
             };
             if let Some(cv2) = cv2 {
-                return cv2 >= threshold;
+                let decided = cv2 >= threshold;
+                // Only while the lever is on, so the shipped path pays a
+                // predictable branch and no atomic. The window figure is
+                // one classifier tick and moves between dispatches, so
+                // this decision is not constant over a run and a single
+                // reading of it describes one dispatch.
+                if from_window {
+                    SMT_WINDOW_DECISIONS[usize::from(decided)]
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                return decided;
             }
         }
         let stats = crate::sched::split_observer::snapshot_leaf_stats();
@@ -1282,6 +1293,27 @@ impl JobPlan {
         );
         self.effective_workers(running)
     }
+}
+
+/// Dispatches the window-driven SMT switch decided each way, indexed by
+/// the decision: `[0]` counts false, `[1]` counts true.
+///
+/// Counted only while the lever is on. The switch reads one classifier
+/// tick and that figure moves between dispatches, so its decision is not
+/// constant over a run and a reading taken once reports one dispatch.
+static SMT_WINDOW_DECISIONS: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// How many dispatches the window-driven SMT switch sent each way, as
+/// `(declined, allowed)`. Both zero while the lever is off, which is
+/// distinct from a lever that ran and always answered the same way.
+pub fn smt_window_decisions() -> (u64, u64) {
+    (
+        SMT_WINDOW_DECISIONS[0].load(core::sync::atomic::Ordering::Relaxed),
+        SMT_WINDOW_DECISIONS[1].load(core::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// `running` narrowed to the CPUs the process may currently use.
@@ -1691,6 +1723,20 @@ mod tests {
         assert!(HwClass::AmxFp16.is_matrix_extension());
         assert!(HwClass::TensorCoreHopper.is_matrix_extension());
         assert!(HwClass::TensorCoreBlackwell.is_matrix_extension());
+    }
+
+    #[test]
+    fn the_tally_indexes_allowed_and_declined_the_right_way_round() {
+        // The slot is chosen by usize::from(decided), so a reversed
+        // index would swap the two counts and report a lever that always
+        // allowed SMT as one that always declined it - readable as a
+        // result rather than as a defect. Compared as deltas because the
+        // counters are process-wide.
+        let before = smt_window_decisions();
+        SMT_WINDOW_DECISIONS[usize::from(true)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let after = smt_window_decisions();
+        assert_eq!(after.1, before.1 + 1, "a true decision lands in the allowed slot");
+        assert_eq!(after.0, before.0, "and leaves the declined one alone");
     }
 
     #[test]
