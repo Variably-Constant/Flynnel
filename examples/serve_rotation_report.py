@@ -43,6 +43,10 @@ ARM = re.compile(
     r"^ARM (\S+) trial=(\d+) position=(\d+) foreign=(\d+)"
     r"(?:\s+busy_cores=([\d.-]+))?"
 )
+# Busy cores on the way out of an arm, so a window is judged on the
+# worse of its two ends rather than on how the box looked when it
+# opened.
+ARM_END = re.compile(r"^ARM_END (\S+) trial=(\d+) busy_cores=([\d.-]+)")
 CONTROL = re.compile(r"^control (\d+) (\d+) (\d+) ([\d.]+)\s*$")
 THROUGHPUT = re.compile(r"^throughput (\d+) (\d+) (\d+) ([\d.]+)\s*$")
 RETAINED = re.compile(r"^retained (\d+) (\d+) ([\d.]+)")
@@ -69,7 +73,10 @@ def median(v):
 
 def parse(paths):
     arms = defaultdict(
-        lambda: {"ctl": [], "thr": [], "ret": [], "pos": [], "foreign": [], "busy": []}
+        lambda: {
+            "ctl": [], "thr": [], "ret": [], "pos": [],
+            "foreign": [], "busy": [], "busy_end": [],
+        }
     )
     by_trial = defaultdict(lambda: defaultdict(dict))
     cur = None
@@ -84,6 +91,10 @@ def parse(paths):
                     arms[m.group(1)]["foreign"].append(int(m.group(4)))
                     if m.group(5) is not None:
                         arms[m.group(1)]["busy"].append(float(m.group(5)))
+                    continue
+                m = ARM_END.match(line)
+                if m:
+                    arms[m.group(1)]["busy_end"].append(float(m.group(3)))
                     continue
                 if cur is None:
                     continue
@@ -192,6 +203,14 @@ def main(paths):
         print()
         print(f"BUSY CORES at arm start: median {cores[len(cores) // 2]:.2f}, "
               f"min {cores[0]:.2f}, max {cores[-1]:.2f} over {len(cores)} arms.")
+        ends = sorted(c for d in arms.values() for c in d["busy_end"])
+        if ends:
+            print(f"BUSY CORES at arm end:   median {ends[len(ends) // 2]:.2f}, "
+                  f"min {ends[0]:.2f}, max {ends[-1]:.2f} over {len(ends)} arms.")
+        else:
+            print("Arm ends were not sampled, so a window that began clear and")
+            print("finished in a storm is not distinguishable here from one that")
+            print("stayed clear throughout.")
     else:
         print()
         print("BUSY CORES not recorded. The process count above cannot say")
