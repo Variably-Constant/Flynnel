@@ -231,6 +231,9 @@ required-features = ["persisted-calibration"]
 name = "leaf_overhead"
 
 [[example]]
+name = "tile_crossover"
+
+[[example]]
 name = "audit_real_workloads_routing"
 
 [[example]]
