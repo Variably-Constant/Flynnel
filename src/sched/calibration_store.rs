@@ -853,16 +853,23 @@ fn two_draw_disagreement_per_mille(a: &CpuCalibration, b: &CpuCalibration) -> [u
 
 /// Agreements the record that ends up stored should carry.
 ///
-/// Medians within [`PROVISIONAL_SPREAD_PER_MILLE`] raise the count,
-/// whichever record is kept. Otherwise a dearer offer leaves the count
-/// alone, since load only adds time, and a cheaper one resets it to
-/// zero. A zeroed table is not a draw to agree with.
+/// All three figures must land within [`PROVISIONAL_SPREAD_PER_MILLE`],
+/// because all three are served. On one quiet 12-core host, 42
+/// consecutive pairs agreed on dispatch 40 times, on collapse 38 and on
+/// wake 37, so requiring the three costs few confirmations; a pair
+/// agreeing on dispatch alone published a collapse of 29183 against a
+/// 10733 median of the same 43 draws.
+///
+/// Agreement raises the count whichever record is kept. Otherwise a
+/// dearer offer leaves it alone, since load only adds time, and a
+/// cheaper one resets it. A zeroed table is not a draw to agree with.
 fn confirmations_after(incumbent: &CpuCalibration, offered: &CpuCalibration) -> u32 {
     if incumbent.samples == 0 {
         return 0;
     }
-    let agreed = two_draw_disagreement_per_mille(incumbent, offered)[0]
-        <= PROVISIONAL_SPREAD_PER_MILLE as u64;
+    let agreed = two_draw_disagreement_per_mille(incumbent, offered)
+        .iter()
+        .all(|gap| *gap <= PROVISIONAL_SPREAD_PER_MILLE as u64);
     if agreed {
         incumbent.confirmations.saturating_add(1)
     } else if incumbent.dispatch_cost_ns < offered.dispatch_cost_ns {
@@ -1636,6 +1643,17 @@ mod tests {
             confirmations_after(&held, &far),
             0,
             "a dearer draw that disagrees leaves the count where it was"
+        );
+
+        // Agreement on dispatch alone is not agreement. All three are
+        // served, so a pair that matches on the cost and parts company
+        // on a threshold derived from it confirms nothing.
+        let same_cost_far_collapse =
+            CpuCalibration::new(1_400, 29_000, 40_000, 41, 9, Some(990));
+        assert_eq!(
+            confirmations_after(&held, &same_cost_far_collapse),
+            0,
+            "dispatch within the bound does not carry a collapse outside it"
         );
 
         let cheaper_and_apart = CpuCalibration::new(200, 70_000, 40_000, 41, 9, Some(990));
