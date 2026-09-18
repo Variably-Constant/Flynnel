@@ -6,6 +6,12 @@
 # lines the paired report reads, so a lever rotation and a serve rotation
 # are read by the same tool.
 #
+# The caller states what engagement looks like, because it differs per
+# lever: one moves a counter, another flips a resolved decision, and a
+# marker belonging to one reads as a clean pass for every other. The
+# census counts the caller's own patterns and says unjudged where none
+# was given, so a rotation cannot report engagement it never looked for.
+#
 # Every process gets a FRESH calibration directory. A shared one would
 # let a record drawn under one arm serve the other, which makes the
 # thresholds a confound rather than a constant.
@@ -41,6 +47,16 @@ param(
     [int]$SmtPrior = 0,
     [double]$SettleCores = 1.4,
     [int]$SettleTries = 12,
+    # What engagement looks like for this lever, as two separate
+    # questions. Read is whether the switch reached its mechanism;
+    # Acted is whether the mechanism then changed a decision. A lever
+    # can be read and do nothing, and the two cases call for different
+    # answers, so a single count cannot stand for both.
+    #
+    # Left empty, the census reports the figure as unjudged rather than
+    # as zero: no pattern is not the same observation as no match.
+    [string]$ReadPattern = '',
+    [string]$ActedPattern = '',
     [string]$Tag = ''
 )
 
@@ -126,8 +142,19 @@ $failed = @($written | Select-String -Pattern '^ARM_FAILED ').Count
 # a failed arm is the engagement assertion firing rather than a crash.
 # Counted here so the log states it instead of leaving a reader to infer
 # it from an exit code nobody kept.
-$engaged = @($written | Select-String -Pattern 'oncore_items=[1-9]').Count
-"ROW_CENSUS arms=$arms retained=$retained failed=$failed engaged_rows=$engaged expected=$($Trials * 2)" |
+#
+# Each figure is either a count or the word unjudged. A caller that
+# names no pattern gets the word, because a zero here would claim an
+# observation that was never made.
+function Census-Rows {
+    param([string[]]$Lines, [string]$Pattern)
+    if (-not $Pattern) { return 'unjudged' }
+    @($Lines | Select-String -Pattern $Pattern).Count
+}
+
+$read = Census-Rows -Lines $written -Pattern $ReadPattern
+$acted = Census-Rows -Lines $written -Pattern $ActedPattern
+"ROW_CENSUS arms=$arms retained=$retained failed=$failed read_rows=$read acted_rows=$acted expected=$($Trials * 2)" |
     Add-Content -Path $log
 "LEVER_DONE $(Get-Date -Format o)" | Add-Content -Path $log
 Exit-TimingRun -Log $log
@@ -140,5 +167,18 @@ if ($failed -gt 0) {
     "ARMS_REFUSED $failed of $arms; a lever that did not engage cannot be compared" |
         Add-Content -Path $log
     exit 5
+}
+
+# Only the on arm carries the read marker, so a healthy rotation matches
+# about half its rows. Zero means the switch never reached its
+# mechanism, which makes both arms the same arm and any comparison
+# between them a statement about nothing.
+#
+# A lever that is read and changes no decision is not an error; that is
+# a result, and the acted figure carries it.
+if ($ReadPattern -and $read -eq 0) {
+    "LEVER_NEVER_READ no row matched $ReadPattern across $arms arms" |
+        Add-Content -Path $log
+    exit 4
 }
 exit 0
