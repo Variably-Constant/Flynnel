@@ -158,11 +158,19 @@ def report(per, under_test, reference, max_busy=None):
     print(f"{under_test} against {reference}, per trial. Above 1.000 means "
           f"{under_test} was faster.")
     if max_busy is not None:
+        def quiet(arm):
+            # Both samplers answer -1 when their own reading failed, and
+            # a missing figure is no reading at all. Neither is a quiet
+            # box, and a bare `<= max_busy` admits the first as the
+            # quietest one possible.
+            b = arm.get("busy")
+            return b is not None and 0.0 <= b <= max_busy
+
         kept = {t: a for t, a in per.items()
-                if all(a.get(n, {}).get("busy", 1e9) <= max_busy
-                       for n in (under_test, reference))}
+                if all(quiet(a.get(n, {})) for n in (under_test, reference))}
         print(f"Trials where either arm reached {max_busy} busy cores at either "
-              f"end are dropped: {len(per) - len(kept)} of {len(per)} gone.")
+              f"end, or failed to sample, are dropped: "
+              f"{len(per) - len(kept)} of {len(per)} gone.")
         print("A window is judged on the worse of its two ends. A quiet gate is")
         print("checked once at entry and says nothing about the rest of a run, so")
         print("a trial can begin clear and be measured through a storm; a log")
