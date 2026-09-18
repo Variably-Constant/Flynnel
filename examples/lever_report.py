@@ -52,6 +52,11 @@ MEASURES = (
     "cv2_window_min",
     "cv2_window_max",
     "window_ticks",
+    # How the window-driven smt switch decided, per dispatch. Both zero
+    # is a lever that never ran; a single smt=true or smt=false is one
+    # dispatch's answer and the window it reads moves between them.
+    "smt_declined",
+    "smt_allowed",
     # Decisions the adaptive spin controller reached. Zero with
     # spin_adaptive true means it never gathered the evidence, which
     # spin_window alone cannot say because a rescue-dominated window

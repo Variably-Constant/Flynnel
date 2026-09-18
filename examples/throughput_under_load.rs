@@ -354,7 +354,7 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
          leaves={} oncore_items={} per_item_ns={} cv2_wall={} \
          cv2_oncore={} cv2_window={} cv2_window_min={} cv2_window_max={} \
          window_ticks={} class={:?} workers={} allowed={} smt={} \
-         smt_decisions={:?} \
+         smt_declined={} smt_allowed={} \
          spin_adaptive={} spin_window={} spin_adapts={} idle_yields={}",
         site.leaf_count(),
         site.oncore_items(),
@@ -369,7 +369,8 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
         plan.resolved_workers(),
         flynnel::sched::host_width::allowed_parallelism(),
         plan.effective_use_smt(),
-        flynnel::sched::plan::smt_window_decisions(),
+        flynnel::sched::plan::smt_window_decisions().0,
+        flynnel::sched::plan::smt_window_decisions().1,
         flynnel::sched::spin_adaptive(),
         flynnel::sched::spin_window(),
         flynnel::sched::spin_adapt_decisions(),
