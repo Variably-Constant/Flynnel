@@ -9,9 +9,9 @@
 # and awaitquiet's -SelfRoot cannot subtract it: that walks DOWN from
 # the caller and sshd is the caller's ANCESTOR.
 #
-# Start-Process detaches the work. The launching command exits, the
-# connection closes, sshd goes idle, and the harness measures a box that
-# no longer carries its own transport.
+# Creating the process through WMI detaches it. The launching command
+# exits, the connection closes, sshd goes idle, and the harness measures
+# a box that no longer carries its own transport.
 #
 # Prints the detached pid so a caller can follow the run by its process
 # and by the log the harness writes, since nothing is streamed back.

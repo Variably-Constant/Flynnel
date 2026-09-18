@@ -288,13 +288,9 @@ static RESCUE_EVENTS: AtomicU32 = AtomicU32::new(0);
 /// Total idle `yield_now` rounds, exposed for observability. This is
 /// the quantity a flamegraph attributes to `sched_yield`.
 static TOTAL_YIELDS: AtomicU64 = AtomicU64::new(0);
-/// Times [`maybe_adapt`] carried enough evidence to reach its
-/// comparison, counted after the event gate and before the decision.
-///
-/// The window alone cannot report this. A rescue-dominated workload
-/// grows the window and is clamped to the default it started at, so a
-/// controller that ran every time and one that never reached the gate
-/// both leave it reading 500. This separates them.
+/// Times [`maybe_adapt`] passed its event gate and reached a decision.
+/// Counted because the window alone cannot report it: a rescue-dominated
+/// workload grows and is clamped to the default it started at.
 static ADAPT_DECISIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the env once: a fixed `FLYNNEL_SPIN_WINDOW_ROUNDS` pins the
@@ -369,12 +365,10 @@ pub fn total_idle_yields() -> u64 {
     TOTAL_YIELDS.load(Ordering::Relaxed)
 }
 
-/// Times the adaptive controller reached a decision, so a run can say
-/// whether the mechanism ran as well as whether it was switched on.
-/// Zero with [`set_spin_adaptive`] on means the workload never parked
-/// often enough to gather the evidence, which is a different
-/// observation from a controller that ran and left the window where it
-/// found it.
+/// Times the adaptive controller reached a decision. Zero while
+/// [`spin_adaptive`] is true means the workload never parked often
+/// enough to gather the evidence; that is distinct from a controller
+/// that decided and left [`spin_window`] where it found it.
 pub fn spin_adapt_decisions() -> u64 {
     ADAPT_DECISIONS.load(Ordering::Relaxed)
 }
@@ -801,14 +795,9 @@ mod tests {
 
     #[test]
     fn a_held_window_tells_a_controller_that_ran_from_one_that_never_reached_the_gate() {
-        // Both leave the window at the tuned default, so the window
-        // alone cannot say which happened: a rescue-dominated workload
-        // grows and is clamped back to where it started. The decision
-        // count is what separates them, and a run that reads only the
-        // window reports a mechanism it never observed.
-        //
-        // Read as deltas, since the counter is process-wide and other
-        // tests reach the same controller.
+        // Both leave the window at the tuned default, so only the
+        // decision count separates them. Read as deltas: the counter is
+        // process-wide and other tests reach the same controller.
         arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
         let before = spin_adapt_decisions();
         PARK_EVENTS.store(200, Ordering::Relaxed);
