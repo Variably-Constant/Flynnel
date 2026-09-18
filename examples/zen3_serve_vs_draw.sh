@@ -98,7 +98,13 @@ for t in $(seq 1 "$TRIALS"); do
             export FLYNNEL_CALIBRATION_DIR="$fresh"
         fi
         busy=$(settle)
-        foreign=$(pgrep -c -x 'cargo|rustc|cc|ld' 2>/dev/null || echo 0)
+        # Counted by wc rather than pgrep -c, which prints its count and
+        # also exits non-zero when nothing matches, so `|| echo 0`
+        # appends a second count and embeds a newline. That split the ARM
+        # line, put the entry busy figure on a line nothing parses, and
+        # left the filter judging on the exit figure alone while
+        # reporting a dropped count as though it had both.
+        foreign=$(pgrep -x 'cargo|rustc|cc|ld' 2>/dev/null | wc -l)
         echo "ARM $arm trial=$t position=$pos foreign=$foreign busy_cores=$busy" >> "$LOG"
         "$EXE" "$WINDOW_S" "$LOAD" 1 0 0 "$REPS" 0 indexed >> "$LOG" 2>&1
         sleep 0.6
