@@ -80,6 +80,18 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- `CallSiteState::window_cv2_range_per_mille()` reports the smallest and
+  largest per-window cv^2 across every classifier tick.
+  `window_cv2_per_mille` holds the latest tick of what is often
+  thousands, and on a 16-core Linux guest five identical runs of the same
+  harness cell read 1, 0, 527, 209 and 217 per mille, spanning both the
+  uniform edge at 50 and the high-variance edge at 500. So one reading
+  cannot say which regimes a run passed through, and a maximum below the
+  uniform edge is what says a spread-driven mechanism was never consulted
+  in its own regime. `examples/throughput_under_load` prints it as
+  `cv2_window_range`, and takes the mode-2 block size as a ninth argument
+  because the block that clears the edge differs by host.
+
 - `spin_adapt_decisions()` reports how many times the adaptive spin
   controller passed its 256-event gate and reached a decision. The
   window alone cannot answer whether the controller ran: a
