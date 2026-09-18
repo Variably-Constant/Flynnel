@@ -1194,9 +1194,9 @@ fn stored_or_measured() -> HostDispatchProfile {
             } = outcome
             {
                 eprintln!(
-                    "flynnel: this host's stored calibration was drawn at {incumbent} per \
-                     mille occupancy and this one at {offered}; the stored record stands \
-                     and this process uses what it measured"
+                    "flynnel: this host's stored calibration dispatches in {incumbent} ns \
+                     and this one in {offered}; the cheaper record stands and this process \
+                     uses what it measured"
                 );
             }
         }
