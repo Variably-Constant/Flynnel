@@ -9,6 +9,15 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- `examples/zen3_lever_ab.sh` runs on FreeBSD as well as Linux. It takes
+  busy cores from `kern.cp_time` where `/proc/stat` is absent, the core
+  count from `hw.ncpu` where `nproc` is, and it strips the padding
+  FreeBSD's `wc` puts around a count - which had made every arm line
+  unparseable, so a 40-trial rotation reported forty trials and no pairs
+  rather than failing. It also takes the SMT prior as an argument,
+  without which `effective_use_smt` returns on its first line and the
+  window lever's two arms are the same arm.
+
 - `examples/zen3_lever_ab.sh` runs a lever A/B paired by trial on Linux,
   and `examples/paired_arms_report.py` takes an optional field to split
   its pairs on. The three-arm rotation compares arms that ran at
