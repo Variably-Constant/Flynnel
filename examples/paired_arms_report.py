@@ -12,6 +12,20 @@ one means the arm under test was FASTER.
 Prints how large an effect this many trials could have resolved, so a
 null reads as a bound rather than as an absence. A run that cannot see
 a ten per cent regression must not be quoted as evidence there is none.
+
+The arm-state block answers a separate question: whether each arm ran
+the switch its label claims. `paired_armstate_defect_sample.log` beside
+this file carries an off arm that left the switch unset and so ran it
+on, and is what the refusal is checked against:
+
+    python paired_arms_report.py paired_armstate_defect_sample.log \
+        oncore_spread=1 oncore_spread=0 1.4
+
+An arm that pins a state rather than flipping a switch names a width
+the `levers:` line does not carry, so its label cannot be checked
+there. That is reported as unverified rather than failed: the pin shows
+up in the decisions section instead, and refusing the table on it would
+discard a sound run.
 """
 
 import re
@@ -124,9 +138,11 @@ def report_arm_states(per, arms):
     """
     print()
     wrong = 0
+    unchecked = 0
     for name in arms:
         if "=" not in name:
             print(f"  {name:<28} label names no value; cannot be checked")
+            unchecked += 1
             continue
         lever, want = name.split("=", 1)
         want = "true" if want.strip() == "1" else "false"
@@ -134,8 +150,8 @@ def report_arm_states(per, arms):
                        for a in per.values()
                        if name in a and lever in a.get(name, {}).get("levers", {})})
         if not seen:
-            print(f"  {name:<28} no levers line reports {lever}; what ran is unrecorded")
-            wrong += 1
+            print(f"  {name:<28} no levers line reports {lever}; not checkable here")
+            unchecked += 1
         elif seen != [want]:
             print(f"  {name:<28} {lever}={seen}, and this arm means {want}")
             wrong += 1
@@ -144,6 +160,16 @@ def report_arm_states(per, arms):
     if wrong:
         print(f"{wrong} arm(s) did not run the switch their label claims. Their "
               "pairs compare something with itself; do not read the table below.")
+    if unchecked:
+        # An arm that pins a state rather than flipping a switch names a
+        # width, not a lever, and the `levers:` line has no such field.
+        # That is unverifiable HERE, which is not the same as wrong:
+        # refusing the table on it discards a sound run. The section
+        # below reads the state the arms actually ran, so the check moves
+        # there rather than being skipped.
+        print(f"{unchecked} arm label(s) name nothing the levers line reports. "
+              "That is unverified, not failed: confirm the arms differ from "
+              "the decisions section below before reading the table.")
 
 
 def report_engagement(per, under_test, reference):
