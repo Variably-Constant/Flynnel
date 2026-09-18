@@ -26,6 +26,11 @@ ARM = re.compile(
     r"^ARM (\S+) trial=(\d+) position=(\d+) foreign=(\d+)"
     r"(?:\s+busy_cores=([\d.-]+))?"
 )
+# Busy cores on the way out of an arm. Kept beside the entry figure
+# rather than replacing it: a window is judged on the worse of its two
+# ends, since a trial that began clear and finished in a storm was
+# measured through the storm.
+ARM_END = re.compile(r"^ARM_END (\S+) trial=(\d+) busy_cores=([\d.-]+)")
 ROWS = {
     "ctl": re.compile(r"^control (\d+) (\d+) (\d+) ([\d.]+)\s*$"),
     "thr": re.compile(r"^throughput (\d+) (\d+) (\d+) ([\d.]+)\s*$"),
@@ -55,6 +60,11 @@ def parse(path):
                         m.group(5)
                     )
                 continue
+            m = ARM_END.match(line)
+            if m:
+                slot = per[int(m.group(2))].setdefault(m.group(1), {})
+                slot["busy"] = max(slot.get("busy", 0.0), float(m.group(3)))
+                continue
             if cur is None:
                 continue
             arm, trial = cur
@@ -76,13 +86,13 @@ def report(per, under_test, reference, max_busy=None):
         kept = {t: a for t, a in per.items()
                 if all(a.get(n, {}).get("busy", 1e9) <= max_busy
                        for n in (under_test, reference))}
-        print(f"Trials where either arm started above {max_busy} busy cores are "
-              f"dropped: {len(per) - len(kept)} of {len(per)} gone.")
-        print("A quiet gate is checked at entry and says nothing about the rest")
-        print("of the run, so a trial can begin clear and be measured through a")
-        print("storm. This is the same voiding a neighbour's bench does on its")
-        print("own regions, applied here after the fact because the harness")
-        print("records the figure per arm but does not yet act on it.")
+        print(f"Trials where either arm reached {max_busy} busy cores at either "
+              f"end are dropped: {len(per) - len(kept)} of {len(per)} gone.")
+        print("A window is judged on the worse of its two ends. A quiet gate is")
+        print("checked once at entry and says nothing about the rest of a run, so")
+        print("a trial can begin clear and be measured through a storm; a log")
+        print("without ARM_END rows is judged on its entry figure alone and")
+        print("cannot see that case.")
         per = kept
     print()
     print(f"{'metric':<10} {'pairs':>5} {'median':>8} {'min':>8} {'max':>8} "
