@@ -76,7 +76,7 @@
 //!
 //! ```sh
 //! throughput_under_load <window_s> <load_threads> <trials> [smt_prior] \
-//!     [duty_ms] [reps] [irregular] [entry]
+//!     [duty_ms] [reps] [irregular] [entry] [block_items]
 //! ```
 
 use std::env;
@@ -157,11 +157,13 @@ struct Item {
 /// measured cv2_window 3 at a 2048-item block, against a wall cv^2 of
 /// 351. The block has to sit between the two.
 #[inline]
-fn reps_at(index: usize, reps: u32, irregular: u8) -> u32 {
+fn reps_at(index: usize, reps: u32, irregular: u8, block_items: usize) -> u32 {
     if irregular == 0 || reps < 2 {
         return reps;
     }
-    let key = if irregular >= 2 { index / BLOCK_ITEMS } else { index };
+    // Floored at one, so a block size of zero groups nothing rather
+    // than dividing by it.
+    let key = if irregular >= 2 { index / block_items.max(1) } else { index };
     let h = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     // Saturating, so a reps above half of u32 yields a narrower span
     // rather than wrapping to a small one in release.
@@ -169,17 +171,18 @@ fn reps_at(index: usize, reps: u32, irregular: u8) -> u32 {
     1 + (h >> 33) as u32 % span
 }
 
-/// Items sharing one draw in mode 2.
+/// Default items sharing one draw in mode 2, overridable as the ninth
+/// argument.
 ///
-/// Measured on a 24-thread host at reps 8192, mode 2, reading
-/// cv2_window off the engagement line:
+/// The figure that clears the classifier's uniform edge is a property
+/// of the host, because the block only matters relative to a leaf and
+/// leaf size differs between hosts. On a 24-thread Windows host at reps
+/// 8192, reading cv2_window off the engagement line: 256 items gives
+/// 40, 512 gives 51, 2048 gives 3. On a 16-thread Linux guest 512 gives
+/// 17, and the edge is 50 on both.
 ///
-/// - 256 items: 40, under the 50 the classifier calls uniform
-/// - 512 items: 51, and the class moves to MemoryBound
-/// - 2048 items: 3, the window holding one block and seeing it flat
-///
-/// So 512 is the only one of the three that puts a cell in the regime
-/// where a spread-driven mechanism is consulted at all.
+/// So this default is one host's answer and a run on another host
+/// sweeps the argument rather than trusting it.
 const BLOCK_ITEMS: usize = 512;
 
 /// Which dispatch entry a run measures.
@@ -342,13 +345,14 @@ fn reading(value: Option<u64>) -> String {
 /// Read against the same line from the arm the switch was off in. Two
 /// arms whose engagement figures match ran the same code whatever the
 /// throughput rows did.
-fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8) {
+fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_items: usize) {
     let plan = plan(smt_prior);
     let site = &SITE;
     println!(
         "engagement duty_ms={duty_ms} reps={reps} irregular={irregular} \
+         block_items={block_items} \
          leaves={} oncore_items={} per_item_ns={} cv2_wall={} \
-         cv2_oncore={} cv2_window={} window_ticks={} class={:?} workers={} allowed={} smt={} \
+         cv2_oncore={} cv2_window={} cv2_window_range={} window_ticks={} class={:?} workers={} allowed={} smt={} \
          spin_adaptive={} spin_window={} spin_adapts={} idle_yields={}",
         site.leaf_count(),
         site.oncore_items(),
@@ -356,6 +360,8 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8) {
         reading(site.per_item_cv2_per_mille()),
         reading(site.per_item_oncore_cv2_per_mille()),
         reading(site.window_cv2_per_mille()),
+        site.window_cv2_range_per_mille()
+            .map_or_else(|| "-".to_string(), |(lo, hi)| format!("{lo}..{hi}")),
         site.window_ticks(),
         site.learned_class(),
         plan.resolved_workers(),
@@ -377,6 +383,7 @@ fn main() {
     let reps: u32 = arg(6, 16);
     let irregular: u8 = arg::<u8>(7, 0);
     let entry_name: String = arg(8, "plain".to_string());
+    let block_items: usize = arg(9, BLOCK_ITEMS);
     let Some(entry) = Entry::parse(&entry_name) else {
         eprintln!("entry must be plain, indexed or triple, and was {entry_name:?}");
         std::process::exit(2);
@@ -417,7 +424,7 @@ fn main() {
     // The per-item cost is fixed here, once, so every dispatch of every
     // arm runs the same work whatever order the buffer reaches.
     let mut buf: Vec<Item> = (0..ITEMS)
-        .map(|i| Item { reps: reps_at(i, reps, irregular), acc: i as u64 })
+        .map(|i| Item { reps: reps_at(i, reps, irregular, block_items), acc: i as u64 })
         .collect();
     // The triple entry needs somewhere to write. Allocated for every
     // entry so the process's memory is the same whichever one runs, and
@@ -503,7 +510,7 @@ fn main() {
         );
     }
 
-    engagement(smt_prior, duty_ms, reps, irregular);
+    engagement(smt_prior, duty_ms, reps, irregular, block_items);
 
     // The on-core switch is read inside record_leaf_sampled, and only
     // the plain steal-driven bisect calls that. A dispatch entry that

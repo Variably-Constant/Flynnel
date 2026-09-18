@@ -270,6 +270,13 @@ pub struct CallSiteState {
     window_mean_ns: AtomicU64,
     window_cv2: AtomicU64,
     window_ticks: AtomicU64,
+    // Extremes of the per-window cv^2 across every tick, so a reader
+    // gets the range the classifier acted over rather than whichever
+    // tick happened to be last. A single tick's figure spans 0 to 527
+    // across identical runs, so one reading of it cannot say which
+    // regime a run was in.
+    window_cv2_min: AtomicU64,
+    window_cv2_max: AtomicU64,
     // Execution-policy A/B arms: per-arm EWMA wall time + sample
     // counts + a call counter driving the trial cadence.
     arm_ewma_ns: [AtomicU64; 2],
@@ -395,6 +402,8 @@ impl CallSiteState {
             window_mean_ns: AtomicU64::new(0),
             window_cv2: AtomicU64::new(0),
             window_ticks: AtomicU64::new(0),
+            window_cv2_min: AtomicU64::new(u64::MAX),
+            window_cv2_max: AtomicU64::new(0),
             arm_ewma_ns: [const { AtomicU64::new(0) }; 2],
             arm_samples: [const { AtomicU32::new(0) }; 2],
             arm_calls: AtomicU32::new(0),
@@ -839,6 +848,27 @@ impl CallSiteState {
         self.window_ticks.load(Ordering::Relaxed)
     }
 
+    /// Smallest and largest per-window cv^2 the classifier has seen,
+    /// over every tick rather than the latest one.
+    ///
+    /// [`Self::window_cv2_per_mille`] reports one tick of what is often
+    /// thousands, and that figure spans 0 to 527 across identical runs,
+    /// so it cannot say which regimes a run passed through. The range
+    /// can: a maximum below the uniform edge says a spread-driven
+    /// mechanism was never consulted in its own regime, whatever the
+    /// last tick happened to hold. `None` until a tick has classified a
+    /// window.
+    pub fn window_cv2_range_per_mille(&self) -> Option<(u64, u64)> {
+        if self.window_ticks.load(Ordering::Relaxed) == 0 {
+            None
+        } else {
+            Some((
+                self.window_cv2_min.load(Ordering::Relaxed),
+                self.window_cv2_max.load(Ordering::Relaxed),
+            ))
+        }
+    }
+
     /// One classifier tick over the delta window since the previous
     /// tick. Same algorithm as the process-global
     /// `tick_auto_classify`: hysteresis [`SITE_MIGRATION_HYSTERESIS`]
@@ -937,6 +967,8 @@ impl CallSiteState {
         self.window_mean_ns.store(mean_ns, Ordering::Relaxed);
         self.window_cv2.store(cv2, Ordering::Relaxed);
         self.window_ticks.fetch_add(1, Ordering::Relaxed);
+        self.window_cv2_min.fetch_min(cv2, Ordering::Relaxed);
+        self.window_cv2_max.fetch_max(cv2, Ordering::Relaxed);
         let observed = classify_observed(mean_ns, cv2);
         let observed_tag = class_tag_encode(observed);
 
@@ -1434,6 +1466,50 @@ mod tests {
         assert_eq!(batch_weight_per_mille(0, 0), None);
         assert_eq!(batch_weight_per_mille(5_000, 0), None);
         assert_eq!(batch_weight_per_mille(0, 8_000), Some(0));
+    }
+
+    #[test]
+    fn the_range_keeps_a_tick_the_latest_reading_has_already_lost() {
+        // Two windows of different spread, in order. window_cv2 holds
+        // the second and nothing recoverable from it says the first
+        // happened, which is how a run through a high-variance regime
+        // reports as uniform. The range holds both.
+        static S: CallSiteState = CallSiteState::new();
+        const ITEMS: u64 = 1024;
+        let sq = |ns: u64| (ns >> 8).saturating_mul(ns >> 8);
+        let per_item_sq =
+            |ns: u64| ((ns as u128).saturating_mul(ns as u128) / ((ITEMS as u128) << 16)) as u64;
+
+        // Spread: half the leaves at 1280 ns an item, half at 1920.
+        let (fast, slow) = (1280u64 * ITEMS, 1920u64 * ITEMS);
+        S.record_batch_site_only(
+            8 * fast + 8 * slow,
+            8 * sq(fast) + 8 * sq(slow),
+            16,
+            16 * ITEMS,
+            8 * per_item_sq(fast) + 8 * per_item_sq(slow),
+        );
+        let spread_tick = S.window_cv2_per_mille().expect("a window was classified");
+        assert!(spread_tick > 0, "the first window carries a spread");
+
+        // Flat: every leaf the same, so this window's cv^2 is zero.
+        let flat = 1600u64 * ITEMS;
+        S.record_batch_site_only(
+            16 * flat,
+            16 * sq(flat),
+            16,
+            16 * ITEMS,
+            16 * per_item_sq(flat),
+        );
+        assert_eq!(
+            S.window_cv2_per_mille(),
+            Some(0),
+            "the latest reading is the flat window and says nothing of the first"
+        );
+
+        let (lo, hi) = S.window_cv2_range_per_mille().expect("two windows were classified");
+        assert_eq!(lo, 0, "the flat window is the smallest seen");
+        assert_eq!(hi, spread_tick, "and the spread one survives in the range");
     }
 
     #[test]
