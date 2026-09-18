@@ -110,6 +110,14 @@ rayon = "1.12"
 # 2026-06-03: 0.8.2 latest.
 criterion = { version = "0.8.2", features = ["html_reports"] }
 
+# Sets the process affinity mask in tests/affinity_follows_process_mask.rs.
+# Linux takes sched_setaffinity and FreeBSD cpuset_setaffinity, which
+# differ in name, arguments and set type, so the binding crate carries
+# both. Windows needs no dependency: that arm declares the two kernel32
+# symbols it calls.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [features]
 # EVERYTHING ON BY DEFAULT (owner directive, 2026-08-04). A release
 # build ships the whole substrate - the CUDA backend and the GPU-peer
