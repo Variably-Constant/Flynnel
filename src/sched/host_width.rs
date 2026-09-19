@@ -116,11 +116,14 @@ fn process_width() -> std::io::Result<std::num::NonZeroUsize> {
 
 #[cfg(windows)]
 fn process_width() -> std::io::Result<std::num::NonZeroUsize> {
+    // The handle is `*mut c_void` to match the crate's other kernel32
+    // declarations of `GetCurrentProcess`; two declarations of one
+    // symbol with different signatures are a clashing-extern error.
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn GetCurrentProcess() -> isize;
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
         fn GetProcessAffinityMask(
-            process: isize,
+            process: *mut core::ffi::c_void,
             process_mask: *mut usize,
             system_mask: *mut usize,
         ) -> i32;
