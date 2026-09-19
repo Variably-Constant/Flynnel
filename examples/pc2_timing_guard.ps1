@@ -32,7 +32,19 @@ function Get-BusyCores {
     $dt = $b.Timestamp_Sys100NS - $a.Timestamp_Sys100NS
     if ($dt -le 0) { return -1 }
     $idle = ($b.PercentIdleTime - $a.PercentIdleTime) / $dt
-    [Math]::Round([int]$env:NUMBER_OF_PROCESSORS * (1 - $idle), 2)
+    # The idle fraction exceeds one by a sliver when the two samples
+    # straddle a counter update, and the busier the box the less room
+    # there is for that to happen - so a quiet box is where it shows.
+    # Busy cores cannot be negative. Floored at zero rather than
+    # returned negative, because a reader treating a negative as a
+    # failed sample discards the quietest trials it has: 28 of 136
+    # readings on one 40-trial rotation came back between -0.24 and
+    # -0.40 while only 7 were genuinely above the gate.
+    #
+    # -1 stays the failed read, returned above when the interval carried
+    # no ticks at all.
+    $busy = [int]$env:NUMBER_OF_PROCESSORS * (1 - $idle)
+    [Math]::Round([Math]::Max(0, $busy), 2)
 }
 
 function Enter-TimingRun {

@@ -59,7 +59,15 @@ function Get-BusyCores {
     if ($dt -le 0) { return -1 }
     $idle = ($b.PercentIdleTime - $a.PercentIdleTime) / $dt
     $cores = [int]$env:NUMBER_OF_PROCESSORS
-    [Math]::Round($cores * (1 - $idle), 2)
+    # Floored at zero: the idle fraction exceeds one by a sliver when the
+    # samples straddle a counter update, and a negative busy count is
+    # read as a failed sample by every reader here, which discards the
+    # quietest trials. -1 stays the failed read.
+    #
+    # The same function lives in pc2_timing_guard.ps1, which says it is
+    # there so every harness reports one quantity. Two copies is one
+    # more than that.
+    [Math]::Round([Math]::Max(0, $cores * (1 - $idle)), 2)
 }
 
 $log = if ($Tag) { "C:\Temp\serve_vs_draw_${Sha}_$Tag.log" } else { "C:\Temp\serve_vs_draw_$Sha.log" }
