@@ -154,21 +154,24 @@ def report_arm_states(per, arms):
             continue
         field, raw = name.split("=", 1)
         raw = raw.strip()
-        want = "true" if raw == "1" else "false"
         where = "levers"
         seen = sorted({a[name]["levers"][field]
                        for a in per.values()
                        if field in a.get(name, {}).get("levers", {})})
         if not seen:
-            # A pinned-state arm names a width rather than a switch. The
-            # levers line carries booleans only, so the value is read
-            # from the engagement line under the same name and compared
-            # literally.
+            # A pinned-state arm may name something the levers line does
+            # not carry; the engagement line reports it under the same
+            # name.
             seen = sorted({a[name]["engage"][field]
                            for a in per.values()
                            if field in a.get(name, {}).get("engage", {})})
-            want = raw
             where = "engagement"
+        # An arm label writes a switch as 1 or 0 and a width as itself,
+        # and both lines now carry both kinds - spin_window reads 500 on
+        # the levers line beside booleans. What the field holds decides
+        # how to read the label, not which line it came from.
+        boolean = bool(seen) and set(seen) <= {"true", "false"}
+        want = ("true" if raw == "1" else "false") if boolean else raw
         if not seen:
             print(f"  {name:<28} neither line reports {field}; not checkable here")
             unchecked += 1
