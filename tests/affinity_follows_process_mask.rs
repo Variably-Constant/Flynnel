@@ -23,6 +23,64 @@ static SITE: CallSiteState = CallSiteState::new();
 /// CPUs the mask is narrowed to.
 const NARROW_TO: usize = 2;
 
+/// CPUs in the process mask as the platform reports it back, or `None`
+/// where the read failed or is not implemented.
+///
+/// Read after narrowing so a failure says which half broke: a mask that
+/// did not take, or a mask that took and a width that did not follow.
+/// Without it both arrive as the same assertion.
+#[cfg(target_os = "linux")]
+fn mask_cpu_count() -> Option<usize> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return None;
+        }
+        Some(
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+                .count(),
+        )
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn mask_cpu_count() -> Option<usize> {
+    unsafe {
+        let mut set: libc::cpuset_t = std::mem::zeroed();
+        if libc::cpuset_getaffinity(
+            libc::CPU_LEVEL_WHICH,
+            libc::CPU_WHICH_PID,
+            -1,
+            size_of::<libc::cpuset_t>(),
+            &mut set,
+        ) != 0
+        {
+            return None;
+        }
+        Some(
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+                .count(),
+        )
+    }
+}
+
+#[cfg(windows)]
+fn mask_cpu_count() -> Option<usize> {
+    let mut process_mask: usize = 0;
+    let mut system_mask: usize = 0;
+    let ok = unsafe {
+        GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask)
+    };
+    (ok != 0).then(|| process_mask.count_ones() as usize)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", windows)))]
+fn mask_cpu_count() -> Option<usize> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn set_affinity(cpus: &[usize]) -> bool {
     unsafe {
@@ -59,6 +117,11 @@ fn set_affinity(cpus: &[usize]) -> bool {
 unsafe extern "system" {
     fn GetCurrentProcess() -> isize;
     fn SetProcessAffinityMask(process: isize, mask: usize) -> i32;
+    fn GetProcessAffinityMask(
+        process: isize,
+        process_mask: *mut usize,
+        system_mask: *mut usize,
+    ) -> i32;
 }
 
 #[cfg(windows)]
@@ -117,6 +180,7 @@ fn the_plan_follows_a_narrowed_process_mask() {
         set_affinity(&narrow),
         "could not narrow the process affinity mask on this platform"
     );
+    let mask_narrowed = mask_cpu_count();
     let width_narrowed = width_settling_to(NARROW_TO);
     let workers_narrowed = plan.resolved_workers();
 
@@ -125,9 +189,20 @@ fn the_plan_follows_a_narrowed_process_mask() {
     let restored = set_affinity(&all);
     let width_widened = width_settling_to(full);
 
+    // The mask first: a width that did not follow a mask that never took
+    // is a different defect from one that ignored a mask that did.
+    assert_eq!(
+        mask_narrowed,
+        Some(NARROW_TO),
+        "the platform accepted the narrowing call and then reported \
+         {mask_narrowed:?} cpus in the mask, so the mask itself did not take"
+    );
     assert_eq!(
         width_narrowed, NARROW_TO,
-        "allowed_parallelism read {width_narrowed} under a {NARROW_TO}-cpu mask"
+        "the process mask holds {NARROW_TO} cpus and allowed_parallelism \
+         read {width_narrowed}, so available_parallelism does not honour \
+         the process affinity mask on this platform and the lever cannot \
+         see a narrowing here"
     );
     assert!(
         workers_narrowed <= NARROW_TO,
