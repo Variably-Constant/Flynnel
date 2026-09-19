@@ -206,8 +206,25 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
   `libc` joins the dev-dependencies for the Linux and FreeBSD arms,
   whose affinity calls differ in name, arguments and set type. The
-  Windows arm declares the two kernel32 symbols it calls, so no binding
+  Windows arm declares the kernel32 symbols it calls, so no binding
   crate is added for it.
+
+  Running it established that `FLYNNEL_LEVER_ALLOWED_WIDTH` caps by the
+  affinity mask on Linux and FreeBSD and by nothing on Windows. The
+  Linux and FreeBSD arms pass; the Windows arm narrowed the process mask
+  to two CPUs on a 24-thread host and `allowed_parallelism` still read
+  24. `std::thread::available_parallelism` documents the reason - it
+  "may overcount the amount of parallelism available on systems limited
+  by process-wide affinity masks, or job object limitations" - so
+  `sched::host_width` reports the machine there rather than the share of
+  it this process may use. Both the module and the architecture page
+  said it honoured the mask without naming a platform, and now name one.
+
+  The test reads the mask back through `sched_getaffinity`,
+  `cpuset_getaffinity` or `GetProcessAffinityMask` and asserts on that
+  before the width, so a mask that never took and a mask the platform
+  ignored fail with different messages. Without that the two arrive as
+  the same assertion, which is how the Windows result read at first.
 
 ## 0.6.0 - 2026-09-13
 
