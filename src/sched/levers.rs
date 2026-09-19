@@ -254,6 +254,18 @@ fn read_defaulting_on(name: &str) -> bool {
 /// arm without the lever and millions on the arm with it - and on the
 /// bare-metal run no class moves, so 1.90 per cent is what the
 /// instrumentation costs when nothing downstream changes.
+///
+/// A correctness lever, judged on the class it produces rather than on
+/// throughput. On-core timing is the thread clock and excludes
+/// descheduled time, so what it changes in the classifier's input is
+/// the descheduling there is: the learned class differs between the
+/// arms in 29 trials of 40 on a Linux guest, 6 of 40 on a FreeBSD
+/// guest, and 1 of 40 on bare metal. A host that does not deschedule
+/// has nothing here to correct.
+///
+/// Its price on a guest, at an 8 second window over 40 trials: 0.9814
+/// at a 2.52 per cent bound where the class moves, 0.9872 at 4.34 where
+/// it holds. About the same either way.
 pub fn oncore_spread() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| read_defaulting_on("FLYNNEL_LEVER_ONCORE_SPREAD"))

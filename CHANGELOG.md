@@ -9,6 +9,33 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- `FLYNNEL_LEVER_ONCORE_SPREAD` is documented as a correctness lever and
+  carries its measured price. It swaps the classifier's input from wall
+  time to the thread clock, which excludes descheduled time, so what it
+  changes is proportional to how much descheduling a host does: the
+  learned class differs between its two arms in 29 trials of 40 on a
+  Linux guest, 6 of 40 on a FreeBSD guest and 1 of 40 on bare metal. A
+  host that does not deschedule has nothing for it to correct.
+
+  Its cost, every figure an upper bound rather than a resolved
+  difference: about 0.4 per cent on a 24-thread bare-metal box whose
+  control resolves to 0.24, and 1.3 to 1.9 on a Linux guest. On that
+  guest at an 8 second window over 40 trials it reads 0.9814 at a 2.52
+  per cent bound in the trials where the class moves and 0.9872 at 4.34
+  where it holds - about the same either way. An earlier reading at a 2
+  second window put those at 1.0000 and 0.9759 and suggested the routing
+  change paid for the bracket; the longer window cut the bound from 6.44
+  to 2.52 and reversed the ordering, so that was noise.
+
+  No speed-up is claimed, and the reason is structural. Four cells were
+  screened on bare metal for one where the class could move at all -
+  reps 4096 uniform, 4096 irregular, 8192 and 16384 - and none did.
+  `classify_observed` returns `PortBound` below 500 ns and never reads
+  cv^2; raising reps lifts the mean past that gate while averaging the
+  variance out of cv^2, so the two conditions a class change needs pull
+  apart. Where the lever acts, the host is too noisy to resolve what it
+  did; where the host resolves it, the lever has nothing to do.
+
 - The split multiplier is decided from the window passed to it rather
   than from the globals the sampler reads. `sample_and_compute` summed
   process-global arena counters and then asserted against them, so the
