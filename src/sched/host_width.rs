@@ -14,8 +14,18 @@
 //! fact: the process may use these CPUs and not those, it changed or it
 //! did not, and there is no threshold to choose.
 //!
-//! `std::thread::available_parallelism` answers exactly this question,
-//! honouring both the process affinity mask and the cgroup CPU quota.
+//! `std::thread::available_parallelism` answers this question on Linux
+//! and FreeBSD, honouring the process affinity mask and the cgroup CPU
+//! quota. It does not answer it on Windows: its documented limitation
+//! is that it "may overcount the amount of parallelism available on
+//! systems limited by process-wide affinity masks, or job object
+//! limitations". Measured on a 24-thread Windows host, a mask narrowed
+//! to two CPUs still read 24.
+//!
+//! So on Windows this module reports the machine rather than the share
+//! of it the process may use, and a caller capping by it caps by
+//! nothing. The affinity half of the lever is Linux and FreeBSD only;
+//! the cgroup half does not arise there.
 //!
 //! # The cadence is the design
 //!
@@ -92,6 +102,15 @@ fn report_probe_failure(err: &std::io::Error, keeping: usize) {
 /// A failed read keeps the previous answer and leaves the timestamp
 /// alone, so the next call retries rather than waiting out the interval
 /// on a reading that never happened.
+///
+/// Reads [`std::thread::available_parallelism`], which honours a
+/// process affinity mask on Linux and on FreeBSD and does not on
+/// Windows: its documented limitation is that it "may overcount the
+/// amount of parallelism available on systems limited by process-wide
+/// affinity masks, or job object limitations". A narrowed mask there is
+/// invisible to this function, so a caller capping by it caps by
+/// nothing. Measured on a 24-thread Windows host: the mask narrowed to
+/// two CPUs and this returned 24.
 pub fn allowed_parallelism() -> usize {
     resolve(
         &ALLOWED,
