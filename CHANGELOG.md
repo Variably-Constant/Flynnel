@@ -209,16 +209,24 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   Windows arm declares the kernel32 symbols it calls, so no binding
   crate is added for it.
 
-  Running it established that `FLYNNEL_LEVER_ALLOWED_WIDTH` caps by the
-  affinity mask on Linux and FreeBSD and by nothing on Windows. The
-  Linux and FreeBSD arms pass; the Windows arm narrowed the process mask
-  to two CPUs on a 24-thread host and `allowed_parallelism` still read
-  24. `std::thread::available_parallelism` documents the reason - it
-  "may overcount the amount of parallelism available on systems limited
-  by process-wide affinity masks, or job object limitations" - so
-  `sched::host_width` reports the machine there rather than the share of
-  it this process may use. Both the module and the architecture page
-  said it honoured the mask without naming a platform, and now name one.
+  Running it found that `FLYNNEL_LEVER_ALLOWED_WIDTH` capped by nothing
+  on Windows. The Linux and FreeBSD arms passed; the Windows arm
+  narrowed the process mask to two CPUs on a 24-thread host and
+  `allowed_parallelism` still read 24.
+  `std::thread::available_parallelism` documents the reason - it "may
+  overcount the amount of parallelism available on systems limited by
+  process-wide affinity masks, or job object limitations" - so
+  `sched::host_width` was reporting the machine there rather than the
+  share of it the process may use.
+
+  `sched::host_width` now reads `GetProcessAffinityMask` on Windows and
+  `available_parallelism` elsewhere, so the same question is asked by
+  the route each platform answers it on and the lever caps on all three.
+  A failed call falls back to `available_parallelism` rather than
+  publishing a width nothing measured, and the mask is per processor
+  group, so above 64 CPUs it describes the group. Both the module and
+  the architecture page had said the width honoured the mask without
+  naming a platform, and now say which call each platform uses.
 
   The test reads the mask back through `sched_getaffinity`,
   `cpuset_getaffinity` or `GetProcessAffinityMask` and asserts on that
