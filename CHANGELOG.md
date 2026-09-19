@@ -113,6 +113,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   `examples/paired_pinstate_defect_sample.log` are what the two refusals
   are checked against.
 
+  `levers::describe()` carries `spin_adaptive` and `spin_window`, which
+  it did not. It is documented as every switch and its state, and the
+  two that decide how the pool parks were absent, so a row printed from
+  it could not say whether adaptation ran; the harnesses fetched
+  `spin_adaptive` separately, which is why the engagement line had it
+  and the levers line did not. That puts a width on a line that
+  otherwise carries booleans, so the label check now decides from the
+  values it found rather than from which line they came from: a field
+  holding only `true` or `false` reads the label as a switch, anything
+  else compares literally. Without that, an arm labelled
+  `spin_window=8` would have been compared against `false` and a sound
+  arm reported as a mismatch.
+
   Two levers now ship on, so an arm that expressed "off" by leaving its
   variable unset ran the lever on: all three arms of a rotation became
   one arm, with a tight null, because two identical arms agree. The
