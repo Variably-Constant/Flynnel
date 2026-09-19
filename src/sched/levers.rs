@@ -309,9 +309,10 @@ pub fn allowed_width() -> bool {
 /// Decline to displace a stored calibration whose dispatch cost is
 /// cheaper than the one being offered.
 ///
-/// The one switch here that defaults on. The others default off because
-/// off is the behavior that shipped and a measurement has to earn the
-/// flip; this one has the measurement. Across 16 draws at each of three
+/// One of the two switches here that default on, with `oncore_spread`.
+/// The rest default off because off is the behavior that shipped and a
+/// measurement has to earn the flip; this one has the measurement.
+/// Across 16 draws at each of three
 /// load levels on a 12-core host, the dispatch cost read 1300 to 1500 ns
 /// idle and 3.2 to 7.0 million saturated, with no overlap, so the
 /// cheaper record is the quieter draw and the ordering needs no
@@ -365,21 +366,30 @@ mod tests {
     }
 
     #[test]
-    fn every_lever_is_off_unless_asked_for() {
-        // The default is what ships, so it is worth an assertion rather
-        // than a comment: a switch that defaulted on would change the
-        // crate for every consumer who never set it.
-        for name in [
-            "FLYNNEL_LEVER_ONCORE_SPREAD",
-            "FLYNNEL_LEVER_BATCH_WEIGHT",
-            "FLYNNEL_LEVER_SMT_WINDOW",
-            "FLYNNEL_LEVER_ALLOWED_WIDTH",
-            "FLYNNEL_LEVER_CALIBRATION_REFUSAL",
-        ] {
-            assert!(
-                std::env::var_os(name).is_some() || !read(name),
-                "{name} must be off when unset"
-            );
-        }
+    fn an_unset_switch_takes_the_default_of_the_reader_it_uses() {
+        // Both readers, not the accessors: each accessor caches in a
+        // OnceLock, so calling one here fixes its value for every later
+        // test in this binary.
+        //
+        // Named by reader rather than by lever because the levers do not
+        // share a default. oncore_spread and calibration_refusal take
+        // read_defaulting_on; batch_weight, smt_from_window and
+        // allowed_width take read.
+        unsafe { std::env::remove_var("FLYNNEL_LEVER_DEFAULT_TEST") };
+        assert!(
+            !read("FLYNNEL_LEVER_DEFAULT_TEST"),
+            "read must answer off for a switch nobody set"
+        );
+        assert!(
+            read_defaulting_on("FLYNNEL_LEVER_DEFAULT_TEST"),
+            "read_defaulting_on must answer on for a switch nobody set"
+        );
+
+        // And that each reader still honours an explicit off, so a
+        // default-on switch can be turned off by a caller.
+        unsafe { std::env::set_var("FLYNNEL_LEVER_DEFAULT_TEST", "0") };
+        assert!(!read("FLYNNEL_LEVER_DEFAULT_TEST"));
+        assert!(!read_defaulting_on("FLYNNEL_LEVER_DEFAULT_TEST"));
+        unsafe { std::env::remove_var("FLYNNEL_LEVER_DEFAULT_TEST") };
     }
 }
