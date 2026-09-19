@@ -331,15 +331,26 @@ pub fn calibration_refusal() -> bool {
 /// A row that does not say which arm produced it is a row that cannot be
 /// checked, and an arm that failed to engage looks exactly like one that
 /// engaged and did nothing.
+///
+/// The spin pair lives in [`crate::sched::jec_sleep`] rather than here,
+/// and is reported anyway: it is a runtime switch that changes how the
+/// pool parks, so a row without it does not say which arm produced it.
+/// `spin_window` is reported beside `spin_adaptive` because the window
+/// alone cannot say whether the controller ran - a rescue-dominated
+/// workload grows it and is clamped back to the tuned default it
+/// started from.
 pub fn describe() -> String {
     format!(
         "oncore_spread={} batch_weight={} smt_window={} allowed_width={} \
-         calibration_refusal={} serve_policy={:?} occupancy_floor={}",
+         calibration_refusal={} spin_adaptive={} spin_window={} \
+         serve_policy={:?} occupancy_floor={}",
         oncore_spread(),
         batch_weight(),
         smt_from_window(),
         allowed_width(),
         calibration_refusal(),
+        crate::sched::spin_adaptive(),
+        crate::sched::spin_window(),
         serve_policy(),
         occupancy_floor_per_mille(),
     )
