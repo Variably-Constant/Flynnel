@@ -245,10 +245,18 @@ fn read_defaulting_on(name: &str) -> bool {
 /// code with it off, at bounds of 0.64, 0.22 and 0.31 per cent with
 /// controls resolving to 0.19 and tighter.
 /// Measured again on three hosts, paired by trial, at 4096 reps of
-/// uniform work: 0.9964 at a 1.90 per cent bound on a 24-thread Windows
-/// bare-metal box whose control resolves to 0.24, 0.9922 at 4.79 on a
-/// 16-core Linux guest, 0.9917 at 11.15 on a 16-core FreeBSD guest.
-/// Not slower on any, no speed-up claimed on any.
+/// uniform work: 0.9978 at a 0.22 per cent bound on a 24-thread Windows
+/// bare-metal box, 32 clean pairs of 40, control 0.9988 at 0.38;
+/// 0.9922 at 4.79 on a 16-core Linux guest, 0.9917 at 11.15 on a
+/// 16-core FreeBSD guest. Not slower on any, no speed-up claimed on any.
+///
+/// The bare-metal cell was read twice. An earlier rotation gave 0.9964
+/// at 1.90 per cent over 7 pairs of 40, taken while an unrelated process
+/// held a core continuously: the box's idle floor was 1.81 cores against
+/// the harness's 1.4-core gate, so most trials were dropped for a
+/// condition none of them caused. The figures above are the repeat on a
+/// quiet box, and the difference between the two bounds is the floor
+/// rather than the lever.
 ///
 /// The bracket is taken in all three - oncore_items reads zero on the
 /// arm without the lever and millions on the arm with it - and on the
@@ -265,7 +273,8 @@ fn read_defaulting_on(name: &str) -> bool {
 ///
 /// Its price on a guest, at an 8 second window over 40 trials: 0.9814
 /// at a 2.52 per cent bound where the class moves, 0.9872 at 4.34 where
-/// it holds. About the same either way.
+/// it holds. About the same either way. On quiet bare metal, where no
+/// class moves at this size, 0.9978 at 0.22 over 32 pairs.
 pub fn oncore_spread() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| read_defaulting_on("FLYNNEL_LEVER_ONCORE_SPREAD"))

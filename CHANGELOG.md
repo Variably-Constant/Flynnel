@@ -18,8 +18,14 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   host that does not deschedule has nothing for it to correct.
 
   Its cost, every figure an upper bound rather than a resolved
-  difference: about 0.4 per cent on a 24-thread bare-metal box whose
-  control resolves to 0.24, and 1.3 to 1.9 on a Linux guest. On that
+  difference: 0.9978 at a 0.22 per cent bound on a 24-thread bare-metal
+  box over 32 clean pairs of 40, control 0.9988 at 0.38, and 1.3 to 1.9
+  on a Linux guest. That cell was read twice - an earlier rotation gave
+  0.9964 at 1.90 over 7 pairs while an unrelated process held a core
+  continuously, putting the box's idle floor at 1.81 cores against the
+  harness's 1.4-core gate, so most trials were dropped for a condition
+  none of them caused. The difference between the two bounds is the
+  floor, not the lever. On that
   guest at an 8 second window over 40 trials it reads 0.9814 at a 2.52
   per cent bound in the trials where the class moves and 0.9872 at 4.34
   where it holds - about the same either way. An earlier reading at a 2
