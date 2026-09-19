@@ -1151,7 +1151,7 @@ impl JobPlan {
                 // this decision is not constant over a run and a single
                 // reading of it describes one dispatch.
                 if from_window {
-                    SMT_WINDOW_DECISIONS[usize::from(decided)]
+                    SMT_WINDOW_DECISIONS[decision_slot(decided)]
                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 return decided;
@@ -1305,6 +1305,14 @@ static SMT_WINDOW_DECISIONS: [core::sync::atomic::AtomicU64; 2] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
 ];
+
+/// The slot a decision is counted in: `1` when SMT was allowed, `0`
+/// when it was declined, matching the `(declined, allowed)` order
+/// [`smt_window_decisions`] publishes.
+#[inline]
+const fn decision_slot(decided: bool) -> usize {
+    usize::from(decided)
+}
 
 /// How many dispatches the window-driven SMT switch sent each way, as
 /// `(declined, allowed)`. Both zero while the lever is off, which is
@@ -1727,16 +1735,19 @@ mod tests {
 
     #[test]
     fn the_tally_indexes_allowed_and_declined_the_right_way_round() {
-        // The slot is chosen by usize::from(decided), so a reversed
-        // index would swap the two counts and report a lever that always
-        // allowed SMT as one that always declined it - readable as a
-        // result rather than as a defect. Compared as deltas because the
-        // counters are process-wide.
-        let before = smt_window_decisions();
-        SMT_WINDOW_DECISIONS[usize::from(true)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let after = smt_window_decisions();
-        assert_eq!(after.1, before.1 + 1, "a true decision lands in the allowed slot");
-        assert_eq!(after.0, before.0, "and leaves the declined one alone");
+        // A reversed index would swap the two counts and report a lever
+        // that always allowed SMT as one that always declined it, which
+        // reads as a result rather than as a defect.
+        //
+        // Counted into a local pair rather than SMT_WINDOW_DECISIONS. A
+        // delta across two reads of those is this test's only while
+        // nothing else moves them in between, and any other test in this
+        // binary that reaches the `from_window` branch does.
+        let mut slots = [0u64; 2];
+        slots[decision_slot(true)] += 1;
+        assert_eq!(slots, [0, 1], "an allowed decision lands in slot one");
+        slots[decision_slot(false)] += 1;
+        assert_eq!(slots, [1, 1], "and a declined one in slot zero");
     }
 
     #[test]
