@@ -167,7 +167,7 @@ def report_arm_states(per, arms):
                            if field in a.get(name, {}).get("engage", {})})
             where = "engagement"
         # An arm label writes a switch as 1 or 0 and a width as itself,
-        # and both lines now carry both kinds - spin_window reads 500 on
+        # and either line can carry either kind: spin_window reads 500 on
         # the levers line beside booleans. What the field holds decides
         # how to read the label, not which line it came from.
         boolean = bool(seen) and set(seen) <= {"true", "false"}
