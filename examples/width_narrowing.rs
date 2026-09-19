@@ -1,9 +1,9 @@
 //! Dispatch throughput while the CPUs the process may use are taken
 //! away from under it.
 //!
-//! The allowed-width lever caps the worker count by
-//! `std::thread::available_parallelism`, which honours the process
-//! affinity mask and the cgroup CPU quota. Neither of those moves when
+//! The allowed-width lever caps the worker count by the CPUs the
+//! process may use, read from the process affinity mask and the cgroup
+//! CPU quota. Neither of those moves when
 //! a neighbour gets busy, so a harness that applies LOAD can never
 //! reach this mechanism however contended it makes the host: the pool
 //! is sized against a width that is still correct. What reaches it is

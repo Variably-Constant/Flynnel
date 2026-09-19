@@ -9,6 +9,12 @@
 #   ... timed work ...
 #   Exit-TimingRun -Log $log
 #
+# -BoundOn says what the run's wall is bound on and picks the CPU ceiling from
+# it: host, the default, waits for a box quiet enough that its cores are not
+# deciding the answer; device waits only for a box that is not saturated,
+# because background CPU does not reach a wall read off device clocks. A
+# caller passing -MaxIdleCores gets that number and -BoundOn does not apply.
+#
 # Exit-TimingRun must also be called from the harness's trap. It is safe
 # to call when no claim is held and safe to call twice.
 
@@ -54,11 +60,22 @@ function Enter-TimingRun {
         # The caller's own pid. Defaults to this session's, which is the
         # harness when this file is dot-sourced into it.
         [int]$OwnerPid = $PID,
-        [double]$MaxIdleCores = 1.2,
+        # What the run's wall is bound on, which is what decides how much
+        # background CPU it can carry. A host-bound run reads a wall the box's
+        # cores set. A device-bound one reads device clocks plus a short host
+        # tail, and background CPU does not reach it.
+        [ValidateSet('host', 'device')][string]$BoundOn = 'host',
+        # Below zero takes the ceiling from -BoundOn. A caller naming a number
+        # gets that number.
+        [double]$MaxIdleCores = -1,
         # Ceiling on the wait. awaitquiet's own default is 180, which is
         # right for a run nobody is watching and wrong for a smoke test.
         [double]$WaitMinutes = 180
     )
+
+    if ($MaxIdleCores -lt 0) {
+        $MaxIdleCores = if ($BoundOn -eq 'device') { 20.0 } else { 1.2 }
+    }
 
     # What was actually measured, not what the tree is called.
     #
@@ -93,8 +110,17 @@ function Enter-TimingRun {
     #
     # 1.2 clears that floor and stays under the 1.4 a neighbour's gate
     # uses, so this never measures on a box busier than they would take.
+    #
+    # A device-bound run takes 20.0 instead, which is where a load ladder
+    # stopped rather than where its numbers moved. Over rungs of 0, 1, 2, 4,
+    # 8, 12, 16 and 20 delivered cores and back down, 100 passes a rung, every
+    # one of the wave calibration's nine figures stayed inside the spread its
+    # unloaded rung produced, with the box at 22.05 of 24 busy at the top; the
+    # narrow lane's root step read 40960 ns on all 100 passes of every rung.
+    # Nothing is measured above 20 delivered cores, which is why the ceiling
+    # sits there and not higher.
     $waitLog = [System.IO.Path]::ChangeExtension($Log, 'awaitquiet.log')
-    "AWAITING_QUIET $(Get-Date -Format o) max_idle_cores=$MaxIdleCores progress in $waitLog" |
+    "AWAITING_QUIET $(Get-Date -Format o) bound_on=$BoundOn max_idle_cores=$MaxIdleCores progress in $waitLog" |
         Add-Content -Path $Log
     & powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Temp\awaitquiet.ps1' `
         -SelfRoot $OwnerPid -MaxIdleCores $MaxIdleCores -Minutes $WaitMinutes > $waitLog 2>&1

@@ -1283,9 +1283,9 @@ impl JobPlan {
         } else {
             arena.primary_workers()
         };
-        // The query is a syscall and a cgroup read, cached on a cadence,
-        // so the switch is what keeps that cost off a quiet host's hot
-        // path until a measurement says it is free.
+        // The query is a syscall and a cgroup read, cached on a cadence;
+        // a caller that turns the lever off takes it off this path
+        // entirely.
         let running = capped_by_allowed_width(
             running,
             crate::sched::levers::allowed_width(),
@@ -1776,7 +1776,7 @@ mod tests {
     fn the_switch_short_circuits_the_probe() {
         // The probe is a syscall and a cgroup read. With the lever off
         // it must not run at all, which is what keeps the cost off a
-        // host that never asked for the lever.
+        // host that turned the lever off.
         let mut probed = false;
         let width = capped_by_allowed_width(16, false, || {
             probed = true;

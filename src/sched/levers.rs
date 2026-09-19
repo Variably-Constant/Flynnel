@@ -14,9 +14,10 @@
 //! A switch whose default flips on the strength of an argument rather
 //! than a reading is how the thing this campaign is fixing got in.
 //!
-//! One switch has earned it. [`calibration_refusal`] defaults on, and
-//! the reading is on the function. Each of the others is off and says
-//! what would have to be measured for that to change.
+//! Three have earned it: [`calibration_refusal`], [`oncore_spread`] and
+//! [`allowed_width`] default on, and the reading is on each function.
+//! The other two are off and say what would have to be measured for
+//! that to change.
 //!
 //! # Why environment variables rather than features
 //!
@@ -310,17 +311,31 @@ pub fn smt_from_window() -> bool {
 /// Cap a plan's worker count by the CPUs the process may currently use,
 /// re-read on a cadence, so a narrowed affinity mask or cgroup quota
 /// reaches the sizing.
+///
+/// On unless the variable turns it off. What it buys is a host that
+/// narrows after the pool is spawned: `tests/affinity_follows_process_mask`
+/// holds that the plan's width follows the mask down and back on all
+/// three platforms. Its price is the re-read, one affinity query every
+/// 250 ms, paid for nothing on a host whose mask never changes. Measured
+/// twice, paired by trial on a 24-thread Windows bare-metal box at 4096
+/// reps of uniform work, 40 trials each, no decision moving between the
+/// arms: 1.0006 at a 0.13 per cent bound over 40 clean pairs, retained
+/// 1.0005 at 0.17, control 1.0000 at 0.10, on the code that ships; and
+/// 1.0000 at 0.15 over 23 clean pairs, retained 1.0014 at 0.21, control
+/// 1.0000 at 0.30, on a tree whose Windows probe was still
+/// `available_parallelism`.
 pub fn allowed_width() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| read("FLYNNEL_LEVER_ALLOWED_WIDTH"))
+    *V.get_or_init(|| read_defaulting_on("FLYNNEL_LEVER_ALLOWED_WIDTH"))
 }
 
 /// Decline to displace a stored calibration whose dispatch cost is
 /// cheaper than the one being offered.
 ///
-/// One of the two switches here that default on, with `oncore_spread`.
-/// The rest default off because off is the behavior that shipped and a
-/// measurement has to earn the flip; this one has the measurement.
+/// One of the three switches here that default on, with `oncore_spread`
+/// and `allowed_width`. The rest default off because off is the behavior
+/// that shipped and a measurement has to earn the flip; this one has the
+/// measurement.
 /// Across 16 draws at each of three
 /// load levels on a 12-core host, the dispatch cost read 1300 to 1500 ns
 /// idle and 3.2 to 7.0 million saturated, with no overlap, so the
@@ -392,9 +407,9 @@ mod tests {
         // test in this binary.
         //
         // Named by reader rather than by lever because the levers do not
-        // share a default. oncore_spread and calibration_refusal take
-        // read_defaulting_on; batch_weight, smt_from_window and
-        // allowed_width take read.
+        // share a default. oncore_spread, calibration_refusal and
+        // allowed_width take read_defaulting_on; batch_weight and
+        // smt_from_window take read.
         unsafe { std::env::remove_var("FLYNNEL_LEVER_DEFAULT_TEST") };
         assert!(
             !read("FLYNNEL_LEVER_DEFAULT_TEST"),

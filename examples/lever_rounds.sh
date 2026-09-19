@@ -117,10 +117,10 @@ echo "HEAD $(cd "$tree" && git rev-parse --short HEAD 2>/dev/null || echo unknow
 # stored record old enough to age out, since a fresh draw with nothing
 # stored has no incumbent to compare against.
 #
-# ALLOWED_WIDTH: the cap comes from available_parallelism, which reads
-# the affinity mask and the cgroup quota. Burner threads move neither,
-# so the pool here is sized against a width that is still correct
-# whatever the load. width_rounds.sh narrows the process instead.
+# ALLOWED_WIDTH: the cap comes from the process affinity mask and the
+# cgroup quota. Burner threads move neither, so the pool here is sized
+# against a width that is still correct whatever the load.
+# width_rounds.sh narrows the process instead.
 echo "SKIPPED CALIBRATION_REFUSAL - this harness pins the profile with FLYNNEL_HOST_PROFILE_NS, so no calibration is drawn and the comparison the switch gates is never reached"
 echo "SKIPPED ALLOWED_WIDTH - load does not move the affinity mask or the cgroup quota; see width_rounds.sh"
 

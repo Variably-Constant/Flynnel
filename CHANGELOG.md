@@ -9,6 +9,21 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- `FLYNNEL_LEVER_ALLOWED_WIDTH` defaults on. A plan's worker count is
+  capped by the CPUs the process may use at that moment, re-read every
+  250 ms, so a process whose affinity mask or cgroup quota narrows after
+  the pool is spawned stops chunking for threads that cannot reach a
+  core; `tests/affinity_follows_process_mask.rs` holds that on Linux,
+  FreeBSD and Windows. Its price is the re-read on a host whose mask
+  never changes, measured twice paired by trial on a 24-thread
+  bare-metal box at 4096 reps of uniform work over 40 trials with no
+  decision moving between the arms: 1.0006 at a 0.13 per cent bound
+  over 40 clean pairs, retained 1.0005 at 0.17, control 1.0000 at 0.10,
+  on the code that ships; and 1.0000 at 0.15 over 23 clean pairs,
+  retained 1.0014 at 0.21, control 1.0000 at 0.30, on a tree whose
+  Windows probe was still `available_parallelism`. Off restores the
+  shipped sizing, the arena's spawned width whatever the host allows.
+
 - `FLYNNEL_LEVER_ONCORE_SPREAD` is documented as a correctness lever and
   carries its measured price. It swaps the classifier's input from wall
   time to the thread clock, which excludes descheduled time, so what it

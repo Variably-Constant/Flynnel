@@ -140,7 +140,7 @@ def report_arm_states(per, arms):
 
     These labels carry the value: `oncore_spread=1` is an arm that has
     to run that lever on. An arm expressing off by leaving the switch
-    unset takes whatever the crate defaults to, and two levers default
+    unset takes whatever the crate defaults to, and three levers default
     on, so a rotation can compare an arm with itself and still produce
     a clean paired null.
     """
