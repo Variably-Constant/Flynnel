@@ -1310,7 +1310,7 @@ static SMT_WINDOW_DECISIONS: [core::sync::atomic::AtomicU64; 2] = [
 /// when it was declined, matching the `(declined, allowed)` order
 /// [`smt_window_decisions`] publishes.
 #[inline]
-const fn decision_slot(decided: bool) -> usize {
+fn decision_slot(decided: bool) -> usize {
     usize::from(decided)
 }
 
