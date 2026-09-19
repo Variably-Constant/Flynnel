@@ -113,7 +113,7 @@ Four small modules probe the host. The first three read hardware at startup and 
 | [`numa_topology`](NUMA-And-Topology.md#numatopology) | `/sys/devices/system/node/*` (Linux) or `GetLogicalProcessorInformationEx` (Windows) for per-CPU node membership and SLIT distances | `NumaTopology`, `numa_topology()` |
 | [`cpu_info`](NUMA-And-Topology.md#cpuinfo) | `std::thread::available_parallelism` + CPUID HTT bit for SMT factor | `CpuInfo`, `cpu_info()` |
 | [`numa_latency`](NUMA-And-Topology.md#numalatencytable) | Ping-pong cache-line round-trip between pinned cores (calibrated) | `TopologyLatencyTable`, `topology_latency_table()` |
-| `sched::host_width` | `std::thread::available_parallelism` for the CPUs the process may use right now, honouring the affinity mask and the cgroup quota on Linux and FreeBSD. On Windows it reports the machine: that function may overcount under a process-wide affinity mask, and a mask narrowed to two CPUs on a 24-thread host still read 24 | `allowed_parallelism()` |
+| `sched::host_width` | the CPUs the process may use right now: `std::thread::available_parallelism` on Linux and FreeBSD, honouring the affinity mask and the cgroup quota, and `GetProcessAffinityMask` on Windows, where that function may overcount under a process-wide mask | `allowed_parallelism()` |
 
 `host_width` is the one that is not a startup fact. A container's CPU quota can be lowered while it runs and an operator can re-pin a running process, so a width read once describes the machine at that moment rather than the one the next dispatch will get, and the pool's threads outlive the change. It is re-read at most every 250 ms because the answer costs a syscall and, on Linux, a cgroup read; `JobPlan::resolved_workers` caps by it.
 

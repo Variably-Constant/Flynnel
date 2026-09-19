@@ -19,13 +19,12 @@
 //! quota. It does not answer it on Windows: its documented limitation
 //! is that it "may overcount the amount of parallelism available on
 //! systems limited by process-wide affinity masks, or job object
-//! limitations". Measured on a 24-thread Windows host, a mask narrowed
-//! to two CPUs still read 24.
+//! limitations", and on a 24-thread Windows host a mask narrowed to two
+//! CPUs read 24 through it.
 //!
-//! So on Windows this module reports the machine rather than the share
-//! of it the process may use, and a caller capping by it caps by
-//! nothing. The affinity half of the lever is Linux and FreeBSD only;
-//! the cgroup half does not arise there.
+//! So Windows reads `GetProcessAffinityMask` and counts its set bits,
+//! and the three hosts answer the same question by the route each one
+//! answers it on.
 //!
 //! # The cadence is the design
 //!
@@ -96,6 +95,56 @@ fn report_probe_failure(err: &std::io::Error, keeping: usize) {
     }
 }
 
+/// The CPUs this process may currently use, asked of the platform.
+///
+/// [`std::thread::available_parallelism`] everywhere but Windows, where
+/// its documented limitation is that it "may overcount the amount of
+/// parallelism available on systems limited by process-wide affinity
+/// masks, or job object limitations" - a narrowed process reads the
+/// whole machine. There the mask is read directly and its set bits
+/// counted.
+///
+/// `GetProcessAffinityMask` reports the calling process's mask within
+/// its processor group, so above 64 CPUs it describes the group rather
+/// than the machine. A failed call falls back to
+/// `available_parallelism` rather than reporting a width nothing
+/// measured.
+#[cfg(not(windows))]
+fn process_width() -> std::io::Result<std::num::NonZeroUsize> {
+    std::thread::available_parallelism()
+}
+
+#[cfg(windows)]
+fn process_width() -> std::io::Result<std::num::NonZeroUsize> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessAffinityMask(
+            process: isize,
+            process_mask: *mut usize,
+            system_mask: *mut usize,
+        ) -> i32;
+    }
+    let mut process_mask: usize = 0;
+    let mut system_mask: usize = 0;
+    // SAFETY: both pointers address locals that outlive the call, and
+    // `GetCurrentProcess` returns a pseudo-handle that needs no release.
+    // The call writes only through those two pointers.
+    let ok = unsafe {
+        GetProcessAffinityMask(
+            GetCurrentProcess(),
+            &raw mut process_mask,
+            &raw mut system_mask,
+        )
+    };
+    if ok == 0 {
+        return std::thread::available_parallelism();
+    }
+    std::num::NonZeroUsize::new(process_mask.count_ones() as usize).ok_or_else(|| {
+        std::io::Error::other("the process affinity mask names no cpu")
+    })
+}
+
 /// How many logical CPUs this process is allowed to run on, re-read at
 /// most once per [`RECHECK_INTERVAL_MS`].
 ///
@@ -103,21 +152,17 @@ fn report_probe_failure(err: &std::io::Error, keeping: usize) {
 /// alone, so the next call retries rather than waiting out the interval
 /// on a reading that never happened.
 ///
-/// Reads [`std::thread::available_parallelism`], which honours a
-/// process affinity mask on Linux and on FreeBSD and does not on
-/// Windows: its documented limitation is that it "may overcount the
-/// amount of parallelism available on systems limited by process-wide
-/// affinity masks, or job object limitations". A narrowed mask there is
-/// invisible to this function, so a caller capping by it caps by
-/// nothing. Measured on a 24-thread Windows host: the mask narrowed to
-/// two CPUs and this returned 24.
+/// Asks [`process_width`], which is
+/// [`std::thread::available_parallelism`] on Linux and FreeBSD and
+/// `GetProcessAffinityMask` on Windows, so a narrowed process reads its
+/// own share on all three.
 pub fn allowed_parallelism() -> usize {
     resolve(
         &ALLOWED,
         &LAST_READ_MS,
         now_ms(),
         RECHECK_INTERVAL_MS,
-        std::thread::available_parallelism,
+        process_width,
     )
 }
 
