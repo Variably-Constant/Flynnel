@@ -5,7 +5,7 @@ scheduler as PowerShell commands and objects, bound straight to the
 Rust with [PWRS](https://crates.io/crates/PoWerRuSt). The cmdlets are
 the library. Nothing here shells out to anything.
 
-Sixty-seven commands, forty object types and twenty-two
+Seventy-one commands, forty object types and twenty-three
 enumerations. Every command answers to a shorter name with the `Fly`
 prefix: `Measure-FlyReduce` is `Measure-FlynnelReduce`.
 
@@ -189,7 +189,19 @@ occupancy, and which shape the last reduce took.
 `Request-FlynnelTraceFlush`, `Get-FlynnelLeafStat`,
 `Reset-FlynnelLeafStat`, `Measure-FlynnelOccupancy`,
 `Get-FlynnelThreadTick`, `Get-FlynnelReducePath`, `Get-FlynnelSpread`,
-`Get-FlynnelCallSite`, `Reset-FlynnelCallSite`.
+`Get-FlynnelCallSite`, `Reset-FlynnelCallSite`,
+`Set-FlynnelTraceState`.
+
+`Set-FlynnelTraceState` is the one that could not exist until the
+crate stopped latching its flag: the ring was armed by an environment
+variable read once, and a module cannot set the environment of a
+process it is already inside.
+
+`Get-FlynnelSpread` answers two statistics over a caller's samples,
+not one. The spread reads the extremes and one stalled sample moves
+it; the interquartile range reads the middle half and does not. A run
+with a wide spread and a narrow range was steady with an interruption
+in it, which is a different finding from one that was not steady.
 
 `Get-FlynnelCallSite` is the per-location half: the scheduler keeps a
 classifier per source location, so two callers of the same kernel with
@@ -205,7 +217,21 @@ decided from it, and how to make it measure again.
 `Get-FlynnelWorkloadClass`, the `Measure-` forms of each, and the
 persisted store: `Get-FlynnelHostStamp`,
 `Get-FlynnelCalibrationStore`, `Get-FlynnelCpuCalibration`,
-`Get-FlynnelAccelCalibration`.
+`Get-FlynnelAccelCalibration`, `Clear-FlynnelCalibrationStore`.
+
+The store is shared by every process on the host, so clearing it asks
+first. It does not delete the file: other processes hold it mapped,
+and it is cleared by publishing a zeroed record under the same writer
+lease and the same lock every reader uses.
+
+A stored CPU record says what its trust verdict is made of.
+`IsTrustworthy` is `Samples` and `Confirmations` both above zero, not
+a spread test, because reproducibility is a property of two draws and
+no statistic over one draw's samples substitutes for a second draw
+agreeing. `OccupancyPerMille` is beside them: the spread says whether
+the samples agreed with each other, and only occupancy says whether
+they agreed on the wrong number because a neighbour held half the
+machine.
 
 ## Two conventions worth knowing before you read a number
 
