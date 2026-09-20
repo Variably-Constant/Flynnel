@@ -687,6 +687,33 @@ impl CalibrationStore {
         self.stamp_hash
     }
 
+    /// Discard what this host has measured: publish a zeroed record
+    /// with no accelerators, under the writer lease.
+    ///
+    /// Deliberately not an unlink. Other processes hold this file
+    /// mapped; on Windows an open mapping cannot be removed at all,
+    /// and on Linux removing it would leave every existing mapping
+    /// pointed at a nameless file still serving the very numbers the
+    /// call meant to discard. Publishing goes through the same lease
+    /// and the same SeqLock every reader already uses, so a reader
+    /// racing this sees either the old table or the cleared one and
+    /// never a torn mix of both.
+    ///
+    /// A cleared record reads back with `samples` and `confirmations`
+    /// at zero, which is exactly what [`CpuCalibration::is_trustworthy`]
+    /// tests, so nothing serves from it and the next draw has a clean
+    /// slate to be confirmed against.
+    ///
+    /// Fails rather than waits when another process holds the lease:
+    /// clearing a table someone is mid-way through publishing into is
+    /// a race whichever order it resolves in, and the caller is better
+    /// told to try again.
+    pub fn clear(&self) -> Result<(), StoreError> {
+        let guard = self.try_acquire_writer()?;
+        guard.publish(&CpuCalibration::default(), &[]);
+        Ok(())
+    }
+
     fn header(&self) -> &Header {
         // SAFETY: the mapping is FILE_SIZE bytes and the header sits at
         // offset zero, laid out by `lay_out` before the magic was

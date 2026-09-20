@@ -766,6 +766,60 @@ mod store {
     #[derive(Default)]
     pub struct GetFlynnelCalibrationStore {}
 
+    /// The row an open table answers, so the cmdlet that reads the
+    /// store and the one that clears it describe it the same way.
+    ///
+    /// Takes the pipeline because a table that will not settle is
+    /// reported as an error record beside a row that is still partly
+    /// true: the path and the stamps are real, and only the record
+    /// columns are missing.
+    fn opened_store_row(
+        ps: &Pipeline<'_>,
+        path: &std::path::Path,
+        process_hash: u64,
+        opened: &CalibrationStore,
+    ) -> PsResult<StoreInfo> {
+        let stamp_hash = opened.stamp_hash();
+        let mut row = StoreInfo {
+            exists: true,
+            path: path.display().to_string(),
+            layout_version: LAYOUT_VERSION,
+            stamp_hash: Some(stamp_hash),
+            process_stamp_hash: process_hash,
+            stamp_matches: Some(stamp_hash == process_hash),
+            read_settled: false,
+            accel_records: None,
+            cpu_samples: None,
+            cpu_measured_at: None,
+            cpu_trustworthy: None,
+        };
+        match opened.read() {
+            Some((cpu, accels)) => {
+                row.read_settled = true;
+                row.accel_records = Some(accels.len() as u32);
+                row.cpu_samples = Some(cpu.samples);
+                row.cpu_measured_at = if cpu.samples == 0 {
+                    None
+                } else {
+                    Some(cpu.measured_unix_s)
+                };
+                row.cpu_trustworthy = Some(cpu.is_trustworthy());
+            }
+            None => {
+                // A writer held the table through the whole retry
+                // window. The row still goes out, because the path
+                // and the stamps are real, but the failure is named
+                // rather than left to look like an empty table.
+                ps.write_error(&store_err(
+                    "the table did not settle within its retry window, so a writer is \
+                     holding it; the record columns are absent because the read failed, \
+                     not because the table is empty",
+                ))?;
+            }
+        }
+        Ok(row)
+    }
+
     impl Cmdlet for GetFlynnelCalibrationStore {
         fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
             let stamp = HostStamp::detect();
@@ -795,45 +849,71 @@ mod store {
             }
             let opened = CalibrationStore::open_or_create(&dir, &stamp)
                 .map_err(|e| store_err(format!("{e:?}")))?;
-            let stamp_hash = opened.stamp_hash();
-            let mut row = StoreInfo {
-                exists: true,
-                path: path.display().to_string(),
-                layout_version: LAYOUT_VERSION,
-                stamp_hash: Some(stamp_hash),
-                process_stamp_hash: process_hash,
-                stamp_matches: Some(stamp_hash == process_hash),
-                read_settled: false,
-                accel_records: None,
-                cpu_samples: None,
-                cpu_measured_at: None,
-                cpu_trustworthy: None,
+            ps.write(opened_store_row(ps, &path, process_hash, &opened)?)
+        }
+    }
+
+    /// Discards what this host has measured, so the next draw starts
+    /// from nothing.
+    ///
+    /// Not a delete. Other processes hold the table mapped, so the
+    /// crate clears it by publishing a zeroed record under the same
+    /// writer lease and the same lock every reader uses: a reader
+    /// racing this sees the old table or the cleared one, never a
+    /// torn mix. The file stays where it is and reads back with no
+    /// samples and no confirmations, which is what makes it unserved.
+    ///
+    /// This throws away measurement every process on the host shares,
+    /// and it cannot be undone, so it asks. It refuses rather than
+    /// waits when another process is mid-publish.
+    ///
+    /// # Examples
+    ///
+    /// `Clear-FlynnelCalibrationStore -Confirm:$false`
+    #[cmdlet(
+        verb = "Clear",
+        noun = "FlynnelCalibrationStore",
+        alias = "Clear-FlyCalibrationStore",
+        supports_should_process,
+        confirm_impact = "High",
+        output = ["Flynnel.CalibrationStore"]
+    )]
+    #[derive(Default)]
+    pub struct ClearFlynnelCalibrationStore {}
+
+    impl Cmdlet for ClearFlynnelCalibrationStore {
+        fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+            let stamp = HostStamp::detect();
+            let Some(dir) = calibration_dir() else {
+                return Err(store_err(
+                    "no calibration directory is configured on this host; set \
+                     FLYNNEL_CALIBRATION_DIR",
+                )
+                .terminating());
             };
-            match opened.read() {
-                Some((cpu, accels)) => {
-                    row.read_settled = true;
-                    row.accel_records = Some(accels.len() as u32);
-                    row.cpu_samples = Some(cpu.samples);
-                    row.cpu_measured_at = if cpu.samples == 0 {
-                        None
-                    } else {
-                        Some(cpu.measured_unix_s)
-                    };
-                    row.cpu_trustworthy = Some(cpu.is_trustworthy());
-                }
-                None => {
-                    // A writer held the table through the whole retry
-                    // window. The row still goes out, because the path
-                    // and the stamps are real, but the failure is named
-                    // rather than left to look like an empty table.
-                    ps.write_error(&store_err(
-                        "the table did not settle within its retry window, so a writer is \
-                         holding it; the record columns are absent because the read failed, \
-                         not because the table is empty",
-                    ))?;
-                }
+            let path = table_path(&dir, &stamp);
+            if !path.exists() {
+                pwrs::warning!(
+                    ps,
+                    "no calibration table exists for this host, so there is nothing to clear"
+                )?;
+                return Ok(());
             }
-            ps.write(row)
+            if !ps.should_process(
+                &path.display().to_string(),
+                "discard every measurement in it, for every process on this host",
+            )? {
+                return Ok(());
+            }
+            let opened = CalibrationStore::open_or_create(&dir, &stamp)
+                .map_err(|e| store_err(format!("{e:?}")))?;
+            opened.clear().map_err(|e| {
+                store_err(format!(
+                    "the table could not be cleared, which on a busy host usually means another \
+                     process holds the writer lease: {e:?}"
+                ))
+            })?;
+            ps.write(opened_store_row(ps, &path, stamp.hash(), &opened)?)
         }
     }
 
