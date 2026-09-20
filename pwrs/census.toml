@@ -172,6 +172,49 @@ item = "crate::sched::plan::JobPlan::apply_site_class_measured"
 reason = "unsafe-or-structural"
 note = "the same, against the site's measured window rather than its learned class"
 
+# ---------------------------------------------------------------------
+# The split observer, read through the pool family
+# ---------------------------------------------------------------------
+# Its read side is a Flynnel.SplitState column each:
+# split_multiplier, snapshot_leaf_stats, observed_mean_leaf_ns,
+# observed_per_item_ns, per_item_cv_squared_per_mille and
+# leaf_cv_squared_per_mille are what Get-FlynnelSplitMultiplier
+# assembles; set_split_multiplier, reset_leaf_stats and spawn_observer
+# are the three cmdlets beside it. LeafStats is the shape they read.
+#
+# Its write side is not a surface a script may have, and those four are
+# carved out below.
+
+[[entry]]
+item = "crate::sched::split_observer"
+reason = "internal-to-another-surface"
+note = "read and set through the pool family: Get-FlynnelSplitMultiplier, Set-FlynnelSplitMultiplier, Reset-FlynnelSplitStats and Start-FlynnelSplitObserver, with Get-FlynnelLeafStat over the same statistics"
+
+[[entry]]
+item = "crate::sched::split_observer::record_leaf_time_ns"
+reason = "unsafe-or-structural"
+note = "the pool's own recording hook, called by a worker as it finishes a leaf. A script has no leaf and would be injecting invented samples into the window the multiplier is derived from, which is an instrument reporting work nothing did"
+
+[[entry]]
+item = "crate::sched::split_observer::record_leaf_batch"
+reason = "unsafe-or-structural"
+note = "the same hook for a batch of leaves, on the same reasoning"
+
+[[entry]]
+item = "crate::sched::split_observer::sample_and_compute"
+reason = "unsafe-or-structural"
+note = "one step of the observer's own loop: it closes the current window and retunes the multiplier from it. Called out of band it would end a window the observer is midway through, so the next sample describes part of one window and part of another"
+
+[[entry]]
+item = "crate::sched::split_observer::acquire_test_lock"
+reason = "unsafe-or-structural"
+note = "serializes the crate's own tests against the process-wide leaf statistics; a script holding it would block the observer rather than read anything"
+
+[[entry]]
+item = "crate::sched::split_observer::AUTO_CLASSIFY_QUANTUM"
+reason = "unsafe-or-structural"
+note = "a tuning constant the classifier counts leaves against, not state a caller sets or reads"
+
 [[entry]]
 item = "crate::sched::trace::emit"
 reason = "unsafe-or-structural"
