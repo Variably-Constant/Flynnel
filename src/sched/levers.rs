@@ -74,8 +74,11 @@ fn read(name: &str) -> bool {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ServePolicy {
     /// The shipped arm: whatever
-    /// [`crate::sched::calibration_store::CpuCalibration::is_trustworthy`]
-    /// admits, which is a record some other draw has agreed with.
+    /// `calibration_store::CpuCalibration::is_trustworthy` admits,
+    /// which is a record some other draw has agreed with. Named in
+    /// backticks rather than linked, because the item is behind
+    /// `persisted-calibration` and a link to it is broken in a build
+    /// without that feature.
     ///
     /// A fresh stamp therefore serves from its third start: the first
     /// stores a provisional record, the second agrees with it and
@@ -94,6 +97,15 @@ pub enum ServePolicy {
     SpreadAt(u32),
 }
 
+/// Carried only where the store is, because the record it judges is
+/// `calibration_store::CpuCalibration` and that module sits behind
+/// `persisted-calibration`. The one caller, `stored_record_serves` in
+/// `par_iter`, is gated on the same feature, so a build without it has
+/// nothing to ask and nothing to answer with.
+///
+/// The enum itself stays ungated: it names no gated type, and
+/// `serve_policy()` reads the same switch in every configuration.
+#[cfg(feature = "persisted-calibration")]
 impl ServePolicy {
     /// Whether this record may be served.
     ///
