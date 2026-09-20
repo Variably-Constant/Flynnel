@@ -391,6 +391,16 @@ Describe 'Get-FlynnelCpuCalibration' {
         $record.IsTrustworthy | Should -Be $expected
     }
 
+    It 'types the active profile rather than naming it' {
+        # Every other classification on the row is an enum. A string
+        # here is the one column a caller has to compare with a
+        # literal, and a rename upstream would break that comparison
+        # silently rather than at the type.
+        $all = Get-FlynnelCalibration
+        $all.ActiveProfile | Should -BeOfType [Flynnel.DispatchProfile]
+        $all.ActiveClass | Should -BeOfType [Flynnel.WorkloadClass]
+    }
+
     It 'reports an unmeasured occupancy as nothing rather than as zero' {
         # Zero is the share a thread that never reached a core genuinely
         # had. A platform with no thread clock recorded nothing, and the

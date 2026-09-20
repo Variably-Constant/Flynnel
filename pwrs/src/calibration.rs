@@ -1109,7 +1109,12 @@ pub struct Calibration {
     /// Whether the bisect's seed-depth hysteresis is on.
     pub seed_hysteresis: bool,
     /// The dispatch profile the process is currently running under.
-    pub active_profile: String,
+    ///
+    /// The enum rather than its name. Every other classification on
+    /// this row is typed, and a string here would be the one column a
+    /// caller has to compare with a literal instead of with
+    /// [Flynnel.DispatchProfile].
+    pub active_profile: crate::types::DispatchProfile,
     /// The workload class the process is currently learning.
     pub active_class: crate::types::WorkloadClass,
 }
@@ -1164,7 +1169,7 @@ impl Cmdlet for GetFlynnelCalibration {
             class_source: thresholds.source,
             k_gating: CrateKGating::Auto.resolved().into(),
             seed_hysteresis: par_iter::seed_hysteresis(),
-            active_profile: format!("{:?}", adaptive_profile::active_dispatch_profile()),
+            active_profile: adaptive_profile::active_dispatch_profile().into(),
             active_class: adaptive_profile::active_workload_class().into(),
         })
     }

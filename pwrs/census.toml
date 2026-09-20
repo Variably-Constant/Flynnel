@@ -229,6 +229,50 @@ reaches = "Get-FlynnelPrefixSum"
 note = "also the two-phase scan, the histogram, the sort's merge rounds, the file kernels and the parallel BLAKE3 subtrees"
 
 # ---------------------------------------------------------------------
+# The adaptive profile, read through the calibration family
+# ---------------------------------------------------------------------
+
+[[entry]]
+item = "crate::sched::adaptive_profile::active_dispatch_profile"
+reason = "internal-to-another-surface"
+note = "the ActiveProfile column of Get-FlynnelCalibration, reported as the Flynnel.DispatchProfile enum rather than its name"
+
+[[entry]]
+item = "crate::sched::adaptive_profile::active_workload_class"
+reason = "internal-to-another-surface"
+note = "the ActiveClass column beside it"
+
+[[entry]]
+item = "crate::sched::adaptive_profile::class_thresholds"
+reason = "internal-to-another-surface"
+note = "the six boundaries Get-FlynnelClassThreshold reports, and the same six on Get-FlynnelCalibration"
+
+[[entry]]
+item = "crate::sched::adaptive_profile::ClassThresholds"
+reason = "internal-to-another-surface"
+note = "the shape those boundaries are read from. Every field is an atomic the calibration writes with a Release store while dispatch reads it Relaxed, so the type is live state rather than a snapshot a script could hold"
+
+[[entry]]
+item = "crate::sched::adaptive_profile::calibrate_class_thresholds"
+reason = "internal-to-another-surface"
+note = "run by Measure-FlynnelClassThreshold"
+
+[[entry]]
+item = "crate::sched::adaptive_profile::ThresholdCalibration"
+reason = "internal-to-another-surface"
+note = "what that measurement answered, reported as Flynnel.ThresholdCalibration"
+
+[[entry]]
+item = "crate::sched::adaptive_profile::classify_observed"
+reason = "internal-to-another-surface"
+note = "Get-FlynnelWorkloadClass, which classifies a caller's own leaf figures against the live boundaries without running anything"
+
+[[entry]]
+item = "crate::sched::adaptive_profile::AUTO_MIGRATION_HYSTERESIS"
+reason = "unsafe-or-structural"
+note = "consecutive agreeing ticks required before the classifier migrates a process between classes; a constant the tick counts against, not state a caller sets"
+
+# ---------------------------------------------------------------------
 # The persisted calibration store, read and never written
 # ---------------------------------------------------------------------
 # Its read side is the four store cmdlets. Its write side is carved
