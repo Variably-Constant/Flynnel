@@ -685,7 +685,13 @@ fn stabilisers_from_env() {
 
 /// Whether a change of seed depth needs corroboration before it takes
 /// effect.
-fn seed_hysteresis_enabled() -> bool {
+///
+/// Public so a reader does not have to go through
+/// [`set_seed_hysteresis`] to find out. Setting the switch to what it
+/// already holds answers the same question, but it is two atomic
+/// read-modify-writes on a line every dispatch reads, so a caller
+/// polling it in a loop charges the scheduler rather than only itself.
+pub fn seed_hysteresis() -> bool {
     stabilisers_from_env();
     SEED_HYSTERESIS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -776,7 +782,7 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
     // the far side of a boundary cannot halve or double the leaf count
     // by itself.
     let depth = match plan.site {
-        Some(site) if seed_hysteresis_enabled() => site.get().stabilise_seed_depth(depth),
+        Some(site) if seed_hysteresis() => site.get().stabilise_seed_depth(depth),
         _ => depth,
     };
     // A factor the caller set is them describing their own workload,

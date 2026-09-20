@@ -431,6 +431,152 @@ impl CallSiteState {
         }
     }
 
+    /// Returns the site to the state [`CallSiteState::new`] gives, so a
+    /// second arm in the same process does not inherit what the first
+    /// one taught the classifier.
+    ///
+    /// Site state is leaked for the life of the process, which is what
+    /// makes a `SiteRef` `'static`. Without this, two arms measured in
+    /// one process share a learned class, an EWMA per policy arm and a
+    /// seed depth, and the second arm's numbers describe both. Measuring
+    /// them in separate processes instead carries whatever else differed
+    /// between those processes, which for a decision driven by a
+    /// measured estimate is the thing being measured.
+    ///
+    /// Not atomic as a whole. A dispatch running at this site while the
+    /// reset lands sees some counters cleared and some not, which skews
+    /// that one window; call it between arms, not during one.
+    pub fn reset(&self) {
+        // Destructured rather than assigned field by field, so a field
+        // added to the struct and not cleared here fails to compile. A
+        // reset that silently skips a counter is the defect it exists to
+        // prevent, and it would show up as the second arm agreeing
+        // suspiciously with the first.
+        let Self {
+            active_tag,
+            pending_tag,
+            pending_run,
+            leaf_count,
+            leaf_sum_ns,
+            leaf_sumsq_scaled,
+            leaf_items,
+            leaf_sumsq_per_item,
+            leaf_weight_sum,
+            leaf_oncore_items,
+            leaf_oncore_sum,
+            leaf_oncore_sumsq_per_item,
+            last_count,
+            last_sum_ns,
+            last_sumsq,
+            last_items,
+            last_sumsq_per_item,
+            last_weight_sum,
+            last_oncore_items,
+            last_oncore_sum,
+            last_oncore_sumsq_per_item,
+            window_mean_ns,
+            window_cv2,
+            window_ticks,
+            window_cv2_min,
+            window_cv2_max,
+            arm_ewma_ns,
+            arm_samples,
+            arm_calls,
+            routing_ewma_ns,
+            routing_samples,
+            routing_calls,
+            place_cpu_ns,
+            place_backend_ns,
+            place_calls,
+            split_cpu_ns_per_item,
+            split_backend_ns_per_item,
+            split_cpu_ns_per_item_by_size,
+            split_backend_ns_per_item_by_size,
+            reduce_cost_sum_cycles,
+            reduce_cost_samples,
+            collapse_overran,
+            active_depth,
+            pending_depth,
+            depth_run,
+            recent_occupancy_pct,
+            pool_thread_ticks,
+            pool_wall_ticks,
+            last_seed_depth,
+            seed_depth_flips,
+        } = self;
+
+        for tag in [active_tag, pending_tag] {
+            tag.store(TAG_UNINIT, Ordering::Relaxed);
+        }
+        for counter in [
+            leaf_count,
+            leaf_sum_ns,
+            leaf_sumsq_scaled,
+            leaf_items,
+            leaf_sumsq_per_item,
+            leaf_weight_sum,
+            leaf_oncore_items,
+            leaf_oncore_sum,
+            leaf_oncore_sumsq_per_item,
+            last_count,
+            last_sum_ns,
+            last_sumsq,
+            last_items,
+            last_sumsq_per_item,
+            last_weight_sum,
+            last_oncore_items,
+            last_oncore_sum,
+            last_oncore_sumsq_per_item,
+            window_mean_ns,
+            window_cv2,
+            window_ticks,
+            window_cv2_max,
+            split_cpu_ns_per_item,
+            split_backend_ns_per_item,
+            reduce_cost_sum_cycles,
+            pool_thread_ticks,
+            pool_wall_ticks,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        for counter in [
+            pending_run,
+            arm_calls,
+            routing_calls,
+            reduce_cost_samples,
+            depth_run,
+            seed_depth_flips,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        for depth in [active_depth, pending_depth, last_seed_depth] {
+            depth.store(DEPTH_UNSET, Ordering::Relaxed);
+        }
+        for bank in [
+            &arm_ewma_ns[..],
+            &routing_ewma_ns[..],
+            &place_cpu_ns[..],
+            &place_backend_ns[..],
+            &split_cpu_ns_per_item_by_size[..],
+            &split_backend_ns_per_item_by_size[..],
+        ] {
+            for cell in bank {
+                cell.store(0, Ordering::Relaxed);
+            }
+        }
+        for bank in [&arm_samples[..], &routing_samples[..], &place_calls[..]] {
+            for cell in bank {
+                cell.store(0, Ordering::Relaxed);
+            }
+        }
+        // The extremes start at the identity for a min, so the first
+        // window after a reset sets both rather than being weighed
+        // against a range the previous arm established.
+        window_cv2_min.store(u64::MAX, Ordering::Relaxed);
+        recent_occupancy_pct.store(OCCUPANCY_UNREPORTED, Ordering::Relaxed);
+        collapse_overran.store(false, Ordering::Relaxed);
+    }
+
     /// Note the seed depth a dispatch at this site is about to use, and
     /// count it when it differs from the one before.
     ///
@@ -1355,8 +1501,17 @@ impl core::fmt::Debug for SiteRef {
 /// textual call site inside a generic caller can surface as
 /// distinct `Location` constants per instantiation, and the value
 /// key merges those back into one site.
+/// The location is kept beside the state so the registry can say where
+/// each site is. The key is a hash and cannot be turned back into a
+/// file and line, and `CallSiteState` holds no location of its own, so
+/// without this a walk of the registry answers a list of anonymous
+/// counters. One pointer per site, stored once when the location is
+/// first seen; the dispatch path reads through a thread-local one-slot
+/// cache and does not touch this map at all.
+type SiteEntry = (&'static std::panic::Location<'static>, &'static CallSiteState);
+
 static SITE_REGISTRY: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::HashMap<u64, &'static CallSiteState>>,
+    std::sync::RwLock<std::collections::HashMap<u64, SiteEntry>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
 fn location_key(loc: &'static std::panic::Location<'static>) -> u64 {
@@ -1404,13 +1559,15 @@ pub fn site_for_location(loc: &'static std::panic::Location<'static>) -> SiteRef
     let existing = SITE_REGISTRY
         .read()
         .ok()
-        .and_then(|map| map.get(&key).copied());
+        .and_then(|map| map.get(&key).map(|&(_, site)| site));
     let site: &'static CallSiteState = match existing {
         Some(site) => site,
         None => match SITE_REGISTRY.write() {
-            Ok(mut map) => map
-                .entry(key)
-                .or_insert_with(|| Box::leak(Box::new(CallSiteState::new()))),
+            Ok(mut map) => {
+                map.entry(key)
+                    .or_insert_with(|| (loc, Box::leak(Box::new(CallSiteState::new()))))
+                    .1
+            }
             // Lock poisoned (a panic while inserting): fall back to
             // a leaked one-off state so dispatch keeps working; the
             // site just will not be shared with future calls.
@@ -1425,6 +1582,73 @@ pub fn site_for_location(loc: &'static std::panic::Location<'static>) -> SiteRef
 #[cfg(test)]
 pub(crate) fn registry_len() -> usize {
     SITE_REGISTRY.read().map(|m| m.len()).unwrap_or(0)
+}
+
+/// Reads the registry, recovering it when a panic has poisoned the
+/// lock.
+///
+/// The map survives such a panic intact. The only write is one
+/// `or_insert_with`, which either completes or inserts nothing, and
+/// [`site_for_location`] answers a poisoned write lock by leaking a
+/// one-off state rather than writing a partial entry. So the sites
+/// already registered are still valid and still readable, and
+/// refusing to read them would report damage the registry does not
+/// have.
+fn registry() -> std::sync::RwLockReadGuard<'static, std::collections::HashMap<u64, SiteEntry>> {
+    match SITE_REGISTRY.read() {
+        Ok(map) => map,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// One call site the registry has materialised, and where it is.
+#[derive(Copy, Clone, Debug)]
+pub struct RegisteredSite {
+    /// The source location the site was first seen at.
+    ///
+    /// The same textual site inside a generic caller can surface as
+    /// distinct `Location` constants per instantiation, and the
+    /// registry merges those onto one entry, so this is whichever of
+    /// them arrived first. They agree on file, line and column, which
+    /// is what the entry is keyed on.
+    pub location: &'static std::panic::Location<'static>,
+    /// What that site has learned.
+    pub site: SiteRef,
+}
+
+/// Every call site the registry holds, each with where it is.
+///
+/// The whole set in one allocation rather than a walk the caller
+/// drives: the lock this takes is the one a dispatch meeting a new
+/// location must take to write, and a caller holding it open across
+/// its own work would block those dispatches for that long.
+///
+/// Order is the map's and carries no meaning; sort on the location.
+pub fn registered_sites() -> Vec<RegisteredSite> {
+    registry()
+        .values()
+        .map(|&(location, state)| RegisteredSite {
+            location,
+            site: SiteRef::new(state),
+        })
+        .collect()
+}
+
+/// Resets every site in the registry, answering how many.
+///
+/// For measuring two arms in one process: see [`CallSiteState::reset`]
+/// for why the alternative, a process each, measures something else.
+///
+/// Holds the read lock for the whole sweep, which blocks a dispatch
+/// that meets a location for the first time but not one reaching a
+/// site already registered. The sweep is a few tens of atomic stores
+/// per site.
+pub fn reset_all_sites() -> usize {
+    let map = registry();
+    for (_, state) in map.values() {
+        state.reset();
+    }
+    map.len()
 }
 
 #[cfg(test)]
@@ -1576,6 +1800,63 @@ mod tests {
         assert_eq!(S.learned_class(), None);
         assert_eq!(S.cv2_per_mille(), None);
         assert_eq!(S.leaf_count(), 0);
+    }
+
+    #[test]
+    fn a_reset_site_reads_as_a_fresh_one() {
+        static S: CallSiteState = CallSiteState::new();
+        // Teach it a depth flip, which is a counter with a reader, and
+        // a depth, whose fresh value is not zero. A reset that wrote
+        // zeros everywhere would pass on the counter and fail here.
+        S.record_seed_depth(3);
+        S.record_seed_depth(5);
+        assert_eq!(S.seed_depth_flips(), 1, "the site must have learned something first");
+
+        S.reset();
+
+        assert_eq!(S.seed_depth_flips(), 0);
+        assert_eq!(S.learned_class(), None);
+        assert_eq!(S.cv2_per_mille(), None);
+        assert_eq!(S.leaf_count(), 0);
+        // The depth is unset again rather than zero, so the next
+        // dispatch establishes one and counts no flip against the arm
+        // before it.
+        S.record_seed_depth(9);
+        assert_eq!(S.seed_depth_flips(), 0, "the first depth after a reset flips nothing");
+    }
+
+    #[test]
+    fn the_registry_says_where_each_site_is() {
+        let mine = caller_site();
+        let sites = registered_sites();
+        let found = sites
+            .iter()
+            .find(|r| r.site == mine)
+            .expect("a site resolved through caller_site is in the registry");
+        assert!(
+            found.location.file().ends_with("call_site.rs"),
+            "the location is this file, not the binding's: {}",
+            found.location.file()
+        );
+        assert!(found.location.line() > 0);
+    }
+
+    #[test]
+    fn resetting_every_site_covers_the_one_just_made() {
+        // Safe to run beside the other tests in this module even though
+        // the sweep is process-wide: every one of them that asserts on
+        // counters owns its state as a `static CallSiteState`, which is
+        // never in the registry, and the one that does use caller_site
+        // asserts identity and registry size, neither of which a reset
+        // changes.
+        let mine = caller_site();
+        mine.get().record_seed_depth(2);
+        mine.get().record_seed_depth(7);
+        assert_eq!(mine.get().seed_depth_flips(), 1);
+
+        let swept = reset_all_sites();
+        assert!(swept >= 1, "the sweep counts the sites it reset");
+        assert_eq!(mine.get().seed_depth_flips(), 0);
     }
 
     #[test]
