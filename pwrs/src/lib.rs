@@ -66,6 +66,22 @@ pwrs::export_module! {
         pool::StartFlynnelSplitObserver,
         pool::NewFlynnelIoPool,
         pool::GetFlynnelIoPool,
+        kernels::InvokeFlynnelMap,
+        kernels::InvokeFlynnelZip,
+        kernels::MeasureFlynnelReduce,
+        kernels::GetFlynnelPrefixSum,
+        kernels::GetFlynnelHistogram,
+        kernels::GetFlynnelDotProduct,
+        kernels::SortFlynnelArray,
+        kernels::MeasureFlynnelFileHash,
+        kernels::TestFlynnelFileHash,
+        kernels::SearchFlynnelFile,
+        kernels::MeasureFlynnelFileLine,
+        kernels::MeasureFlynnelFileByte,
+        kernels::SearchFlynnelText,
+        kernels::MeasureFlynnelTextCount,
+        kernels::SplitFlynnelText,
+        kernels::UpdateFlynnelText,
     ],
     classes: [
         host::CpuInfo,
@@ -84,6 +100,14 @@ pwrs::export_module! {
         pool::SpinState,
         pool::SplitState,
         pool::IoPool,
+        kernels::Reduction,
+        kernels::HistogramBin,
+        kernels::FileHash,
+        kernels::HashCheck,
+        kernels::FileMatch,
+        kernels::FileMeasure,
+        kernels::TextMatch,
+        kernels::TextMeasure,
     ],
     enums: [
         host::Vendor,
@@ -99,10 +123,15 @@ pwrs::export_module! {
         types::WorkloadClass,
         types::CooperativeRouting,
         types::VariantRouting,
+        kernels::MapOp,
+        kernels::ZipOp,
+        kernels::ReduceOp,
+        kernels::TextTransform,
     ],
 }
 
 mod host;
+mod kernels;
 mod plan;
 mod pool;
 mod types;
