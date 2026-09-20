@@ -50,6 +50,13 @@ param(
     # is not the next arm's starting condition.
     [double]$Cooldown = 0.75,
     # Where the per-commit anchor medians accumulate.
+    #
+    # The default sits in the tree, which is right for a repository
+    # built in place and wrong for a per-commit clone: a fresh tree has
+    # an empty store, so every run reports "no earlier build on this
+    # host to compare with" and the cross-build drift the anchor exists
+    # to carry can never accumulate. A clone-per-commit workflow has to
+    # pass a path outside the tree.
     [string]$AnchorStore = (Join-Path $PSScriptRoot 'anchor-medians.json'),
     # Where each run's per-kernel medians accumulate, so run-to-run
     # spread can be read rather than the within-run spread standing in

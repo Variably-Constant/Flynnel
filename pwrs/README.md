@@ -78,6 +78,20 @@ which is what filtering and formatting want, or with `-AsArray` one
 beside it. Bins is a number the caller picks and nothing else bounds,
 so at a large one the records cost more than the binning.
 
+Measured on pc2, PowerShell 7.6, the same binning over the same array
+both ways, control drift 1.75% across the run:
+
+| 50,000 bins | ms |
+|---|---|
+| one record per bin | 22.29 |
+| one record for the histogram | 5.14 |
+
+4.3 times, and the difference over the bin count puts one pipeline
+record at 343 ns on this host. That is the marginal cost of a record
+carrying a real object, which is the figure to reason with here; the
+1712 ns in the table above is a bare pipeline record with nothing
+behind it.
+
 **A kernel that only reads can change the array in place.**
 `Update-FlynnelArray` runs the same operations as `Invoke-FlynnelMap`
 over a pin of the caller's own buffer and writes nothing back. It
