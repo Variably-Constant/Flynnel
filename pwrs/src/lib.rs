@@ -128,6 +128,7 @@ pwrs::export_module! {
         pool::IoPool,
         kernels::Reduction,
         kernels::HistogramBin,
+        kernels::Histogram,
         kernels::FileHash,
         kernels::HashCheck,
         kernels::FileMatch,

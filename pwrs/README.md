@@ -5,7 +5,7 @@ scheduler as PowerShell commands and objects, bound straight to the
 Rust with [PWRS](https://crates.io/crates/PoWerRuSt). The cmdlets are
 the library. Nothing here shells out to anything.
 
-Sixty-five commands, thirty-eight object types and twenty-two
+Sixty-five commands, thirty-nine object types and twenty-two
 enumerations. Every command answers to a shorter name with the `Fly`
 prefix: `Measure-FlyReduce` is `Measure-FlynnelReduce`.
 
@@ -70,6 +70,13 @@ receives that array as a single item rather than one element at a time.
 
 The answer is also a typed array, so feeding one kernel's output into
 the next stays on the fast path.
+
+**A cmdlet whose row count the caller names offers both shapes.**
+`Get-FlynnelHistogram` answers one `Flynnel.HistogramBin` per bin,
+which is what filtering and formatting want, or with `-AsArray` one
+`Flynnel.Histogram` carrying the whole count array and the range
+beside it. Bins is a number the caller picks and nothing else bounds,
+so at a large one the records cost more than the binning.
 
 **A kernel that only reads can change the array in place.**
 `Update-FlynnelArray` runs the same operations as `Invoke-FlynnelMap`

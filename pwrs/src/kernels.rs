@@ -291,6 +291,31 @@ pub struct HistogramBin {
     pub count: u64,
 }
 
+/// A whole histogram as one object, with the counts as an array.
+///
+/// The bins are recoverable from the range: bin `i` runs from
+/// `Low + Width * i` to `Low + Width * (i + 1)`.
+#[psclass(name = "Flynnel.Histogram")]
+#[derive(Clone, Default)]
+pub struct Histogram {
+    /// The lowest value the first bin takes.
+    pub low: f64,
+    /// The highest value the last bin takes. The last bin takes it
+    /// itself, so the whole range is covered.
+    pub high: f64,
+    /// How wide one bin is. Zero when every element has one value,
+    /// which puts all of them in the first bin.
+    pub width: f64,
+    /// How many elements landed in each bin, in bin order. As long as
+    /// Bins asked for.
+    ///
+    /// Plural because every PowerShell object answers an intrinsic
+    /// Count of one, so a property named Count that failed to resolve
+    /// would read as a histogram of a single bin rather than as an
+    /// error.
+    pub counts: Vec<u64>,
+}
+
 /// Applies one operation to every element of an array on Flynnel's
 /// workers, through `par_map_in_place`.
 ///
@@ -828,16 +853,23 @@ impl Cmdlet for GetFlynnelPrefixSum {
 /// Without Min and Max the range comes from the data, in one parallel
 /// pass before the binning pass.
 ///
+/// Answers one record per bin, which suits filtering and formatting,
+/// or with AsArray one record for the whole histogram, which suits a
+/// bin count high enough that a record each would cost more than the
+/// binning.
+///
 /// # Examples
 ///
 /// `Get-FlynnelHistogram -InputObject $x -Bins 16`
 ///
 /// `Get-FlynnelHistogram -InputObject $x -Bins 10 -Min 0 -Max 1`
+///
+/// `Get-FlynnelHistogram -InputObject $x -Bins 1000000 -AsArray`
 #[cmdlet(
     verb = "Get",
     noun = "FlynnelHistogram",
     alias = "Get-FlyHistogram",
-    output = ["Flynnel.HistogramBin"]
+    output = ["Flynnel.HistogramBin", "Flynnel.Histogram"]
 )]
 #[derive(Default)]
 pub struct GetFlynnelHistogram {
@@ -853,6 +885,15 @@ pub struct GetFlynnelHistogram {
     /// The top of the range. Absent, the largest element.
     #[param]
     pub max: Option<f64>,
+    /// Answer one Flynnel.Histogram, whose Count is the whole array of
+    /// counts and which carries the range beside it, instead of one
+    /// Flynnel.HistogramBin record per bin.
+    ///
+    /// One record crosses the boundary once. A bin per record crosses
+    /// it once per bin, which is what Bins asks for and nothing else
+    /// bounds.
+    #[param]
+    pub as_array: bool,
     /// The plan to run under.
     #[param]
     pub plan: Option<Plan>,
@@ -935,6 +976,15 @@ impl Cmdlet for GetFlynnelHistogram {
             for (slot, count) in part.iter().enumerate() {
                 total[slot] += *count;
             }
+        }
+
+        if self.as_array {
+            return ps.write(Histogram {
+                low: lo,
+                high: hi,
+                width,
+                counts: total,
+            });
         }
 
         for (index, count) in total.iter().enumerate() {

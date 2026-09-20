@@ -273,6 +273,30 @@ $crossingUntyped = Measure-Cell -Body {
 }
 Start-Cooldown
 
+# ----------------------------------------------------------------------
+# What a record per row costs, isolated
+# ----------------------------------------------------------------------
+#
+# Every other kernel's row count is fixed by the hardware or by a path
+# list whose input crossing already dominates. The histogram's is Bins,
+# which the caller names and nothing else bounds, so it is the one place
+# the return shape can be varied with everything else held still: both
+# cells bin the same array over the same range and differ only in what
+# crosses back. The gap divided by Bins is the per-record cost at this
+# host's own width, rather than the 1712 ns the sibling module measured
+# on a bare pipeline.
+
+$histBins = 50000
+Write-Host 'record-shape cells'
+$histRows = Measure-Cell -Body {
+    Get-FlynnelHistogram -InputObject $data -Bins $histBins
+}
+Start-Cooldown
+$histArray = Measure-Cell -Body {
+    Get-FlynnelHistogram -InputObject $data -Bins $histBins -AsArray
+}
+Start-Cooldown
+
 # Straight records whether this row's shape is the anchor's shape. The
 # anchor is a straight scan, so it speaks for the kernels whose inner
 # loop is also a straight scan and not for the ones whose inner loop
@@ -584,6 +608,11 @@ $result = [PSCustomObject]@{
     CrossingInMs    = [Math]::Round($crossingIn.MedianMs, 4)
     CrossingInOutMs = [Math]::Round($crossingInOut.MedianMs, 4)
     CrossingUntypedMs = [Math]::Round($crossingUntyped.MedianMs, 4)
+    RecordBins        = $histBins
+    RecordRowsMs      = [Math]::Round($histRows.MedianMs, 4)
+    RecordArrayMs     = [Math]::Round($histArray.MedianMs, 4)
+    RecordNs          = [Math]::Round(
+                            ($histRows.MedianMs - $histArray.MedianMs) * 1e6 / $histBins, 1)
     LoadThreads     = $LoadThreads
     LoadedControlFirstMs = if ($loadedControlFirst) {
                                [Math]::Round($loadedControlFirst.MedianMs, 4)
@@ -625,6 +654,12 @@ Write-Host ("crossing at {0} elements: {1} ms in, {2} ms in and out, {3} ms in u
 Write-Host ("  so a typed array costs {0} ns an element in, and an untyped one {1} ns" -f
     [Math]::Round($result.CrossingInMs * 1e6 / $n, 1),
     [Math]::Round($result.CrossingUntypedMs * 1e6 / $n, 1))
+Write-Host ("{0} histogram bins: {1} ms a record each against {2} ms in one, {3}x" -f
+    $result.RecordBins, $result.RecordRowsMs, $result.RecordArrayMs,
+    $(if ($result.RecordArrayMs -gt 0) {
+          [Math]::Round($result.RecordRowsMs / $result.RecordArrayMs, 1)
+      } else { 'n/a' }))
+Write-Host ("  so a pipeline record costs {0} ns here" -f $result.RecordNs)
 if ($null -ne $anchorDriftPct) {
     Write-Host ("anchor {0} ms, {1}% from {2}" -f
         $result.AnchorMs, $anchorDriftPct, $previous.Commit)
