@@ -17,7 +17,7 @@
 
 use core_affinity::CoreId;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Default number of ping-pong iterations per pair. At the
@@ -180,6 +180,20 @@ fn measure_pair(core_a: CoreId, core_b: CoreId, iters: u32) -> u64 {
 
     let counter = AlignedAtomic(AtomicU64::new(0));
 
+    // Both sides run on threads this function owns, and neither is the
+    // caller.
+    //
+    // Pinning the caller would be cheaper by one spawn and it is what
+    // this did: it bound the calling thread to `core_a` and never put
+    // it back, so a process that measured its latency table once was
+    // left with its own thread on one cpu for good. On Linux that used
+    // to decide the pool's width, because the width was read from the
+    // calling thread's mask; that reading is now taken from the
+    // process, but a measurement must not move a thread it was only
+    // asked to time.
+    //
+    // A scope joins both threads before it returns, so whatever they
+    // do to their own affinity leaves with them.
     std::thread::scope(|scope| {
         let cref = &counter;
         // Total transitions: 2 per iteration, plus a final B
@@ -188,7 +202,7 @@ fn measure_pair(core_a: CoreId, core_b: CoreId, iters: u32) -> u64 {
 
         // Thread B: wait for odd values, write the next even.
         let _b = scope.spawn(move || {
-            let _ = core_affinity::set_for_current(core_b);
+            pin_or_say(core_b);
             let mut my_val: u64 = 2;
             while my_val <= target {
                 // Wait for A's previous odd write (= my_val - 1).
@@ -204,38 +218,68 @@ fn measure_pair(core_a: CoreId, core_b: CoreId, iters: u32) -> u64 {
 
         // Thread A: write odd, wait for B's even response. Owns
         // the timer.
-        let _ = core_affinity::set_for_current(core_a);
+        let a = scope.spawn(move || {
+            pin_or_say(core_a);
 
-        // Warm-up: 8 full round trips (= 16 transitions) to
-        // stabilize cache lines + branch predictor before the
-        // timed window. Each warmup iteration: A writes one odd
-        // value, waits for B's even response.
-        let warmup_iters: u64 = 8u64.min(iters as u64);
-        let mut my_val: u64 = 1;
-        for _ in 0..warmup_iters {
-            cref.0.store(my_val, Ordering::Release);
-            let expected_from_b = my_val + 1;
-            while cref.0.load(Ordering::Acquire) != expected_from_b {
-                core::hint::spin_loop();
+            // Warm-up: 8 full round trips (= 16 transitions) to
+            // stabilize cache lines + branch predictor before the
+            // timed window. Each warmup iteration: A writes one odd
+            // value, waits for B's even response.
+            let warmup_iters: u64 = 8u64.min(iters as u64);
+            let mut my_val: u64 = 1;
+            for _ in 0..warmup_iters {
+                cref.0.store(my_val, Ordering::Release);
+                let expected_from_b = my_val + 1;
+                while cref.0.load(Ordering::Acquire) != expected_from_b {
+                    core::hint::spin_loop();
+                }
+                my_val = my_val.wrapping_add(2);
             }
-            my_val = my_val.wrapping_add(2);
-        }
 
-        let timed_iters = (iters as u64) - warmup_iters;
-        let t0 = Instant::now();
-        for _ in 0..timed_iters {
-            cref.0.store(my_val, Ordering::Release);
-            let expected_from_b = my_val + 1;
-            while cref.0.load(Ordering::Acquire) != expected_from_b {
-                core::hint::spin_loop();
+            let timed_iters = (iters as u64) - warmup_iters;
+            let t0 = Instant::now();
+            for _ in 0..timed_iters {
+                cref.0.store(my_val, Ordering::Release);
+                let expected_from_b = my_val + 1;
+                while cref.0.load(Ordering::Acquire) != expected_from_b {
+                    core::hint::spin_loop();
+                }
+                my_val = my_val.wrapping_add(2);
             }
-            my_val = my_val.wrapping_add(2);
-        }
-        let elapsed = t0.elapsed();
-        (elapsed.as_nanos() as u64)
-            .checked_div(timed_iters)
-            .unwrap_or(0)
+            let elapsed = t0.elapsed();
+            (elapsed.as_nanos() as u64)
+                .checked_div(timed_iters)
+                .unwrap_or(0)
+        });
+
+        // A panic in the timing thread is the measurement failing, and
+        // there is no reading to report from it.
+        a.join().unwrap_or(0)
     })
+}
+
+/// Bind the calling thread to `core`, saying once when the host will
+/// not.
+///
+/// The figure this function serves is the cost of a line moving
+/// between two named cores. Unpinned, the two threads may share one
+/// core or migrate mid-run, and the number then describes neither
+/// core. That is a reading worth distrusting, so a host that refuses
+/// the bind says so rather than returning a plausible number from an
+/// unpinned run.
+fn pin_or_say(core: CoreId) {
+    if core_affinity::set_for_current(core) {
+        return;
+    }
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "flynnel: this host refused to bind a thread to cpu {:?}; the latency table \
+             measures whatever cores the scheduler chose and its figures name a pair they \
+             may not have run on",
+            core.id
+        );
+    }
 }
 
 /// Build the latency table by measuring every off-diagonal
