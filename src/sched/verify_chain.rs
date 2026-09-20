@@ -144,6 +144,95 @@ struct ChainShared {
     /// (signalled flag, condvar) for finalize to wait on. Workers
     /// pulse the condvar when they decrement pending to zero.
     notify: (Mutex<()>, Condvar),
+    /// Chunks that have arrived and not yet been folded in, by the
+    /// index they were submitted at, and how far the fold has got.
+    ///
+    /// A hash chain is ordered: `update(a)` then `update(b)` is not
+    /// `update(b)` then `update(a)`. Submitting to the IO pool means
+    /// tasks finish in whatever order the pool runs them, so folding
+    /// each chunk in as its own task completed made the root depend
+    /// on completion order. Two runs over the same chunks could root
+    /// differently, and a chain whose purpose is deciding whether two
+    /// traces are bit-exact would report a mismatch between identical
+    /// ones.
+    ///
+    /// So a task deposits its bytes at its own index and then folds
+    /// in whatever unbroken prefix is ready, under the hasher lock.
+    /// The hashing still leaves the caller's thread; only the order
+    /// is pinned.
+    arrivals: Mutex<Arrivals>,
+}
+
+/// Chunks waiting to be folded in, and how far the fold has got.
+#[derive(Default)]
+struct Arrivals {
+    /// One slot per submitted chunk, taken as soon as it is folded
+    /// in so the bytes are dropped the moment they are spent.
+    slots: Vec<Option<Vec<u8>>>,
+    /// The next index the hasher wants. Everything below it is in.
+    next: usize,
+}
+
+/// The arrival table, recovering a lock a panicking fold poisoned.
+///
+/// Refusing here would strand every later chunk, and the state behind
+/// the lock is a vector of byte slots with an index into it: a panic
+/// leaves it consistent, because nothing is half-written across the
+/// two fields except inside this lock.
+fn lock_arrivals(inner: &ChainShared) -> std::sync::MutexGuard<'_, Arrivals> {
+    match inner.arrivals.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The hasher, recovering a lock a panicking fold poisoned.
+///
+/// Dropping the update on a poisoned lock is what the first version
+/// of this function did, and it is the same failure this whole
+/// rewrite is about: a chunk that never enters the chain gives a root
+/// that is wrong and looks fine. Recovering means a panic during one
+/// fold costs the panicking chunk and not every chunk after it.
+fn lock_hasher(inner: &ChainShared) -> std::sync::MutexGuard<'_, Option<Box<dyn VerifyHasher>>> {
+    match inner.hasher.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Put a chunk in its slot and fold in whatever unbroken prefix is
+/// now ready.
+///
+/// Separate from the task that calls it so a test can drive arrivals
+/// in any order it likes. The global IO pool is behind a `OnceLock`
+/// seeded from an environment variable, so a test cannot install one
+/// without fixing it for every other test in the binary; the property
+/// that matters is that the fold order does not depend on arrival
+/// order, and that is testable here directly.
+fn deposit_and_fold(inner: &ChainShared, index: usize, chunk: Vec<u8>) {
+    {
+        let mut arrivals = lock_arrivals(inner);
+        arrivals.slots[index] = Some(chunk);
+    }
+    fold_ready_prefix(inner);
+}
+
+/// Fold in every chunk from the fold cursor up to the first gap.
+///
+/// Whichever caller finds the prefix ready does the work, so none
+/// waits on a particular peer and the hasher still sees submission
+/// order.
+fn fold_ready_prefix(inner: &ChainShared) {
+    let mut arrivals = lock_arrivals(inner);
+    let mut hasher = lock_hasher(inner);
+    let Some(h) = hasher.as_mut() else { return };
+    let mut next = arrivals.next;
+    while let Some(slot) = arrivals.slots.get_mut(next) {
+        let Some(bytes) = slot.take() else { break };
+        h.update(&bytes);
+        next += 1;
+    }
+    arrivals.next = next;
 }
 
 /// Running hash-chain over a sequence of stripe outputs. Submit
@@ -173,6 +262,7 @@ impl VerifyChain {
                 hasher: Mutex::new(Some(hasher)),
                 pending: AtomicUsize::new(0),
                 notify: (Mutex::new(()), Condvar::new()),
+                arrivals: Mutex::new(Arrivals::default()),
             }),
         }
     }
@@ -182,14 +272,17 @@ impl VerifyChain {
     /// otherwise runs inline on the caller thread.
     pub fn submit_chunk(&self, chunk: Vec<u8>) {
         self.inner.pending.fetch_add(1, Ordering::AcqRel);
+        // The index is taken here, on the submitting thread, because
+        // submission order is the order the caller means and the
+        // order the pool happens to run the tasks in is not.
+        let index = {
+            let mut arrivals = lock_arrivals(&self.inner);
+            arrivals.slots.push(None);
+            arrivals.slots.len() - 1
+        };
         let inner = Arc::clone(&self.inner);
         let task = move || {
-            // Update the hasher (briefly hold the mutex).
-            if let Ok(mut guard) = inner.hasher.lock()
-                && let Some(h) = guard.as_mut()
-            {
-                h.update(&chunk);
-            }
+            deposit_and_fold(&inner, index, chunk);
             // Decrement pending; if we hit zero, notify any
             // finalize waiter.
             let prev = inner.pending.fetch_sub(1, Ordering::AcqRel);
@@ -226,7 +319,13 @@ impl VerifyChain {
             g = self.inner.notify.1.wait(g).unwrap();
             drop(g);
         }
-        let mut guard = self.inner.hasher.lock().unwrap();
+        // Every task has run, so every slot is filled; fold in any
+        // prefix a task left behind because its own predecessor had
+        // not arrived when it held the lock. Without this, a chain
+        // whose last task finished before an earlier one would root
+        // over a short prefix and say nothing about it.
+        fold_ready_prefix(&self.inner);
+        let mut guard = lock_hasher(&self.inner);
         match guard.take() {
             Some(hasher) => hasher.finalize(),
             None => [0u8; 32],
@@ -310,6 +409,83 @@ mod tests {
         assert_eq!(chain.pending_count(), 0);
         let root = chain.finalize();
         assert!(root.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn the_root_does_not_depend_on_the_order_the_chunks_finish() {
+        // The property the whole family rests on, and the one no test
+        // reached: a chain decides whether two traces are bit-exact,
+        // so a root that moves with completion order would report a
+        // mismatch between identical traces.
+        //
+        // Driven through deposit_and_fold rather than through the IO
+        // pool because the pool is behind a OnceLock seeded from an
+        // environment variable: installing one in a test fixes it for
+        // every other test in the binary. What matters is that the
+        // fold order is submission order whatever order the arrivals
+        // come in, and that is exactly what this drives.
+        let chunks: Vec<Vec<u8>> = vec![
+            b"first".to_vec(),
+            b"second".to_vec(),
+            b"third".to_vec(),
+            b"fourth".to_vec(),
+        ];
+
+        let in_order = VerifyChain::new();
+        for c in &chunks {
+            in_order.submit_chunk(c.clone());
+        }
+        let want = in_order.finalize();
+
+        // The same four submitted in the same order, but completing
+        // last-to-first, which is what a pool is free to do.
+        for arrival in [[3usize, 1, 0, 2], [3, 2, 1, 0], [1, 3, 2, 0]] {
+            let chain = VerifyChain::new();
+            {
+                let mut arrivals = lock_arrivals(&chain.inner);
+                arrivals.slots.resize_with(chunks.len(), || None);
+            }
+            for &i in &arrival {
+                deposit_and_fold(&chain.inner, i, chunks[i].clone());
+            }
+            assert_eq!(
+                chain.finalize(),
+                want,
+                "arrivals {arrival:?} rooted differently from submission order"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chunk_still_outstanding_is_folded_in_by_finalize() {
+        // A task can leave its chunk in its slot when an earlier one
+        // has not arrived. If finalize did not sweep the remainder,
+        // the root would cover a prefix and say nothing about it.
+        let chunks: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec()];
+
+        let in_order = VerifyChain::new();
+        for c in &chunks {
+            in_order.submit_chunk(c.clone());
+        }
+        let want = in_order.finalize();
+
+        let chain = VerifyChain::new();
+        {
+            let mut arrivals = lock_arrivals(&chain.inner);
+            arrivals.slots.resize_with(2, || None);
+        }
+        // Only the second arrives, so nothing can fold yet.
+        deposit_and_fold(&chain.inner, 1, chunks[1].clone());
+        {
+            let arrivals = lock_arrivals(&chain.inner);
+            assert_eq!(arrivals.next, 0, "nothing folds while index 0 is missing");
+        }
+        // The first arrives without anyone folding after it.
+        {
+            let mut arrivals = lock_arrivals(&chain.inner);
+            arrivals.slots[0] = Some(chunks[0].clone());
+        }
+        assert_eq!(chain.finalize(), want, "finalize must sweep what is left");
     }
 
     #[test]
