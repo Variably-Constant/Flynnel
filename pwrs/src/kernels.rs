@@ -8,6 +8,38 @@
 //! already owns. Each cmdlet here is one such body over one substrate:
 //! arrays and numbers, files, or text.
 //!
+//! # A kernel body calls nothing managed, and the compiler only
+//! catches half of that
+//!
+//! Flynnel's workers are threads .NET has never heard of: not garbage
+//! collection roots, never suspended at a safepoint, not competing
+//! with the engine's thread pool. A reverse call into the managed
+//! vtable attaches the calling thread to the runtime and it loses all
+//! of that for the life of the process.
+//!
+//! Half of this the type system enforces. `Pipeline` is `!Send` and
+//! `!Sync` by construction, so no closure handed to a parallel
+//! primitive can capture it: the stream calls, the stopping check, the
+//! session state and a script block are all refused at compile time.
+//!
+//! The other half it does not. `PsObject` is `unsafe impl Send` and
+//! `unsafe impl Sync` on purpose, because a GCHandle may be held from
+//! any thread, and both `PsObject::get` and `PsObject::pin` take
+//! `&self` and call the vtable. A `Send + Sync` closure may therefore
+//! capture one and call either, and that compiles.
+//!
+//! So the rule is a rule rather than a guarantee: **resolve every
+//! managed value before the parallel section and hand the closure
+//! plain Rust data.** Pinning is where this is easy to get wrong,
+//! because `pin` is exactly what a kernel wants when its input is a
+//! shell `double[]`, and calling it inside `collect_indexed` instead
+//! of before it reads naturally and attaches every worker that runs
+//! the chunk.
+//!
+//! Every body below keeps to it: the closures see `&mut [f64]`,
+//! `&[u8]` and indices, and every `ps.write` sits outside the
+//! parallel section.
+//!
 //! # The shape every kernel shares
 //!
 //! The whole input crosses in one call, and the whole answer crosses
@@ -461,6 +493,12 @@ impl Cmdlet for InvokeFlynnelMap {
         // drifted 4.55 per cent. So the return's remaining 25 ns an
         // element is not the copy, and the view only adds a Rust-side
         // one. Do not re-try this without a different reason.
+        //
+        // The second reason not to: a view hands the managed side a
+        // free callback, which is a reverse call into this library
+        // and attaches whichever thread runs it. Nothing here
+        // registers one, so no worker is attached by a kernel's
+        // answer any more than by its body.
         ps.write(PsArray(items))
     }
 }
