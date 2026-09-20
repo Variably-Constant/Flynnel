@@ -121,6 +121,10 @@ pwrs::export_module! {
         rings::NewFlynnelNotifyRing,
         rings::SendFlynnelItem,
         rings::ReceiveFlynnelItem,
+        backends::GetFlynnelBackend,
+        backends::TestFlynnelBackend,
+        backends::GetFlynnelAccelOp,
+        backends::GetFlynnelAccelTarget,
     ],
     classes: [
         host::CpuInfo,
@@ -177,6 +181,10 @@ pwrs::export_module! {
         rings::Injector,
         rings::NotifySender,
         rings::NotifyReceiver,
+        backends::BackendRow,
+        backends::BackendProbe,
+        backends::AccelOp,
+        backends::AccelTarget,
     ],
     enums: [
         host::Vendor,
@@ -205,9 +213,11 @@ pwrs::export_module! {
         rings::PushKind,
         rings::PopKind,
         rings::RingRole,
+        backends::BackendKind,
     ],
 }
 
+mod backends;
 mod calibration;
 mod host;
 mod kernels;

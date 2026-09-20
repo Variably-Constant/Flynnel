@@ -481,7 +481,12 @@ Describe 'Send-FlynnelItem and Receive-FlynnelItem' {
     }
 
     It 'refuses an object that is not a ring' {
-        { 'x' | Send-FlynnelItem -To (Get-Date) } | Should -Throw
+        # The item is a real byte[] so the only thing left to object to
+        # is -To. A string here would fail to bind to the byte[]
+        # parameter and the test would pass without the ring check ever
+        # running, which is a test asserting the wrong thing.
+        $item = New-Payload -Seed 1 -Length 8
+        { , $item | Send-FlynnelItem -To (Get-Date) } | Should -Throw
         { Receive-FlynnelItem -From 42 } | Should -Throw
     }
 

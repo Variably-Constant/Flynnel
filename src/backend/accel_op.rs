@@ -360,6 +360,54 @@ pub fn accel_op_name(op: AccelOpId) -> String {
     op_by_id(op).name.clone()
 }
 
+/// One registered op, as [`registered_accel_ops`] answers it.
+#[derive(Clone, Debug)]
+pub struct RegisteredAccelOp {
+    /// The id, usable with [`accel_target`] and [`dispatch_accel`].
+    pub op: AccelOpId,
+    /// The name it registered under.
+    pub name: String,
+    /// Bytes each item moves, which the gate reads to decide whether
+    /// a transfer is worth making.
+    pub bytes_per_item: u32,
+    /// Every backend this op has a kernel bound on. Empty means every
+    /// dispatch of it runs the CPU implementation.
+    pub kernels: Vec<Backend>,
+}
+
+/// Every op registered in this process, in the order they registered.
+///
+/// The registry is private and an `AccelOpId` cannot be constructed
+/// from a number, so without this a caller holding no id from
+/// [`register_accel_op`] has no way to reach an op at all - which is
+/// the position anything inspecting the process from outside is in,
+/// including a binding.
+///
+/// It takes the read lock once and copies, so nothing here holds a
+/// lock a dispatch might want. Not on any dispatch path: the routing
+/// in [`dispatch_accel`] reaches an op by index and never enumerates.
+pub fn registered_accel_ops() -> Vec<RegisteredAccelOp> {
+    let ops = match registry().read() {
+        Ok(guard) => guard,
+        // The registry is a vector that is only ever pushed to, so a
+        // panic elsewhere leaves it intact and refusing to read it
+        // would strand every later caller over an unrelated failure.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    ops.iter()
+        .enumerate()
+        .map(|(index, op)| RegisteredAccelOp {
+            op: AccelOpId(index as u32),
+            name: op.name.clone(),
+            bytes_per_item: op.bytes_per_item,
+            kernels: match op.kernels.read() {
+                Ok(k) => k.iter().map(|(backend, _)| *backend).collect(),
+                Err(poisoned) => poisoned.into_inner().iter().map(|(b, _)| *b).collect(),
+            },
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +637,62 @@ mod tests {
     fn accel_op_name_round_trips() {
         let op = register_accel_op("named_op", 0, |_n, _a| {});
         assert_eq!(accel_op_name(op), "named_op");
+    }
+
+    #[test]
+    fn the_registry_lists_an_op_with_its_bytes_and_its_bindings() {
+        // The registry is process-wide and every other test in this
+        // file registers into it, so this asserts about its OWN op by
+        // name rather than about the vector's length or its last
+        // entry, either of which would depend on test order.
+        let op = register_accel_op("listed_op", 12, |_n, _a| {});
+        let listed = registered_accel_ops();
+
+        let mine = listed
+            .iter()
+            .find(|r| r.name == "listed_op")
+            .expect("an op that registered is in the registry");
+        assert_eq!(mine.op, op, "the id listed is the id register handed back");
+        assert_eq!(mine.bytes_per_item, 12);
+        assert!(
+            mine.kernels.is_empty(),
+            "an op with nothing bound reports no kernels, which is what says every \
+             dispatch of it runs the CPU implementation"
+        );
+
+        // And a binding shows up, so the column is not always empty.
+        let stub = Arc::new(StubAccel {
+            id: Backend::Custom(0x7005),
+            caps: BackendCapabilities::cpu_defaults(),
+            kernel_calls: AtomicU32::new(0),
+            fail: false,
+        });
+        register_backend(Arc::clone(&stub) as _);
+        bind_accel_kernel(op, Backend::Custom(0x7005), "k", b"").expect("stub binds");
+
+        let after = registered_accel_ops();
+        let mine = after
+            .iter()
+            .find(|r| r.name == "listed_op")
+            .expect("still registered");
+        assert_eq!(mine.kernels, vec![Backend::Custom(0x7005)]);
+    }
+
+    #[test]
+    fn every_listed_id_resolves_to_the_name_it_was_listed_under() {
+        // The id is an index into a private vector, so a listing that
+        // paired the wrong id with a name would be undetectable from
+        // outside and would send every later accel_target and
+        // dispatch_accel at the wrong op.
+        register_accel_op("paired_a", 1, |_n, _a| {});
+        register_accel_op("paired_b", 2, |_n, _a| {});
+        for row in registered_accel_ops() {
+            assert_eq!(
+                accel_op_name(row.op),
+                row.name,
+                "the id listed for {} resolves to a different op",
+                row.name
+            );
+        }
     }
 }

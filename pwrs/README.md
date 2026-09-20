@@ -5,9 +5,9 @@ scheduler as PowerShell commands and objects, bound straight to the
 Rust with [PWRS](https://crates.io/crates/PoWerRuSt). The cmdlets are
 the library. Nothing here shells out to anything.
 
-Eighty commands, fifty-four object types and twenty-six enumerations.
-Every command answers to a shorter name with the `Fly` prefix:
-`Measure-FlyReduce` is `Measure-FlynnelReduce`.
+Eighty-four commands, fifty-eight object types and twenty-seven
+enumerations. Every command answers to a shorter name with the `Fly`
+prefix: `Measure-FlyReduce` is `Measure-FlynnelReduce`.
 
 Windows x64 and Linux x64 in one module, on PowerShell 7 and Windows
 PowerShell 5.1.
@@ -265,6 +265,36 @@ one, because the ring is only correct with one thread on each and two
 objects put that in the script's hands rather than in a doc comment.
 Each handle carries `Role` and `Index`, so the grid's output is split
 with `Where-Object Role -eq Producer` rather than by counting.
+
+**Backends.** What devices this host has and what each can do.
+`Get-FlynnelBackend` writes a row for every backend the build carries,
+on every host. `Test-FlynnelBackend` runs the host's probe again.
+`Get-FlynnelAccelOp` lists the accelerator operations registered in
+the process and `Get-FlynnelAccelTarget` says where one would run
+under a plan, without running it.
+
+An absent device is a row saying so, never a missing row. This module
+ships with every backend feature on, so the code is compiled in
+everywhere and absence is always a runtime fact; a missing row would
+read exactly like a capability nobody bound.
+
+Three columns, because they are three questions and they come apart
+in both directions. `Registered` is whether an implementation is in
+the process registry. `Available` is whether the host's probe finds
+the runtime, and a CUDA runtime can load on a machine with no card.
+`Detected` is whether the crate's own sweep listed it. Each row also
+carries the `Probe` text, so a reading can be argued with rather than
+only believed.
+
+`CapabilitiesKnown` says whether the four capability columns came
+from an implementation at all. Zero is otherwise ambiguous: an
+unregistered backend has none to ask, and the CPU backend has a
+genuine measured zero for host-to-device bandwidth.
+
+There is no `Register-FlynnelBackend`. Registering takes a Rust
+implementation of the backend trait, and registering an accelerator
+operation takes its CPU implementation as a closure; a script has
+neither. Both absences are decisions, not gaps.
 
 ## Two conventions worth knowing before you read a number
 

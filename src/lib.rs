@@ -80,8 +80,9 @@ pub use backend::{
     KernelHandle, backend_by_id, backends, cpu_backend, register_backend,
 };
 pub use backend::accel_op::{
-    AccelOpId, AccelReport, accel_op_name, accel_target, bind_accel_kernel,
-    bind_accel_kernel_handle, dispatch_accel, register_accel_op,
+    AccelOpId, AccelReport, RegisteredAccelOp, accel_op_name, accel_target,
+    bind_accel_kernel, bind_accel_kernel_handle, dispatch_accel, register_accel_op,
+    registered_accel_ops,
 };
 pub use dispatch_profile::DispatchProfile;
 pub use foundation::{HwClass, SchedTier, Variant};
