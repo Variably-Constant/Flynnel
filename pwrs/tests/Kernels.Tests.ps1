@@ -386,10 +386,16 @@ Describe 'Get-FlynnelHistogram' {
             Should -Not -Be 'System.Object'
     }
 
-    It 'writes nothing for empty input with AsArray, as without it' {
-        $empty = [double[]]@()
-        @(Get-FlynnelHistogram -InputObject $empty -Bins 4).Count | Should -Be 0
-        @(Get-FlynnelHistogram -InputObject $empty -Bins 4 -AsArray).Count | Should -Be 0
+    It 'refuses an empty array the same way with AsArray as without' {
+        # PowerShell will not bind an empty array to a mandatory
+        # parameter, so the kernel's own empty-input branch is not
+        # reachable from a script at all and there is no "writes
+        # nothing" behavior to assert. What is worth holding is that
+        # AsArray does not move where that refusal happens.
+        { Get-FlynnelHistogram -InputObject ([double[]]@()) -Bins 4 -ErrorAction Stop } |
+            Should -Throw -ExpectedMessage '*empty array*'
+        { Get-FlynnelHistogram -InputObject ([double[]]@()) -Bins 4 -AsArray -ErrorAction Stop } |
+            Should -Throw -ExpectedMessage '*empty array*'
     }
 }
 
