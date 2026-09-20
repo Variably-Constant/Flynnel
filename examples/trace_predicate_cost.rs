@@ -40,10 +40,16 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-/// Calls per timed cell. Large enough that the cell is milliseconds
-/// rather than microseconds, so the clock's own resolution is not the
-/// thing being reported.
-const CALLS: u64 = 50_000_000;
+/// Calls per timed cell.
+///
+/// Five hundred million rather than fifty. At fifty the cell was 31
+/// milliseconds and the control moved 2.6 to 12.6 per cent across a
+/// run - which is 0.016 to 0.079 ns on a 0.63 ns cell, the same size
+/// as the difference being measured. Every run declared itself
+/// unreadable, correctly. A longer cell is the fix: the predicate
+/// does not get cheaper, the clock and the scheduler get averaged
+/// over more of it.
+const CALLS: u64 = 500_000_000;
 
 /// Timed cells per shape. The median is taken, so an odd count has a
 /// middle.
@@ -140,6 +146,16 @@ fn main() {
     println!(
         "at 1560 consulted loads a dispatch that is {:.1} ns a dispatch",
         (settable_ns - latch_ns) * 1560.0
+    );
+
+    // The bound is the useful answer even when the difference is not
+    // resolvable. A dispatch over 200,000 elements costs about 380
+    // microseconds, so a per-dispatch figure is read against that.
+    const DISPATCH_NS: f64 = 380_000.0;
+    let per_dispatch = (settable_ns - latch_ns) * 1560.0;
+    println!(
+        "which is {:.4}% of a 200,000-element dispatch",
+        per_dispatch / DISPATCH_NS * 100.0
     );
 
     // A run whose control moved across it is measuring the box.
