@@ -66,6 +66,38 @@ flynnel = { path = ".." }
 # carries an unrelated `pwrs` from 2015; the library it builds is still
 # `pwrs`, which is what the source writes.
 pwrs = { package = "PoWerRuSt", version = "0.1.4" }
+# The same BLAKE3 flynnel's verify-chain feature already links, pinned
+# to the same version so cargo unifies them and the binary carries one
+# copy. Named here rather than reached through the crate's hasher
+# because the tree functions this module needs live in blake3::hazmat,
+# and a path needs the crate in scope.
+#
+# What they buy: set_input_offset and finalize_non_root give a subtree's
+# chaining value, and merge_subtrees_non_root and merge_subtrees_root
+# combine them, so a file's chunks hash on Flynnel's workers in parallel
+# and still produce the standard BLAKE3 root. Without them the only
+# parallelism is across files.
+blake3 = "1.8.5"
+# The census tool's parser, and only its. Optional and behind the
+# `census` feature so a module build never compiles it: the tool reads
+# the scheduler's source to prove the binding covers it, and nothing
+# the shipped library does needs a Rust parser.
+syn = { version = "2", features = ["full", "parsing", "clone-impls"], optional = true }
+
+[features]
+# Builds src/bin/census.rs, which walks ../src and fails when a public
+# item is neither bound nor censused. Off by default; the gate turns it
+# on.
+census = ["dep:syn"]
+
+# Declared rather than discovered, because declaring any bin turns
+# cargo's discovery off for the whole kind and a second tool added
+# later would silently never build. required-features keeps it out of
+# an ordinary module build.
+[[bin]]
+name = "census"
+path = "src/bin/census.rs"
+required-features = ["census"]
 
 [profile.release]
 opt-level = 3

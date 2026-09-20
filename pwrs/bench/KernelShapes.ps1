@@ -51,10 +51,21 @@ param(
     [double]$Cooldown = 0.75,
     # Where the per-commit anchor medians accumulate.
     [string]$AnchorStore = (Join-Path $PSScriptRoot 'anchor-medians.json'),
+    # Where each run's per-kernel medians accumulate, so run-to-run
+    # spread can be read rather than the within-run spread standing in
+    # for it.
+    [string]$RunStore = (Join-Path $PSScriptRoot 'run-medians.json'),
     # Where this run's table and raw cells land.
     [string]$OutDir = $PSScriptRoot,
     # A name for this run in the output file.
-    [string]$Tag = 'kernelshapes'
+    [string]$Tag = 'kernelshapes',
+    # How many burner processes contend for the box during the load
+    # arm. Half the logical processors, which is the ratio the
+    # campaign's own loaded rotations used: 12 burners on a 24-thread
+    # host. Enough that the pool must share and not so much that it is
+    # starved into measuring the scheduler's queueing instead of its
+    # work. Zero skips the load arm entirely.
+    [int]$LoadThreads = [int]([Environment]::ProcessorCount / 2)
 )
 
 Set-StrictMode -Version Latest
@@ -114,6 +125,52 @@ function Measure-Cell {
 
 function Start-Cooldown {
     if ($Cooldown -gt 0) { Start-Sleep -Milliseconds ([int]($Cooldown * 1000)) }
+}
+
+# ----------------------------------------------------------------------
+# The load arm
+# ----------------------------------------------------------------------
+
+# A quiet row says what a change costs when nothing else wants the
+# cores. The criterion this crate is held to is about the loaded case:
+# never slower than the current system, faster under load. A table with
+# only the quiet arm cannot speak to it.
+#
+# Burners are separate processes rather than threads so they contend
+# for cores the way a neighbour does, and so a wedged one can be seen
+# and killed in a process listing rather than being invisible inside
+# this one.
+
+$script:Burners = @()
+
+function Start-Burners {
+    if ($LoadThreads -le 0) { return }
+    $spin = 'while ($true) { $null = [Math]::Sqrt([Environment]::TickCount) }'
+    $script:Burners = 1..$LoadThreads | ForEach-Object {
+        Start-Process -FilePath 'powershell' `
+            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $spin `
+            -WindowStyle Hidden -PassThru
+    }
+    # Long enough for the scheduler to have placed them, short enough
+    # not to dominate the run.
+    Start-Sleep -Milliseconds 500
+}
+
+function Stop-Burners {
+    foreach ($burner in $script:Burners) {
+        if ($burner -and -not $burner.HasExited) {
+            Stop-Process -Id $burner.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $script:Burners = @()
+}
+
+# A burner left running would hold the box against every other agent on
+# it, so the stop is bound to the script ending rather than only to the
+# happy path.
+trap {
+    Stop-Burners
+    throw
 }
 
 # ----------------------------------------------------------------------
@@ -289,6 +346,55 @@ foreach ($k in $kernels) {
 $controlLast = Measure-Cell -Body $controlBody
 
 # ----------------------------------------------------------------------
+# The load arm
+# ----------------------------------------------------------------------
+#
+# The quiet and loaded passes cannot interleave, because the burners
+# are either running or not. So the loaded pass is its own phase with
+# its own control at both ends: a loaded row is read against the loaded
+# control, never against the quiet one.
+#
+# Only the flynnel arm is repeated under load. The serial arm is the
+# same code down one lane and the native arm is not this crate, so what
+# the criterion asks about is how the pool's own figure moves when the
+# box is contended.
+
+$loadedControlFirst = $null
+$loadedControlLast = $null
+$loaded = @{}
+if ($LoadThreads -gt 0) {
+    Write-Host ("starting {0} burner(s) for the load arm" -f $LoadThreads)
+    Start-Burners
+    $loadedControlFirst = Measure-Cell -Body $controlBody
+    Start-Cooldown
+    foreach ($k in $kernels) {
+        Write-Host ("loaded cell {0}" -f $k.Name)
+        $loaded[$k.Name] = Measure-Cell -Body $k.Flynnel
+        Start-Cooldown
+    }
+    $loadedControlLast = Measure-Cell -Body $controlBody
+    Stop-Burners
+    Write-Host 'burners stopped'
+}
+
+foreach ($row in $rows) {
+    $cell = $loaded[$row.Kernel]
+    if ($cell) {
+        $row | Add-Member -NotePropertyName LoadedMs -NotePropertyValue (
+            [Math]::Round($cell.MedianMs, 4))
+        $row | Add-Member -NotePropertyName LoadCost -NotePropertyValue (
+            if ($row.FlynnelMs -gt 0) {
+                [Math]::Round($cell.MedianMs / $row.FlynnelMs, 3)
+            } else { $null })
+    } else {
+        # Named rather than left absent, so a table without the load
+        # arm cannot be read as one where load cost nothing.
+        $row | Add-Member -NotePropertyName LoadedMs -NotePropertyValue $null
+        $row | Add-Member -NotePropertyName LoadCost -NotePropertyValue $null
+    }
+}
+
+# ----------------------------------------------------------------------
 # The two figures every row is read against
 # ----------------------------------------------------------------------
 
@@ -336,6 +442,57 @@ foreach ($row in $rows) {
 }
 
 # ----------------------------------------------------------------------
+# Across runs, which is a different question from across samples
+# ----------------------------------------------------------------------
+#
+# The repeats inside one invocation are samples, not runs. They share a
+# process: the same warmed allocator, the same calibration, the same
+# code placement. A median over seven of them says how tight this
+# process was, not how tight the figure is.
+#
+# So each run appends its medians here, keyed by commit, machine and
+# host edition, and the table reports how many runs are on record and
+# how far apart they fell. One run on record prints a null rather than
+# a zero spread, because a single point has no spread and a zero would
+# read as a tight one.
+
+$runStore = @()
+if (Test-Path $RunStore) {
+    $runStore = @(Get-Content -LiteralPath $RunStore -Raw | ConvertFrom-Json)
+}
+$runId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+foreach ($row in $rows) {
+    $runStore = @($runStore) + [PSCustomObject]@{
+        RunId     = $runId
+        Commit    = $commit
+        Machine   = $hostInfo.Machine
+        Edition   = $hostInfo.Edition
+        When      = (Get-Date -Format 'o')
+        Kernel    = $row.Kernel
+        FlynnelMs = $row.FlynnelMs
+        LoadedMs  = $row.LoadedMs
+    }
+}
+foreach ($row in $rows) {
+    $mine = @($runStore | Where-Object {
+        $_.Commit -eq $commit -and $_.Machine -eq $hostInfo.Machine -and
+        $_.Edition -eq $hostInfo.Edition -and $_.Kernel -eq $row.Kernel -and
+        $null -ne $_.FlynnelMs -and $_.FlynnelMs -gt 0
+    })
+    $row | Add-Member -NotePropertyName Runs -NotePropertyValue $mine.Count
+    if ($mine.Count -lt 2) {
+        # One point has no spread. A zero here would be read as
+        # agreement between runs that never happened.
+        $row | Add-Member -NotePropertyName RunSpread -NotePropertyValue $null
+    } else {
+        $values = @($mine | ForEach-Object FlynnelMs | Sort-Object)
+        $row | Add-Member -NotePropertyName RunSpread -NotePropertyValue (
+            [Math]::Round($values[-1] / $values[0], 3))
+    }
+}
+$runStore | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $RunStore -Encoding utf8
+
+# ----------------------------------------------------------------------
 # Report
 # ----------------------------------------------------------------------
 
@@ -351,6 +508,19 @@ $result = [PSCustomObject]@{
     ControlLastMs   = [Math]::Round($controlLast.MedianMs, 4)
     ControlDriftPct = $controlDriftPct
     EmptyCallMs     = [Math]::Round($empty.MedianMs, 6)
+    LoadThreads     = $LoadThreads
+    LoadedControlFirstMs = if ($loadedControlFirst) {
+                               [Math]::Round($loadedControlFirst.MedianMs, 4)
+                           } else { $null }
+    LoadedControlLastMs  = if ($loadedControlLast) {
+                               [Math]::Round($loadedControlLast.MedianMs, 4)
+                           } else { $null }
+    # What the burners did to a cell the module cannot reach. Every
+    # LoadCost in the table is read against this: a row that slowed by
+    # less than the control did was not slowed by the load.
+    ControlLoadCost = if ($loadedControlFirst -and $controlFirst.MedianMs -gt 0) {
+                          [Math]::Round($loadedControlFirst.MedianMs / $controlFirst.MedianMs, 3)
+                      } else { $null }
     Rows            = $rows
 }
 
@@ -381,12 +551,27 @@ if ($null -ne $anchorDriftPct) {
     Write-Host ("anchor {0} ms, no earlier build on this host to compare with" -f
         $result.AnchorMs)
 }
+if ($LoadThreads -gt 0) {
+    Write-Host ("load arm: {0} burner(s), control {1} ms quiet against {2} ms loaded, {3}x" -f
+        $LoadThreads, $result.ControlFirstMs, $result.LoadedControlFirstMs,
+        $result.ControlLoadCost)
+} else {
+    Write-Host 'load arm: skipped, LoadThreads is zero'
+}
 Write-Host ''
-$rows | Format-Table Kernel, FlynnelMs, SerialMs, NativeMs, VsSerial, VsNative,
-    AnchorSpeaksFor, CrossBuild -AutoSize
+$rows | Format-Table Kernel, FlynnelMs, SerialMs, NativeMs, LoadedMs, VsSerial, VsNative,
+    LoadCost, Runs, RunSpread, AnchorSpeaksFor, CrossBuild -AutoSize
 Write-Host ''
+Write-Host 'Runs is how many invocations of this script are on record for this commit, host'
+Write-Host 'and edition, and RunSpread is the widest over the narrowest of their medians.'
+Write-Host 'The repeats inside one invocation are samples sharing a process, not runs; a'
+Write-Host 'RunSpread of null means one run is on record and there is nothing to compare.'
 Write-Host 'VsSerial is how many times faster the pool is than one worker running the same'
 Write-Host 'kernel. VsNative is against the PowerShell way to get the same answer.'
+Write-Host 'LoadCost is the same kernel under contention over itself on a quiet box, and is'
+Write-Host 'read against ControlLoadCost above: a row that rose by less than the control did'
+Write-Host 'was not slowed by the load. A null LoadCost means the arm did not run, which is'
+Write-Host 'not the same as a load that cost nothing.'
 Write-Host 'AnchorSpeaksFor is false where the inner loop branches on the data, which is'
 Write-Host 'the shape the anchor was measured not to stand in for.'
 Write-Host ("raw cells in {0}" -f $outFile)

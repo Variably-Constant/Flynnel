@@ -117,8 +117,12 @@ impl Cmdlet for GetFlynnelPool {
 #[psclass(name = "Flynnel.WorkerStat")]
 #[derive(Clone, Default)]
 pub struct WorkerStat {
-    /// Index of the worker across the whole pool.
+    /// Index of the row in the pool's statistics table.
     pub index: u64,
+    /// Whether this row is a worker. The table runs past the pool's
+    /// workers into the external slots a foreign thread pushes
+    /// through, and those are not workers however idle they read.
+    pub is_worker: bool,
     /// Jobs taken from its own deque.
     pub local_pops: u64,
     /// Jobs it stole from a peer.
@@ -160,15 +164,33 @@ pub struct WorkerStat {
     output = ["Flynnel.WorkerStat"]
 )]
 #[derive(Default)]
-pub struct GetFlynnelWorker {}
+pub struct GetFlynnelWorker {
+    /// Also write the external slots a foreign thread pushes through.
+    /// They sit past the workers in the same table and are not
+    /// workers; IsWorker tells them apart.
+    #[param]
+    pub include_external_slot: bool,
+}
 
 impl Cmdlet for GetFlynnelWorker {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         use std::sync::atomic::Ordering::Relaxed;
         let arena = flynnel::sched::arena::global_local_arena();
+        // The stats table is longer than the pool: the entries past
+        // the worker count belong to the external slots a foreign
+        // thread pushes through. They are real rows and they are not
+        // workers, and emitting them unmarked gives a caller a set of
+        // permanently idle workers that do not exist. They are named
+        // rather than dropped, and left out unless asked for.
+        let workers = arena.total_workers();
         for (index, s) in arena.iter_worker_stats().enumerate() {
+            let is_worker = index < workers;
+            if !is_worker && !self.include_external_slot {
+                continue;
+            }
             ps.write(WorkerStat {
                 index: index as u64,
+                is_worker,
                 local_pops: s.local_pops.load(Relaxed),
                 peer_steal_hits: s.peer_steal_hits.load(Relaxed),
                 peer_steal_misses: s.peer_steal_misses.load(Relaxed),

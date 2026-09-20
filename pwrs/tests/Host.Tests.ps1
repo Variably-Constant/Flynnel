@@ -12,6 +12,15 @@ BeforeAll {
     $script:topo = Get-FlynnelTopology
 }
 
+Describe 'the types this family exports' {
+    It 'shapes each type the way its cmdlet documents' {
+        foreach ($type in 'Flynnel.NodeCpus', 'Flynnel.HwClassInfo') {
+            @(Get-FlynnelTypeProperty -TypeName $type).Count |
+                Should -BeGreaterThan 0 -Because "$type must carry something"
+        }
+    }
+}
+
 Describe 'Get-FlynnelCpuInfo' {
     It 'reports at least one logical processor and one physical core' {
         $script:cpu.LogicalThreads | Should -BeGreaterThan 0

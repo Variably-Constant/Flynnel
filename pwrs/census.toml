@@ -1,0 +1,109 @@
+# Every public item of the scheduler that the PowerShell module does
+# not bind, and why.
+#
+# The tool at src/bin/census.rs reads this against the crate's own
+# source and the built module's descriptor, and fails when a public
+# item is in neither, when an entry names an item that no longer
+# exists, or when a reason is not one of the six below.
+#
+# Six reasons are accepted and nothing else, because a free-text
+# reason is where "not yet" hides.
+#
+#   generic-over-caller-type        the signature is generic over a
+#                                   type the caller supplies, which a
+#                                   script has no way to name
+#   takes-a-rust-closure            reachable only by running a body
+#                                   the module owns; the entry has to
+#                                   name the cmdlet that reaches it,
+#                                   and the tool fails one that does
+#                                   not
+#   unsafe-or-structural            not public surface a script can
+#                                   hold: pub(crate), cfg(test), no
+#                                   accessor, or an invariant a script
+#                                   cannot maintain
+#   internal-to-another-surface     bound through a different family
+#   not-in-the-shipped-feature-set  behind a feature this module does
+#                                   not ship
+#   pending-on-main                 exists on a branch; the entry has
+#                                   to name the commit that brings it,
+#                                   and the tool fails once that
+#                                   commit is an ancestor of HEAD, so
+#                                   the reminder cannot be forgotten
+#
+# This file is a seed. It carries only entries established by reading
+# the crate directly. The rest come from running the tool and triaging
+# what it reports; an entry written before the tool has named the item
+# is a guess, and a guess here is indistinguishable from coverage.
+
+# ---------------------------------------------------------------------
+# Closure-taking primitives, each reached by a declared kernel
+# ---------------------------------------------------------------------
+# A script has no closure to give and this module never runs a script
+# block on a worker, so these are exercised by naming a body the module
+# owns. Each cmdlet below calls the primitive directly in
+# pwrs/src/kernels.rs.
+
+[[entry]]
+item = "crate::sched::par_iter::par_map_in_place"
+reason = "takes-a-rust-closure"
+reaches = "Invoke-FlynnelMap"
+note = "fourteen element-wise operations, one closure each"
+
+[[entry]]
+item = "crate::sched::par_iter::par_zip_apply"
+reason = "takes-a-rust-closure"
+reaches = "Invoke-FlynnelZip"
+note = "six pairwise operations over two slices of equal length"
+
+[[entry]]
+item = "crate::sched::par_iter::reduce_chunks"
+reason = "takes-a-rust-closure"
+reaches = "Measure-FlynnelReduce"
+note = "seven reductions; the init, fold and reduce closures are the module's"
+
+[[entry]]
+item = "crate::sched::par_iter::collect_indexed"
+reason = "takes-a-rust-closure"
+reaches = "Get-FlynnelPrefixSum"
+note = "also the two-phase scan, the histogram, the sort's merge rounds, the file kernels and the parallel BLAKE3 subtrees"
+
+# ---------------------------------------------------------------------
+# Not public surface a script can hold
+# ---------------------------------------------------------------------
+# Established by reading src/sched/call_site.rs, occupancy.rs and
+# trace.rs in full.
+
+[[entry]]
+item = "crate::sched::call_site::CallSiteState"
+reason = "unsafe-or-structural"
+note = "every field is a private atomic and the type is neither Copy nor Clone, so only a static reference exists; the registry holding them has no public walk, so a binding cannot enumerate the sites"
+
+[[entry]]
+item = "crate::sched::call_site::SiteRef"
+reason = "unsafe-or-structural"
+note = "a pointer-identity handle to the above, useful only to code that already holds one"
+
+[[entry]]
+item = "crate::sched::call_site::caller_site"
+reason = "unsafe-or-structural"
+note = "track_caller, so from a binding it answers the binding's own location rather than any call site of interest"
+
+[[entry]]
+item = "crate::sched::trace::emit"
+reason = "unsafe-or-structural"
+note = "writes a per-thread ring the calling thread owns; a cmdlet would record the pipeline thread, which runs no scheduler work"
+
+[[entry]]
+item = "crate::sched::trace::register_thread"
+reason = "unsafe-or-structural"
+note = "the pool registers its own workers at spawn; a second registration from the pipeline thread would add a ring nothing drains"
+
+[[entry]]
+item = "crate::sched::trace::dump_to_stderr"
+reason = "unsafe-or-structural"
+note = "writes to stderr, which a cmdlet cannot compose; it is the only reader of the ring's records, so no cmdlet can export them until an accessor exists"
+
+[[entry]]
+item = "crate::sched::occupancy::OccupancyWindow"
+reason = "internal-to-another-surface"
+note = "bound as Measure-FlynnelOccupancy, which starts a window, sleeps and samples it in one call; an open window is not a thing a script can usefully hold across a pipeline"

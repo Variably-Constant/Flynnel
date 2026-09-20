@@ -30,8 +30,11 @@
 
 use pwrs::prelude::*;
 
+use blake3::hazmat::{
+    ChainingValue, HasherExt, Mode, left_subtree_len, merge_subtrees_non_root,
+    merge_subtrees_root,
+};
 use flynnel::sched::par_iter::{collect_indexed, par_map_in_place, par_zip_apply, reduce_chunks};
-use flynnel::sched::verify_chain::{Blake3Hasher, VerifyHasher};
 
 use crate::plan::Plan;
 
@@ -88,10 +91,17 @@ fn band_for(n: usize) -> u8 {
 
 /// The plan this dispatch runs under: the caller's if they gave one,
 /// otherwise one sized to the input.
-fn kernel_plan(caller: Option<&Plan>, n: usize) -> flynnel::JobPlan {
+///
+/// A caller's plan is built into the crate's own here rather than held
+/// as one, so a shape whose numbers are missing is refused at the
+/// kernel that would have run it.
+fn kernel_plan(caller: Option<&Plan>, n: usize) -> PsResult<flynnel::JobPlan> {
     match caller {
-        Some(p) => p.inner,
-        None => flynnel::JobPlan::new(band_for(n), n.min(u32::MAX as usize) as u32),
+        Some(p) => p.to_job_plan(),
+        None => Ok(flynnel::JobPlan::new(
+            band_for(n),
+            n.min(u32::MAX as usize) as u32,
+        )),
     }
 }
 
@@ -301,7 +311,7 @@ impl Cmdlet for InvokeFlynnelMap {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let mut items = std::mem::take(&mut self.input_object);
         let n = items.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Invoke-FlynnelMap")?;
         if n == 0 {
             return ps.write(Vec::<f64>::new());
@@ -390,7 +400,7 @@ impl Cmdlet for InvokeFlynnelZip {
             .terminating());
         }
         let n = lhs.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Invoke-FlynnelZip")?;
         if n == 0 {
             return ps.write(Vec::<f64>::new());
@@ -481,7 +491,7 @@ impl Cmdlet for MeasureFlynnelReduce {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let items = std::mem::take(&mut self.input_object);
         let n = items.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelReduce")?;
 
         let op = self.operation;
@@ -594,7 +604,7 @@ impl Cmdlet for GetFlynnelPrefixSum {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let items = std::mem::take(&mut self.input_object);
         let n = items.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Get-FlynnelPrefixSum")?;
         if n == 0 {
             return ps.write(Vec::<f64>::new());
@@ -678,7 +688,7 @@ impl Cmdlet for GetFlynnelHistogram {
             return Err(arg_err("Bins must be at least one").terminating());
         }
         let bins = self.bins as usize;
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Get-FlynnelHistogram")?;
         if n == 0 {
             return Ok(());
@@ -800,7 +810,7 @@ impl Cmdlet for GetFlynnelDotProduct {
             .terminating());
         }
         let n = lhs.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Get-FlynnelDotProduct")?;
         if n == 0 {
             return ps.write(0.0f64);
@@ -852,7 +862,7 @@ impl Cmdlet for SortFlynnelArray {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let items = std::mem::take(&mut self.input_object);
         let n = items.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Sort-FlynnelArray")?;
         if n <= 1 {
             return ps.write(items);
@@ -989,13 +999,100 @@ fn hex32(bytes: &[u8; 32]) -> String {
     s
 }
 
-/// The BLAKE3 root of a file, read a chunk at a time so a file larger
-/// than memory still hashes.
-fn hash_file(path: &str) -> Result<(String, u64), String> {
+/// The largest file this module reads whole in order to hash its
+/// subtrees in parallel. Above it the file is streamed and hashed on
+/// one thread.
+///
+/// Both paths produce the same BLAKE3 root, so this bounds memory and
+/// speed and never what the answer is.
+const MAX_IN_MEMORY: u64 = 1 << 30;
+
+/// The largest span one worker hashes as a single subtree. Below this
+/// the split stops and one hasher runs the span, which is where
+/// BLAKE3's own SIMD parallelism does the work; above it the span is
+/// divided and the halves go to different workers.
+const SUBTREE_LEAF: usize = 1 << 20;
+
+/// The subtree spans of a buffer, left to right, by BLAKE3's own split
+/// rule.
+///
+/// `left_subtree_len` is the only split that produces valid subtrees;
+/// any other either panics or yields a root that is not BLAKE3's. The
+/// recursion stops at a span small enough to be worth one worker, and
+/// a span at or below one chunk cannot be split at all.
+fn plan_subtrees(start: usize, len: usize, out: &mut Vec<(usize, usize)>) {
+    if len <= SUBTREE_LEAF || len <= blake3::CHUNK_LEN {
+        out.push((start, len));
+        return;
+    }
+    let left = left_subtree_len(len as u64) as usize;
+    plan_subtrees(start, left, out);
+    plan_subtrees(start + left, len - left, out);
+}
+
+/// Combine the subtree chaining values back up the tree, walking the
+/// same split that produced them so each one lands where it belongs.
+fn fold_subtrees(
+    start: usize,
+    len: usize,
+    cvs: &[ChainingValue],
+    next: &mut usize,
+) -> ChainingValue {
+    if len <= SUBTREE_LEAF || len <= blake3::CHUNK_LEN {
+        let cv = cvs[*next];
+        *next += 1;
+        return cv;
+    }
+    let left = left_subtree_len(len as u64) as usize;
+    let l = fold_subtrees(start, left, cvs, next);
+    let r = fold_subtrees(start + left, len - left, cvs, next);
+    merge_subtrees_non_root(&l, &r, Mode::Hash)
+}
+
+/// The BLAKE3 root of a buffer, its subtrees hashed on Flynnel's
+/// workers and merged into the standard root.
+///
+/// This is BLAKE3's own tree, not a scheme of this module's: each
+/// worker hashes a span at its true input offset and answers the
+/// chaining value the specification defines for it, and the merges are
+/// the specification's. The answer equals `blake3::hash` over the same
+/// bytes, which Kernels.Tests.ps1 checks against a published vector
+/// and against the sequential path.
+fn hash_bytes_parallel(plan: &flynnel::JobPlan, bytes: &[u8]) -> String {
+    let n = bytes.len();
+    if n <= SUBTREE_LEAF {
+        return hex32(blake3::hash(bytes).as_bytes());
+    }
+    // The root split is the one merge that is root-flagged, so it is
+    // taken here and the two halves are folded as ordinary subtrees.
+    let left = left_subtree_len(n as u64) as usize;
+    let mut spans = Vec::new();
+    plan_subtrees(0, left, &mut spans);
+    let left_count = spans.len();
+    plan_subtrees(left, n - left, &mut spans);
+
+    let cvs: Vec<ChainingValue> = collect_indexed(plan, spans.len(), 1, |i| {
+        let (start, len) = spans[i];
+        blake3::Hasher::new()
+            .set_input_offset(start as u64)
+            .update(&bytes[start..start + len])
+            .finalize_non_root()
+    });
+
+    let mut from_left = 0usize;
+    let lcv = fold_subtrees(0, left, &cvs[..left_count], &mut from_left);
+    let mut from_right = 0usize;
+    let rcv = fold_subtrees(left, n - left, &cvs[left_count..], &mut from_right);
+    hex32(merge_subtrees_root(&lcv, &rcv, Mode::Hash).as_bytes())
+}
+
+/// The BLAKE3 root of a file read a chunk at a time, for a file too
+/// large to hold.
+fn hash_file_streaming(path: &str) -> Result<(String, u64), String> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut reader = std::io::BufReader::new(file);
-    let mut hasher = Box::new(Blake3Hasher::new());
+    let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; FILE_CHUNK];
     let mut total = 0u64;
     loop {
@@ -1006,7 +1103,30 @@ fn hash_file(path: &str) -> Result<(String, u64), String> {
         hasher.update(&buf[..got]);
         total += got as u64;
     }
-    Ok((hex32(&hasher.finalize()), total))
+    Ok((hex32(hasher.finalize().as_bytes()), total))
+}
+
+/// The BLAKE3 root of one file, hashed across workers when it fits in
+/// memory and streamed on one thread when it does not.
+fn hash_file_parallel(plan: &flynnel::JobPlan, path: &str) -> Result<(String, u64), String> {
+    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if size > MAX_IN_MEMORY {
+        return hash_file_streaming(path);
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    Ok((hash_bytes_parallel(plan, &bytes), bytes.len() as u64))
+}
+
+/// The BLAKE3 root of each of several files, one file per worker.
+///
+/// Splitting within a file as well would nest a dispatch inside a
+/// worker for no gain: with more files than workers every worker is
+/// already busy, and the subtree split would only add merges.
+fn hash_files(plan: &flynnel::JobPlan, paths: &[String]) -> Vec<Result<(String, u64), String>> {
+    if paths.len() == 1 {
+        return vec![hash_file_parallel(plan, &paths[0])];
+    }
+    collect_indexed(plan, paths.len(), 1, |i| hash_file_streaming(&paths[i]))
 }
 
 /// Hashes files with BLAKE3 on Flynnel's workers, one task per file.
@@ -1015,11 +1135,16 @@ fn hash_file(path: &str) -> Result<(String, u64), String> {
 /// is the same one Flynnel's attestation path produces and the module
 /// takes no hashing dependency of its own.
 ///
-/// Within a single file the hash is sequential: BLAKE3's root over a
-/// chunked tree needs the tree API the crate does not re-export, and a
-/// scheme of this module's own would not be BLAKE3. The parallelism is
-/// across files, and a single file is read in one-megabyte chunks so
-/// its size is not bounded by memory.
+/// One file is split across workers as well. BLAKE3 is a tree, so a
+/// span hashed at its true input offset yields the chaining value the
+/// specification defines for it, and merging those up the tree gives
+/// the same root a single pass would. The answer is standard BLAKE3,
+/// not a scheme of this module's, and the suite checks it against a
+/// published vector and against the one-thread path.
+///
+/// A file above a gigabyte is streamed on one thread instead, because
+/// the split needs the bytes in memory. Both paths give the same root,
+/// so the bound is on memory and speed and never on the answer.
 ///
 /// # Examples
 ///
@@ -1044,13 +1169,12 @@ impl Cmdlet for MeasureFlynnelFileHash {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let paths = std::mem::take(&mut self.path);
         let n = paths.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelFileHash")?;
         if n == 0 {
             return Ok(());
         }
-        let rows: Vec<Result<(String, u64), String>> =
-            collect_indexed(&plan, n, 1, |i| hash_file(&paths[i]));
+        let rows = hash_files(&plan, &paths);
 
         let mut refused = 0usize;
         for (i, row) in rows.into_iter().enumerate() {
@@ -1115,13 +1239,12 @@ impl Cmdlet for TestFlynnelFileHash {
             .terminating());
         }
         let n = paths.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Test-FlynnelFileHash")?;
         if n == 0 {
             return Ok(());
         }
-        let rows: Vec<Result<(String, u64), String>> =
-            collect_indexed(&plan, n, 1, |i| hash_file(&paths[i]));
+        let rows = hash_files(&plan, &paths);
 
         let mut refused = 0usize;
         for (i, row) in rows.into_iter().enumerate() {
@@ -1238,7 +1361,7 @@ impl Cmdlet for SearchFlynnelFile {
             return Err(arg_err("Pattern must not be empty").terminating());
         }
         let n = paths.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Search-FlynnelFile")?;
         if n == 0 {
             return Ok(());
@@ -1309,7 +1432,7 @@ impl Cmdlet for MeasureFlynnelFileLine {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let paths = std::mem::take(&mut self.path);
         let n = paths.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelFileLine")?;
         if n == 0 {
             return Ok(());
@@ -1370,7 +1493,7 @@ impl Cmdlet for MeasureFlynnelFileByte {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let paths = std::mem::take(&mut self.path);
         let n = paths.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelFileByte")?;
         if n == 0 {
             return Ok(());
@@ -1537,7 +1660,7 @@ impl Cmdlet for SearchFlynnelText {
             return Err(arg_err("Pattern must not be empty").terminating());
         }
         let hay = text.as_bytes();
-        let plan = kernel_plan(self.plan.as_ref(), hay.len());
+        let plan = kernel_plan(self.plan.as_ref(), hay.len())?;
         say_plan(ps, &plan, hay.len(), "Search-FlynnelText")?;
         if hay.is_empty() {
             return Ok(());
@@ -1588,7 +1711,7 @@ impl Cmdlet for MeasureFlynnelTextCount {
         let text = std::mem::take(&mut self.text);
         let hay = text.as_bytes();
         let n = hay.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelTextCount")?;
 
         let matches = match self.pattern.as_deref() {
@@ -1679,7 +1802,7 @@ impl Cmdlet for SplitFlynnelText {
             return Err(arg_err("Separator must not be empty").terminating());
         }
         let hay = text.as_bytes();
-        let plan = kernel_plan(self.plan.as_ref(), hay.len());
+        let plan = kernel_plan(self.plan.as_ref(), hay.len())?;
         say_plan(ps, &plan, hay.len(), "Split-FlynnelText")?;
 
         let hits = find_all(&plan, hay, separator.as_bytes());
@@ -1785,7 +1908,7 @@ impl Cmdlet for UpdateFlynnelText {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let text = std::mem::take(&mut self.text);
         let n = text.len();
-        let plan = kernel_plan(self.plan.as_ref(), n);
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Update-FlynnelText")?;
 
         match self.operation {

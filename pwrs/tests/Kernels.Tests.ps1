@@ -38,6 +38,61 @@ AfterAll {
     }
 }
 
+Describe 'the types this family exports' {
+    It 'shapes each row type the way its cmdlet documents' {
+        $shape = @{
+            'Flynnel.Reduction'    = @('Operation', 'Count', 'Value')
+            'Flynnel.HistogramBin' = @('Index', 'Low', 'High', 'Count')
+            'Flynnel.FileHash'     = @('Path', 'Hash', 'Bytes')
+            'Flynnel.HashCheck'    = @('Path', 'Expected', 'Actual', 'IsMatch')
+            'Flynnel.FileMatch'    = @('Path', 'LineNumber', 'Line')
+            'Flynnel.FileMeasure'  = @('Path', 'Lines', 'Bytes')
+            'Flynnel.TextMatch'    = @('Index', 'LineNumber', 'Line')
+            'Flynnel.TextMeasure'  = @('Bytes', 'Lines', 'Words', 'Matches')
+        }
+        foreach ($type in $shape.Keys) {
+            $properties = @(Get-FlynnelTypeProperty -TypeName $type | ForEach-Object Name)
+            foreach ($wanted in $shape[$type]) {
+                $properties | Should -Contain $wanted -Because "$type must carry $wanted"
+            }
+        }
+    }
+
+    It 'gives every operation enum at least one value' {
+        foreach ($name in 'Flynnel.MapOp', 'Flynnel.ZipOp', 'Flynnel.ReduceOp',
+                          'Flynnel.TextTransform') {
+            $type = $name -as [type]
+            $type | Should -Not -BeNullOrEmpty -Because "$name must be exported"
+            [Enum]::GetValues($type).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'covers every map operation the enum declares' {
+        # An operation the enum names and no kernel implements would
+        # bind and then do nothing recognisable, and nothing else here
+        # would report it.
+        $x = @(4.0, -9.0, 0.25)
+        foreach ($op in [Enum]::GetValues([Flynnel.MapOp])) {
+            $extra = switch ([string]$op) {
+                'Clamp'  { @{ Min = -1.0; Max = 1.0 } }
+                'Scale'  { @{ Factor = 2.0 } }
+                'Offset' { @{ Addend = 1.0 } }
+                default  { @{} }
+            }
+            $got = Invoke-FlynnelMap -InputObject $x -Operation $op @extra
+            @($got).Count | Should -Be 3 -Because "$op must answer one value per element"
+        }
+    }
+
+    It 'covers every zip operation the enum declares' {
+        $a = @(4.0, -9.0, 0.25)
+        $b = @(2.0, 3.0, 0.5)
+        foreach ($op in [Enum]::GetValues([Flynnel.ZipOp])) {
+            @(Invoke-FlynnelZip -Left $a -Right $b -Operation $op).Count | Should -Be 3
+        }
+    }
+}
+
 Describe 'Invoke-FlynnelMap' {
     It 'squares every element' {
         $got = Invoke-FlynnelMap -InputObject $script:Data -Operation Square
@@ -203,7 +258,9 @@ Describe 'Get-FlynnelHistogram' {
         $want = New-Object 'long[]' 8
         foreach ($x in $script:Data) {
             if ($x -lt -400 -or $x -gt 600) { continue }
-            $slot = [Math]::Min(7, [int](($x - (-400)) / $width))
+            # Floor, not [int]: the cast rounds, and half the values
+            # would land one bin high against a kernel that truncates.
+            $slot = [Math]::Min(7, [int][Math]::Floor(($x - (-400)) / $width))
             $want[$slot]++
         }
         for ($i = 0; $i -lt 8; $i++) {
@@ -307,6 +364,49 @@ Describe 'Measure-FlynnelFileHash' {
             Should -Be (Get-Item -LiteralPath $script:A).Length
     }
 
+    It 'gives a split file the same root as a streamed one' {
+        # The check that matters for the tree path. A file on its own
+        # is split across workers, each hashing a subtree at its true
+        # input offset; the same file in a list of two is streamed on
+        # one thread. The two must agree, and they only can if every
+        # offset and every merge is right. A wrong offset gives a
+        # well-formed hash that is simply the wrong one, which nothing
+        # else here would catch.
+        #
+        # The size is over the one-megabyte split threshold and has a
+        # ragged tail, so the rightmost subtree is short and the
+        # recursion cannot be right by accident on a power of two.
+        $big = Join-Path $script:Work 'big.bin'
+        $bytes = [byte[]]::new(3 * 1MB + 777)
+        [System.Random]::new(20260920).NextBytes($bytes)
+        [System.IO.File]::WriteAllBytes($big, $bytes)
+
+        $split = Measure-FlynnelFileHash -Path $big
+        $streamed = @(Measure-FlynnelFileHash -Path @($big, $script:A)) |
+            Where-Object Path -eq $big
+
+        $split.Hash | Should -Be $streamed.Hash
+        $split.Bytes | Should -Be $bytes.Length
+        $split.Hash.Length | Should -Be 64
+    }
+
+    It 'agrees across the split threshold' {
+        # Just under the threshold takes the single-hasher path and
+        # just over takes the tree. A file that grows by one byte must
+        # not change which answer is correct, so both are checked
+        # against the streamed path on the same content.
+        foreach ($size in (1MB - 1), (1MB + 1)) {
+            $path = Join-Path $script:Work "edge-$size.bin"
+            $bytes = [byte[]]::new($size)
+            [System.Random]::new($size).NextBytes($bytes)
+            [System.IO.File]::WriteAllBytes($path, $bytes)
+            $alone = (Measure-FlynnelFileHash -Path $path).Hash
+            $withOther = (@(Measure-FlynnelFileHash -Path @($path, $script:A)) |
+                Where-Object Path -eq $path).Hash
+            $alone | Should -Be $withOther -Because "size $size must hash the same either way"
+        }
+    }
+
     It 'writes an error for a file it cannot read and keeps going' {
         $missing = Join-Path $script:Work 'not-here.bin'
         $errors = @()
@@ -321,8 +421,7 @@ Describe 'Measure-FlynnelFileHash' {
         $warnings = @()
         $missing = Join-Path $script:Work 'also-not-here.bin'
         $null = Measure-FlynnelFileHash -Path @($script:A, $missing) `
-            -WarningVariable warnings -WarningAction SilentlyContinue `
-            -ErrorAction SilentlyContinue
+            -WarningVariable warnings -ErrorAction SilentlyContinue
         ($warnings -join ' ') | Should -Match '1 of 2'
     }
 }
@@ -403,8 +502,11 @@ Describe 'Search-FlynnelFile' {
     }
 
     It 'refuses an empty pattern' {
+        # PowerShell's own binder refuses it before the cmdlet runs,
+        # which is earlier and better than the cmdlet's own check. The
+        # assertion is that it is refused, not by whom.
         { Search-FlynnelFile -Pattern '' -Path $script:Hay -ErrorAction Stop } |
-            Should -Throw -ExpectedMessage '*must not be empty*'
+            Should -Throw -ExpectedMessage '*empty*'
     }
 }
 
@@ -543,8 +645,10 @@ Describe 'Split-FlynnelText' {
     }
 
     It 'refuses an empty separator' {
+        # Refused by the binder before the cmdlet runs, as with an
+        # empty pattern.
         { Split-FlynnelText -Text 'abc' -Separator '' -ErrorAction Stop } |
-            Should -Throw -ExpectedMessage '*must not be empty*'
+            Should -Throw -ExpectedMessage '*empty*'
     }
 }
 

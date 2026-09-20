@@ -1,19 +1,29 @@
 //! Job plans: what the scheduler decides before it dispatches
 //! anything.
 //!
-//! A plan is the unit every other family takes. It is a value in the
-//! crate and it is a value here: each `With` method answers a fresh
-//! plan and leaves the one it was called on alone, which is what lets
-//! a script keep a base plan and vary it.
+//! A plan is a value. It carries what the caller asked for, nothing
+//! derived, and it crosses into any cmdlet that takes `-Plan`:
 //!
-//!     $base = New-FlynnelPlan -KOuter 8 -BatchSize 100000 -Profile Streaming
-//!     $wide = $base.WithSmt().WithWorkers(24)
-//!     Resolve-FlynnelPlan -Plan $wide
+//!     $p = New-FlynnelPlan -KOuter 8 -BatchSize 100000 -Smt -Workers 4
+//!     $p = $p | Update-FlynnelPlan -Variant Faithful
+//!     Invoke-FlynnelMap -InputObject $x -Operation Sqrt -Plan $p
+//!
+//! A value and not a fluent object, because the binding framework
+//! cannot pass an object holding Rust-only state back into a cmdlet:
+//! such a class has no properties to rebuild it from and says so. The
+//! choice is between chained builders that no cmdlet can accept and a
+//! value every cmdlet can, and a value is the more useful half. It is
+//! also the shape a PowerShell reader expects, since parameters are
+//! how this shell configures anything.
+//!
+//! `New-FlynnelPlan` takes the options a caller reaches for most.
+//! `Update-FlynnelPlan` takes every option there is and answers a
+//! modified copy, leaving the plan it was given alone.
 //!
 //! `Resolve-FlynnelPlan` is the one to reach for when the question is
 //! what a plan does on this host: it answers every resolved figure in
-//! one call, where reading them method by method is twenty crossings
-//! for one answer.
+//! one call, and those figures live there rather than on the plan
+//! because they are answers about a host, not things the caller said.
 
 use pwrs::prelude::*;
 
@@ -31,382 +41,292 @@ fn arg_err(message: impl Into<String>) -> PsError {
     )
 }
 
-/// A scheduling plan for one dispatch: the data size, the batch, and
-/// every hint the caller has given about how the work should run.
+/// The shape of the work a plan describes.
 ///
-/// Each `With` method answers a fresh plan and leaves this one alone,
-/// so a base plan can be varied without being consumed.
-#[psclass(name = "Flynnel.JobPlan", mode = proxy)]
+/// A shape is a name plus the numbers that name needs, so the numbers
+/// ride beside it and the plan refuses a shape whose numbers are
+/// absent rather than substituting a zero for them.
+#[psenum(name = "Flynnel.WorkloadShape")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkloadShapeKind {
+    /// Single-producer streaming: orchestration only, no burst and no
+    /// mailbox route.
+    #[default]
+    Streaming,
+    /// A producer emitting several jobs between waits, which takes the
+    /// burst push path. Needs ShapeBurst.
+    ProducerFast,
+    /// Independent consumers stealing from each other. Needs
+    /// ShapeConsumers and ShapeBatchSize.
+    WorkSteal,
+    /// Cooperative cross-core work, which turns the owner-directed
+    /// mailbox route on. Needs ShapeCores.
+    Cooperative,
+    /// Racing several implementations of the same work, where each
+    /// push is a distinct entry rather than a burst. Needs
+    /// ShapeVariants.
+    VariantRace,
+}
+
+/// A scheduling plan: the data size, the batch, and every hint the
+/// caller has given about how the work should run.
+///
+/// Every field is what the caller asked for. What the host resolves it
+/// to is Resolve-FlynnelPlan's answer, not a property here, so a plan
+/// never carries a figure that depends on which machine read it.
+#[psclass(name = "Flynnel.JobPlan")]
+#[derive(Clone, Default)]
 pub struct Plan {
-    #[psfield(skip)]
-    pub(crate) inner: flynnel::JobPlan,
-}
-
-impl Plan {
-    pub(crate) fn of(inner: flynnel::JobPlan) -> Self {
-        Self { inner }
-    }
-}
-
-/// The operations of a `Flynnel.JobPlan`. Every `With` method answers
-/// a fresh plan; every other method reads this one.
-#[psmethods]
-impl Plan {
-    // -- what the plan was built with ---------------------------------
-
-    /// Log2 of the data size the plan was built for.
-    pub fn k_outer(&self) -> PsResult<u8> {
-        Ok(self.inner.k_outer)
-    }
-
-    /// The batch size the plan was built for.
-    pub fn batch_size(&self) -> PsResult<u32> {
-        Ok(self.inner.batch_size)
-    }
-
-    /// Whether a dispatch profile was named when the plan was built.
-    ///
-    /// A plan does not retain the profile itself. Naming one sets the
-    /// SMT request, the cost estimate and the oversubscription and is
-    /// then dissolved into them, so the profile is an input and what
-    /// it did is read from those three rather than from a field.
-    pub fn profile_explicit(&self) -> PsResult<bool> {
-        Ok(self.inner.profile_explicit)
-    }
-
-    /// The accuracy variant the work is asked for.
-    pub fn variant(&self) -> PsResult<Variant> {
-        Ok(self.inner.variant.into())
-    }
-
+    /// Log2 of the data size, which picks the tier band.
+    pub k_outer: u8,
+    /// How many items the dispatch covers.
+    pub batch_size: u32,
+    /// The dispatch profile named when the plan was built. Null means
+    /// none was named and the plan takes the process's current
+    /// adaptive profile.
+    pub profile: Option<DispatchProfile>,
+    /// Whether the plan was built with none of the host's adaptive
+    /// state, for a measurement whose subject is that state.
+    pub bare: bool,
+    /// Whether the caller asked for the SMT siblings. What the plan
+    /// actually does with them is EffectiveUseSmt on the resolution,
+    /// because a profile can overrule the request.
+    pub smt: bool,
+    /// A pinned worker count, which stops the plan resolving one.
+    pub workers: Option<u32>,
+    /// A NUMA node to prefer.
+    pub numa_hint: Option<u32>,
     /// The kernel target class.
-    pub fn hw_class(&self) -> PsResult<HwClass> {
-        Ok(self.inner.hw_class.into())
+    pub hw_class: Option<HwClass>,
+    /// The accuracy variant the work is asked for.
+    pub variant: Option<Variant>,
+    /// The caller's leaf shape, which lets the classifier route
+    /// correctly on the first call rather than after it has learned.
+    pub leaf_shape: Option<LeafShape>,
+    /// The per-item cost estimate in nanoseconds. The leaf-width model
+    /// needs this and TaskOverheadNs together.
+    pub per_item_ns: Option<u32>,
+    /// What one task costs to hand off, in nanoseconds.
+    pub task_overhead_ns: Option<u32>,
+    /// How long one task runs, in nanoseconds.
+    pub task_span_ns: Option<u32>,
+    /// How many tasks there effectively are.
+    pub effective_task_count: Option<u32>,
+    /// Log2 of the in-kernel lane count.
+    pub k_inner_log2: Option<u8>,
+    /// A per-element cost in nanoseconds.
+    pub cost_ns_per_elem: Option<u32>,
+    /// How long a worker spins before it yields, in nanoseconds.
+    pub spin_before_yield_ns: Option<u64>,
+    /// Log2 of the leaves wanted per worker.
+    pub oversubscription_log2: Option<u8>,
+    /// A pinned bisect variant.
+    pub bisect_variant: Option<BisectVariant>,
+    /// A coherence tier to pin the right-half push to.
+    pub deque_tier_hint: Option<DequeTier>,
+    /// Whether the SMT-sibling mailbox route is pinned on or off.
+    pub mailbox_routing: Option<bool>,
+    /// The shape an N-way cooperative join takes.
+    pub cooperative_routing: Option<CooperativeRouting>,
+    /// The workload shape, which sets the mailbox route, the
+    /// oversubscription and the burst path together.
+    pub shape: Option<WorkloadShapeKind>,
+    /// Jobs a ProducerFast shape emits between waits.
+    pub shape_burst: Option<u32>,
+    /// Consumers a WorkSteal shape has.
+    pub shape_consumers: Option<u32>,
+    /// What each WorkSteal consumer handles.
+    pub shape_batch_size: Option<u32>,
+    /// Cores a Cooperative shape spans.
+    pub shape_cores: Option<u32>,
+    /// Implementations a VariantRace shape races.
+    pub shape_variants: Option<u32>,
+}
+
+impl Plan {
+    /// The crate's own plan, built from what the caller asked for.
+    ///
+    /// Rebuilt on each use rather than held, because the crate's
+    /// `JobPlan` also carries a per-call-site identity the scheduler
+    /// attaches itself, and a plan kept across calls would carry one
+    /// site's identity into another's statistics.
+    pub(crate) fn to_job_plan(&self) -> PsResult<flynnel::JobPlan> {
+        let mut plan = match (self.bare, self.profile) {
+            (true, _) => flynnel::JobPlan::bare(self.k_outer, self.batch_size),
+            (false, Some(profile)) => {
+                flynnel::JobPlan::set_profile(self.k_outer, self.batch_size, profile.into())
+            }
+            (false, None) => flynnel::JobPlan::new(self.k_outer, self.batch_size),
+        };
+        if self.smt {
+            plan = plan.with_smt();
+        }
+        if let Some(v) = self.hw_class {
+            plan = plan.with_hw_class(v.into());
+        }
+        if let Some(v) = self.variant {
+            plan = plan.with_variant(v.into());
+        }
+        if let Some(v) = self.numa_hint {
+            plan = plan.with_numa_hint(v);
+        }
+        if let Some(v) = self.leaf_shape {
+            plan = plan.with_leaf_shape(v.into());
+        }
+        if let Some(v) = self.per_item_ns {
+            plan = plan.with_estimated_per_item_ns(v);
+        }
+        if let Some(v) = self.task_overhead_ns {
+            plan = plan.with_task_overhead_ns(v);
+        }
+        if let Some(v) = self.task_span_ns {
+            plan = plan.with_task_span_ns(v);
+        }
+        if let Some(v) = self.effective_task_count {
+            plan = plan.with_effective_task_count(v);
+        }
+        if let Some(v) = self.k_inner_log2 {
+            plan = plan.with_k_inner_log2(v);
+        }
+        if let Some(v) = self.cost_ns_per_elem {
+            plan = plan.with_cost_ns_per_elem(v);
+        }
+        if let Some(v) = self.spin_before_yield_ns {
+            plan = plan.with_spin_before_yield_ns(v);
+        }
+        if let Some(v) = self.oversubscription_log2 {
+            plan = plan.with_oversubscription_log2(v);
+        }
+        if let Some(v) = self.bisect_variant {
+            plan = plan.with_bisect_variant(v.into());
+        }
+        if let Some(v) = self.deque_tier_hint {
+            plan = plan.with_deque_tier_hint(v.into());
+        }
+        if let Some(v) = self.mailbox_routing {
+            plan = plan.with_mailbox_routing(v);
+        }
+        if let Some(v) = self.cooperative_routing {
+            plan = plan.with_cooperative_routing(v.into());
+        }
+        // A shape sets the mailbox route, the oversubscription and the
+        // burst path together, so it is applied after the options it
+        // would otherwise overwrite one at a time.
+        if let Some(shape) = self.shape {
+            plan = plan.with_workload_shape(self.workload_shape(shape)?);
+        }
+        // Applied after the shape, so a worker count the caller pinned
+        // survives a shape that implies a different one.
+        if let Some(v) = self.workers {
+            plan = plan.with_workers(v);
+        }
+        Ok(plan)
     }
 
-    /// The caller's leaf-shape hint.
-    pub fn leaf_shape(&self) -> PsResult<LeafShape> {
-        Ok(self.inner.leaf_shape.into())
-    }
-
-    /// Whether the right-half push is pinned to a coherence tier, and
-    /// to which. Null when the plan leaves it to the default.
-    pub fn deque_tier_hint(&self) -> PsResult<Option<DequeTier>> {
-        Ok(self.inner.deque_tier_hint.map(Into::into))
-    }
-
-    /// Whether this plan pins the SMT-sibling mailbox route.
-    pub fn use_mailbox_routing(&self) -> PsResult<bool> {
-        Ok(self.inner.use_mailbox_routing)
-    }
-
-    /// Whether the caller pinned a worker count rather than letting
-    /// the plan resolve one.
-    pub fn caller_pinned(&self) -> PsResult<bool> {
-        Ok(self.inner.caller_pinned())
-    }
-
-    // -- the builders, each answering a fresh plan ---------------------
-
-    /// A plan with the SMT siblings asked for.
-    pub fn with_smt(&self) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_smt()))
-    }
-
-    // The argument is `hw_class` and not `class` because the
-    // generated shell writes the Rust parameter name straight into
-    // C#, where `class` is a keyword: it produced
-    // `WithHwClass(HwClass class)` and a CS1001 at that column.
-    /// A plan targeting `hw_class`.
-    pub fn with_hw_class(&self, hw_class: HwClass) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_hw_class(hw_class.into())))
-    }
-
-    /// A plan asking for `variant` accuracy.
-    pub fn with_variant(&self, variant: Variant) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_variant(variant.into())))
-    }
-
-    /// A plan hinted to a NUMA node.
-    pub fn with_numa_hint(&self, node: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_numa_hint(node)))
-    }
-
-    /// A plan carrying the caller's leaf shape, which lets the
-    /// classifier route correctly on the first call.
-    pub fn with_leaf_shape(&self, shape: LeafShape) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_leaf_shape(shape.into())))
-    }
-
-    /// A plan carrying a per-item cost estimate in nanoseconds. Set
-    /// this and the task overhead together: the leaf-width model needs
-    /// both, and with only one it falls back to the minimum leaf.
-    pub fn with_estimated_per_item_ns(&self, ns: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_estimated_per_item_ns(ns)))
-    }
-
-    /// A plan carrying what one task costs to hand off, in
-    /// nanoseconds.
-    pub fn with_task_overhead_ns(&self, ns: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_task_overhead_ns(ns)))
-    }
-
-    /// A plan carrying how long one task runs, in nanoseconds.
-    pub fn with_task_span_ns(&self, ns: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_task_span_ns(ns)))
-    }
-
-    /// A plan carrying how many tasks there effectively are.
-    pub fn with_effective_task_count(&self, count: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_effective_task_count(count)))
-    }
-
-    /// A plan carrying log2 of the in-kernel lane count.
-    pub fn with_k_inner_log2(&self, log2: u8) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_k_inner_log2(log2)))
-    }
-
-    /// A plan carrying a per-element cost in nanoseconds.
-    pub fn with_cost_ns_per_elem(&self, ns: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_cost_ns_per_elem(ns)))
-    }
-
-    /// A plan carrying how long a worker spins before it yields.
-    pub fn with_spin_before_yield_ns(&self, ns: u64) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_spin_before_yield_ns(ns)))
-    }
-
-    /// A plan carrying log2 of the leaves wanted per worker.
-    pub fn with_oversubscription_log2(&self, log2: u8) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_oversubscription_log2(log2)))
-    }
-
-    /// A plan pinned to a worker count, which stops the plan
-    /// resolving one and makes CallerPinned true.
-    pub fn with_workers(&self, workers: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_workers(workers)))
-    }
-
-    /// A plan pinned to a bisect variant.
-    pub fn with_bisect_variant(&self, variant: BisectVariant) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_bisect_variant(variant.into())))
-    }
-
-    /// A plan whose right-half push is pinned to one coherence tier.
-    pub fn with_deque_tier_hint(&self, tier: DequeTier) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_deque_tier_hint(tier.into())))
-    }
-
-    /// A plan with the SMT-sibling mailbox route turned on or off.
-    pub fn with_mailbox_routing(&self, enable: bool) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_mailbox_routing(enable)))
-    }
-
-    /// A plan pinning the shape an N-way cooperative join takes.
-    pub fn with_cooperative_routing(&self, routing: CooperativeRouting) -> PsResult<Plan> {
-        Ok(Plan::of(
-            self.inner.with_cooperative_routing(routing.into()),
-        ))
-    }
-
-    // A workload shape is a shape name plus the numbers that shape
-    // needs, so each is its own method rather than one method with
-    // five arguments of which four are ignored. Each sets the mailbox
-    // route, the oversubscription and the burst path together.
-
-    /// A plan shaped for single-producer streaming: orchestration
-    /// only, no burst and no mailbox route.
-    pub fn with_streaming_shape(&self) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_workload_shape(
-            flynnel::sched::workload_shape::WorkloadShape::Streaming,
-        )))
-    }
-
-    /// A plan shaped for a producer that emits `burst` jobs between
-    /// waits, which takes the burst push path.
-    pub fn with_producer_fast_shape(&self, burst: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_workload_shape(
-            flynnel::sched::workload_shape::WorkloadShape::ProducerFast { burst },
-        )))
-    }
-
-    /// A plan shaped for independent consumers stealing from each
-    /// other, given how many there are and what each handles.
-    pub fn with_work_steal_shape(&self, n_consumers: u32, batch_size: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_workload_shape(
-            flynnel::sched::workload_shape::WorkloadShape::WorkSteal {
-                n_consumers,
-                batch_size,
+    /// The crate's workload shape, refusing a shape whose numbers are
+    /// missing rather than standing a zero in for them.
+    fn workload_shape(
+        &self,
+        shape: WorkloadShapeKind,
+    ) -> PsResult<flynnel::sched::workload_shape::WorkloadShape> {
+        use flynnel::sched::workload_shape::WorkloadShape as W;
+        let need = |value: Option<u32>, name: &str| -> PsResult<u32> {
+            match value {
+                Some(v) => Ok(v),
+                None => Err(arg_err(format!(
+                    "the {shape:?} shape needs {name}; a shape is a name plus the numbers it \
+                     needs, and a zero here would be a number nobody gave"
+                ))
+                .terminating()),
+            }
+        };
+        Ok(match shape {
+            WorkloadShapeKind::Streaming => W::Streaming,
+            WorkloadShapeKind::ProducerFast => W::ProducerFast {
+                burst: need(self.shape_burst, "ShapeBurst")?,
             },
-        )))
-    }
-
-    /// A plan shaped for cooperative cross-core work over `n_cores`,
-    /// which turns the owner-directed mailbox route on.
-    pub fn with_cooperative_shape(&self, n_cores: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_workload_shape(
-            flynnel::sched::workload_shape::WorkloadShape::Cooperative { n_cores },
-        )))
-    }
-
-    /// A plan shaped for racing `n_variants` implementations of the
-    /// same work, where each push is a distinct entry rather than a
-    /// burst.
-    pub fn with_variant_race_shape(&self, n_variants: u32) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_workload_shape(
-            flynnel::sched::workload_shape::WorkloadShape::VariantRace { n_variants },
-        )))
-    }
-
-    // -- what it resolves to on this host ------------------------------
-
-    /// The per-element cost in force, from the caller's estimate or
-    /// the profile's default. Null when the profile supplies none and
-    /// the caller set none.
-    pub fn effective_ns_per_elem(&self) -> PsResult<Option<u32>> {
-        Ok(self.inner.effective_ns_per_elem())
-    }
-
-    /// Log2 of the leaves per worker in force.
-    pub fn effective_oversubscription_log2(&self) -> PsResult<u8> {
-        Ok(self.inner.effective_oversubscription_log2())
-    }
-
-    /// The leaves per worker in force.
-    pub fn effective_leaves_per_worker(&self) -> PsResult<u64> {
-        Ok(self.inner.effective_leaves_per_worker() as u64)
-    }
-
-    /// Whether the SMT siblings are actually used, which the profile
-    /// can decline even when the caller asked.
-    pub fn effective_use_smt(&self) -> PsResult<bool> {
-        Ok(self.inner.effective_use_smt())
-    }
-
-    /// How long a worker spins before yielding under this plan.
-    pub fn effective_spin_before_yield_ns(&self) -> PsResult<u64> {
-        Ok(self.inner.effective_spin_before_yield_ns())
-    }
-
-    /// The whole job's estimated cost in nanoseconds, from the
-    /// per-item estimate and the batch. Null without an estimate.
-    pub fn estimated_total_ns(&self) -> PsResult<Option<u64>> {
-        Ok(self.inner.estimated_total_ns())
-    }
-
-    /// The in-kernel lane count this plan implies.
-    pub fn k_inner_lanes(&self) -> PsResult<u64> {
-        Ok(self.inner.k_inner_lanes() as u64)
-    }
-
-    /// The workers this plan resolves to right now.
-    ///
-    /// Starts the arena if it is not already running, so this is not a
-    /// free inspection on a process that has not dispatched yet.
-    pub fn resolved_workers(&self) -> PsResult<u64> {
-        Ok(self.inner.resolved_workers() as u64)
-    }
-
-    /// The workers this plan would use given an arena of
-    /// `arena_workers`, without starting anything.
-    pub fn effective_workers(&self, arena_workers: u64) -> PsResult<u64> {
-        Ok(self.inner.effective_workers(arena_workers as usize) as u64)
-    }
-
-    /// The leaf count the Tiny-Tasks model recommends for `workers`.
-    /// Null unless the plan carries both a per-item cost and a task
-    /// overhead, which is the gate the model needs.
-    pub fn optimal_chunk_count(&self, workers: u64) -> PsResult<Option<u32>> {
-        Ok(self.inner.optimal_chunk_count(workers as usize))
-    }
-
-    /// The same for an explicit item count `n`.
-    pub fn optimal_chunk_count_for(&self, workers: u64, n: u64) -> PsResult<Option<u32>> {
-        Ok(self
-            .inner
-            .optimal_chunk_count_for(workers as usize, n as usize))
-    }
-
-    /// The scheduler tier this plan picks against this host's
-    /// topology.
-    pub fn tier(&self) -> PsResult<SchedTier> {
-        Ok(flynnel::sched::plan::pick_tier(&self.inner, flynnel::numa_topology()).into())
-    }
-
-    /// The backend this plan would dispatch to.
-    ///
-    /// Starts the arena if it is not already running.
-    pub fn backend_name(&self) -> PsResult<String> {
-        Ok(format!("{:?}", self.inner.pick_backend().id()))
+            WorkloadShapeKind::WorkSteal => W::WorkSteal {
+                n_consumers: need(self.shape_consumers, "ShapeConsumers")?,
+                batch_size: need(self.shape_batch_size, "ShapeBatchSize")?,
+            },
+            WorkloadShapeKind::Cooperative => W::Cooperative {
+                n_cores: need(self.shape_cores, "ShapeCores")?,
+            },
+            WorkloadShapeKind::VariantRace => W::VariantRace {
+                n_variants: need(self.shape_variants, "ShapeVariants")?,
+            },
+        })
     }
 }
 
-/// Everything a plan answers about this host, in one object.
+/// Everything a plan resolves to on this host.
 #[psclass(name = "Flynnel.ResolvedPlan")]
 #[derive(Clone, Default)]
 pub struct ResolvedPlan {
-    /// Log2 of the data size.
+    /// Log2 of the data size the plan was built for.
     pub k_outer: u8,
-    /// The batch size.
+    /// The batch size the plan was built for.
     pub batch_size: u32,
     /// Whether a dispatch profile was named when the plan was built.
-    /// The profile itself is not retained: it sets the SMT request,
-    /// the cost estimate and the oversubscription below and is
-    /// dissolved into them.
+    ///
+    /// A plan does not retain the profile itself once it reaches the
+    /// scheduler. Naming one sets the SMT request, the cost estimate
+    /// and the oversubscription and is then dissolved into them, so
+    /// the profile is an input and what it did is read from those
+    /// three rather than from a field.
     pub profile_explicit: bool,
-    /// The accuracy variant.
+    /// The accuracy variant in force.
     pub variant: Variant,
-    /// The kernel target class.
+    /// The kernel target class in force.
     pub hw_class: HwClass,
-    /// The caller's leaf-shape hint.
+    /// The leaf shape in force.
     pub leaf_shape: LeafShape,
-    /// The scheduler tier picked against this host's topology.
+    /// The tier this plan dispatches at on this host.
     pub tier: SchedTier,
-    /// Workers resolved right now.
+    /// How many workers it resolves to.
     pub resolved_workers: u64,
-    /// Whether the caller pinned that count.
+    /// Whether the caller pinned that count rather than letting the
+    /// plan resolve one.
     pub caller_pinned: bool,
-    /// Whether SMT siblings are actually used.
+    /// Whether the SMT siblings are actually asked for, which the
+    /// profile can decide against the caller's request.
     pub effective_use_smt: bool,
-    /// The per-element cost in force, null when there is none.
+    /// The per-element cost in force, from the caller's estimate or
+    /// the profile's default. Null when neither supplies one.
     pub effective_ns_per_elem: Option<u32>,
-    /// Log2 of the leaves per worker.
+    /// Log2 of the leaves wanted per worker, in force.
     pub effective_oversubscription_log2: u8,
-    /// Leaves per worker.
+    /// Leaves per worker, in force.
     pub effective_leaves_per_worker: u64,
-    /// Spin before yield, nanoseconds.
+    /// How long a worker spins before it yields, in force.
     pub effective_spin_before_yield_ns: u64,
-    /// The job's estimated cost, null without a per-item estimate.
+    /// The whole dispatch's estimated cost in nanoseconds. Null when
+    /// the leaf-width model has nothing to solve.
     pub estimated_total_ns: Option<u64>,
     /// In-kernel lanes.
     pub k_inner_lanes: u64,
-    /// The Tiny-Tasks leaf count for the resolved worker count, null
-    /// unless both the per-item cost and the task overhead are set.
+    /// The leaf count the width model recommends. Null when the model
+    /// is unsolvable, which is not the same as a count of zero.
     pub optimal_chunk_count: Option<u32>,
-    /// Which backend the plan would dispatch to.
+    /// The backend this plan picks.
     pub backend: String,
-    /// Whether the right-half push is pinned to a tier.
+    /// The coherence tier the right-half push is pinned to, if any.
     pub deque_tier_hint: Option<DequeTier>,
-    /// Whether the SMT-sibling mailbox route is pinned on.
+    /// Whether the SMT-sibling mailbox route is on.
     pub use_mailbox_routing: bool,
 }
 
-/// Builds a job plan: the data size, the batch, and how the work
-/// should be classified.
+/// Builds a job plan.
 ///
-/// One of Profile, Bare or neither. With Profile the plan takes that
-/// dispatch profile and its defaults; with Bare it takes none of the
-/// host's adaptive state, which is what a measurement wants when the
-/// adaptive layer is the thing under test; with neither it takes the
-/// process's current adaptive profile.
+/// Takes the options a caller reaches for most. Update-FlynnelPlan
+/// takes every option there is, including these, and answers a
+/// modified copy.
 ///
 /// # Examples
 ///
 /// `New-FlynnelPlan -KOuter 8 -BatchSize 100000`
 ///
-/// `New-FlynnelPlan -KOuter 10 -BatchSize 1000000 -Profile Streaming`
-///
-/// `New-FlynnelPlan -KOuter 6 -BatchSize 4096 -Bare -PerItemNs 200 -TaskOverheadNs 900`
+/// `New-FlynnelPlan -KOuter 8 -BatchSize 100000 -Profile Streaming -Workers 4`
 #[cmdlet(
     verb = "New",
     noun = "FlynnelPlan",
@@ -456,33 +376,11 @@ impl Cmdlet for NewFlynnelPlan {
             )
             .terminating());
         }
-        let mut plan = match (self.bare, self.profile) {
-            (true, _) => flynnel::JobPlan::bare(self.k_outer, self.batch_size),
-            (false, Some(profile)) => {
-                flynnel::JobPlan::set_profile(self.k_outer, self.batch_size, profile.into())
-            }
-            (false, None) => flynnel::JobPlan::new(self.k_outer, self.batch_size),
-        };
-        if let Some(ns) = self.per_item_ns {
-            plan = plan.with_estimated_per_item_ns(ns);
-        }
-        if let Some(ns) = self.task_overhead_ns {
-            plan = plan.with_task_overhead_ns(ns);
-        }
-        if let Some(shape) = self.leaf_shape {
-            plan = plan.with_leaf_shape(shape.into());
-        }
-        if self.smt {
-            plan = plan.with_smt();
-        }
-        if let Some(workers) = self.workers {
-            if workers == 0 {
-                return Err(arg_err("Workers must be at least one").terminating());
-            }
-            plan = plan.with_workers(workers);
+        if self.workers == Some(0) {
+            return Err(arg_err("Workers must be at least one").terminating());
         }
         // A per-item cost without the task overhead leaves the
-        // Tiny-Tasks model unsolvable, and the plan then uses the
+        // leaf-width model unsolvable, and the plan then uses the
         // minimum leaf. Saying so costs nothing and is the difference
         // between a tuned plan and one that looks tuned.
         if self.per_item_ns.is_some() != self.task_overhead_ns.is_some() {
@@ -493,16 +391,221 @@ impl Cmdlet for NewFlynnelPlan {
                  nothing"
             )?;
         }
-        ps.write(Plan::of(plan))
+        let plan = Plan {
+            k_outer: self.k_outer,
+            batch_size: self.batch_size,
+            profile: self.profile,
+            bare: self.bare,
+            smt: self.smt,
+            workers: self.workers,
+            leaf_shape: self.leaf_shape,
+            per_item_ns: self.per_item_ns,
+            task_overhead_ns: self.task_overhead_ns,
+            ..Plan::default()
+        };
+        // Built once here, so an argument the crate refuses is refused
+        // now rather than at whichever kernel first used the plan.
+        plan.to_job_plan()?;
+        ps.write(plan)
+    }
+}
+
+/// Answers a copy of a plan with the options given changed, and leaves
+/// the plan it was given alone.
+///
+/// Every option a plan can carry is here, including the ones
+/// New-FlynnelPlan also takes. An option not given is left as it was,
+/// so this is a change rather than a rebuild. There is deliberately no
+/// way to clear an option: a plan built without it is the way back,
+/// and a switch that both sets and clears cannot say which a caller
+/// meant.
+///
+/// # Examples
+///
+/// `$p | Update-FlynnelPlan -Variant Faithful -Workers 8`
+///
+/// `Update-FlynnelPlan -Plan $p -Shape WorkSteal -ShapeConsumers 8 -ShapeBatchSize 64`
+#[cmdlet(
+    verb = "Update",
+    noun = "FlynnelPlan",
+    alias = "Update-FlyPlan",
+    output = ["Flynnel.JobPlan"]
+)]
+#[derive(Default)]
+pub struct UpdateFlynnelPlan {
+    /// The plan to copy and change.
+    #[param(mandatory, position = 0, value_from_pipeline)]
+    pub plan: Option<Plan>,
+    /// Ask for the SMT siblings, or stop asking.
+    #[param]
+    pub smt: Option<bool>,
+    /// Pin the worker count rather than resolving one.
+    #[param]
+    pub workers: Option<u32>,
+    /// A NUMA node to prefer.
+    #[param]
+    pub numa_hint: Option<u32>,
+    /// The kernel target class.
+    #[param]
+    pub hw_class: Option<HwClass>,
+    /// The accuracy variant the work is asked for.
+    #[param]
+    pub variant: Option<Variant>,
+    /// The caller's leaf shape.
+    #[param]
+    pub leaf_shape: Option<LeafShape>,
+    /// The per-item cost estimate in nanoseconds.
+    #[param]
+    pub per_item_ns: Option<u32>,
+    /// What one task costs to hand off, in nanoseconds.
+    #[param]
+    pub task_overhead_ns: Option<u32>,
+    /// How long one task runs, in nanoseconds.
+    #[param]
+    pub task_span_ns: Option<u32>,
+    /// How many tasks there effectively are.
+    #[param]
+    pub effective_task_count: Option<u32>,
+    /// Log2 of the in-kernel lane count.
+    #[param]
+    pub k_inner_log2: Option<u8>,
+    /// A per-element cost in nanoseconds.
+    #[param]
+    pub cost_ns_per_elem: Option<u32>,
+    /// How long a worker spins before it yields, in nanoseconds.
+    #[param]
+    pub spin_before_yield_ns: Option<u64>,
+    /// Log2 of the leaves wanted per worker.
+    #[param]
+    pub oversubscription_log2: Option<u8>,
+    /// A pinned bisect variant.
+    #[param]
+    pub bisect_variant: Option<BisectVariant>,
+    /// A coherence tier to pin the right-half push to.
+    #[param]
+    pub deque_tier_hint: Option<DequeTier>,
+    /// Turn the SMT-sibling mailbox route on or off.
+    #[param]
+    pub mailbox_routing: Option<bool>,
+    /// The shape an N-way cooperative join takes.
+    #[param]
+    pub cooperative_routing: Option<CooperativeRouting>,
+    /// The workload shape.
+    #[param]
+    pub shape: Option<WorkloadShapeKind>,
+    /// Jobs a ProducerFast shape emits between waits.
+    #[param]
+    pub shape_burst: Option<u32>,
+    /// Consumers a WorkSteal shape has.
+    #[param]
+    pub shape_consumers: Option<u32>,
+    /// What each WorkSteal consumer handles.
+    #[param]
+    pub shape_batch_size: Option<u32>,
+    /// Cores a Cooperative shape spans.
+    #[param]
+    pub shape_cores: Option<u32>,
+    /// Implementations a VariantRace shape races.
+    #[param]
+    pub shape_variants: Option<u32>,
+}
+
+impl Cmdlet for UpdateFlynnelPlan {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let Some(base) = self.plan.as_ref() else {
+            return Err(arg_err("Plan is required").terminating());
+        };
+        if self.workers == Some(0) {
+            return Err(arg_err("Workers must be at least one").terminating());
+        }
+        let mut next = base.clone();
+        if let Some(v) = self.smt {
+            next.smt = v;
+        }
+        // Each option is taken only when it was given, so an absent
+        // one leaves what the plan already carried.
+        if self.workers.is_some() {
+            next.workers = self.workers;
+        }
+        if self.numa_hint.is_some() {
+            next.numa_hint = self.numa_hint;
+        }
+        if self.hw_class.is_some() {
+            next.hw_class = self.hw_class;
+        }
+        if self.variant.is_some() {
+            next.variant = self.variant;
+        }
+        if self.leaf_shape.is_some() {
+            next.leaf_shape = self.leaf_shape;
+        }
+        if self.per_item_ns.is_some() {
+            next.per_item_ns = self.per_item_ns;
+        }
+        if self.task_overhead_ns.is_some() {
+            next.task_overhead_ns = self.task_overhead_ns;
+        }
+        if self.task_span_ns.is_some() {
+            next.task_span_ns = self.task_span_ns;
+        }
+        if self.effective_task_count.is_some() {
+            next.effective_task_count = self.effective_task_count;
+        }
+        if self.k_inner_log2.is_some() {
+            next.k_inner_log2 = self.k_inner_log2;
+        }
+        if self.cost_ns_per_elem.is_some() {
+            next.cost_ns_per_elem = self.cost_ns_per_elem;
+        }
+        if self.spin_before_yield_ns.is_some() {
+            next.spin_before_yield_ns = self.spin_before_yield_ns;
+        }
+        if self.oversubscription_log2.is_some() {
+            next.oversubscription_log2 = self.oversubscription_log2;
+        }
+        if self.bisect_variant.is_some() {
+            next.bisect_variant = self.bisect_variant;
+        }
+        if self.deque_tier_hint.is_some() {
+            next.deque_tier_hint = self.deque_tier_hint;
+        }
+        if self.mailbox_routing.is_some() {
+            next.mailbox_routing = self.mailbox_routing;
+        }
+        if self.cooperative_routing.is_some() {
+            next.cooperative_routing = self.cooperative_routing;
+        }
+        if self.shape.is_some() {
+            next.shape = self.shape;
+        }
+        if self.shape_burst.is_some() {
+            next.shape_burst = self.shape_burst;
+        }
+        if self.shape_consumers.is_some() {
+            next.shape_consumers = self.shape_consumers;
+        }
+        if self.shape_batch_size.is_some() {
+            next.shape_batch_size = self.shape_batch_size;
+        }
+        if self.shape_cores.is_some() {
+            next.shape_cores = self.shape_cores;
+        }
+        if self.shape_variants.is_some() {
+            next.shape_variants = self.shape_variants;
+        }
+        // Refused here rather than at whichever kernel first used it.
+        next.to_job_plan()?;
+        ps.write(next)
     }
 }
 
 /// Answers everything a plan resolves to on this host in one object:
 /// the workers, the tier, the leaf width, the backend and the rest.
 ///
-/// Reading these one method at a time is one crossing each; this is
-/// one crossing for all of them, which is the difference the module's
-/// own measurements are about.
+/// Reading these one at a time would be one crossing each; this is one
+/// crossing for all of them. They live here rather than on the plan
+/// because they are answers about a host, and a plan that carried them
+/// would be a different value on every machine that read it.
 ///
 /// Starts the arena if it is not already running, because the worker
 /// count and the backend are answers about a live pool.
@@ -520,9 +623,7 @@ impl Cmdlet for NewFlynnelPlan {
 )]
 #[derive(Default)]
 pub struct ResolveFlynnelPlan {
-    /// The plan to resolve. Optional in the type because a proxy
-    /// class has no default to derive; mandatory to the binder, which
-    /// is what guarantees it is here.
+    /// The plan to resolve.
     #[param(mandatory, position = 0, value_from_pipeline)]
     pub plan: Option<Plan>,
 }
@@ -532,7 +633,7 @@ impl Cmdlet for ResolveFlynnelPlan {
         let Some(plan) = self.plan.as_ref() else {
             return Err(arg_err("Plan is required").terminating());
         };
-        let p = &plan.inner;
+        let p = plan.to_job_plan()?;
         let workers = p.resolved_workers();
         ps.write(ResolvedPlan {
             k_outer: p.k_outer,
@@ -541,7 +642,7 @@ impl Cmdlet for ResolveFlynnelPlan {
             variant: p.variant.into(),
             hw_class: p.hw_class.into(),
             leaf_shape: p.leaf_shape.into(),
-            tier: flynnel::sched::plan::pick_tier(p, flynnel::numa_topology()).into(),
+            tier: flynnel::sched::plan::pick_tier(&p, flynnel::numa_topology()).into(),
             resolved_workers: workers as u64,
             caller_pinned: p.caller_pinned(),
             effective_use_smt: p.effective_use_smt(),

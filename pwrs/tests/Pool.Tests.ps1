@@ -47,9 +47,33 @@ Describe 'Start-FlynnelPool and Get-FlynnelPool' {
     }
 }
 
+Describe 'the types this family exports' {
+    It 'shapes each type the way its cmdlet documents' {
+        foreach ($type in 'Flynnel.WorkerStat', 'Flynnel.SpinState', 'Flynnel.SplitState') {
+            @(Get-FlynnelTypeProperty -TypeName $type).Count |
+                Should -BeGreaterThan 0 -Because "$type must carry something"
+        }
+    }
+}
+
 Describe 'Get-FlynnelWorker' {
     It 'writes one row per worker, in one call' {
         @(Get-FlynnelWorker).Count | Should -Be $script:pool.TotalWorkers
+    }
+
+    It 'leaves the external slots out unless asked, and marks them when asked' {
+        # The pool's statistics table runs past its workers into the
+        # slots a foreign thread pushes through. Those rows are real
+        # and they are not workers, and unmarked they read as a set of
+        # permanently idle workers that do not exist.
+        $workers = @(Get-FlynnelWorker)
+        $all = @(Get-FlynnelWorker -IncludeExternalSlot)
+        $all.Count | Should -BeGreaterOrEqual $workers.Count
+        ($workers | Where-Object { -not $_.IsWorker }).Count | Should -Be 0
+        if ($all.Count -gt $workers.Count) {
+            ($all | Where-Object { -not $_.IsWorker }).Count |
+                Should -Be ($all.Count - $workers.Count)
+        }
     }
 
     It 'numbers them from zero without a gap' {
@@ -111,7 +135,7 @@ Describe 'the split dials' {
 
     It 'clamps out of range and says so rather than accepting it' {
         $warnings = @()
-        $set = Set-FlynnelSplitMultiplier -Value 99 -WarningVariable warnings -WarningAction SilentlyContinue
+        $set = Set-FlynnelSplitMultiplier -Value 99 -WarningVariable warnings
         $set.Multiplier | Should -BeLessOrEqual 8
         $warnings.Count | Should -BeGreaterThan 0
     }
@@ -148,7 +172,7 @@ Describe 'the IO pool' {
 
     It 'says when the process has no global pool rather than writing an empty one' {
         $warnings = @()
-        $global = Get-FlynnelIoPool -WarningVariable warnings -WarningAction SilentlyContinue
+        $global = Get-FlynnelIoPool -WarningVariable warnings
         if ($null -eq $global) {
             $warnings.Count | Should -BeGreaterThan 0
         } else {

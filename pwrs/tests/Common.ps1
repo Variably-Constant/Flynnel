@@ -41,6 +41,15 @@ function Test-FlynnelMultiNode {
     (Get-FlynnelTopology).NodeCount -gt 1
 }
 
+# Capturing a warning takes -WarningVariable on its own.
+#
+# Adding -WarningAction SilentlyContinue captures nothing. The binding
+# builds a warning's text only when the engine says the warning stream
+# is on, so suppressing the stream suppresses the write itself and the
+# variable stays empty. A script calling these cmdlets for real is
+# unaffected; it is only a test trying to be quiet that loses the
+# thing it came to read.
+
 # Every property of a class the module exports, for the checks that a
 # figure which can be unmeasured is nullable rather than a zero-valued
 # primitive.
