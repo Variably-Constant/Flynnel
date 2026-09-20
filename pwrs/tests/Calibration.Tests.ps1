@@ -185,12 +185,17 @@ Describe 'Measure-FlynnelClassThreshold' {
 
     It 'writes nothing for Background, and says why' {
         # The crate's spawned form answers no handle and no result, so
-        # a row here would be invented rather than measured.
+        # a row here would be invented rather than measured. The why
+        # has two cases and both are a why: it started and there is
+        # nothing to wait on, or there was no IO pool and it did not
+        # start at all. The sibling test below checks which case is
+        # reported; this one checks that a reason is given and no row
+        # is invented either way.
         $warnings = @()
         $output = Measure-FlynnelClassThreshold -Background `
             -WarningVariable warnings
         $output | Should -BeNullOrEmpty
-        ($warnings -join ' ') | Should -Match 'no handle'
+        ($warnings -join ' ') | Should -Match 'no handle|nothing was started'
     }
 }
 
