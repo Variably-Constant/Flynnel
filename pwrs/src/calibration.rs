@@ -289,14 +289,27 @@ pub struct MeasureFlynnelClassThreshold {
 impl Cmdlet for MeasureFlynnelClassThreshold {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         if self.background {
+            // Asked before, because the crate's spawned form is a
+            // silent no-op without an IO pool and a caller told it
+            // might have done nothing learns less than one told it
+            // did not.
+            let has_io_pool = flynnel::sched::global_io_pool().is_some();
             adaptive_profile::spawn_class_threshold_calibration();
-            pwrs::warning!(
-                ps,
-                "started in the background. The crate's spawned form answers no handle and no \
-                 result, so there is nothing to wait on and nothing to write; read \
-                 Get-FlynnelClassThreshold later to see whether the values moved. It is also a \
-                 no-op when the IO pool is disabled."
-            )?;
+            if has_io_pool {
+                pwrs::warning!(
+                    ps,
+                    "started on the IO pool. The crate's spawned form answers no handle and no \
+                     result, so there is nothing to wait on and nothing to write; read \
+                     Get-FlynnelClassThreshold later to see whether the values moved."
+                )?;
+            } else {
+                pwrs::warning!(
+                    ps,
+                    "there is no IO pool in this process, so nothing was started and the class \
+                     thresholds will not move; set FLYNNEL_SCHED_SMT_AS_IO=1 before the pool \
+                     starts, or drop Background to measure on this thread instead"
+                )?;
+            }
             return Ok(());
         }
         // Stamped before the atomic is written, so a clock this module

@@ -268,6 +268,11 @@ reason = "internal-to-another-surface"
 note = "Get-FlynnelWorkloadClass, which classifies a caller's own leaf figures against the live boundaries without running anything"
 
 [[entry]]
+item = "crate::sched::adaptive_profile::spawn_class_threshold_calibration"
+reason = "internal-to-another-surface"
+note = "Measure-FlynnelClassThreshold -Background. It answers no handle and no result, so the cmdlet writes nothing and says so; it also asks whether an IO pool exists first, because the crate's form is a silent no-op without one"
+
+[[entry]]
 item = "crate::sched::adaptive_profile::AUTO_MIGRATION_HYSTERESIS"
 reason = "unsafe-or-structural"
 note = "consecutive agreeing ticks required before the classifier migrates a process between classes; a constant the tick counts against, not state a caller sets"

@@ -391,6 +391,22 @@ Describe 'Get-FlynnelCpuCalibration' {
         $record.IsTrustworthy | Should -Be $expected
     }
 
+    It 'says whether a background calibration actually started' {
+        # The crate's spawned form is a no-op without an IO pool. A
+        # caller told it might have done nothing knows less than one
+        # told it did not, and the difference decides whether reading
+        # the thresholds again later is worth anything.
+        $warnings = @()
+        $null = Measure-FlynnelClassThreshold -Background -WarningVariable warnings
+        $warnings.Count | Should -BeGreaterThan 0
+        $pool = Get-FlynnelIoPool -WarningVariable ignored
+        if ($null -eq $pool) {
+            "$warnings" | Should -BeLike '*nothing was started*'
+        } else {
+            "$warnings" | Should -BeLike '*started on the IO pool*'
+        }
+    }
+
     It 'types the active profile rather than naming it' {
         # Every other classification on the row is an enum. A string
         # here is the one column a caller has to compare with a
