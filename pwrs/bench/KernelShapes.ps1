@@ -94,6 +94,28 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 $commit = (& git -C $repoRoot rev-parse --short HEAD 2>&1 | Out-String).Trim()
 $dirty = @(& git -C $repoRoot status --porcelain 2>&1).Count
 
+# The commit describes the tree this script sits in. It describes the
+# binary only when the module was built from that same tree, and this
+# fleet clones a tree per commit, so pointing -Module at a different
+# clone is easy and silent. It has already happened: a run stamped
+# 54d4238 measured a module built at 5c9be71, and its anchor went into
+# the store under the wrong commit, where a later run would have read
+# it as a cross-build comparison it is not.
+#
+# Reported rather than refused, because measuring one build's module
+# with a later build's harness is a legitimate thing to want. What is
+# not legitimate is not knowing which you did.
+$moduleRoot = (Resolve-Path $Module).Path
+$treeRoot = (Resolve-Path $repoRoot).Path
+$commitDescribesModule = $moduleRoot.StartsWith($treeRoot, [StringComparison]::OrdinalIgnoreCase)
+if (-not $commitDescribesModule) {
+    Write-Host ("PROVENANCE: the module at {0} is outside the tree this script runs from ({1}), " -f
+        $moduleRoot, $treeRoot)
+    Write-Host ("  so commit {0} names the harness and not the binary being measured." -f $commit)
+    Write-Host '  The anchor for this run is stored against that commit, and a later run comparing'
+    Write-Host '  against it is comparing harnesses rather than builds.'
+}
+
 $hostInfo = [PSCustomObject]@{
     Machine        = [Environment]::MachineName
     Edition        = $PSVersionTable.PSEdition
@@ -103,6 +125,9 @@ $hostInfo = [PSCustomObject]@{
     ProcessorCount = [Environment]::ProcessorCount
     Commit         = $commit
     Dirty          = $dirty
+    ModulePath     = $moduleRoot
+    # False means Commit above is the harness's, not the binary's.
+    CommitDescribesModule = $commitDescribesModule
 }
 
 # ----------------------------------------------------------------------
