@@ -100,7 +100,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 $exe = ".\target\release\examples\throughput_under_load.exe"
 
-if (-not (Enter-TimingRun -What "flynnel lever $short, $Trials trials" -Log $log)) {
+if (-not (Enter-TimingRun -What "flynnel lever $short, $Trials trials" -Log $log `
+          -Tree $tree -Who 'Flynnel-Scholar')) {
     exit 3
 }
 

@@ -108,7 +108,8 @@ $exe = ".\target\release\examples\throughput_under_load.exe"
 # The build is contention tolerant and ran above. Everything past here is
 # timed, so the box has to be clear before it starts and the run has to
 # be announced while it lasts.
-if (-not (Enter-TimingRun -What "flynnel serve-vs-draw A/B, $Trials trials" -Log $log)) {
+if (-not (Enter-TimingRun -What "flynnel serve-vs-draw A/B, $Trials trials" -Log $log `
+          -Tree $tree -Who 'Flynnel-Scholar')) {
     exit 3
 }
 

@@ -5,9 +5,18 @@
 # job at a time is a constraint on the box, not on one agent's jobs.
 #
 #   . C:\Temp\pc2_timing_guard.ps1
-#   if (-not (Enter-TimingRun -What "what this measures" -Log $log)) { exit 3 }
+#   if (-not (Enter-TimingRun -What "what this measures" -Log $log `
+#             -Tree 'C:\Temp\the-tree-being-measured' -Who 'Your-Name')) { exit 3 }
 #   ... timed work ...
 #   Exit-TimingRun -Log $log
+#
+# -Tree is the tree whose commit the log records. It is read with git -C, so
+# a harness that sets no location still gets its own provenance rather than
+# the dot-sourcing directory's; a tree that gives no head is refused, since a
+# provenance line holding a git error attributes the numbers to nothing.
+#
+# -Who is the agent the presence claim names, so an operator reading the
+# presence list knows whose run is holding the box.
 #
 # -BoundOn says what the run's wall is bound on and picks the CPU ceiling from
 # it: host, the default, waits for a box quiet enough that its cores are not
@@ -57,6 +66,17 @@ function Enter-TimingRun {
     param(
         [Parameter(Mandatory = $true)][string]$What,
         [Parameter(Mandatory = $true)][string]$Log,
+        # The tree whose commit this log records. Read with git -C, so the
+        # provenance belongs to the tree being measured rather than to
+        # whatever directory the harness happened to be dot-sourced from.
+        # The default is that directory, which is what a harness that sets
+        # its location already gets; one that does not is refused below
+        # rather than given a git error where a commit should be.
+        [string]$Tree = (Get-Location).Path,
+        # The agent whose run this is, so the presence line says who to ask
+        # about it. A claim is worth keeping beside a measurement because it
+        # carries intent, and intent belongs to somebody.
+        [string]$Who = 'an agent that did not name itself',
         # The caller's own pid. Defaults to this session's, which is the
         # harness when this file is dot-sourced into it.
         [int]$OwnerPid = $PID,
@@ -84,10 +104,20 @@ function Enter-TimingRun {
     # a source file moves. A log naming only the path attributes its
     # numbers to a commit the tree no longer holds. HEAD plus the
     # modified paths says what the run really built.
-    $head = (& git rev-parse --short HEAD 2>&1 | Out-String).Trim()
-    $dirty = @(& git status --porcelain --untracked-files=no 2>&1 |
+    # Read against the named tree rather than the current directory, and
+    # refused when no head comes back. A log whose provenance line holds a
+    # git error attributes its numbers to nothing, and every reader after
+    # it has to take the tree's name on trust - which is the one thing the
+    # name cannot be trusted for.
+    $head = (& git -C $Tree rev-parse --short HEAD 2>&1 | Out-String).Trim()
+    if ($head -notmatch '^[0-9a-f]{7,40}$') {
+        "NO_PROVENANCE $Tree gave no head ($head); declining to measure rather than measure unattributably" |
+            Add-Content -Path $Log
+        return $false
+    }
+    $dirty = @(& git -C $Tree status --porcelain --untracked-files=no 2>&1 |
         ForEach-Object { $_.ToString().Trim() })
-    "SOURCE_STATE head=$head dirty=$($dirty.Count) in $(Get-Location)" |
+    "SOURCE_STATE head=$head dirty=$($dirty.Count) in $Tree" |
         Add-Content -Path $Log
     foreach ($d in $dirty) { "SOURCE_DIRTY $d" | Add-Content -Path $Log }
 
@@ -134,7 +164,7 @@ function Enter-TimingRun {
     }
     "QUIET_REACHED $(Get-Date -Format o)" | Add-Content -Path $Log
 
-    $claim = "$What, TIMINGS, needs a quiet box, and this line stands until it exits, Flynnel-Scholar"
+    $claim = "$What, TIMINGS, needs a quiet box, and this line stands until it exits, $Who"
     & powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Temp\presence.ps1' `
         -Claim $claim -OwnerPid $OwnerPid *>&1 | Add-Content -Path $Log
     $script:TimingClaimHeld = $true
