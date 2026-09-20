@@ -224,6 +224,100 @@ reaches = "Get-FlynnelPrefixSum"
 note = "also the two-phase scan, the histogram, the sort's merge rounds, the file kernels and the parallel BLAKE3 subtrees"
 
 # ---------------------------------------------------------------------
+# The persisted calibration store, read and never written
+# ---------------------------------------------------------------------
+# Its read side is the four store cmdlets. Its write side is carved
+# out below, and the distinction is the point rather than an omission:
+# the table is shared by every process on the host, so a script
+# publishing into it would be handing every future process a
+# measurement nothing took. Reading is a report; writing is a claim.
+
+[[entry]]
+item = "crate::sched::calibration_store"
+reason = "internal-to-another-surface"
+note = "read through Get-FlynnelHostStamp, Get-FlynnelCalibrationStore, Get-FlynnelCpuCalibration and Get-FlynnelAccelCalibration, which answer the stamp, the table's presence, the CPU record and one row per accelerator"
+
+[[entry]]
+item = "crate::sched::calibration_store::WriterGuard"
+reason = "unsafe-or-structural"
+note = "holds the table's single-writer lease and must be beaten on a cadence or the lease lapses mid-write. A script holding one across a pipeline would either block every other process's calibration or drop the lease with a half-written record behind it"
+
+[[entry]]
+item = "crate::sched::calibration_store::try_acquire_writer"
+reason = "unsafe-or-structural"
+note = "takes that lease"
+
+[[entry]]
+item = "crate::sched::calibration_store::PublishOutcome"
+reason = "unsafe-or-structural"
+note = "what a publish decided, which only a caller that published has"
+
+[[entry]]
+item = "crate::sched::calibration_store::CpuCalibration::new"
+reason = "unsafe-or-structural"
+note = "builds a record to publish. The fields are timings, so a script calling this would be writing numbers nothing measured into a table every process on the host reads"
+
+[[entry]]
+item = "crate::sched::calibration_store::AccelCalibration::new"
+reason = "unsafe-or-structural"
+note = "the same for a device record"
+
+[[entry]]
+item = "crate::sched::calibration_store::AccelCalibration::with_wave"
+reason = "unsafe-or-structural"
+note = "attaches wave costs to a record being built for publication; the costs themselves are read back through Get-FlynnelAccelCalibration"
+
+[[entry]]
+item = "crate::sched::calibration_store::fnv1a_64"
+reason = "unsafe-or-structural"
+note = "the hash the stamp and the record checksums are built from, part of the on-disk format rather than a figure"
+
+[[entry]]
+item = "crate::sched::calibration_store::CALIBRATION_MAGIC"
+reason = "unsafe-or-structural"
+note = "the file's leading magic, part of the on-disk format"
+
+[[entry]]
+item = "crate::sched::calibration_store::LAYOUT_VERSION"
+reason = "unsafe-or-structural"
+note = "bumped when a stored field changes meaning, which invalidates every record by stamp; part of the on-disk format"
+
+[[entry]]
+item = "crate::sched::calibration_store::MAX_ACCEL"
+reason = "unsafe-or-structural"
+note = "how many device records the fixed-size table holds; part of the on-disk format"
+
+[[entry]]
+item = "crate::sched::calibration_store::LEASE_GRACE_EPOCHS"
+reason = "unsafe-or-structural"
+note = "how many missed beats end a writer's lease; part of the write protocol a reader never runs"
+
+[[entry]]
+item = "crate::sched::calibration_store::NO_WRITER"
+reason = "unsafe-or-structural"
+note = "the lease slot's empty value; part of the same protocol"
+
+[[entry]]
+item = "crate::sched::calibration_store::OCCUPANCY_UNRECORDED"
+reason = "unsafe-or-structural"
+note = "the stored encoding for a draw that recorded no occupancy. A reader never sees it: CpuCalibration::occupancy turns it into the null that Get-FlynnelCpuCalibration reports, which is the whole point of the encoding"
+
+[[entry]]
+item = "crate::sched::calibration_store::ACCEL_DOORBELL_OK"
+reason = "unsafe-or-structural"
+note = "a capability bit in the stored flags word, read through AccelCalibration::has"
+
+[[entry]]
+item = "crate::sched::calibration_store::ACCEL_TIMED_LOCK_OK"
+reason = "unsafe-or-structural"
+note = "the same"
+
+[[entry]]
+item = "crate::sched::calibration_store::ACCEL_SYS_ATOMICS_OK"
+reason = "unsafe-or-structural"
+note = "the same"
+
+# ---------------------------------------------------------------------
 # Not public surface a script can hold
 # ---------------------------------------------------------------------
 # Established by reading src/sched/call_site.rs, occupancy.rs and
