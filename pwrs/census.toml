@@ -137,6 +137,41 @@ item = "crate::sched::call_site::caller_site"
 reason = "unsafe-or-structural"
 note = "track_caller, so from a binding it answers the binding's own location rather than any call site of interest"
 
+# ---------------------------------------------------------------------
+# Plan methods a script cannot reach, carved out one at a time
+# ---------------------------------------------------------------------
+# Most of JobPlan IS reachable: every with_ method has an option on
+# Flynnel.JobPlan, and every reader is a column of Flynnel.ResolvedPlan.
+# A subtree entry saying so would be right about those and wrong about
+# with_backend, which has no option because the backend family is not
+# bound yet. That one has to keep failing the census until it is, so
+# the five below are named individually rather than swept up.
+
+[[entry]]
+item = "crate::sched::plan::JobPlan::for_op_generic"
+reason = "generic-over-caller-type"
+note = "generic over the op type the caller supplies, which a script has no way to name"
+
+[[entry]]
+item = "crate::sched::plan::JobPlan::with_site"
+reason = "unsafe-or-structural"
+note = "takes a SiteRef, a pointer-identity handle to a leaked static. Get-FlynnelCallSite reads sites and answers rows rather than handles, on purpose: a script holding one could attach a plan to a site it did not create and has no way to reason about the lifetime of"
+
+[[entry]]
+item = "crate::sched::plan::JobPlan::with_site_if_none"
+reason = "unsafe-or-structural"
+note = "the same handle, applied only when the plan carries no site"
+
+[[entry]]
+item = "crate::sched::plan::JobPlan::apply_site_class"
+reason = "unsafe-or-structural"
+note = "re-derives the plan from what a site learned, which needs the SiteRef the two entries above explain a script cannot hold"
+
+[[entry]]
+item = "crate::sched::plan::JobPlan::apply_site_class_measured"
+reason = "unsafe-or-structural"
+note = "the same, against the site's measured window rather than its learned class"
+
 [[entry]]
 item = "crate::sched::trace::emit"
 reason = "unsafe-or-structural"
