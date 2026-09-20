@@ -29,11 +29,18 @@
 //!
 //! # Many items in one call
 //!
-//! Measured at this boundary: one Push or Pop per item costs 4848 ns on
-//! PowerShell 7.6 and 2013 ns on Windows PowerShell, where 256 items
-//! passed in one call cost 39 ns and 22 ns each. So `PushMany` and
-//! `PopMany` are the primary forms and the single-item ones exist for
-//! the case where a script genuinely has one item.
+//! One Push or Pop per item costs 4848 ns on PowerShell 7.6 and 2013 ns
+//! on Windows PowerShell, where 256 items passed in one call cost 39 ns
+//! and 22 ns each. So `PushMany` and `PopMany` are the primary forms
+//! and the single-item ones exist for the case where a script genuinely
+//! has one item.
+//!
+//! Those four figures were measured in the sibling SubEtha module's
+//! `bench/CallShapes.ps1`, over the rings that module binds, and they
+//! are quoted here because the boundary is the same one and the shapes
+//! are the same shapes. They are not a measurement of these rings, and
+//! nothing has yet measured these. `bench/KernelShapes.ps1` is where
+//! that goes.
 //!
 //! # Where the Rust handle lives
 //!
