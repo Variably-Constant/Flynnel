@@ -151,12 +151,46 @@ pub struct TraceCounters {
     pub armed: bool,
 }
 
+/// Set once Set-FlynnelTraceState has moved the flag in this process.
+///
+/// Without it EnabledBy would keep naming the environment variable
+/// after a cmdlet had overridden it, which is a row asserting a
+/// provenance that is no longer true.
+static TRACE_SET_BY_CMDLET: AtomicU64 = AtomicU64::new(0);
+
+/// The trace row, shared by the cmdlet that reads it and the one that
+/// sets it, so the two cannot describe the state differently.
+fn trace_state_row() -> TraceState {
+    // The dispatch counters have no public predicate. Whether they
+    // are armed is read from the variable that arms them, which is
+    // the same thing the crate latches.
+    let counters = matches!(
+        std::env::var("FLYNNEL_TRACE_DISPATCH").as_deref(),
+        Ok("1") | Ok("on") | Ok("true") | Ok("ON") | Ok("TRUE")
+    );
+    let by = if TRACE_SET_BY_CMDLET.load(Ordering::Relaxed) == 0 {
+        "FLYNNEL_TRACE"
+    } else {
+        "Set-FlynnelTraceState"
+    };
+    TraceState {
+        is_enabled: trace::is_enabled(),
+        enabled_by: by.to_string(),
+        dispatch_counters_armed: counters,
+        counters_armed_by: "FLYNNEL_TRACE_DISPATCH".to_string(),
+        worker_flushes_done: trace::worker_flushes_done(),
+    }
+}
+
 /// Reads whether the dispatch trace is recording and how it was armed.
 ///
-/// The trace is armed by an environment variable read once at the first
-/// call that asks and latched for the process. There is no cmdlet that
-/// turns it on: by the time a module could call one, the latch has
-/// already been taken. Set the variable before the process starts.
+/// The ring is seeded from an environment variable read once, and
+/// Set-FlynnelTraceState can move it afterwards. EnabledBy says which
+/// of those last decided it.
+///
+/// The dispatch counters are a separate switch and are still latched
+/// from their own variable, so CountersArmed false means every figure
+/// on Get-FlynnelTrace is a zero the scheduler never counted.
 ///
 /// # Examples
 ///
@@ -172,20 +206,7 @@ pub struct GetFlynnelTraceState {}
 
 impl Cmdlet for GetFlynnelTraceState {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        // The dispatch counters have no public predicate. Whether they
-        // are armed is read from the variable that arms them, which is
-        // the same thing the crate latches.
-        let counters = matches!(
-            std::env::var("FLYNNEL_TRACE_DISPATCH").as_deref(),
-            Ok("1") | Ok("on") | Ok("true") | Ok("ON") | Ok("TRUE")
-        );
-        ps.write(TraceState {
-            is_enabled: trace::is_enabled(),
-            enabled_by: "FLYNNEL_TRACE".to_string(),
-            dispatch_counters_armed: counters,
-            counters_armed_by: "FLYNNEL_TRACE_DISPATCH".to_string(),
-            worker_flushes_done: trace::worker_flushes_done(),
-        })
+        ps.write(trace_state_row())
     }
 }
 
@@ -647,6 +668,56 @@ impl Cmdlet for GetFlynnelSpread {
             median,
             maximum,
         })
+    }
+}
+
+/// Turns the dispatch trace ring on or off, and writes back the state
+/// that is now in force.
+///
+/// Until this existed the ring could only be armed by setting
+/// FLYNNEL_TRACE before the process started, which a module cannot do
+/// from inside the process it is already running in.
+///
+/// Recording is per thread and a ring is drained by a worker flush,
+/// so turning it on records from the next event on each thread and
+/// says nothing about what happened before. Turning it off stops the
+/// recording and leaves whatever each ring already holds.
+///
+/// On is a switch, so turning the ring off takes the colon form
+/// PowerShell uses for a switch given a value.
+///
+/// This is process-wide.
+///
+/// # Examples
+///
+/// `Set-FlynnelTraceState -On`
+///
+/// `Set-FlynnelTraceState -On:$false`
+#[cmdlet(
+    verb = "Set",
+    noun = "FlynnelTraceState",
+    alias = "Set-FlyTraceState",
+    output = ["Flynnel.TraceState"]
+)]
+#[derive(Default)]
+pub struct SetFlynnelTraceState {
+    /// Record events from now on.
+    #[param]
+    pub on: bool,
+}
+
+impl Cmdlet for SetFlynnelTraceState {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let was = trace::set_enabled(self.on);
+        TRACE_SET_BY_CMDLET.store(1, Ordering::Relaxed);
+        if was == self.on {
+            pwrs::warning!(
+                ps,
+                "the trace ring was already {}, so nothing changed",
+                if was { "on" } else { "off" }
+            )?;
+        }
+        ps.write(trace_state_row())
     }
 }
 

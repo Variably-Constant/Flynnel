@@ -250,6 +250,41 @@ Describe 'Get-FlynnelSpread' {
     }
 }
 
+Describe 'Set-FlynnelTraceState' {
+    AfterAll {
+        # Process-wide, so leave it as the suite found it.
+        $null = Set-FlynnelTraceState -On:$false -WarningVariable ignored
+    }
+
+    It 'turns the ring on and reads it back' {
+        # Until this cmdlet existed the ring could only be armed by an
+        # environment variable set before the process started, which a
+        # module cannot do from inside the process it is running in.
+        $on = Set-FlynnelTraceState -On -WarningVariable ignored
+        $on.IsEnabled | Should -BeTrue
+        (Get-FlynnelTraceState).IsEnabled | Should -BeTrue
+
+        $off = Set-FlynnelTraceState -On:$false -WarningVariable ignored
+        $off.IsEnabled | Should -BeFalse
+        (Get-FlynnelTraceState).IsEnabled | Should -BeFalse
+    }
+
+    It 'stops naming the variable once a cmdlet has decided it' {
+        # EnabledBy is a provenance column. After a setter has moved
+        # the flag, naming the environment variable would assert a
+        # provenance that is no longer true.
+        $null = Set-FlynnelTraceState -On:$false -WarningVariable ignored
+        (Get-FlynnelTraceState).EnabledBy | Should -Be 'Set-FlynnelTraceState'
+    }
+
+    It 'says when a set changed nothing' {
+        $null = Set-FlynnelTraceState -On:$false -WarningVariable ignored
+        $warnings = @()
+        $null = Set-FlynnelTraceState -On:$false -WarningVariable warnings
+        "$warnings" | Should -BeLike '*already off*'
+    }
+}
+
 Describe 'Get-FlynnelCallSite' {
     BeforeAll {
         # A site exists only once a dispatch has reached that source

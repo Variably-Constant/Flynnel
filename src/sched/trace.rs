@@ -9,9 +9,10 @@
 //!
 //! # Enabling
 //!
-//! Off by default. Set environment variable `FLYNNEL_TRACE=1` at
-//! process start. The first [`is_enabled`] call latches the decision
-//! via `OnceLock<bool>`; subsequent calls are a single cached load.
+//! Off by default. Set environment variable `FLYNNEL_TRACE=1` before
+//! the process starts, or call [`set_enabled`] once it is running.
+//! The first [`is_enabled`] call seeds the flag from the variable;
+//! every call after that is a `Once` guard and one relaxed load.
 //!
 //! # Cost when off
 //!
@@ -29,8 +30,7 @@
 //! `FLYNNEL_TRACE=1`, dumps every thread's buffer, then exits.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Event kinds emitted at the instrumented hook points. Compact `u8`
 /// so the per-event memory cost stays low.
@@ -90,9 +90,22 @@ thread_local! {
         RefCell::new(Vec::with_capacity(16_384));
 }
 
-/// Process-wide enable flag. Latched on first call to [`is_enabled`]
-/// from `FLYNNEL_TRACE` env var.
-static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+/// Process-wide enable flag, seeded from `FLYNNEL_TRACE` on the first
+/// call to [`is_enabled`] and settable afterwards.
+///
+/// An `AtomicBool` rather than a `OnceLock<bool>` so the ring can be
+/// turned on after the process has started. Latched, nothing could:
+/// a caller who did not set the variable before launch had no way to
+/// trace at all, and a module cannot set the environment of a process
+/// it is already inside.
+///
+/// The cost of that is one atomic load on a path consulted twice per
+/// leaf, on top of the `Once` guard that the latch also paid. What it
+/// measures at is recorded on the work item; it is not assumed.
+static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Reads `FLYNNEL_TRACE` once, before the flag is first answered.
+static TRACE_FROM_ENV: std::sync::Once = std::sync::Once::new();
 
 /// Strictly-monotonic id for `register_thread`, so the dump can
 /// associate each recorded buffer with a thread name.
@@ -164,15 +177,43 @@ pub fn clear_worker_flush_request() {
     WORKER_FLUSH_FLAG.store(false, core::sync::atomic::Ordering::Release);
 }
 
-/// Returns true if the `FLYNNEL_TRACE` env var was set to a truthy
-/// value at process startup. Latched on first call via `OnceLock`.
+/// Whether the per-thread trace ring is recording.
+///
+/// Seeded from `FLYNNEL_TRACE` on the first call and settable after
+/// that with [`set_enabled`].
 #[inline]
 pub fn is_enabled() -> bool {
-    *TRACE_ENABLED.get_or_init(|| {
-        std::env::var("FLYNNEL_TRACE")
+    trace_from_env();
+    TRACE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Seeds the flag from the environment, once.
+///
+/// Separate from the load so the env read happens exactly once and
+/// the steady-state cost is the `Once` guard plus one relaxed load.
+#[inline]
+fn trace_from_env() {
+    TRACE_FROM_ENV.call_once(|| {
+        let on = std::env::var("FLYNNEL_TRACE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+            .unwrap_or(false);
+        TRACE_ENABLED.store(on, Ordering::Relaxed);
+    });
+}
+
+/// Turns the trace ring on or off, answering what it held before.
+///
+/// Seeds from the environment first, so a caller who turns it off has
+/// turned off whatever the variable asked for rather than racing the
+/// seeding.
+///
+/// Recording is per thread and the rings are drained by
+/// `dump_to_stderr` or a worker flush, so turning it on mid-process
+/// records from the next event on each thread and says nothing about
+/// what happened before.
+pub fn set_enabled(on: bool) -> bool {
+    trace_from_env();
+    TRACE_ENABLED.swap(on, Ordering::Relaxed)
 }
 
 #[inline]

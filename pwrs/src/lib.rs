@@ -85,6 +85,7 @@ pwrs::export_module! {
         kernels::SplitFlynnelText,
         kernels::UpdateFlynnelText,
         observe::GetFlynnelTraceState,
+        observe::SetFlynnelTraceState,
         observe::GetFlynnelTrace,
         observe::ClearFlynnelTrace,
         observe::RequestFlynnelTraceFlush,
