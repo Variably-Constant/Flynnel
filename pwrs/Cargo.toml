@@ -1,0 +1,77 @@
+[package]
+name = "flynnel-pwrs"
+# Tracks the flynnel crate, so a gallery listing says which scheduler is
+# inside it.
+version = "0.6.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/Variably-Constant/Flynnel"
+authors = ["Markus Newton"]
+description = """A K-aware, NUMA-aware work-stealing scheduler as PowerShell \
+cmdlets and objects. The host's NUMA topology, CPU facts and cache allocation; \
+job plans that resolve a worker count, a leaf shape and an execution tier for \
+this machine; the worker pool and its spin, split and IO dials; kernels over \
+arrays, files and text that run on the scheduler's own threads; racing, where \
+several implementations start together and the first tolerable answer wins; \
+CPU-plus-GPU hybrid dispatch; the GPU as a shared-memory peer with lanes, waves \
+and resident ops; work stealing across processes through memory-mapped deques; \
+per-host calibration; and the dispatch trace, call sites and occupancy the \
+scheduler measures about itself. Bound directly to Rust with PoWerRuSt (pwrs), \
+Rust bindings for writing PowerShell binary modules in the spirit of PyO3: the \
+cmdlets are the library, not a wrapper over a command line. Anything over many \
+items is taken in one call, because the boundary is a hundred times cheaper \
+amortized than per item. Every cmdlet answers to a shorter name with the Fly \
+prefix. Windows x64 and Linux x64 in one module, on PowerShell 7 and Windows \
+PowerShell 5.1. Source and issues at \
+https://github.com/Variably-Constant/Flynnel; the binding framework at \
+https://github.com/Variably-Constant/PWRS and https://crates.io/crates/PoWerRuSt."""
+# The gallery's tags: the words a PowerShell user searches, which are not
+# the words the crate registers under. The registry's five-keyword cap
+# does not apply, since this crate ships to the gallery and not to
+# crates.io.
+keywords = ["powershell", "scheduler", "parallel", "numa", "work-stealing", "cmdlet", "bindings"]
+categories = ["concurrency", "api-bindings"]
+# Ships as a PowerShell module rather than to crates.io.
+publish = false
+
+# What the gallery shows that a cargo manifest has no field for.
+# `license` above is the SPDX name and the listing wants a link, a
+# copyright line and release notes have nowhere else to live, and the
+# icon is fetched as an image by whoever renders the listing, so it names
+# the raw file rather than the page GitHub wraps around it.
+[package.metadata.pwrs]
+license-uri = "https://github.com/Variably-Constant/Flynnel/blob/main/LICENSE"
+icon-uri = "https://raw.githubusercontent.com/Variably-Constant/Flynnel/main/assets/icon.png"
+copyright = "Copyright (c) 2026 Markus Newton"
+company = "Variably Constant"
+release-notes = """First release."""
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The scheduler. A path dependency on the tree this crate sits in, and
+# deliberately not a workspace member: the root manifest stays a single
+# package so nothing a consumer resolves changes.
+#
+# Default features, which is all of them. A PowerShell module ships as
+# one artifact with no way to ask for an extra, and every backend here
+# dlopens at runtime and degrades where the host lacks the device, so a
+# capability compiled out is a capability nobody can use.
+flynnel = { path = ".." }
+# The binding framework. Its attributes turn a struct into a cmdlet or a
+# class and its build tool generates the managed shell around the
+# library. Registered under the project's own name because crates.io
+# carries an unrelated `pwrs` from 2015; the library it builds is still
+# `pwrs`, which is what the source writes.
+pwrs = { package = "PoWerRuSt", version = "0.1.4" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Unwinding stays on: the PWRS exports catch panics at the boundary and
+# turn them into terminating error records. `abort` would take the host
+# process down with the pipeline.
+panic = "unwind"

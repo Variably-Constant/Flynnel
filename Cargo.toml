@@ -42,6 +42,7 @@ exclude = [
     "/examples/trace_real_grep.rs",
     "/kaggle/**",
     "/tpu/**",
+    "/pwrs/**",
 ]
 
 [dependencies]
