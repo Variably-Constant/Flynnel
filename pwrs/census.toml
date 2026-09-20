@@ -309,8 +309,8 @@ note = "the stored encoding for a draw that recorded no occupancy. A reader neve
 
 [[entry]]
 item = "crate::sched::calibration_store::PROVISIONAL_SPREAD_PER_MILLE"
-reason = "internal-to-another-surface"
-note = "the TrustBoundPerMille column of Get-FlynnelCpuCalibration. It rides beside IsTrustworthy because the verdict alone cannot say whether a record missed the bound by a little or by ten times, and on at least one host here every draw fails it"
+reason = "unsafe-or-structural"
+note = "the agreement window the publish path judges two draws by when it decides whether one confirms the other. It is not what IsTrustworthy tests - that is Samples and Confirmations both above zero - so surfacing it beside the verdict would name a bound the verdict never consulted"
 
 [[entry]]
 item = "crate::sched::calibration_store::ACCEL_DOORBELL_OK"

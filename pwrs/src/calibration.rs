@@ -604,8 +604,8 @@ mod store {
     use pwrs::prelude::*;
 
     use flynnel::sched::calibration_store::{
-        AccelKind as CrateAccelKind, CalibrationStore, HostStamp, LAYOUT_VERSION,
-        PROVISIONAL_SPREAD_PER_MILLE, calibration_dir, table_path,
+        AccelKind as CrateAccelKind, CalibrationStore, HostStamp, LAYOUT_VERSION, calibration_dir,
+        table_path,
     };
 
     /// What kind of device a stored accelerator record describes.
@@ -842,16 +842,30 @@ mod store {
         pub spread_per_mille: Option<u32>,
         /// How many samples it took. Zero means nothing was published.
         pub samples: u32,
-        /// Whether it passes the crate's own trust check.
-        pub is_trustworthy: bool,
-        /// The spread this record had to come in under to pass that
-        /// check, in parts per thousand.
+        /// Independent draws of this host whose dispatch median agreed
+        /// with this record's. Zero makes the record provisional:
+        /// stored so the next draw has something to agree with, and
+        /// not served, because one draw cannot say whether its own
+        /// median reproduces.
+        pub confirmations: u32,
+        /// The share of a core the measuring thread actually held while
+        /// this was drawn, in parts per thousand. Null where the
+        /// platform reports no thread clock.
         ///
-        /// Beside IsTrustworthy because the verdict alone is half an
-        /// answer: a reader cannot tell a record that missed by a
-        /// little from one that missed by ten times without the bound
-        /// SpreadPerMille was judged against.
-        pub trust_bound_per_mille: u32,
+        /// SpreadPerMille says whether the samples agreed with each
+        /// other. It cannot say whether they agreed on the wrong
+        /// number, which is what a draw taken while a neighbour held
+        /// half the machine produces: every sample slow, and slow by
+        /// about the same amount. This is the figure that separates
+        /// those, and it gates nothing.
+        pub occupancy_per_mille: Option<u32>,
+        /// Whether it passes the crate's own trust check, which is
+        /// Samples and Confirmations both above zero.
+        ///
+        /// Not a spread test. Reproducibility is a property of two
+        /// draws, and no statistic over one draw's samples substitutes
+        /// for a second draw agreeing.
+        pub is_trustworthy: bool,
         /// Where it came from, which for this row is always the table.
         pub source: Source,
     }
@@ -916,8 +930,9 @@ mod store {
                     Some(cpu.spread_per_mille)
                 },
                 samples: cpu.samples,
+                confirmations: cpu.confirmations,
+                occupancy_per_mille: cpu.occupancy(),
                 is_trustworthy: cpu.is_trustworthy(),
-                trust_bound_per_mille: PROVISIONAL_SPREAD_PER_MILLE,
                 source: Source::Stored,
             })
         }

@@ -375,21 +375,34 @@ Describe 'Get-FlynnelCpuCalibration' {
         $record.Source | Should -Be ([Flynnel.Source]::Stored)
     }
 
-    It 'says what the trust verdict was judged against' {
-        # IsTrustworthy alone cannot say whether a record missed the
-        # bound by a little or by ten times, and on at least one host
-        # here every draw misses it. The bound has to ride beside the
-        # verdict for the verdict to mean anything.
+    It 'says what the trust verdict is made of' {
+        # The verdict is Samples and Confirmations both above zero, and
+        # not a spread test: reproducibility is a property of two
+        # draws, and no statistic over one draw's samples substitutes
+        # for a second draw agreeing. A row carrying the verdict and
+        # neither input cannot be checked by its reader.
         $record = Get-FlynnelCpuCalibration -WarningAction SilentlyContinue `
             -ErrorAction SilentlyContinue
         if ($null -eq $record) {
             Set-ItResult -Skipped -Because 'no stored record on this host'
             return
         }
-        $record.TrustBoundPerMille | Should -BeGreaterThan 0
-        if ($null -ne $record.SpreadPerMille) {
-            $within = $record.SpreadPerMille -le $record.TrustBoundPerMille
-            $record.IsTrustworthy | Should -Be $within
+        $expected = ($record.Samples -gt 0) -and ($record.Confirmations -gt 0)
+        $record.IsTrustworthy | Should -Be $expected
+    }
+
+    It 'reports an unmeasured occupancy as nothing rather than as zero' {
+        # Zero is the share a thread that never reached a core genuinely
+        # had. A platform with no thread clock recorded nothing, and the
+        # two must not read alike.
+        $record = Get-FlynnelCpuCalibration -WarningAction SilentlyContinue `
+            -ErrorAction SilentlyContinue
+        if ($null -eq $record) {
+            Set-ItResult -Skipped -Because 'no stored record on this host'
+            return
+        }
+        if ($null -ne $record.OccupancyPerMille) {
+            $record.OccupancyPerMille | Should -BeLessOrEqual 1000
         }
     }
 }
