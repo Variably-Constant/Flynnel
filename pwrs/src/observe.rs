@@ -637,3 +637,229 @@ impl Cmdlet for GetFlynnelSpread {
         })
     }
 }
+
+// ---------------------------------------------------------------------
+// Call sites
+// ---------------------------------------------------------------------
+
+/// What one dispatch call site has learned about the work that reaches
+/// it.
+///
+/// The scheduler keeps this per source location, so two callers of the
+/// same kernel with different workloads each get their own classifier
+/// rather than averaging into one.
+#[psclass(name = "Flynnel.CallSite")]
+#[derive(Clone, Default)]
+pub struct CallSite {
+    /// The source file the site is in.
+    pub file: String,
+    /// Its line.
+    pub line: u32,
+    /// Its column, which is what tells two sites on one line apart.
+    pub column: u32,
+    /// The class the site settled on, null before it has classified a
+    /// window.
+    pub learned_class: Option<crate::types::WorkloadClass>,
+    /// Leaves the site has sampled. Sampled, not dispatched: the
+    /// on-core pair below is filled on a strided path and this is the
+    /// count that path produced.
+    pub leaf_count: u64,
+    /// What one item cost, in nanoseconds, null below the sample floor.
+    pub per_item_ns: Option<u64>,
+    /// Spread of the per-item cost over the site's whole life, in parts
+    /// per thousand of the mean squared.
+    ///
+    /// Lifetime, not the window the class came from. A site that
+    /// changed regime once carries both regimes in this figure forever,
+    /// so read WindowCv2MinPerMille and WindowCv2MaxPerMille to see
+    /// what the classifier actually acted on.
+    pub cv2_per_mille: Option<u64>,
+    /// The same spread measured on the threads' own clocks rather than
+    /// the wall, which advance only while a thread is on a core. Also
+    /// lifetime.
+    ///
+    /// There is no window-scoped form of this figure, so the spread the
+    /// lever acted on at the window it acted cannot be read. That is a
+    /// hole in the crate's surface rather than in this row.
+    pub per_item_oncore_cv2_per_mille: Option<u64>,
+    /// Items the on-core figures were measured over. Zero says the
+    /// strided path never sampled here, which is why the spread beside
+    /// it is null rather than a reading of nothing.
+    pub oncore_items: u64,
+    /// Mean leaf time of the delta window the latest tick classified.
+    pub window_mean_ns: Option<u64>,
+    /// Spread of that one window.
+    ///
+    /// One classifier tick out of thousands. It spans the whole range
+    /// within a single run, so a reading of it says almost nothing on
+    /// its own; the two extremes below are the figure to judge a run
+    /// by.
+    pub window_cv2_per_mille: Option<u64>,
+    /// The lowest per-window spread across every tick this site has
+    /// classified.
+    pub window_cv2_min_per_mille: Option<u64>,
+    /// The highest, which with the lowest gives the range the
+    /// classifier acted over.
+    pub window_cv2_max_per_mille: Option<u64>,
+    /// Windows the site has classified.
+    pub window_ticks: u64,
+    /// What fraction of its interval the most recent dispatch here
+    /// spent on a core, in hundredths. Null before any dispatch has
+    /// reported, which is a different state from a pool that held none
+    /// of its cores.
+    pub recent_occupancy_pct: Option<u32>,
+    /// The seed depth in force, null before one is established.
+    pub seeded_depth: Option<u32>,
+    /// Dispatches that seeded a different leaf count from the dispatch
+    /// before them. The figure the seed-depth stabilizers are measured
+    /// against.
+    ///
+    /// Counts only dispatches that reach the adaptive depth, which a
+    /// plan naming an explicit variant does not. Zero at a site whose
+    /// callers all name one means the question was never asked, not
+    /// that the answer was steady.
+    pub seed_depth_flips: u32,
+    /// Whether a body that ran inline here overran the threshold that
+    /// admitted it. While true, this site dispatches whatever the
+    /// caller estimates.
+    pub collapse_overran: bool,
+    /// Wall time of the execution-policy arms, in nanoseconds, as an
+    /// exponential moving average. Zero means the arm has no samples.
+    pub arm_ewma_default_ns: u64,
+    /// The alternative execution-policy arm, on the same terms.
+    pub arm_ewma_alternative_ns: u64,
+    /// The routing arms, kept apart from the execution-policy pair
+    /// because one EWMA over both would let neither consumer read its
+    /// own effect.
+    pub routing_ewma_default_ns: u64,
+    /// The alternative routing arm.
+    pub routing_ewma_alternative_ns: u64,
+    /// The share of a split this site sends to the CPU, in parts per
+    /// thousand.
+    pub split_cpu_share_per_mille: u32,
+    /// Average cost of one reduce merge here, in cycles, null until the
+    /// observer has timed any.
+    pub reduce_cost_avg_cycles: Option<u64>,
+}
+
+fn call_site_row(entry: &flynnel::RegisteredSite) -> CallSite {
+    let s = entry.site.get();
+    let (arm_default, arm_alternative) = s.arm_ewmas();
+    let (route_default, route_alternative) = s.routing_ewmas();
+    let (cv2_min, cv2_max) = match s.window_cv2_range_per_mille() {
+        Some((lo, hi)) => (Some(lo), Some(hi)),
+        None => (None, None),
+    };
+    CallSite {
+        file: entry.location.file().to_string(),
+        line: entry.location.line(),
+        column: entry.location.column(),
+        learned_class: s.learned_class().map(|c| c.into()),
+        leaf_count: s.leaf_count(),
+        per_item_ns: s.per_item_ns(),
+        cv2_per_mille: s.per_item_cv2_per_mille(),
+        per_item_oncore_cv2_per_mille: s.per_item_oncore_cv2_per_mille(),
+        oncore_items: s.oncore_items(),
+        window_mean_ns: s.window_mean_ns(),
+        window_cv2_per_mille: s.window_cv2_per_mille(),
+        window_cv2_min_per_mille: cv2_min,
+        window_cv2_max_per_mille: cv2_max,
+        window_ticks: s.window_ticks(),
+        recent_occupancy_pct: s.recent_occupancy(),
+        seeded_depth: s.seeded_depth(),
+        seed_depth_flips: s.seed_depth_flips(),
+        collapse_overran: s.collapse_overran(),
+        arm_ewma_default_ns: arm_default,
+        arm_ewma_alternative_ns: arm_alternative,
+        routing_ewma_default_ns: route_default,
+        routing_ewma_alternative_ns: route_alternative,
+        split_cpu_share_per_mille: s.split_cpu_share_per_mille(),
+        reduce_cost_avg_cycles: s.reduce_cost_avg_cycles(),
+    }
+}
+
+/// Reads every dispatch call site the scheduler has materialised in
+/// this process, and what each has learned.
+///
+/// A site appears once a dispatch has reached that source location, so
+/// a process that has run no work through Flynnel answers nothing. The
+/// locations are inside the scheduler and inside this module, because
+/// those are the callers: a cmdlet's own line is not a call site.
+///
+/// Every site in one call. The registry sits behind the lock a dispatch
+/// meeting a new location has to take to write, so reading it a site at
+/// a time would hold that lock repeatedly against the pool.
+///
+/// # Examples
+///
+/// `Get-FlynnelCallSite`
+///
+/// `Get-FlynnelCallSite | Sort-Object LeafCount -Descending`
+#[cmdlet(
+    verb = "Get",
+    noun = "FlynnelCallSite",
+    alias = "Get-FlyCallSite",
+    output = ["Flynnel.CallSite"]
+)]
+#[derive(Default)]
+pub struct GetFlynnelCallSite {}
+
+impl Cmdlet for GetFlynnelCallSite {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let sites = flynnel::registered_sites();
+        if sites.is_empty() {
+            pwrs::warning!(
+                ps,
+                "no dispatch has reached a call site in this process yet, so there is nothing \
+                 to report; run a kernel first"
+            )?;
+            return Ok(());
+        }
+        for entry in &sites {
+            ps.write(call_site_row(entry))?;
+        }
+        Ok(())
+    }
+}
+
+/// Returns every call site to the state it starts a process in, and
+/// writes how many it reset.
+///
+/// For measuring two arms in one process. Site state is kept for the
+/// life of the process, so without this the second arm inherits the
+/// class, the per-arm averages and the seed depth the first one taught
+/// the classifier, and its numbers describe both. Running the arms in
+/// separate processes instead carries whatever else differed between
+/// those processes, which for a decision driven by a measured estimate
+/// is the thing being measured.
+///
+/// This throws measurement away and cannot be undone, so it asks.
+/// Between arms, never during one: a dispatch running while the reset
+/// lands sees some counters cleared and some not.
+///
+/// # Examples
+///
+/// `Reset-FlynnelCallSite -Confirm:$false`
+#[cmdlet(
+    verb = "Reset",
+    noun = "FlynnelCallSite",
+    alias = "Reset-FlyCallSite",
+    should_process = true,
+    confirm_impact = "High",
+    output = ["System.UInt64"]
+)]
+#[derive(Default)]
+pub struct ResetFlynnelCallSite {}
+
+impl Cmdlet for ResetFlynnelCallSite {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let held = flynnel::registered_sites().len();
+        if !ps.should_process(
+            &format!("{held} call site(s) in this process"),
+            "discard everything they have learned",
+        )? {
+            return Ok(());
+        }
+        ps.write(flynnel::reset_all_sites() as u64)
+    }
+}

@@ -5,7 +5,7 @@ scheduler as PowerShell commands and objects, bound straight to the
 Rust with [PWRS](https://crates.io/crates/PoWerRuSt). The cmdlets are
 the library. Nothing here shells out to anything.
 
-Sixty-five commands, thirty-nine object types and twenty-two
+Sixty-seven commands, forty object types and twenty-two
 enumerations. Every command answers to a shorter name with the `Fly`
 prefix: `Measure-FlyReduce` is `Measure-FlynnelReduce`.
 
@@ -165,7 +165,14 @@ occupancy, and which shape the last reduce took.
 `Get-FlynnelTraceState`, `Get-FlynnelTrace`, `Clear-FlynnelTrace`,
 `Request-FlynnelTraceFlush`, `Get-FlynnelLeafStat`,
 `Reset-FlynnelLeafStat`, `Measure-FlynnelOccupancy`,
-`Get-FlynnelThreadTick`, `Get-FlynnelReducePath`, `Get-FlynnelSpread`.
+`Get-FlynnelThreadTick`, `Get-FlynnelReducePath`, `Get-FlynnelSpread`,
+`Get-FlynnelCallSite`, `Reset-FlynnelCallSite`.
+
+`Get-FlynnelCallSite` is the per-location half: the scheduler keeps a
+classifier per source location, so two callers of the same kernel with
+different workloads each get their own rather than averaging into one.
+`Reset-FlynnelCallSite` clears what they learned, which is what lets
+two arms of a comparison run in the same process.
 
 **Calibration.** What the scheduler measured about this host, what it
 decided from it, and how to make it measure again.

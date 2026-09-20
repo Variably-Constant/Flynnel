@@ -235,3 +235,83 @@ Describe 'Get-FlynnelSpread' {
         $row.Maximum | Should -Be 9
     }
 }
+
+Describe 'Get-FlynnelCallSite' {
+    BeforeAll {
+        # A site exists only once a dispatch has reached that source
+        # location, so the suite has to make one before it can read any.
+        $script:Work = [double[]](1..4000)
+        $null = Invoke-FlynnelMap -InputObject $script:Work -Operation Square
+    }
+
+    It 'answers a row per site, each saying where it is' {
+        $sites = @(Get-FlynnelCallSite -WarningVariable ignored)
+        $sites.Count | Should -BeGreaterThan 0
+        foreach ($s in $sites) {
+            $s.File | Should -Not -BeNullOrEmpty
+            $s.Line | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'reports an unmeasured figure as nothing rather than zero' {
+        # The convention this whole family keeps. A spread of zero is a
+        # perfectly uniform workload, which is a reading; no reading at
+        # all has to look different from it.
+        foreach ($s in @(Get-FlynnelCallSite -WarningVariable ignored)) {
+            if ($s.OncoreItems -eq 0) {
+                $s.PerItemOncoreCv2PerMille | Should -BeNullOrEmpty
+            }
+            if ($s.WindowTicks -eq 0) {
+                $s.WindowMeanNs | Should -BeNullOrEmpty
+                $s.WindowCv2MinPerMille | Should -BeNullOrEmpty
+                $s.WindowCv2MaxPerMille | Should -BeNullOrEmpty
+            }
+        }
+    }
+
+    It 'carries the range beside the single window reading' {
+        # WindowCv2PerMille is one classifier tick out of thousands and
+        # spans the whole range within a run, so a reader judging a run
+        # by it alone is reading noise. The extremes are what the row
+        # exists to carry.
+        foreach ($s in @(Get-FlynnelCallSite -WarningVariable ignored)) {
+            if ($null -ne $s.WindowCv2MinPerMille) {
+                $s.WindowCv2MaxPerMille | Should -Not -BeNullOrEmpty
+                $s.WindowCv2MaxPerMille | Should -BeGreaterOrEqual $s.WindowCv2MinPerMille
+            }
+        }
+    }
+}
+
+Describe 'Reset-FlynnelCallSite' {
+    BeforeEach {
+        $null = Invoke-FlynnelMap -InputObject ([double[]](1..4000)) -Operation Square
+    }
+
+    It 'changes nothing under WhatIf' {
+        $before = @(Get-FlynnelCallSite -WarningVariable ignored).Count
+        $null = Reset-FlynnelCallSite -WhatIf
+        @(Get-FlynnelCallSite -WarningVariable ignored).Count | Should -Be $before
+    }
+
+    It 'answers how many sites it reset' {
+        $held = @(Get-FlynnelCallSite -WarningVariable ignored).Count
+        Reset-FlynnelCallSite -Confirm:$false | Should -Be $held
+    }
+
+    It 'leaves the sites registered and forgetful, not gone' {
+        # A reset clears what a site learned; it must not unregister it.
+        # A missing row would read as a location no dispatch ever
+        # reached, which is a different fact from one that has been
+        # cleared.
+        $null = Reset-FlynnelCallSite -Confirm:$false
+        $after = @(Get-FlynnelCallSite -WarningVariable ignored)
+        $after.Count | Should -BeGreaterThan 0
+        foreach ($s in $after) {
+            $s.SeedDepthFlips | Should -Be 0
+            $s.CollapseOverran | Should -BeFalse
+            $s.LearnedClass | Should -BeNullOrEmpty
+            $s.RecentOccupancyPct | Should -BeNullOrEmpty
+        }
+    }
+}

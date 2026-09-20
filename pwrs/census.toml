@@ -85,13 +85,33 @@ note = "also the two-phase scan, the histogram, the sort's merge rounds, the fil
 
 [[entry]]
 item = "crate::sched::call_site::CallSiteState"
-reason = "unsafe-or-structural"
-note = "every field is a private atomic and the type is neither Copy nor Clone, so only a static reference exists; the registry holding them has no public walk, so a binding cannot enumerate the sites"
+reason = "internal-to-another-surface"
+note = "read through Get-FlynnelCallSite, which flattens every reader on it into one Flynnel.CallSite row a script can hold. The type itself cannot cross: every field is a private atomic and it is neither Copy nor Clone, so only a static reference exists, and a proxy over a leaked static would hand a script a handle whose lifetime it cannot reason about"
 
 [[entry]]
 item = "crate::sched::call_site::SiteRef"
-reason = "unsafe-or-structural"
-note = "a pointer-identity handle to the above, useful only to code that already holds one"
+reason = "internal-to-another-surface"
+note = "the handle Get-FlynnelCallSite reads each row through. Pointer identity is its whole content, which is meaningful to code holding two of them and not to a script; the row carries the file, line and column instead, which is the identity a reader can act on"
+
+[[entry]]
+item = "crate::sched::call_site::RegisteredSite"
+reason = "internal-to-another-surface"
+note = "the location-plus-state pair registered_sites answers; Get-FlynnelCallSite flattens it into the row rather than surfacing the pair, because a script has no use for a SiteRef beside the location"
+
+[[entry]]
+item = "crate::sched::call_site::registered_sites"
+reason = "internal-to-another-surface"
+note = "bound as Get-FlynnelCallSite, which writes one row per site in one call"
+
+[[entry]]
+item = "crate::sched::call_site::reset_all_sites"
+reason = "internal-to-another-surface"
+note = "bound as Reset-FlynnelCallSite, which confirms first because the reset discards measurement and cannot be undone"
+
+[[entry]]
+item = "crate::sched::par_iter::seed_hysteresis"
+reason = "internal-to-another-surface"
+note = "read by Get-FlynnelSeedHysteresis. It exists so that reading the switch is a load: the only other access is set_seed_hysteresis, and reading through it costs two atomic read-modify-writes on a line the bisect reads on every dispatch"
 
 [[entry]]
 item = "crate::sched::call_site::caller_site"

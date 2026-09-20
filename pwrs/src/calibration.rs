@@ -520,30 +520,11 @@ impl Cmdlet for MeasureFlynnelKGating {
 // Seed hysteresis
 // ---------------------------------------------------------------------
 
-/// The current seed-hysteresis setting, read by setting it to what it
-/// already is.
-///
-/// The crate has no getter: the only public access is a setter that
-/// answers the previous value. So reading costs two atomic
-/// read-modify-writes where a load would do, and they land on a switch
-/// the bisect reads on every dispatch. One call is negligible; a
-/// script polling it in a loop dirties that cache line against every
-/// worker reading it, which is a cost on the scheduler's own path
-/// rather than on the caller's.
-///
-/// Called once per cmdlet invocation and never per item. A crate-side
-/// getter would remove the writes entirely and is filed.
-fn read_seed_hysteresis() -> bool {
-    let was = par_iter::set_seed_hysteresis(true);
-    par_iter::set_seed_hysteresis(was);
-    was
-}
-
 /// Reads whether the bisect's seed-depth hysteresis is on.
 ///
-/// The crate has no getter for this, so this reads it by setting it to
-/// what it already is and keeping the answer, which leaves the switch
-/// as it found it.
+/// One atomic load. The switch sits on a line the bisect reads on every
+/// dispatch, so a script polling this in a loop costs the caller and
+/// leaves the scheduler's own path alone.
 ///
 /// # Examples
 ///
@@ -559,7 +540,7 @@ pub struct GetFlynnelSeedHysteresis {}
 
 impl Cmdlet for GetFlynnelSeedHysteresis {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        ps.write(read_seed_hysteresis())
+        ps.write(par_iter::seed_hysteresis())
     }
 }
 
@@ -592,7 +573,7 @@ impl Cmdlet for SetFlynnelSeedHysteresis {
         let was = par_iter::set_seed_hysteresis(self.on);
         // Read back rather than trust the write, as every other setter
         // in this module does.
-        let now = read_seed_hysteresis();
+        let now = par_iter::seed_hysteresis();
         if now != self.on {
             pwrs::warning!(
                 ps,
@@ -1158,7 +1139,7 @@ impl Cmdlet for GetFlynnelCalibration {
             trivial_reduce_cycles: thresholds.trivial_reduce_cycles,
             class_source: thresholds.source,
             k_gating: CrateKGating::Auto.resolved().into(),
-            seed_hysteresis: read_seed_hysteresis(),
+            seed_hysteresis: par_iter::seed_hysteresis(),
             active_profile: format!("{:?}", adaptive_profile::active_dispatch_profile()),
             active_class: adaptive_profile::active_workload_class().into(),
         })
