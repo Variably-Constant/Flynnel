@@ -1161,8 +1161,8 @@ mod store {
 }
 
 pub use store::{
-    AccelKind, AccelRecord, CpuRecord, GetFlynnelAccelCalibration, GetFlynnelCalibrationStore,
-    GetFlynnelCpuCalibration, GetFlynnelHostStamp, Stamp, StoreInfo,
+    AccelKind, AccelRecord, ClearFlynnelCalibrationStore, CpuRecord, GetFlynnelAccelCalibration,
+    GetFlynnelCalibrationStore, GetFlynnelCpuCalibration, GetFlynnelHostStamp, Stamp, StoreInfo,
 };
 
 // ---------------------------------------------------------------------

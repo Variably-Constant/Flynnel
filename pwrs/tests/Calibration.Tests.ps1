@@ -433,6 +433,44 @@ Describe 'Get-FlynnelCpuCalibration' {
     }
 }
 
+Describe 'Clear-FlynnelCalibrationStore' {
+    It 'changes nothing under WhatIf' {
+        # The suite must not destroy this host's calibration, so the
+        # only path exercised against a real table is the one that
+        # declines to act.
+        $before = Get-FlynnelCalibrationStore -WarningAction SilentlyContinue `
+            -ErrorAction SilentlyContinue
+        $null = Clear-FlynnelCalibrationStore -WhatIf -WarningAction SilentlyContinue `
+            -ErrorAction SilentlyContinue
+        $after = Get-FlynnelCalibrationStore -WarningAction SilentlyContinue `
+            -ErrorAction SilentlyContinue
+        if ($null -eq $before -or $null -eq $after) {
+            Set-ItResult -Skipped -Because 'no calibration directory on this host'
+            return
+        }
+        $after.CpuSamples | Should -Be $before.CpuSamples
+        $after.Exists | Should -Be $before.Exists
+    }
+
+    It 'says there is nothing to clear rather than failing' {
+        # A host that has never calibrated has no table, and that is
+        # the normal first state rather than an error.
+        $store = Get-FlynnelCalibrationStore -WarningAction SilentlyContinue `
+            -ErrorAction SilentlyContinue
+        if ($null -eq $store) {
+            Set-ItResult -Skipped -Because 'no calibration directory on this host'
+            return
+        }
+        if ($store.Exists) {
+            Set-ItResult -Skipped -Because 'this host has a table, so the empty path is not reachable here'
+            return
+        }
+        $warnings = @()
+        $null = Clear-FlynnelCalibrationStore -Confirm:$false -WarningVariable warnings
+        "$warnings" | Should -BeLike '*nothing to clear*'
+    }
+}
+
 Describe 'Get-FlynnelAccelCalibration' {
     It 'answers without throwing on a host with no device' {
         { Get-FlynnelAccelCalibration -WarningAction SilentlyContinue `

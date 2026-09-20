@@ -110,6 +110,7 @@ pwrs::export_module! {
         calibration::GetFlynnelCalibrationStore,
         calibration::GetFlynnelCpuCalibration,
         calibration::GetFlynnelAccelCalibration,
+        calibration::ClearFlynnelCalibrationStore,
     ],
     classes: [
         host::CpuInfo,
