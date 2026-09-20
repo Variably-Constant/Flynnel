@@ -551,3 +551,73 @@ note = "writes to stderr, which a cmdlet cannot compose; it is the only reader o
 item = "crate::sched::occupancy::OccupancyWindow"
 reason = "internal-to-another-surface"
 note = "bound as Measure-FlynnelOccupancy, which starts a window, sleeps and samples it in one call; an open window is not a thing a script can usefully hold across a pipeline"
+
+# ---------------------------------------------------------------------
+# The rings, each generic over T and each bound at one instantiation
+# ---------------------------------------------------------------------
+# Every ring in the crate is generic over `T: Send` and a script has no
+# Rust type to offer, so pwrs/src/rings.rs binds each at a byte payload
+# and these entries record the generic form against the concrete class
+# that carries it. The subtree covers the shape's own methods, which
+# are bound one for one on that class; the carve-outs below name the
+# calls that are NOT bound, and why.
+
+[[entry]]
+item = "crate::sched::flynnel_ring"
+reason = "generic-over-caller-type"
+note = "FlynnelRing<T> is bound as Flynnel.Ring over a byte payload; PushResult and PopResult become Flynnel.PushOutcome and Flynnel.PopOutcome, each with a Kind so a caller can tell Full from Closed and Empty from a zero-length item"
+
+[[entry]]
+item = "crate::sched::flynnel_ring::FlynnelRing::push_blocking"
+reason = "unsafe-or-structural"
+note = "spins until a consumer frees a slot, and on a ring nobody is draining it never returns. The caller would have to guarantee a draining thread, which a single pipeline thread cannot, and the spin reads no stopping flag so Ctrl-C does not reach it. Flynnel.Ring binds the try-form and a script that wants to wait writes the loop"
+
+[[entry]]
+item = "crate::sched::flynnel_ring::FlynnelRing::pop_blocking"
+reason = "unsafe-or-structural"
+note = "the same invariant pointed the other way: it spins until a producer arrives, and a script holding both ends on one thread cannot be that producer"
+
+[[entry]]
+item = "crate::sched::flynnel_ring_spsc"
+reason = "generic-over-caller-type"
+note = "Producer and Consumer are bound as Flynnel.SpscProducer and Flynnel.SpscConsumer over a byte payload, written as two objects by New-FlynnelSpscRing so the single-owner contract is visible; new_spsc is that cmdlet"
+
+[[entry]]
+item = "crate::sched::flynnel_ring_mpsc"
+reason = "generic-over-caller-type"
+note = "MpscProducer and MpscConsumer are bound as Flynnel.MpscProducer and Flynnel.MpscConsumer; new_mpsc is New-FlynnelMpscRing, which writes the consumer and one producer per requested producer"
+
+[[entry]]
+item = "crate::sched::flynnel_ring_composed"
+reason = "generic-over-caller-type"
+note = "new_composed_mpsc is New-FlynnelComposedMpsc and new_composed_mpmc is New-FlynnelComposedMpmc; ComposedMpscConsumer, GridProducer and GridConsumer are Flynnel.ComposedConsumer, Flynnel.GridProducer and Flynnel.GridConsumer. The composed producers are the SPSC ones, because in the crate that is what they are, so push_composed is the same Push"
+
+[[entry]]
+item = "crate::sched::injector"
+reason = "generic-over-caller-type"
+note = "Injector<T> is bound as Flynnel.Injector over a byte payload, with steal as its Pop under the three-way protocol; DEFAULT_INJECTOR_CAPACITY is what New-FlynnelInjector takes when no capacity is named"
+
+[[entry]]
+item = "crate::sched::injector::Injector::push"
+reason = "unsafe-or-structural"
+note = "the spinning form, which never returns on a queue nobody drains. Flynnel.Injector binds try_push as its Push"
+
+[[entry]]
+item = "crate::sched::notify_ring"
+reason = "generic-over-caller-type"
+note = "NotifyHub<T> reaches a script as its two handles rather than as itself: New-FlynnelNotifyRing writes Flynnel.NotifySender and one Flynnel.NotifyReceiver per consumer slot, and each carries the hub for its depth. NotifySendResult and NotifyTrySendResult are Flynnel.PushOutcome"
+
+[[entry]]
+item = "crate::sched::notify_ring::NotifySender::send"
+reason = "unsafe-or-structural"
+note = "spins while the ring is full and returns only when a consumer drains or the hub shuts down, neither of which a script waiting inside it could bring about. Flynnel.NotifySender binds try_send, which tells Full from Closed"
+
+[[entry]]
+item = "crate::sched::notify_ring::NotifyReceiver::recv"
+reason = "unsafe-or-structural"
+note = "parks the calling thread on a Parker captured at registration. From a script that is the pipeline thread, and a parked pipeline thread is a host that cannot be interrupted; try_recv is bound instead and a poll loop is the script's own"
+
+[[entry]]
+item = "crate::sched::notify_ring::NotifyShutdownOnDrop"
+reason = "unsafe-or-structural"
+note = "a guard whose whole behaviour is its Drop, which fires at a scope end a script does not have. The equivalent from PowerShell is Shutdown in a finally block, which the sender's help shows"

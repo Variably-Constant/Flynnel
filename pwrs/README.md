@@ -5,9 +5,9 @@ scheduler as PowerShell commands and objects, bound straight to the
 Rust with [PWRS](https://crates.io/crates/PoWerRuSt). The cmdlets are
 the library. Nothing here shells out to anything.
 
-Seventy-one commands, forty object types and twenty-three
-enumerations. Every command answers to a shorter name with the `Fly`
-prefix: `Measure-FlyReduce` is `Measure-FlynnelReduce`.
+Eighty commands, fifty-four object types and twenty-six enumerations.
+Every command answers to a shorter name with the `Fly` prefix:
+`Measure-FlyReduce` is `Measure-FlynnelReduce`.
 
 Windows x64 and Linux x64 in one module, on PowerShell 7 and Windows
 PowerShell 5.1.
@@ -232,6 +232,39 @@ agreeing. `OccupancyPerMille` is beside them: the spread says whether
 the samples agreed with each other, and only occupancy says whether
 they agreed on the wrong number because a neighbour held half the
 machine.
+
+**Rings.** The scheduler's own in-process queues, each bound over a
+byte payload because a script has no Rust type to offer.
+`New-FlynnelRing` is the general multi-producer multi-consumer shape;
+`New-FlynnelSpscRing` is the cheapest, with no compare-and-swap on
+either side; `New-FlynnelMpscRing` shares one ring between producers
+and `New-FlynnelComposedMpsc` gives each its own;
+`New-FlynnelComposedMpmc` is the N-by-M grid of them.
+`New-FlynnelInjector` is the fork queue on its own and
+`New-FlynnelNotifyRing` is the hub that wakes a parked consumer.
+`Send-FlynnelItem` and `Receive-FlynnelItem` are the pipeline forms.
+
+Two things decide how a script uses them.
+
+A ring **refuses**; it does not park. A full ring hands the item back
+and the caller retries, backs off or drops it, so a slow stage does
+not slow its upstream by itself. Every push answers `Accepted` and,
+when it did not, carries the item it refused - a full ring costs a
+retry and never costs data, including through `Send-FlynnelItem`,
+which writes a refused item back to the pipeline.
+
+And the blocking forms the crate carries are deliberately **not**
+bound. `push_blocking`, `pop_blocking`, `NotifySender::send` and
+`NotifyReceiver::recv` each wait inside Rust with no way to see the
+pipeline's stopping flag, so calling one from a script would hang a
+host that Ctrl-C cannot reach. A script that wants to wait writes the
+loop, where its own `Start-Sleep` and Ctrl-C both work.
+
+The two ends of an SPSC ring come back as two objects rather than
+one, because the ring is only correct with one thread on each and two
+objects put that in the script's hands rather than in a doc comment.
+Each handle carries `Role` and `Index`, so the grid's output is split
+with `Where-Object Role -eq Producer` rather than by counting.
 
 ## Two conventions worth knowing before you read a number
 

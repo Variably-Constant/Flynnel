@@ -112,6 +112,15 @@ pwrs::export_module! {
         calibration::GetFlynnelCpuCalibration,
         calibration::GetFlynnelAccelCalibration,
         calibration::ClearFlynnelCalibrationStore,
+        rings::NewFlynnelRing,
+        rings::NewFlynnelSpscRing,
+        rings::NewFlynnelMpscRing,
+        rings::NewFlynnelComposedMpsc,
+        rings::NewFlynnelComposedMpmc,
+        rings::NewFlynnelInjector,
+        rings::NewFlynnelNotifyRing,
+        rings::SendFlynnelItem,
+        rings::ReceiveFlynnelItem,
     ],
     classes: [
         host::CpuInfo,
@@ -154,6 +163,20 @@ pwrs::export_module! {
         calibration::StoreInfo,
         calibration::CpuRecord,
         calibration::AccelRecord,
+        rings::PushOutcome,
+        rings::PopOutcome,
+        rings::RingStat,
+        rings::Ring,
+        rings::SpscProducer,
+        rings::SpscConsumer,
+        rings::MpscProducerHandle,
+        rings::MpscConsumerHandle,
+        rings::ComposedConsumer,
+        rings::GridProducerHandle,
+        rings::GridConsumerHandle,
+        rings::Injector,
+        rings::NotifySender,
+        rings::NotifyReceiver,
     ],
     enums: [
         host::Vendor,
@@ -179,6 +202,9 @@ pwrs::export_module! {
         calibration::KGating,
         calibration::AccelKind,
         plan::WorkloadShapeKind,
+        rings::PushKind,
+        rings::PopKind,
+        rings::RingRole,
     ],
 }
 
@@ -188,4 +214,5 @@ mod kernels;
 mod observe;
 mod plan;
 mod pool;
+mod rings;
 mod types;
