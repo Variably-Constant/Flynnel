@@ -215,6 +215,43 @@ item = "crate::sched::split_observer::AUTO_CLASSIFY_QUANTUM"
 reason = "unsafe-or-structural"
 note = "a tuning constant the classifier counts leaves against, not state a caller sets or reads"
 
+# ---------------------------------------------------------------------
+# The dispatch trace, read through the observation family
+# ---------------------------------------------------------------------
+# Five of it are reached, and reading pwrs/src/observe.rs is how that
+# was established rather than assumed: is_enabled and
+# worker_flushes_done are Flynnel.TraceState columns,
+# request_worker_flush and worker_flushes_done are
+# Request-FlynnelTraceFlush, and reset_current_thread with
+# clear_worker_flush_request are the two halves of Clear-FlynnelTrace.
+#
+# The rest write to a ring or to stderr and are carved out below.
+
+[[entry]]
+item = "crate::sched::trace"
+reason = "internal-to-another-surface"
+note = "read and cleared through the observation family: Get-FlynnelTraceState, Request-FlynnelTraceFlush and Clear-FlynnelTrace"
+
+[[entry]]
+item = "crate::sched::trace::flush_with_label"
+reason = "unsafe-or-structural"
+note = "writes the ring to stderr under a caller's label, which a cmdlet cannot compose any more than it can compose dump_to_stderr"
+
+[[entry]]
+item = "crate::sched::trace::worker_loop_maybe_flush"
+reason = "unsafe-or-structural"
+note = "the worker loop's own flush check, run between steals. From the pipeline thread it would drain a ring that thread does not own and has never written to"
+
+[[entry]]
+item = "crate::sched::trace::TraceEvent"
+reason = "unsafe-or-structural"
+note = "the tag on a record in the per-thread ring. Nothing public reads the ring - dump_to_stderr is its only reader and writes where a cmdlet cannot follow - so the tag cannot reach a script whatever shape it is given"
+
+[[entry]]
+item = "crate::sched::trace::TraceRecord"
+reason = "unsafe-or-structural"
+note = "one record in that ring, on the same reasoning: unreachable until an accessor exists that answers records rather than printing them"
+
 [[entry]]
 item = "crate::sched::trace::emit"
 reason = "unsafe-or-structural"
