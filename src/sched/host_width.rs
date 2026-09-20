@@ -109,7 +109,192 @@ fn report_probe_failure(err: &std::io::Error, keeping: usize) {
 /// than the machine. A failed call falls back to
 /// `available_parallelism` rather than reporting a width nothing
 /// measured.
-#[cfg(not(windows))]
+/// On Linux, the thread-group leader's affinity mask, floored by the
+/// cgroup quota.
+///
+/// Not [`std::thread::available_parallelism`], which asks
+/// `sched_getaffinity` about the calling thread. That distinction is
+/// the whole of this function: the scheduler pins its workers, so a
+/// probe that happened to run on a pinned worker answers one, and the
+/// answer is kept in a process-wide cache every later caller reads.
+/// One pinned thread would cap the whole pool at a single worker. The
+/// Windows arm has always read the process rather than the thread;
+/// this makes the two agree.
+///
+/// `Cpus_allowed_list` in `/proc/self/status` is the thread-group
+/// leader's mask, which is the process-level answer and follows a live
+/// change to it. Read through `/proc` rather than the syscall because
+/// this crate takes no libc dependency of its own.
+///
+/// The quota is applied as a floor because `available_parallelism`
+/// honoured it and dropping it would size a pool for the machine
+/// inside a container allowed part of it. It is read once: a quota can
+/// change, but two file reads at this cadence buy less than they cost,
+/// and the affinity half does follow a change.
+#[cfg(target_os = "linux")]
+fn process_width() -> std::io::Result<std::num::NonZeroUsize> {
+    let mask = proc_status_allowed_cpus()?;
+    let width = match cgroup_quota_cpus() {
+        Some(quota) => mask.min(quota),
+        None => mask,
+    };
+    std::num::NonZeroUsize::new(width).ok_or_else(|| {
+        std::io::Error::other("the process affinity mask names no cpu")
+    })
+}
+
+/// The CPUs named by `Cpus_allowed_list` in `/proc/self/status`.
+#[cfg(target_os = "linux")]
+fn proc_status_allowed_cpus() -> std::io::Result<usize> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let list = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .ok_or_else(|| {
+            std::io::Error::other("/proc/self/status carries no Cpus_allowed_list")
+        })?;
+    count_cpu_list(list.trim())
+}
+
+/// How many CPUs a Linux CPU list such as `0-3,8,12-15` names.
+///
+/// A part that does not parse is an error rather than a part skipped:
+/// skipping would answer a smaller width than the host allows, which
+/// is indistinguishable from a genuinely narrowed process and would
+/// cap the pool silently.
+#[cfg(target_os = "linux")]
+fn count_cpu_list(list: &str) -> std::io::Result<usize> {
+    fn malformed(part: &str, why: &dyn std::fmt::Display) -> std::io::Error {
+        std::io::Error::other(format!("cpu list entry {part:?} is not a cpu or a range: {why}"))
+    }
+    let mut total = 0usize;
+    for part in list.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            Some((low, high)) => {
+                let low: usize = low.trim().parse().map_err(|err| malformed(part, &err))?;
+                let high: usize = high.trim().parse().map_err(|err| malformed(part, &err))?;
+                if high < low {
+                    return Err(malformed(part, &"its end is below its start"));
+                }
+                total += high - low + 1;
+            }
+            None => {
+                part.parse::<usize>().map_err(|err| malformed(part, &err))?;
+                total += 1;
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// The cgroup CPU quota as a whole number of CPUs, read once.
+///
+/// `None` when the host sets no quota, which is the common case on a
+/// bare-metal box and not a failure.
+#[cfg(target_os = "linux")]
+fn cgroup_quota_cpus() -> Option<usize> {
+    static QUOTA: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *QUOTA.get_or_init(read_cgroup_quota_cpus)
+}
+
+/// One cgroup file, telling a file that is not there from one that
+/// could not be read.
+///
+/// A missing file is how a host with no cgroup limit presents, and is
+/// the answer rather than a failure. Any other error is named, because
+/// a quota that exists and cannot be read is a limit the pool is about
+/// to ignore, and staying quiet there would size the pool for the
+/// whole machine inside a container.
+#[cfg(target_os = "linux")]
+fn read_cgroup_file(path: &str) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            report_quota_unreadable(path, &err);
+            None
+        }
+    }
+}
+
+/// One whole number parsed out of a cgroup file, naming what failed.
+#[cfg(target_os = "linux")]
+fn cgroup_number(path: &str, field: &str) -> Option<u64> {
+    match field.parse::<u64>() {
+        Ok(value) => Some(value),
+        Err(err) => {
+            report_quota_unreadable(path, &format!("{field:?}: {err}"));
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_cgroup_quota_cpus() -> Option<usize> {
+    // cgroup v2 names both numbers in one file: "<quota> <period>",
+    // with "max" for no limit.
+    const V2: &str = "/sys/fs/cgroup/cpu.max";
+    if let Some(text) = read_cgroup_file(V2) {
+        let mut fields = text.split_whitespace();
+        let Some(quota) = fields.next() else {
+            report_quota_unreadable(V2, &"the file is empty");
+            return None;
+        };
+        if quota == "max" {
+            return None;
+        }
+        let Some(period) = fields.next() else {
+            report_quota_unreadable(V2, &format!("{:?} names no period", text.trim()));
+            return None;
+        };
+        return quota_to_cpus(cgroup_number(V2, quota)?, cgroup_number(V2, period)?);
+    }
+    // cgroup v1 keeps them apart, and a quota at or below zero is no
+    // limit rather than a limit of nothing.
+    const QUOTA_V1: &str = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us";
+    const PERIOD_V1: &str = "/sys/fs/cgroup/cpu/cpu.cfs_period_us";
+    let quota = read_cgroup_file(QUOTA_V1)?;
+    let period = read_cgroup_file(PERIOD_V1)?;
+    let quota = match quota.trim().parse::<i64>() {
+        Ok(value) if value <= 0 => return None,
+        Ok(value) => value as u64,
+        Err(err) => {
+            report_quota_unreadable(QUOTA_V1, &format!("{:?}: {err}", quota.trim()));
+            return None;
+        }
+    };
+    quota_to_cpus(quota, cgroup_number(PERIOD_V1, period.trim())?)
+}
+
+/// A quota and period in the same unit, rounded up to whole CPUs.
+///
+/// Rounded up because a quota of one and a half CPUs can keep two
+/// threads busy, and rounding down would idle the half.
+#[cfg(target_os = "linux")]
+fn quota_to_cpus(quota: u64, period: u64) -> Option<usize> {
+    if period == 0 {
+        return None;
+    }
+    Some(quota.div_ceil(period).max(1) as usize)
+}
+
+/// Say once that a quota file could not be read, naming it.
+#[cfg(target_os = "linux")]
+fn report_quota_unreadable(path: &str, saw: &dyn std::fmt::Display) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "flynnel: {path} reads {saw}, which is not a quota and a period; the pool \
+             sizes by the affinity mask alone and ignores whatever limit that file sets"
+        );
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn process_width() -> std::io::Result<std::num::NonZeroUsize> {
     std::thread::available_parallelism()
 }
@@ -220,6 +405,43 @@ mod tests {
     /// change.
     fn says(n: usize) -> impl FnOnce() -> std::io::Result<std::num::NonZeroUsize> {
         move || Ok(std::num::NonZeroUsize::new(n).expect("a width is at least one"))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cpu_list_counts_its_singles_and_its_ranges() {
+        assert_eq!(count_cpu_list("0-15").expect("a plain range"), 16);
+        assert_eq!(count_cpu_list("14").expect("one cpu"), 1);
+        assert_eq!(count_cpu_list("0-3,8,12-15").expect("a mixed list"), 9);
+        // The shape a pinned worker leaves, and the reading that
+        // caused the whole defect: one cpu, not the machine.
+        assert_eq!(count_cpu_list("7").expect("a pinned thread"), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cpu_list_that_does_not_parse_is_an_error_not_a_smaller_width() {
+        // Skipping a part would answer fewer cpus than the host
+        // allows, which reads exactly like a narrowed process and
+        // would cap the pool with nothing said.
+        for bad in ["0-", "-3", "x", "0-x", "7-3"] {
+            assert!(
+                count_cpu_list(bad).is_err(),
+                "{bad:?} must not be counted as a width"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_quota_rounds_up_to_whole_cpus() {
+        // Half a cpu of quota still keeps a thread busy, and a second
+        // thread can use the other half of the period.
+        assert_eq!(quota_to_cpus(100_000, 100_000), Some(1));
+        assert_eq!(quota_to_cpus(150_000, 100_000), Some(2));
+        assert_eq!(quota_to_cpus(200_000, 100_000), Some(2));
+        assert_eq!(quota_to_cpus(50_000, 100_000), Some(1), "never below one");
+        assert_eq!(quota_to_cpus(100_000, 0), None, "a period of zero is no quota");
     }
 
     /// A probe that cannot answer, as an unsupported host would.
