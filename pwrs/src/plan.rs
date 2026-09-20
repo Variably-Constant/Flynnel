@@ -64,9 +64,14 @@ impl Plan {
         Ok(self.inner.batch_size)
     }
 
-    /// The dispatch profile in force.
-    pub fn profile(&self) -> PsResult<DispatchProfile> {
-        Ok(self.inner.profile.into())
+    /// Whether a dispatch profile was named when the plan was built.
+    ///
+    /// A plan does not retain the profile itself. Naming one sets the
+    /// SMT request, the cost estimate and the oversubscription and is
+    /// then dissolved into them, so the profile is an input and what
+    /// it did is read from those three rather than from a field.
+    pub fn profile_explicit(&self) -> PsResult<bool> {
+        Ok(self.inner.profile_explicit)
     }
 
     /// The accuracy variant the work is asked for.
@@ -200,10 +205,53 @@ impl Plan {
         ))
     }
 
-    /// A plan carrying the workload shape outright, which the static
-    /// classifier consults instead of inferring one.
-    pub fn with_workload_shape(&self, shape: LeafShape) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_workload_shape(shape.into())))
+    // A workload shape is a shape name plus the numbers that shape
+    // needs, so each is its own method rather than one method with
+    // five arguments of which four are ignored. Each sets the mailbox
+    // route, the oversubscription and the burst path together.
+
+    /// A plan shaped for single-producer streaming: orchestration
+    /// only, no burst and no mailbox route.
+    pub fn with_streaming_shape(&self) -> PsResult<Plan> {
+        Ok(Plan::of(self.inner.with_workload_shape(
+            flynnel::sched::workload_shape::WorkloadShape::Streaming,
+        )))
+    }
+
+    /// A plan shaped for a producer that emits `burst` jobs between
+    /// waits, which takes the burst push path.
+    pub fn with_producer_fast_shape(&self, burst: u32) -> PsResult<Plan> {
+        Ok(Plan::of(self.inner.with_workload_shape(
+            flynnel::sched::workload_shape::WorkloadShape::ProducerFast { burst },
+        )))
+    }
+
+    /// A plan shaped for independent consumers stealing from each
+    /// other, given how many there are and what each handles.
+    pub fn with_work_steal_shape(&self, n_consumers: u32, batch_size: u32) -> PsResult<Plan> {
+        Ok(Plan::of(self.inner.with_workload_shape(
+            flynnel::sched::workload_shape::WorkloadShape::WorkSteal {
+                n_consumers,
+                batch_size,
+            },
+        )))
+    }
+
+    /// A plan shaped for cooperative cross-core work over `n_cores`,
+    /// which turns the owner-directed mailbox route on.
+    pub fn with_cooperative_shape(&self, n_cores: u32) -> PsResult<Plan> {
+        Ok(Plan::of(self.inner.with_workload_shape(
+            flynnel::sched::workload_shape::WorkloadShape::Cooperative { n_cores },
+        )))
+    }
+
+    /// A plan shaped for racing `n_variants` implementations of the
+    /// same work, where each push is a distinct entry rather than a
+    /// burst.
+    pub fn with_variant_race_shape(&self, n_variants: u32) -> PsResult<Plan> {
+        Ok(Plan::of(self.inner.with_workload_shape(
+            flynnel::sched::workload_shape::WorkloadShape::VariantRace { n_variants },
+        )))
     }
 
     // -- what it resolves to on this host ------------------------------
@@ -281,11 +329,11 @@ impl Plan {
         Ok(flynnel::sched::plan::pick_tier(&self.inner, flynnel::numa_topology()).into())
     }
 
-    /// The name of the backend this plan would dispatch to.
+    /// The backend this plan would dispatch to.
     ///
     /// Starts the arena if it is not already running.
     pub fn backend_name(&self) -> PsResult<String> {
-        Ok(self.inner.pick_backend().name().to_string())
+        Ok(format!("{:?}", self.inner.pick_backend().id()))
     }
 }
 
@@ -297,8 +345,11 @@ pub struct ResolvedPlan {
     pub k_outer: u8,
     /// The batch size.
     pub batch_size: u32,
-    /// The dispatch profile in force.
-    pub profile: DispatchProfile,
+    /// Whether a dispatch profile was named when the plan was built.
+    /// The profile itself is not retained: it sets the SMT request,
+    /// the cost estimate and the oversubscription below and is
+    /// dissolved into them.
+    pub profile_explicit: bool,
     /// The accuracy variant.
     pub variant: Variant,
     /// The kernel target class.
@@ -465,19 +516,24 @@ impl Cmdlet for NewFlynnelPlan {
 )]
 #[derive(Default)]
 pub struct ResolveFlynnelPlan {
-    /// The plan to resolve.
+    /// The plan to resolve. Optional in the type because a proxy
+    /// class has no default to derive; mandatory to the binder, which
+    /// is what guarantees it is here.
     #[param(mandatory, position = 0, value_from_pipeline)]
-    pub plan: Plan,
+    pub plan: Option<Plan>,
 }
 
 impl Cmdlet for ResolveFlynnelPlan {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let p = &self.plan.inner;
+        let Some(plan) = self.plan.as_ref() else {
+            return Err(arg_err("Plan is required").terminating());
+        };
+        let p = &plan.inner;
         let workers = p.resolved_workers();
         ps.write(ResolvedPlan {
             k_outer: p.k_outer,
             batch_size: p.batch_size,
-            profile: p.profile.into(),
+            profile_explicit: p.profile_explicit,
             variant: p.variant.into(),
             hw_class: p.hw_class.into(),
             leaf_shape: p.leaf_shape.into(),
@@ -492,7 +548,7 @@ impl Cmdlet for ResolveFlynnelPlan {
             estimated_total_ns: p.estimated_total_ns(),
             k_inner_lanes: p.k_inner_lanes() as u64,
             optimal_chunk_count: p.optimal_chunk_count(workers),
-            backend: p.pick_backend().name().to_string(),
+            backend: format!("{:?}", p.pick_backend().id()),
             deque_tier_hint: p.deque_tier_hint.map(Into::into),
             use_mailbox_routing: p.use_mailbox_routing,
         })

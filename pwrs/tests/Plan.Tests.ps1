@@ -14,9 +14,18 @@ Describe 'New-FlynnelPlan' {
         $p.BatchSize() | Should -Be 100000
     }
 
-    It 'takes the profile it is given' {
-        $p = New-FlynnelPlan -KOuter 8 -BatchSize 1000 -Profile Streaming
-        $p.Profile() | Should -Be ([Flynnel.DispatchProfile]::Streaming)
+    It 'records that a profile was named, and applies what it implies' {
+        # A plan does not keep the profile: naming one sets the SMT
+        # request, the cost estimate and the oversubscription and is
+        # dissolved into them. So the readable fact is that one was
+        # named, and the evidence it took is in those three.
+        $named = New-FlynnelPlan -KOuter 8 -BatchSize 100000 -Profile Streaming
+        $unnamed = New-FlynnelPlan -KOuter 8 -BatchSize 100000
+        $named.ProfileExplicit() | Should -BeTrue
+        $unnamed.ProfileExplicit() | Should -BeFalse
+        $named.EffectiveUseSmt() | Should -BeFalse
+        (New-FlynnelPlan -KOuter 8 -BatchSize 100000 -Profile LatencyBound).EffectiveUseSmt() |
+            Should -BeTrue
     }
 
     It 'refuses Bare and Profile together rather than silently preferring one' {
@@ -118,7 +127,7 @@ Describe 'Resolve-FlynnelPlan' {
         # the table would be quoted as though it were not.
         $script:r.KOuter | Should -Be $script:plan.KOuter()
         $script:r.BatchSize | Should -Be $script:plan.BatchSize()
-        $script:r.Profile | Should -Be $script:plan.Profile()
+        $script:r.ProfileExplicit | Should -Be $script:plan.ProfileExplicit()
         $script:r.Variant | Should -Be $script:plan.Variant()
         $script:r.HwClass | Should -Be $script:plan.HwClass()
         $script:r.LeafShape | Should -Be $script:plan.LeafShape()
