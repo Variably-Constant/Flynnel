@@ -57,6 +57,12 @@
 // constants) when explaining the WHY of a design. Allow rustdoc to
 // link to them without warning.
 #![allow(rustdoc::private_intra_doc_links)]
+// A link to an item behind a feature resolves with that feature on and
+// dangles with it off, and neither `cargo check` configuration sees it
+// because neither runs rustdoc. Rustdoc's own default for this lint is
+// a warning, which a gate reading exit codes cannot act on, so the
+// crate denies it and the doc leg gains the power to fail.
+#![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod backend;
 pub mod cpu_info;

@@ -211,11 +211,27 @@ pub struct JobPlan {
     /// inner loop carries per k-iteration, as a log2. `Some(log2)`
     /// asks for `2^log2` cells, `None` for one.
     ///
-    /// Read through [`Self::k_inner_lanes`] by
-    /// [`crate::gpu_peer::linalg::gemm_tandem_batched`], which hands it
-    /// to [`crate::gpu_peer::linalg::cpu::gemm_batched_lanes`] for the
-    /// CPU half of the split. It steers that loop and nothing else: the
-    /// device half is untouched, and no other op consults it.
+    /// Read through [`Self::k_inner_lanes`] by the batched-matmul
+    /// tandem split, which hands it to the CPU half's lane-blocked
+    /// inner loop.
+    // Those two names live under `gpu_peer`, which is a feature. A link
+    // to them resolves in a build that has it and dangles in one that
+    // does not, so the sentence naming them is written both ways and
+    // the prose around it stays single-sourced.
+    #[cfg_attr(
+        feature = "gpu-peer",
+        doc = "Those are [`crate::gpu_peer::linalg::gemm_tandem_batched`]",
+        doc = "and [`crate::gpu_peer::linalg::cpu::gemm_batched_lanes`]."
+    )]
+    #[cfg_attr(
+        not(feature = "gpu-peer"),
+        doc = "Those are `gpu_peer::linalg::gemm_tandem_batched` and",
+        doc = "`gpu_peer::linalg::cpu::gemm_batched_lanes`, which this build",
+        doc = "does not carry: they are behind the `gpu-peer` feature."
+    )]
+    ///
+    /// It steers that loop and nothing else: the device half is
+    /// untouched, and no other op consults it.
     ///
     /// Every output cell still accumulates over `k` in the same order
     /// against the same operands whatever the width, so the result is
