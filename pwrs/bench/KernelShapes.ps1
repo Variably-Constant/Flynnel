@@ -150,13 +150,27 @@ function Start-Cooldown {
 
 $script:Burners = @()
 
+# The host that runs a burner, and whether it can be asked to hide.
+#
+# Windows PowerShell is only on Windows, and -WindowStyle is refused
+# outright by every other edition rather than ignored, so naming either
+# unconditionally ends the run before a single cell is timed. That is
+# how this arm first failed on the Linux guest: eight burners asked
+# for, none started, and the whole bench gone at the load arm.
+$script:BurnerShell = if ($IsWindows -or $null -eq $IsWindows) { 'powershell' } else { 'pwsh' }
+$script:BurnerHides = $IsWindows -or $null -eq $IsWindows
+
 function Start-Burners {
     if ($LoadThreads -le 0) { return }
     $spin = 'while ($true) { $null = [Math]::Sqrt([Environment]::TickCount) }'
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $spin)
     $script:Burners = 1..$LoadThreads | ForEach-Object {
-        Start-Process -FilePath 'powershell' `
-            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $spin `
-            -WindowStyle Hidden -PassThru
+        if ($script:BurnerHides) {
+            Start-Process -FilePath $script:BurnerShell -ArgumentList $arguments `
+                -WindowStyle Hidden -PassThru
+        } else {
+            Start-Process -FilePath $script:BurnerShell -ArgumentList $arguments -PassThru
+        }
     }
     # Long enough for the scheduler to have placed them, short enough
     # not to dominate the run.
