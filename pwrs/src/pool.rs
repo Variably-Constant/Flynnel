@@ -266,7 +266,7 @@ impl Cmdlet for SetFlynnelSpinWindow {
                  the range it can use",
                 self.rounds,
                 now.window_rounds
-            );
+            )?;
         }
         ps.write(now)
     }
@@ -438,7 +438,7 @@ impl Cmdlet for SetFlynnelSplitMultiplier {
                 "asked for {} and the multiplier reads {}; it is clamped to one through eight",
                 self.value,
                 now.multiplier
-            );
+            )?;
         }
         ps.write(now)
     }
@@ -579,7 +579,7 @@ impl Cmdlet for GetFlynnelIoPool {
                 ps,
                 "this process has no global IO pool: nothing has started one, which is not \
                  the same as one with no workers"
-            );
+            )?;
             return Ok(());
         };
         ps.write(IoPool {

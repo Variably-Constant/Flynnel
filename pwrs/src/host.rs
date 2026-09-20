@@ -437,7 +437,7 @@ impl Cmdlet for GetFlynnelLatencyTable {
                 ps,
                 "this host has no inter-core latency table: the ping-pong sweep could not \
                  pin threads or did not finish inside its budget, so nothing was measured"
-            );
+            )?;
             return Ok(());
         };
         let n = table.n();

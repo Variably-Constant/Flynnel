@@ -113,9 +113,13 @@ impl Plan {
         Ok(Plan::of(self.inner.with_smt()))
     }
 
-    /// A plan targeting `class`.
-    pub fn with_hw_class(&self, class: HwClass) -> PsResult<Plan> {
-        Ok(Plan::of(self.inner.with_hw_class(class.into())))
+    // The argument is `hw_class` and not `class` because the
+    // generated shell writes the Rust parameter name straight into
+    // C#, where `class` is a keyword: it produced
+    // `WithHwClass(HwClass class)` and a CS1001 at that column.
+    /// A plan targeting `hw_class`.
+    pub fn with_hw_class(&self, hw_class: HwClass) -> PsResult<Plan> {
+        Ok(Plan::of(self.inner.with_hw_class(hw_class.into())))
     }
 
     /// A plan asking for `variant` accuracy.
@@ -487,7 +491,7 @@ impl Cmdlet for NewFlynnelPlan {
                 "the leaf-width model needs both PerItemNs and TaskOverheadNs; with one of \
                  them the plan falls back to the minimum leaf and OptimalChunkCount answers \
                  nothing"
-            );
+            )?;
         }
         ps.write(Plan::of(plan))
     }
