@@ -267,6 +267,51 @@ const DEFAULT_SPIN_WINDOW_ROUNDS: u32 = 500;
 /// analog of quiescing the GPU poller.
 const FLOOR_SPIN_WINDOW_ROUNDS: u32 = 8;
 
+/// Consecutive non-parking returns from [`Sleep::sleep`] tolerated
+/// before a worker waits on a timer instead of re-running the spin
+/// window.
+///
+/// Four rather than one because all three of the single-miss cases
+/// are legitimate and self-clearing: a producer posting work as the
+/// worker goes sleepy, a job landing in the injector during the
+/// same window, and a peer draining the deque first. Each resolves
+/// on the next search. Four in a row does not resolve, and by then
+/// the worker has spent four full spin windows finding nothing.
+const SLEEPLESS_BEFORE_BACKOFF: u32 = 4;
+
+/// First wait once a worker is backing off. A quarter of a
+/// millisecond is longer than any search round and short enough that
+/// a state clearing immediately costs no throughput worth measuring.
+const SLEEPLESS_BACKOFF_FLOOR: std::time::Duration =
+    std::time::Duration::from_micros(250);
+
+/// Ceiling on the doubling. At 32ms a stuck worker still searches
+/// about thirty times a second - fast enough that a pool recovering
+/// on its own is back inside a frame - while costing roughly one
+/// part in a thousand of a core instead of all of it.
+const SLEEPLESS_BACKOFF_CAP: std::time::Duration =
+    std::time::Duration::from_millis(32);
+
+/// Times a worker waited on the timer rather than re-running the
+/// spin window. Zero on a healthy pool; a climbing value is the
+/// signal that workers are being denied a park.
+static SLEEPLESS_BACKOFFS: AtomicU64 = AtomicU64::new(0);
+
+/// How long to wait after `n` consecutive non-parking returns.
+/// Doubles from the floor and clamps at the cap.
+fn sleepless_backoff(n: u32) -> std::time::Duration {
+    let steps = n.saturating_sub(SLEEPLESS_BEFORE_BACKOFF).min(16);
+    SLEEPLESS_BACKOFF_FLOOR
+        .saturating_mul(1u32 << steps)
+        .min(SLEEPLESS_BACKOFF_CAP)
+}
+
+/// Times a worker backed off instead of spinning, since process
+/// start. Stays at zero unless workers are being denied a park.
+pub fn total_sleepless_backoffs() -> u64 {
+    SLEEPLESS_BACKOFFS.load(Ordering::Relaxed)
+}
+
 /// Effective spin-window rounds (on top of [`ROUNDS_UNTIL_SLEEPY`]),
 /// adjusted at runtime by the adaptive controller. Starts at the
 /// tuned default.
@@ -439,6 +484,12 @@ pub(crate) struct IdleState {
     /// idle episode, so a later find is not miscounted as a spin
     /// rescue (the spin did not save this worker - it parked).
     pub parked: bool,
+    /// Consecutive [`Sleep::sleep`] calls that returned without
+    /// parking, reset by any park. Both non-parking exits leave the
+    /// worker searching again and neither yields, so a condition that
+    /// persists turns the idle loop into a spin that holds a core.
+    /// This counts them so the loop can back off.
+    pub(crate) sleepless: u32,
 }
 
 impl IdleState {
@@ -448,6 +499,7 @@ impl IdleState {
             rounds: 0,
             jobs_counter: JobsEventCounter::DUMMY,
             parked: false,
+            sleepless: 0,
         }
     }
 
@@ -604,6 +656,19 @@ impl Sleep {
             thread::yield_now();
         } else {
             self.sleep(idle, has_injected_jobs);
+            // `sleep` returns without parking two ways: the JEC moved,
+            // or the injector held a job. Both send the worker back to
+            // searching and neither yields, so while the condition
+            // holds the worker re-runs the spin window finding nothing
+            // and keeps a core at one hundred percent. Past a few
+            // consecutive misses the spin has stopped paying for
+            // itself, so the worker waits on a timer instead. It still
+            // runs a full search each time round, so work that becomes
+            // takeable is picked up within one interval.
+            if idle.sleepless >= SLEEPLESS_BEFORE_BACKOFF {
+                SLEEPLESS_BACKOFFS.fetch_add(1, Ordering::Relaxed);
+                thread::sleep(sleepless_backoff(idle.sleepless));
+            }
         }
     }
 
@@ -635,6 +700,7 @@ impl Sleep {
             if counters.jobs_counter() != idle.jobs_counter {
                 // JEC changed: work posted since we went sleepy.
                 // Bail out and resume searching.
+                idle.sleepless = idle.sleepless.saturating_add(1);
                 idle.wake_partly();
                 return;
             }
@@ -649,10 +715,12 @@ impl Sleep {
         std::sync::atomic::fence(Ordering::SeqCst);
         if has_injected_jobs() {
             self.counters.sub_sleeping_thread();
+            idle.sleepless = idle.sleepless.saturating_add(1);
         } else {
             // Committing to the condvar: the spin did not rescue this
             // worker. Feed the controller before blocking.
             idle.parked = true;
+            idle.sleepless = 0;
             PARK_EVENTS.fetch_add(1, Ordering::Relaxed);
             maybe_adapt();
             *is_blocked = true;
