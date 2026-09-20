@@ -288,6 +288,12 @@ static RESCUE_EVENTS: AtomicU32 = AtomicU32::new(0);
 /// Total idle `yield_now` rounds, exposed for observability. This is
 /// the quantity a flamegraph attributes to `sched_yield`.
 static TOTAL_YIELDS: AtomicU64 = AtomicU64::new(0);
+/// Times [`maybe_adapt`] passed its event gate and reached a decision.
+/// Counted because the window alone cannot report it: a rescue-dominated
+/// workload grows and is clamped to the default it started at.
+/// Monotonic for the process; [`reset_spin_stats`] leaves it alone, so a
+/// reader can treat a rise as evidence without holding the reset.
+static ADAPT_DECISIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the env once: a fixed `FLYNNEL_SPIN_WINDOW_ROUNDS` pins the
 /// window (adaptation off); `FLYNNEL_ADAPTIVE_SPIN=0` pins the
@@ -334,6 +340,7 @@ fn maybe_adapt() {
     if park + rescue < 256 {
         return;
     }
+    ADAPT_DECISIONS.fetch_add(1, Ordering::Relaxed);
     let cur = SPIN_WINDOW.load(Ordering::Relaxed);
     let new = if park > rescue.saturating_mul(3) {
         (cur / 2).max(FLOOR_SPIN_WINDOW_ROUNDS)
@@ -360,6 +367,15 @@ pub fn total_idle_yields() -> u64 {
     TOTAL_YIELDS.load(Ordering::Relaxed)
 }
 
+/// Times the adaptive controller reached a decision, counted from
+/// process start and never reset. Zero while [`spin_adaptive`] is true
+/// means the workload never parked often enough to gather the evidence;
+/// that is distinct from a controller that decided and left
+/// [`spin_window`] where it found it.
+pub fn spin_adapt_decisions() -> u64 {
+    ADAPT_DECISIONS.load(Ordering::Relaxed)
+}
+
 /// Reset the yield and controller-evidence counters (for measuring a
 /// specific phase).
 pub fn reset_spin_stats() {
@@ -383,6 +399,17 @@ pub fn set_spin_window(rounds: u32) {
 /// resumes from the current window.
 pub fn set_spin_adaptive(on: bool) {
     ADAPTIVE.store(on, Ordering::Relaxed);
+}
+
+/// Whether the adaptive controller is running, after the environment
+/// has been read.
+///
+/// A window still at its default says either that the controller is off
+/// or that it is on and the evidence keeps it there, and a harness
+/// reporting only the window cannot tell those apart.
+pub fn spin_adaptive() -> bool {
+    spin_init();
+    ADAPTIVE.load(Ordering::Relaxed)
 }
 
 /// Per-worker sleep state held inside the global `Sleep` struct.
@@ -714,6 +741,92 @@ impl Sleep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Put the controller in a known state and enable it, so a test
+    /// reads its response rather than whatever an earlier test left.
+    fn arm_controller(window: u32) {
+        spin_init();
+        SPIN_WINDOW.store(window, Ordering::Relaxed);
+        ADAPTIVE.store(true, Ordering::Relaxed);
+        PARK_EVENTS.store(0, Ordering::Relaxed);
+        RESCUE_EVENTS.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_window_that_keeps_being_missed_shrinks_toward_the_floor() {
+        // Parks dominating means the spin ran out before work arrived,
+        // which on a contended host is a worker burning slices a
+        // neighbour could have used.
+        arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
+        PARK_EVENTS.store(300, Ordering::Relaxed);
+        RESCUE_EVENTS.store(4, Ordering::Relaxed);
+        maybe_adapt();
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS / 2);
+
+        for _ in 0..12 {
+            PARK_EVENTS.store(300, Ordering::Relaxed);
+            RESCUE_EVENTS.store(4, Ordering::Relaxed);
+            maybe_adapt();
+        }
+        assert_eq!(spin_window(), FLOOR_SPIN_WINDOW_ROUNDS);
+    }
+
+    #[test]
+    fn a_window_that_keeps_paying_grows_back_but_never_past_the_tuned_default() {
+        // Rescues dominating means work landed inside the window and the
+        // spin saved a park and unpark pair.
+        arm_controller(FLOOR_SPIN_WINDOW_ROUNDS);
+        for _ in 0..64 {
+            PARK_EVENTS.store(4, Ordering::Relaxed);
+            RESCUE_EVENTS.store(300, Ordering::Relaxed);
+            maybe_adapt();
+        }
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
+    }
+
+    #[test]
+    fn one_burst_does_not_move_the_window() {
+        // Below the evidence floor the controller has seen too little to
+        // tell a workload's shape from a moment of it.
+        arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
+        PARK_EVENTS.store(200, Ordering::Relaxed);
+        RESCUE_EVENTS.store(0, Ordering::Relaxed);
+        maybe_adapt();
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
+    }
+
+    #[test]
+    fn a_held_window_tells_a_controller_that_ran_from_one_that_never_reached_the_gate() {
+        // Rescues dominating grows the window and clamps it to the
+        // default it started from, so the window is unmoved and only the
+        // decision count says the controller ran. Compared as an
+        // inequality because the counter is process-wide and monotonic,
+        // so a concurrent test can raise it between the two readings.
+        arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
+        let before = spin_adapt_decisions();
+        PARK_EVENTS.store(4, Ordering::Relaxed);
+        RESCUE_EVENTS.store(300, Ordering::Relaxed);
+        maybe_adapt();
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS, "clamped to where it began");
+        assert!(
+            spin_adapt_decisions() > before,
+            "a held window and a decided one differ only here"
+        );
+    }
+
+    #[test]
+    fn the_controller_stays_still_while_it_is_off() {
+        // Off is the shipped default, and the window it holds is the one
+        // tuned across three host classes.
+        spin_init();
+        SPIN_WINDOW.store(DEFAULT_SPIN_WINDOW_ROUNDS, Ordering::Relaxed);
+        ADAPTIVE.store(false, Ordering::Relaxed);
+        PARK_EVENTS.store(1_000, Ordering::Relaxed);
+        RESCUE_EVENTS.store(0, Ordering::Relaxed);
+        maybe_adapt();
+        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
+        reset_spin_stats();
+    }
 
     #[test]
     fn counters_initial_state_is_zero() {

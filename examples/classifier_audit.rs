@@ -42,8 +42,8 @@ fn main() {
         Cell { name: "transpose",   k_outer: 6, batch_size: 2048*2048,  ns: Some(5),  n_slots: 2048*2048, slot_kind: "f64 slot" },
     ];
 
-    println!("{:<22} {:>10} {:>10} {:>10} {:>14} {:>30} {}",
-        "bench", "k_outer", "batch", "ns", "class", "n_slots", "slot_kind");
+    println!("{:<22} {:>10} {:>10} {:>10} {:>14} {:>30} slot_kind",
+        "bench", "k_outer", "batch", "ns", "class", "n_slots");
     println!("{}", "-".repeat(130));
     for c in cells.iter() {
         let class = infer_class_static(c.k_outer, c.batch_size, c.ns);

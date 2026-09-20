@@ -5,6 +5,256 @@ measurements from `benches/` and `tests/` on the two bench hosts, an
 RTX 3070 with a Ryzen 7 2700 (16 threads) and an RTX 5070 with a
 Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
+## Unreleased
+
+### Changed
+
+- `FLYNNEL_LEVER_ALLOWED_WIDTH` defaults on. A plan's worker count is
+  capped by the CPUs the process may use at that moment, re-read every
+  250 ms, so a process whose affinity mask or cgroup quota narrows after
+  the pool is spawned stops chunking for threads that cannot reach a
+  core; `tests/affinity_follows_process_mask.rs` holds that on Linux,
+  FreeBSD and Windows. Its price is the re-read on a host whose mask
+  never changes, measured twice paired by trial on a 24-thread
+  bare-metal box at 4096 reps of uniform work over 40 trials with no
+  decision moving between the arms: 1.0006 at a 0.13 per cent bound
+  over 40 clean pairs, retained 1.0005 at 0.17, control 1.0000 at 0.10,
+  on the code that ships; and 1.0000 at 0.15 over 23 clean pairs,
+  retained 1.0014 at 0.21, control 1.0000 at 0.30, on a tree whose
+  Windows probe was still `available_parallelism`. Off restores the
+  shipped sizing, the arena's spawned width whatever the host allows.
+
+- `FLYNNEL_LEVER_ONCORE_SPREAD` is documented as a correctness lever and
+  carries its measured price. It swaps the classifier's input from wall
+  time to the thread clock, which excludes descheduled time, so what it
+  changes is proportional to how much descheduling a host does: the
+  learned class differs between its two arms in 29 trials of 40 on a
+  Linux guest, 6 of 40 on a FreeBSD guest and 1 of 40 on bare metal. A
+  host that does not deschedule has nothing for it to correct.
+
+  Its cost, every figure an upper bound rather than a resolved
+  difference: 0.9978 at a 0.22 per cent bound on a 24-thread bare-metal
+  box over 32 clean pairs of 40, control 0.9988 at 0.38, and 1.3 to 1.9
+  on a Linux guest. That cell was read twice - an earlier rotation gave
+  0.9964 at 1.90 over 7 pairs while an unrelated process held a core
+  continuously, putting the box's idle floor at 1.81 cores against the
+  harness's 1.4-core gate, so most trials were dropped for a condition
+  none of them caused. The difference between the two bounds is the
+  floor, not the lever. On that
+  guest at an 8 second window over 40 trials it reads 0.9814 at a 2.52
+  per cent bound in the trials where the class moves and 0.9872 at 4.34
+  where it holds - about the same either way. An earlier reading at a 2
+  second window put those at 1.0000 and 0.9759 and suggested the routing
+  change paid for the bracket; the longer window cut the bound from 6.44
+  to 2.52 and reversed the ordering, so that was noise.
+
+  No speed-up is claimed, and the reason is structural. Four cells were
+  screened on bare metal for one where the class could move at all -
+  reps 4096 uniform, 4096 irregular, 8192 and 16384 - and none did.
+  `classify_observed` returns `PortBound` below 500 ns and never reads
+  cv^2; raising reps lifts the mean past that gate while averaging the
+  variance out of cv^2, so the two conditions a class change needs pull
+  apart. Where the lever acts, the host is too noisy to resolve what it
+  did; where the host resolves it, the lever has nothing to do.
+
+- The split multiplier is decided from the window passed to it rather
+  than from the globals the sampler reads. `sample_and_compute` summed
+  process-global arena counters and then asserted against them, so the
+  test covering its sparse-window short-circuit raced every other test
+  in the binary: a concurrent dispatch could push those counters back
+  over the floor between the test's reset and its assert. It failed once
+  in a gate and passed five times on re-run - alone, in the full
+  parallel suite and single-threaded - which is the shape that gets a
+  gate ignored. The decision now takes the window as arguments and the
+  wrapper reads the globals, so the three tests replacing it are
+  deterministic: nine consecutive suite runs on the guest that caught it
+  read 749 passed and none failed. The early return still skips
+  `reset_leaf_stats`, which is what lets a window too sparse to read
+  accumulate its leaves into the next one.
+
+- The adaptive spin controller is measured on what it does rather than
+  on throughput. Where it shrinks the window, idle yields fall to
+  between 0.22 and 0.51 of the arm without it; where it does not, they
+  read 1.000 to 1.019. Four rotations, two hosts, two operating systems,
+  with the unshrunk trials of each rotation as its own control.
+
+  No throughput effect survives a change of host or load. Pinning the
+  window directly with `FLYNNEL_SPIN_WINDOW_ROUNDS` - 8 against 500,
+  the controller out of the comparison and every trial usable - gives
+  1.0250 and 1.0271 on a Linux guest at half and full load, and 0.9980
+  and 1.0655 on a FreeBSD guest, at bounds of 3.9 to 9.0 per cent. The
+  ratio is flat across load, so the lever cannot show faster-under-load
+  whatever its size: there is nothing for load to change.
+
+  How often the controller shrinks at all is a host property, not a
+  setting: 1, 17, 18 and 21 arms in 40 on one guest and 39 in 40 on the
+  other, at identical settings.
+
+- `examples/zen3_lever_ab.sh` runs on FreeBSD as well as Linux. It takes
+  busy cores from `kern.cp_time` where `/proc/stat` is absent, the core
+  count from `hw.ncpu` where `nproc` is, and it strips the padding
+  FreeBSD's `wc` puts around a count - which had made every arm line
+  unparseable, so a 40-trial rotation reported forty trials and no pairs
+  rather than failing. It also takes the SMT prior as an argument,
+  without which `effective_use_smt` returns on its first line and the
+  window lever's two arms are the same arm.
+
+- `examples/zen3_lever_ab.sh` runs a lever A/B paired by trial on Linux,
+  and `examples/paired_arms_report.py` takes an optional field to split
+  its pairs on. The three-arm rotation compares arms that ran at
+  different times, so drift between them lands in the ratio: its null
+  read 11 per cent on a quiet 16-core guest where the paired shape reads
+  0.61 per cent on ten pairs on a busier host. Every speed lever here is
+  smaller than the first figure and larger than the second.
+
+  The split exists because a mechanism can fire in one run and not the
+  next at identical settings. The adaptive spin controller leaves its
+  window at the tuned default in about three runs in four, so one median
+  over every trial averages the trials where it acted with the trials
+  where it did not and reports neither. Split, the trials where it held
+  are a control for the ones where it moved, from the same rotation on
+  the same box.
+
+- All three rotation readers assert engagement themselves rather than
+  leaving it to whoever reads the log.
+  `examples/paired_arms_report.py` lists which decisions differ between
+  the two arms before printing any ratio, and says so plainly when none
+  does; `examples/lever_report.py` and `examples/smt_report.py` compare
+  each arm's resolved switch state against its label and refuse
+  mismatched cells by name. A log written before its harness reported
+  lever states is described as unrecorded rather than treated as a pass.
+
+  An arm label naming a value neither line reports is described as
+  unverified rather than counted as a mismatch, because refusing the
+  table on it discards a sound run: an arm that pins a width rather than
+  flipping a switch names something the levers line does not carry. That
+  width is read from the engagement line under the same name and
+  compared literally, so a pin that did not take is caught the way a
+  lever arm is. `examples/paired_armstate_defect_sample.log` and
+  `examples/paired_pinstate_defect_sample.log` are what the two refusals
+  are checked against.
+
+  `levers::describe()` carries `spin_adaptive` and `spin_window`, which
+  it did not. It is documented as every switch and its state, and the
+  two that decide how the pool parks were absent, so a row printed from
+  it could not say whether adaptation ran; the harnesses fetched
+  `spin_adaptive` separately, which is why the engagement line had it
+  and the levers line did not. That puts a width on a line that
+  otherwise carries booleans, so the label check now decides from the
+  values it found rather than from which line they came from: a field
+  holding only `true` or `false` reads the label as a switch, anything
+  else compares literally. Without that, an arm labelled
+  `spin_window=8` would have been compared against `false` and a sound
+  arm reported as a mismatch.
+
+  Two levers now ship on, so an arm that expressed "off" by leaving its
+  variable unset ran the lever on: all three arms of a rotation became
+  one arm, with a tight null, because two identical arms agree. The
+  rotations at `examples/lever_rounds.sh` and `examples/width_rounds.sh`
+  now name the value on both arms, and `examples/smt_recovery.rs` and
+  `examples/class_migration_under_load.rs` print the resolved states the
+  way `throughput_under_load` already did.
+
+  A switch's own flag is not counted as a decision it made. Including
+  `spin_adaptive`, which differs between the arms by construction, made
+  the moved-decision test pass for every rotation of the spin lever
+  whatever the controller went on to do: a 432-arm run has it deciding
+  36 to 50 times per process and leaving the window at the tuned default
+  on both arms, which that test called engaged. A lever can be read,
+  then decide, and still change nothing, and only the third says a
+  throughput row is a reading of it.
+
+- `examples/pc2_lever_ab.ps1` takes the engagement markers from its
+  caller as `-ReadPattern` and `-ActedPattern`, and reports them as two
+  figures rather than one. It counted `oncore_items`, which is one
+  lever's marker, so every other lever's rotation passed the check
+  without the switch having reached anything: a 40-trial run of the SMT
+  window lever reported 80 engaged rows of 80 on a counter its
+  mechanism never touches. A caller naming no pattern gets the word
+  `unjudged` instead of a zero, and a run whose read pattern never
+  matches exits non-zero rather than reporting a comparison between two
+  arms that were the same arm.
+
+- A stored calibration is served once an independent draw has agreed
+  with it, where before it was served if the spread across its own nine
+  samples sat under `PROVISIONAL_SPREAD_PER_MILLE`. `CpuCalibration`
+  carries a `confirmations` count, raised when another draw's dispatch,
+  collapse and wake figures all land within that bound;
+  `is_trustworthy` reads the count. A record with none is stored and not
+  served, so a fresh stamp serves from its third start.
+
+  On a 12-core host with at most two other processes running, 40 draws
+  gave within-draw spreads of 273 to 7429, median 1136, and not one met
+  the bound of 250. The same draws, paired, disagreed on their dispatch
+  medians by 0 to 206, median 74. So nothing served on that host and
+  every process paid a 13.9 to 23.1 ms draw, while the figure the draws
+  agreed on went unread.
+
+  All three figures must agree because all three are served. Over 42
+  consecutive pairs there, dispatch agreed 40 times, collapse 38 and
+  wake 37; a pair agreeing on dispatch alone published a collapse of
+  29183 against a 10733 median of the same 43 draws.
+
+  `LAYOUT_VERSION` 7 to 8, which invalidates stored tables by stamp.
+
+  Against the never-slower criterion, both halves on that host: serving
+  removes the draw at start, and routing shows no difference at 1.05 per
+  cent resolution over 14 paired trials whose control resolves to 0.24.
+
+- `PublishOutcome::Published` and `KeptIncumbent` carry the agreement
+  count, and `KeptIncumbent`'s two figures are dispatch costs in
+  nanoseconds. The line reporting them named them parts per mille of
+  occupancy, which cannot exceed 1000.
+
+### Added
+
+- `tests/affinity_follows_process_mask.rs` holds what
+  `FLYNNEL_LEVER_ALLOWED_WIDTH` does. It starts the arena at full width,
+  narrows the process affinity mask to two CPUs, and asserts that
+  `allowed_parallelism` follows, that `resolved_workers` caps by it, and
+  that both come back when the mask widens - so it measures a pool that
+  outlived the change rather than one sized after it. The behavior was
+  measured from outside on a guest before this, which left a ratchet
+  here silent.
+
+  It occupies its own test binary because the mask is process-wide: a
+  test running beside it would be narrowed by it and timed through a
+  mask it did not set. A host that cannot narrow, or allows fewer than
+  four CPUs, fails rather than returning early, because `eprintln` in a
+  test binary is captured and a skip reports the same green as a run. It
+  polls for the width instead of sleeping the re-read cadence, so it
+  carries no second copy of `RECHECK_INTERVAL_MS`.
+
+  `libc` joins the dev-dependencies for the Linux and FreeBSD arms,
+  whose affinity calls differ in name, arguments and set type. The
+  Windows arm declares the kernel32 symbols it calls, so no binding
+  crate is added for it.
+
+  Running it found that `FLYNNEL_LEVER_ALLOWED_WIDTH` capped by nothing
+  on Windows. The Linux and FreeBSD arms passed; the Windows arm
+  narrowed the process mask to two CPUs on a 24-thread host and
+  `allowed_parallelism` still read 24.
+  `std::thread::available_parallelism` documents the reason - it "may
+  overcount the amount of parallelism available on systems limited by
+  process-wide affinity masks, or job object limitations" - so
+  `sched::host_width` was reporting the machine there rather than the
+  share of it the process may use.
+
+  `sched::host_width` now reads `GetProcessAffinityMask` on Windows and
+  `available_parallelism` elsewhere, so the same question is asked by
+  the route each platform answers it on and the lever caps on all three.
+  A failed call falls back to `available_parallelism` rather than
+  publishing a width nothing measured, and the mask is per processor
+  group, so above 64 CPUs it describes the group. Both the module and
+  the architecture page had said the width honoured the mask without
+  naming a platform, and now say which call each platform uses.
+
+  The test reads the mask back through `sched_getaffinity`,
+  `cpuset_getaffinity` or `GetProcessAffinityMask` and asserts on that
+  before the width, so a mask that never took and a mask the platform
+  ignored fail with different messages. Without that the two arrive as
+  the same assertion, which is how the Windows result read at first.
+
 ## 0.6.0 - 2026-09-13
 
 ### Removed
@@ -33,6 +283,40 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   `WorkloadShape::hints()` now returns the hints that steer.
 
 ### Added
+
+- `CallSiteState::window_cv2_range_per_mille()` reports the smallest and
+  largest per-window cv^2 across every classifier tick.
+  `window_cv2_per_mille` holds the latest tick of what is often
+  thousands, and on a 16-core Linux guest five identical runs of the same
+  harness cell read 1, 0, 527, 209 and 217 per mille, spanning both the
+  uniform edge at 50 and the high-variance edge at 500. So one reading
+  cannot say which regimes a run passed through, and a maximum below the
+  uniform edge is what says a spread-driven mechanism was never consulted
+  in its own regime. `examples/throughput_under_load` and
+  `examples/smt_recovery` print it as `cv2_window_min` and
+  `cv2_window_max`, `examples/class_migration_under_load` as a
+  `window_cv2_range` column, and `examples/lever_report.py` and
+  `examples/smt_report.py` carry them through.
+  `throughput_under_load` also takes the mode-2 block size as a ninth
+  argument, because the block that clears the edge differs by host.
+
+  The dispatch path is unchanged. `JobPlan::effective_use_smt` reads the
+  latest tick deliberately: it is consulted per dispatch and wants the
+  classification current at that moment, which ages as later windows
+  replace it. Only the reporting was wrong.
+
+- `spin_adapt_decisions()` reports how many times the adaptive spin
+  controller passed its 256-event gate and reached a decision. The
+  window alone cannot answer whether the controller ran: a
+  rescue-dominated workload grows the window and is clamped to the
+  tuned default it started from, so `spin_window()` reads 500 whether
+  the controller decided on every park or never gathered the evidence.
+  Probed on a 24-thread host with `FLYNNEL_ADAPTIVE_SPIN=1`, a
+  `Streaming` shape at 8192 reps and a `FineGrain` shape at 512 both
+  reported a window of 500, and which of the two had happened was not
+  recoverable from any published figure.
+  `examples/throughput_under_load` prints it as `spin_adapts` beside
+  `spin_window`.
 
 - `JobPlan::optimal_chunk_count_for(workers, n)` sizes the Tiny-Tasks
   model over an item count the caller names, where
@@ -103,6 +387,254 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   item alongside an explicit per-item cost and `use_smt`. The vector
   classes say nothing the batch size does not and still steer nothing.
   `SchedTier`'s doc now lists what the selection reads.
+- Five noisy-host mechanisms ship behind runtime switches, every one
+  DEFAULTING OFF, read once per process from the environment:
+  `FLYNNEL_LEVER_ONCORE_SPREAD`, `FLYNNEL_LEVER_BATCH_WEIGHT`,
+  `FLYNNEL_LEVER_SMT_WINDOW`, `FLYNNEL_LEVER_ALLOWED_WIDTH` and
+  `FLYNNEL_LEVER_CALIBRATION_REFUSAL`. `sched::levers::describe` reports
+  their state for a harness to print beside a result.
+
+  Off is what shipped before them, so a consumer who sets nothing gets
+  the behavior it already had. Each has to earn its default against the
+  same code without it: never slower on a quiet host, faster on a
+  contended one. A switch is what makes that measurable - one binary
+  runs both arms, so the comparison carries no difference in commit,
+  harness, build or machine.
+
+  Environment rather than cargo features, because a feature is chosen at
+  build time and an A/B across one needs two binaries that differ in
+  more than the feature.
+
+  The entries below describe what each switch does when it is on.
+
+- `FLYNNEL_LEVER_ONCORE_SPREAD`: a call site's classifier takes its
+  per-item SPREAD from the thread's own clock, and keeps its mean on
+  wall time.
+
+  Wall time rises both because the work is irregular and because the
+  thread lost its core, and preemption lands on some leaves and not
+  others, so it reaches a wall-time spread as variance indistinguishable
+  from the work's own. A thread's clock does not advance off a core, so
+  a preempted leaf reports what it cost rather than what it waited. The
+  sampled path brackets each leaf with both clocks; a window that
+  carried no on-core reading is classified on wall time, as every window
+  was before.
+
+  WHICH DISPATCH ENTRIES IT REACHES. The bracket is taken by the
+  sampled leaf recorder, and only the plain steal-driven bisect calls
+  that, so the switch changes what `for_each_chunk` and
+  `for_each_chunk_min_leaf` record and nothing else. The indexed and
+  triple bisects time every leaf through a recorder with no bracket, so
+  a site dispatching through `for_each_chunk_indexed`,
+  `for_each_chunk_indexed_min_leaf` or `for_each_chunk_triple_min_leaf`
+  takes no on-core reading whatever this switch is set to. A caller can
+  tell which case it is in from `CallSiteState::oncore_items`, which
+  stays at zero when no leaf was bracketed.
+
+  Measured paired inside one process, where the two figures cover the
+  same leaves and differ only in which clock timed them: across a load
+  event the wall spread rose more than the on-core spread in every one
+  of six trials on the gather shape, with the two agreeing on the quiet
+  window either side of it.
+
+  The on-core ticks are never converted to nanoseconds. On Windows that
+  clock counts executed cycles against a fixed-rate elapsed counter, so
+  a conversion would carry the achieved-to-base clock ratio into every
+  figure; a cv^2 is a ratio and a common factor cancels out of it. They
+  carry their own item count, because the sampled path takes a reading
+  for some leaves and not others and each figure divides by the items it
+  covers.
+
+  Two clock pairs per sampled leaf, taken only on the sampled path.
+  Each worker pays for its own sampled leaves, so what a dispatch adds
+  is that cost times the sampled leaves ONE worker ran, not times the
+  whole dispatch's.
+
+  The cost is not a constant, and not a constant per target either.
+  Measured with `examples/clock_cost.rs`, in nanoseconds, where the
+  bracket is two pairs and the last column is that amortized at the
+  sample stride:
+
+  | host | thread clock | elapsed | bracket | per leaf |
+  |---|---|---|---|---|
+  | Ryzen 9 7900X, Windows, quiet | 206.8 | 6.1 | 425.7 | 53.2 |
+  | Zen3 Linux guest | 670.6 | 28.6 | 1398.4 | 174.8 |
+  | Zen3 Linux guest, busier | 973.4 | 38.1 | 2022.8 | 252.9 |
+
+  On Linux and FreeBSD the thread-clock half is
+  `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, which the vDSO fast path
+  refuses, so it enters the kernel; on Windows it is
+  `QueryThreadCycleTime` against `rdtsc`. Two readings on one guest
+  differ by 1.45x, so the machine and what runs on it vary more than the
+  target does. A caller sizing anything against this figure should read
+  it on the host rather than assume one.
+
+  What it is against: at a per-item cost of 1 ns a 256-item leaf is
+  256 ns, and the bracket is most of it. At 2 us an item the same leaf
+  is 512 us and the bracket is a fraction of a percent. The switch is
+  also only consultable in the second regime, because
+  `classify_observed` returns on the mean alone below `port_heavy_ns`
+  and never reads the spread this improves.
+- `FLYNNEL_LEVER_BATCH_WEIGHT`: a leaf batch is recorded at the share of
+  its interval the pool spent on a core, and every sum a call site keeps
+  carries that weight as a factor along with the count they are divided
+  by, so the means do not move and only a contended batch's influence
+  does. The pool ticks are recorded either way, because that clock pair
+  is read regardless and a site's reported occupancy should not depend
+  on which arm is running. `leaf_count` stays a
+  count of leaves, because the sample guards and the classifier quantum
+  read it, and a batch whose ends did not both carry an on-core reading
+  weighs a whole batch: no reading is not evidence of contention.
+
+  This weighting reaches the class through the SPLIT rather than through
+  the figure the classifier reads - the chain runs weight, cv^2, SMT
+  decision, leaf floor, split - so it separated from the baseline on an
+  adaptive routing and on neither pinned one. It is kept because a
+  contended sample counting for less is right on its own terms, and it
+  is not what the spread change above rests on.
+
+  It changes a figure only where batches DIFFER in the share they held.
+  Each statistic divides a weighted total by a weighted count, so a
+  share every batch in the window shares cancels exactly: a host that is
+  contended steadily moves nothing here however contended it is. What
+  the weighting is for is a window carrying contended batches and quiet
+  ones together, which is what `examples/throughput_under_load.rs` makes
+  with its `duty_ms` argument.
+- `FLYNNEL_LEVER_SMT_WINDOW`: `JobPlan::effective_use_smt` decides from
+  the window the site's classifier last read rather than from its
+  lifetime cv^2, falling back
+  to the lifetime figure only until a window has been classified. The
+  lifetime figure is an equal-weight average over every leaf a site has
+  ever run, so a contended stretch could be diluted only by running
+  enough later leaves to outweigh it, and an SMT decision resting on it
+  did not come back when the host went quiet. The window is also the
+  quantity `cv2_low_per_mille` bounds when a class is decided.
+- `FLYNNEL_LEVER_ALLOWED_WIDTH`: `JobPlan::resolved_workers` caps by the
+  CPUs the process may currently use, through the new
+  `sched::host_width::allowed_parallelism`. The
+  pool is spawned once and its threads outlive a change to the process
+  affinity mask or the cgroup CPU quota, so a host that has narrowed
+  since startup left the arena counting workers that cannot reach a
+  core. `std::thread::available_parallelism` honours both and is re-read
+  at most every 250 ms, because the answer costs a syscall and on Linux
+  a cgroup read. A failed query says so once, naming the error and the
+  width it keeps, and holds the last successful reading: one is a width
+  a genuinely pinned process has, so resolving an error to it would
+  silence the pool wherever the query is unsupported.
+
+  The cap binds only where the allowed width has actually narrowed. A
+  busy neighbor does not move the affinity mask or the cgroup quota, so
+  on a merely contended host this switch caps nothing and changes
+  nothing. `examples/width_narrowing.rs` reports the allowed width and
+  the resolved worker count beside each window so a run can say which
+  case it was in.
+- `CpuCalibration` records the occupancy its draw ran at, and
+  `CALIBRATION` layout version rises from 4 to 5, so the first start on
+  any host after this measures again. The spread a record already
+  carried says whether its samples agreed with each other; it cannot say
+  whether they agreed on the wrong number, which is what a draw taken
+  while a neighbour held half the machine produces - every sample slow,
+  and slow by about the same amount. The figure gates nothing: the share
+  of free cores is a continuous property of a host rather than a state
+  it is in, so no cutoff separates a contended draw from a clean one,
+  and a reader holding two records can prefer the better-drawn one.
+  `OCCUPANCY_UNRECORDED` is distinct from zero, which is the share a
+  thread that never reached a core genuinely reports.
+- `CpuCalibration::new` takes the occupancy as a sixth argument, which
+  is a breaking change for a caller constructing one directly.
+- `OccupancySample::per_mille` reports the same fraction as `percent` at
+  a thousandth rather than a hundredth. Ten per mille is the whole
+  distance between a pool that held its cores and one that lost a
+  hundredth of them, which is what a reader comparing two records is
+  looking at.
+- `FLYNNEL_LEVER_CALIBRATION_REFUSAL`: a calibration draw no longer
+  displaces one taken on a quieter host.
+  `publish` overwrote whatever the table held, so a process measuring
+  while a neighbor held half the machine replaced a better-drawn record
+  and published its own for every later process to read.
+  `WriterGuard::publish_if_better` compares the two records instead.
+
+  It is an ordering between two records, not a threshold on either. No
+  occupancy is called good or bad: the share of free cores is a
+  continuous property of a host rather than a state it is in, so a
+  cutoff would be a policy about how much of a machine a calibration
+  insists on and would have to be argued as one. Two records can still
+  be compared without settling that.
+
+  The comparison runs only where it can decide. An incumbent whose own
+  samples disagreed is replaced whatever it was drawn at, because its
+  spread already says it does not describe the host. Where either record
+  lacks an occupancy the two cannot be ordered and the offer is
+  published, so a platform with no thread clock cannot freeze the table.
+  A tie publishes, because the fresher draw describes the host now. A
+  refusal returns `PublishOutcome::KeptIncumbent` naming both figures
+  rather than passing silently.
+
+  THE COMPARISON IS UNREACHABLE AND THE SWITCH CHANGES NOTHING, on any
+  host. A consumer setting it should expect no behavior change until
+  that is fixed.
+
+  `publish_if_better` has one caller: the branch `stored_or_measured`
+  takes when the stored record is absent or FAILED
+  `CpuCalibration::is_trustworthy`. `prefers_incumbent` returns `None`
+  on its first line unless the incumbent PASSED the same check. A record
+  that passes is returned before that branch is reached and is never
+  offered for comparison, so the two conditions cannot both hold.
+
+  The unit tests build a `CalibrationStore` directly and call the guard
+  with an incumbent of their choosing, which is why they pass while the
+  path a process takes is never exercised.
+
+  Making a stored record something a fresh draw can displace is what
+  would deliver an incumbent to the comparison. Until then
+  `CpuCalibration::occupancy` is provenance a reader can inspect and
+  nothing acts on.
+- `sched::par_iter::sample_iqr_per_mille` reports the interquartile
+  range of a sorted sample set over its median, beside the existing
+  `sample_spread_per_mille`, which reports the full range over the same
+  median. Nothing reads either, and the pair is reported together
+  because having both is what showed neither can serve.
+
+  A range is defined by the two samples a median exists to survive, so
+  one scheduling hiccup in nine sets it. The interquartile range fixes
+  that and does not fix the thing that matters: measured across three
+  load levels on two hosts, both INVERT. Under saturation every sample
+  in a draw is slowed by about the same factor, so the samples agree
+  with each other while the medians independent draws produce scatter
+  enormously. On a Zen3 guest the interquartile range read 128 per
+  mille quiet against 86 saturated, while the medians of independent
+  draws went from 83 to 432,299.
+
+  The consequence for a caller: a dispersion figure taken over one
+  draw's samples does not say whether that draw's median is
+  reproducible, and under load it says the opposite. The figure that
+  does is the disagreement between two draws, which on the same data
+  separated those conditions by 14,149 times where the samples' own
+  spread separated them by 2.4.
+- `examples/clock_cost.rs` times what a thread-clock read costs on the
+  running host and what the sampled leaf bracket amortizes to at a given
+  stride, timing each half as the platform runs it -
+  `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` against `Instant::elapsed` on
+  Linux and FreeBSD, `QueryThreadCycleTime` against `rdtsc` on Windows.
+  It refuses to run where there is no thread clock rather than reporting
+  the cost of returning an absence.
+- `examples/width_narrowing.rs` times dispatch throughput while the CPUs
+  the process may use are taken away from under it, printing its pid
+  before it starts so a driver can narrow it partway through. It exits 3
+  when every window saw one allowed width, because a run the narrowing
+  never reached produces the same rows as a switch with no effect.
+- `sched::spin_adaptive` reports whether the park-versus-rescue
+  controller is running, after the environment has been read. The window
+  `sched::spin_window` returns sits at its tuned default both when the
+  controller is off and when it is on and the evidence keeps it there,
+  so a caller reporting only the window cannot tell those apart.
+- `examples/throughput_under_load.rs` takes the per-item cost and
+  whether it varies with the index. A workload whose items all cost the
+  same gives the call-site classifier a per-item spread of zero, and
+  every adaptive mechanism here reads that classifier, so such a
+  workload cannot show any of them doing anything. The irregular shape
+  varies the cost over `1 ..= 2 * reps - 1`, keeping the mean at `reps`
+  so the two shapes are comparable in total work.
 
 ### Fixed
 

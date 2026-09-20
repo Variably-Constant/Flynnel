@@ -106,13 +106,18 @@ The [`flynnel::backend`](Backend-System.md) module is an orthogonal layer for ro
 
 ## Topology probes
 
-Three small modules probe host hardware at startup; each caches its result in a `OnceLock`:
+Four small modules probe the host. The first three read hardware at startup and cache the result in a `OnceLock`; the fourth re-reads on a cadence, because what it measures can change while the process runs:
 
 | Module | What it probes | Surface |
 |--------|---------------|---------|
 | [`numa_topology`](NUMA-And-Topology.md#numatopology) | `/sys/devices/system/node/*` (Linux) or `GetLogicalProcessorInformationEx` (Windows) for per-CPU node membership and SLIT distances | `NumaTopology`, `numa_topology()` |
 | [`cpu_info`](NUMA-And-Topology.md#cpuinfo) | `std::thread::available_parallelism` + CPUID HTT bit for SMT factor | `CpuInfo`, `cpu_info()` |
 | [`numa_latency`](NUMA-And-Topology.md#numalatencytable) | Ping-pong cache-line round-trip between pinned cores (calibrated) | `TopologyLatencyTable`, `topology_latency_table()` |
+| `sched::host_width` | the CPUs the process may use right now: `std::thread::available_parallelism` on Linux and FreeBSD, honouring the affinity mask and the cgroup quota, and `GetProcessAffinityMask` on Windows, where that function may overcount under a process-wide mask | `allowed_parallelism()` |
+
+`host_width` is the one that is not a startup fact. A container's CPU quota can be lowered while it runs and an operator can re-pin a running process, so a width read once describes the machine at that moment rather than the one the next dispatch will get, and the pool's threads outlive the change. It is re-read at most every 250 ms because the answer costs a syscall and, on Linux, a cgroup read; `JobPlan::resolved_workers` caps by it.
+
+This is deliberately a different quantity from *how busy* the machine is. A neighbour's load is continuous and contested, with no cutoff separating busy from quiet, and shaping a dispatch on it would make identical code behave differently run to run. An affinity mask is a fact: the process may use these CPUs and not those, it changed or it did not, and there is no threshold to choose. `sched::occupancy` measures the busy half and, by design, nothing routes on it.
 
 ## Why these layers exist
 

@@ -147,6 +147,26 @@ impl OccupancySample {
         let pct = thread_ticks.saturating_mul(100) / wall_ticks;
         Some(pct.min(100) as u32)
     }
+
+    /// Occupancy in parts per mille, on the same terms as
+    /// [`percent`](Self::percent).
+    ///
+    /// Formed from the two counters rather than by scaling the
+    /// hundredths, which would carry that figure's step: ten per mille
+    /// is the whole distance between a pool that held its cores and one
+    /// that lost a hundredth of them, and a reader comparing two records
+    /// drawn minutes apart is reading exactly that distance.
+    pub fn per_mille(&self) -> Option<u32> {
+        let (thread_ticks, wall_ticks) = match *self {
+            Self::Measured { thread_ticks, wall_ticks } => (thread_ticks, wall_ticks),
+            Self::Unmeasured { .. } => return None,
+        };
+        if wall_ticks == 0 {
+            return Some(1000);
+        }
+        let share = thread_ticks.saturating_mul(1000) / wall_ticks;
+        Some(share.min(1000) as u32)
+    }
 }
 
 /// Spans a measured interval, reporting what fraction of it this thread

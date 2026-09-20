@@ -39,6 +39,12 @@ exclude = [
     "/examples/migrate_observability.rs",
     "/examples/analyze_trace.py",
     "/examples/pair_orders.py",
+    "/examples/lever_report.py",
+    "/examples/profile_draws_report.py",
+    "/examples/smt_report.py",
+    "/examples/lever_rounds.sh",
+    "/examples/width_report.py",
+    "/examples/width_rounds.sh",
     "/examples/trace_real_grep.rs",
     "/kaggle/**",
     "/tpu/**",
@@ -104,6 +110,14 @@ rayon = "1.12"
 # target/criterion/report/index.html dashboard. crates.io
 # 2026-06-03: 0.8.2 latest.
 criterion = { version = "0.8.2", features = ["html_reports"] }
+
+# Sets the process affinity mask in tests/affinity_follows_process_mask.rs.
+# Linux takes sched_setaffinity and FreeBSD cpuset_setaffinity, which
+# differ in name, arguments and set type, so the binding crate carries
+# both. Windows needs no dependency: that arm declares the two kernel32
+# symbols it calls.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [features]
 # EVERYTHING ON BY DEFAULT (owner directive, 2026-08-04). A release
@@ -192,6 +206,62 @@ name = "class_migration_under_load"
 
 [[example]]
 name = "class_loop_cost"
+
+[[example]]
+name = "smt_recovery"
+
+[[example]]
+name = "profile_cost"
+
+[[example]]
+name = "throughput_under_load"
+
+[[example]]
+name = "clock_cost"
+
+[[example]]
+name = "width_narrowing"
+
+[[example]]
+name = "profile_draws"
+
+[[example]]
+name = "oncore_reach"
+
+[[example]]
+name = "calibration_dump"
+required-features = ["persisted-calibration"]
+
+[[example]]
+name = "calibration_cost"
+required-features = ["persisted-calibration"]
+
+[[example]]
+name = "leaf_overhead"
+
+[[example]]
+name = "tile_crossover"
+
+[[example]]
+name = "audit_real_workloads_routing"
+
+[[example]]
+name = "classifier_audit"
+
+[[example]]
+name = "migrate_observability"
+
+[[example]]
+name = "observe_grep"
+
+[[example]]
+name = "observe_workloads"
+
+[[example]]
+name = "probe_k_gating"
+
+[[example]]
+name = "trace_real_grep"
 
 [[example]]
 name = "smt_wake_cost"

@@ -1114,6 +1114,16 @@ impl JobPlan {
     /// counters. The first call at any site sees no variance
     /// history and pays the SMT cost; subsequent calls converge
     /// within a few samples.
+    ///
+    /// The site's figure is the window its classifier last read, the
+    /// same quantity `cv2_low_per_mille` bounds when a class is
+    /// decided, and it ages: a stretch of spread leaves the window as
+    /// later windows replace it. The site's lifetime cv^2 answers only
+    /// until a window has been classified. That figure is an
+    /// equal-weight average over every leaf the site has ever run, so a
+    /// period of contention can only be diluted by running enough later
+    /// leaves to outweigh it, and a decision resting on it does not come
+    /// back when the host goes quiet.
     #[inline]
     pub fn effective_use_smt(&self) -> bool {
         if !self.use_smt {
@@ -1122,10 +1132,30 @@ impl JobPlan {
         let threshold = crate::sched::adaptive_profile::class_thresholds()
             .cv2_low_per_mille
             .load(core::sync::atomic::Ordering::Relaxed);
-        if let Some(site) = self.site
-            && let Some(cv2) = site.get().cv2_per_mille()
-        {
-            return cv2 >= threshold;
+        if let Some(site) = self.site {
+            let state = site.get();
+            // The window ages out and the lifetime figure does not, so
+            // the switch chooses between a decision that can come back
+            // and one that cannot.
+            let from_window = crate::sched::levers::smt_from_window();
+            let cv2 = if from_window {
+                state.window_cv2_per_mille().or_else(|| state.cv2_per_mille())
+            } else {
+                state.cv2_per_mille()
+            };
+            if let Some(cv2) = cv2 {
+                let decided = cv2 >= threshold;
+                // Only while the lever is on, so the shipped path pays a
+                // predictable branch and no atomic. The window figure is
+                // one classifier tick and moves between dispatches, so
+                // this decision is not constant over a run and a single
+                // reading of it describes one dispatch.
+                if from_window {
+                    SMT_WINDOW_DECISIONS[decision_slot(decided)]
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                return decided;
+            }
         }
         let stats = crate::sched::split_observer::snapshot_leaf_stats();
         !matches!(
@@ -1234,6 +1264,15 @@ impl JobPlan {
     /// in flight, so `total_workers` counts threads that exist rather
     /// than threads that run, and this is the count to divide work by.
     ///
+    /// It is also capped by the CPUs this process is allowed to use
+    /// right now, from
+    /// [`crate::sched::host_width::allowed_parallelism`]. The pool is
+    /// spawned once and its threads outlive a change to the process
+    /// affinity mask or the cgroup quota, so on a host that has narrowed
+    /// since startup the arena counts workers that can no longer reach a
+    /// core. Chunking against that count divides the work among threads
+    /// that will not run it.
+    ///
     /// Starts the arena if it is not already running.
     #[inline]
     #[must_use]
@@ -1244,8 +1283,60 @@ impl JobPlan {
         } else {
             arena.primary_workers()
         };
+        // The query is a syscall and a cgroup read, cached on a cadence;
+        // a caller that turns the lever off takes it off this path
+        // entirely.
+        let running = capped_by_allowed_width(
+            running,
+            crate::sched::levers::allowed_width(),
+            crate::sched::host_width::allowed_parallelism,
+        );
         self.effective_workers(running)
     }
+}
+
+/// Dispatches the window-driven SMT switch decided each way, indexed by
+/// the decision: `[0]` counts false, `[1]` counts true.
+///
+/// Counted only while the lever is on. The switch reads one classifier
+/// tick and that figure moves between dispatches, so its decision is not
+/// constant over a run and a reading taken once reports one dispatch.
+static SMT_WINDOW_DECISIONS: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// The slot a decision is counted in: `1` when SMT was allowed, `0`
+/// when it was declined, matching the `(declined, allowed)` order
+/// [`smt_window_decisions`] publishes.
+#[inline]
+fn decision_slot(decided: bool) -> usize {
+    usize::from(decided)
+}
+
+/// How many dispatches the window-driven SMT switch sent each way, as
+/// `(declined, allowed)`. Both zero while the lever is off, which is
+/// distinct from a lever that ran and always answered the same way.
+pub fn smt_window_decisions() -> (u64, u64) {
+    (
+        SMT_WINDOW_DECISIONS[0].load(core::sync::atomic::Ordering::Relaxed),
+        SMT_WINDOW_DECISIONS[1].load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `running` narrowed to the CPUs the process may currently use.
+///
+/// The probe is a closure so the switch short-circuits it: with the
+/// lever off the syscall and cgroup read never happen.
+///
+/// Narrows only. The arena's threads are spawned once, so a width above
+/// the spawned count names threads that do not exist and the pool
+/// cannot grow into it.
+fn capped_by_allowed_width<P>(running: usize, lever_on: bool, allowed: P) -> usize
+where
+    P: FnOnce() -> usize,
+{
+    if lever_on { running.min(allowed()) } else { running }
 }
 
 /// Integer square root for u64. Used by `optimal_chunk_count` to
@@ -1268,6 +1359,34 @@ fn integer_sqrt(n: u64) -> u64 {
     while x * x > n { x -= 1; }
     while (x + 1) * (x + 1) <= n { x += 1; }
     x
+}
+
+/// Whether a declared tile class promotes out of Inline on its item
+/// count alone.
+///
+/// A matrix-extension class says the item is a tile operation, and the
+/// smallest AMX or tensor-core tile is a multiply-accumulate over a
+/// 16x16 block. One tile never promotes: one item is one leaf, so there
+/// is nothing to split and a dispatch can only add its own cost.
+///
+/// Above one tile the count is a poor proxy. A consumer sweep at depth
+/// 16 has a 2x2 grid at 0.94x and a 4x4 at 2.71x, so some count between
+/// four and sixteen tiles is the crossing. A caller that declares what
+/// an item costs does not need it located: `estimated_per_item_ns`
+/// times the batch, against this host's own collapse threshold, is the
+/// same question asked in work rather than in tiles, and it yields a
+/// different tile count on every host. So the count only decides for a
+/// caller who declared no cost.
+///
+/// `explicit_estimate` is the caller's own figure rather than a
+/// classifier default, which is a routing hint and not a claim about
+/// this item.
+pub fn promotes_on_tile_count(
+    is_matrix_extension: bool,
+    batch_size: u32,
+    explicit_estimate: bool,
+) -> bool {
+    is_matrix_extension && batch_size > 1 && !explicit_estimate
 }
 
 /// Classify a K_outer into its tier band before considering
@@ -1392,10 +1511,17 @@ pub fn pick_tier(plan: &JobPlan, topo: &NumaTopology) -> SchedTier {
     // an AMX-emulating strip a one-tile grid measures 2,388 ns serial
     // against 2,827 ns dispatched.
     //
-    // Above one tile this is still too eager. The same sweep has a
-    // 2x2 grid at 0.94x and a 4x4 at 2.71x, so the crossover lies
-    // between 4 and 16 tiles and is not yet measured.
-    let tile_override = plan.hw_class.is_matrix_extension() && plan.batch_size > 1;
+    // Above one tile the count alone is too eager: the same sweep has a
+    // 2x2 grid at 0.94x and a 4x4 at 2.71x. Where the caller has
+    // declared what an item costs, `heavy_override` above already
+    // decides that on measured work against this host's own collapse
+    // threshold, so the count steps aside and the crossover is a
+    // relation rather than a constant to locate.
+    let tile_override = promotes_on_tile_count(
+        plan.hw_class.is_matrix_extension(),
+        plan.batch_size,
+        plan.estimated_per_item_ns_explicit,
+    );
 
     let base = kband_for(plan.k_outer);
     match base {
@@ -1605,6 +1731,83 @@ mod tests {
         assert!(HwClass::AmxFp16.is_matrix_extension());
         assert!(HwClass::TensorCoreHopper.is_matrix_extension());
         assert!(HwClass::TensorCoreBlackwell.is_matrix_extension());
+    }
+
+    #[test]
+    fn the_tally_indexes_allowed_and_declined_the_right_way_round() {
+        // A reversed index would swap the two counts and report a lever
+        // that always allowed SMT as one that always declined it, which
+        // reads as a result rather than as a defect.
+        //
+        // Counted into a local pair rather than SMT_WINDOW_DECISIONS. A
+        // delta across two reads of those is this test's only while
+        // nothing else moves them in between, and any other test in this
+        // binary that reaches the `from_window` branch does.
+        let mut slots = [0u64; 2];
+        slots[decision_slot(true)] += 1;
+        assert_eq!(slots, [0, 1], "an allowed decision lands in slot one");
+        slots[decision_slot(false)] += 1;
+        assert_eq!(slots, [1, 1], "and a declined one in slot zero");
+    }
+
+    #[test]
+    fn a_narrowed_process_chunks_for_the_cpus_it_still_has() {
+        // The case the lever exists for: the arena spawned sixteen and
+        // the process may now use four.
+        assert_eq!(capped_by_allowed_width(16, true, || 4), 4);
+        assert_eq!(
+            capped_by_allowed_width(16, false, || 4),
+            16,
+            "with the switch off the shipped width stands whatever the host allows"
+        );
+    }
+
+    #[test]
+    fn the_cap_narrows_and_never_widens_past_the_spawned_pool() {
+        // A quota raised above the count the arena was spawned with
+        // names threads that do not exist. host_width tracks the
+        // widening; the pool cannot grow into it, and the minimum is
+        // what keeps a dispatch from chunking for absent workers.
+        assert_eq!(capped_by_allowed_width(16, true, || 64), 16);
+        assert_eq!(capped_by_allowed_width(16, true, || 16), 16);
+    }
+
+    #[test]
+    fn the_switch_short_circuits_the_probe() {
+        // The probe is a syscall and a cgroup read. With the lever off
+        // it must not run at all, which is what keeps the cost off a
+        // host that turned the lever off.
+        let mut probed = false;
+        let width = capped_by_allowed_width(16, false, || {
+            probed = true;
+            4
+        });
+        assert_eq!(width, 16);
+        assert!(!probed, "the lever is off, so the host was never asked");
+    }
+
+    #[test]
+    fn a_declared_cost_takes_the_tile_count_out_of_the_decision() {
+        // Pure, so the host's own collapse threshold is not needed to
+        // assert it. What happens once the count steps aside is
+        // `heavy_override`'s, which reads that threshold and cannot be
+        // pinned from inside a test.
+        assert!(
+            promotes_on_tile_count(true, 4, false),
+            "four tiles and no declared cost: the count is all there is"
+        );
+        assert!(
+            !promotes_on_tile_count(true, 4, true),
+            "four tiles with a declared cost: the work decides, not the count"
+        );
+        assert!(
+            !promotes_on_tile_count(true, 1, false),
+            "one item is one leaf, so there is nothing to split"
+        );
+        assert!(
+            !promotes_on_tile_count(false, 64, false),
+            "a vector class says nothing a batch size does not already say"
+        );
     }
 
     #[test]

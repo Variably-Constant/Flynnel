@@ -208,7 +208,55 @@ fn record_leaf<F: FnOnce() -> R, R>(
     crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafEnd, 0);
     LOCAL_LEAF_BUFFER.with(|cell| {
         let mut buf = cell.borrow_mut();
-        buf.add(site, dt, items as u64);
+        buf.add(site, dt, items as u64, None);
+    });
+    out
+}
+
+/// [`record_leaf`] with the thread's own clock read either side as
+/// well, so the leaf carries its on-core time beside its wall time.
+///
+/// The two differ by whatever the leaf spent off a core, and that
+/// difference is the whole reason a busy host moves the scheduler's
+/// choice rather than only its speed: preemption lands on some leaves
+/// and not others, so it enters a wall-time spread as variance that
+/// cannot be told from the work's own irregularity.
+///
+/// Only the sampled path calls this, and only while
+/// [`crate::sched::levers::oncore_spread`] is on. Two clock pairs are
+/// added to the two counter reads the leaf already pays; on Linux and
+/// FreeBSD the thread-clock half of a pair is a syscall, since the vDSO
+/// serves the monotonic clocks and refuses the per-thread CPU clock.
+/// `examples/clock_cost.rs` reports what a pair costs on a host and
+/// what the bracket amortizes to at the sample stride. A leaf recorded
+/// off this path carries a wall time and no on-core reading, and the
+/// site divides each figure by the items that figure covers.
+///
+/// A platform with no thread clock records the wall time alone, which
+/// is what it has always recorded.
+#[inline(always)]
+fn record_leaf_on_core<F: FnOnce() -> R, R>(
+    site: Option<crate::sched::call_site::SiteRef>,
+    items: usize,
+    body: F,
+) -> R {
+    let (thread_before, _) = crate::sched::occupancy::clock_pair();
+    crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafStart, 0);
+    let t0 = read_tsc();
+    let out = body();
+    let dt = read_tsc().wrapping_sub(t0);
+    crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafEnd, 0);
+    let (thread_after, _) = crate::sched::occupancy::clock_pair();
+    // Both ends must have carried a count for the difference to describe
+    // an interval. One end without one leaves it unknowable, and a zero
+    // here would be the reading of a leaf that never reached a core.
+    let on_core = match (thread_before.ticks(), thread_after.ticks()) {
+        (Some(before), Some(after)) => Some(after.saturating_sub(before)),
+        _ => None,
+    };
+    LOCAL_LEAF_BUFFER.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.add(site, dt, items as u64, on_core);
     });
     out
 }
@@ -286,6 +334,13 @@ struct LocalLeafBuffer {
     /// on-core time against it, which would read as total contention.
     site_thread_at_start: crate::sched::occupancy::ThreadTicks,
     site_wall_at_start: u64,
+    /// The same leaves timed on the thread's own clock, in raw ticks,
+    /// for the leaves that carried a reading. Their own item count,
+    /// because a site reaches the sampled path for some leaves and not
+    /// others and each figure divides by the items it covers.
+    site_oncore_sum: u64,
+    site_oncore_sumsq_per_item: u64,
+    site_oncore_items: u64,
     /// Call site the buffered site-half samples belong to; null
     /// when the recent samples carried no site. Site changes are
     /// rare within one worker (only when it steals across
@@ -321,6 +376,9 @@ impl LocalLeafBuffer {
                 crate::sched::occupancy::NoReading::NoClock,
             ),
             site_wall_at_start: 0,
+            site_oncore_sum: 0,
+            site_oncore_sumsq_per_item: 0,
+            site_oncore_items: 0,
             site: core::ptr::null(),
         }
     }
@@ -331,6 +389,7 @@ impl LocalLeafBuffer {
         site: Option<crate::sched::call_site::SiteRef>,
         nanos: u64,
         items: u64,
+        oncore: Option<u64>,
     ) {
         let scaled = nanos >> 8;
         let sq = scaled.saturating_mul(scaled);
@@ -376,6 +435,23 @@ impl LocalLeafBuffer {
             self.site_sumsq_scaled = self.site_sumsq_scaled.saturating_add(sq);
             self.site_items = self.site_items.saturating_add(items);
             self.site_sumsq_per_item = self.site_sumsq_per_item.saturating_add(per_item_sq);
+            // The on-core reading, where this leaf carried one. Kept in
+            // raw ticks and summed the same shape as the wall side, so
+            // the two spreads are computed by the same arithmetic over
+            // different clocks. A leaf without one contributes to the
+            // wall figures and to nothing here, which is why the item
+            // count is separate: the on-core spread is divided by the
+            // items that actually carried a reading.
+            if let Some(ticks) = oncore {
+                let per_item_oncore = (ticks as u128)
+                    .saturating_mul(ticks as u128)
+                    .checked_div((items as u128) << 16)
+                    .unwrap_or(0) as u64;
+                self.site_oncore_sum = self.site_oncore_sum.saturating_add(ticks);
+                self.site_oncore_sumsq_per_item =
+                    self.site_oncore_sumsq_per_item.saturating_add(per_item_oncore);
+                self.site_oncore_items = self.site_oncore_items.saturating_add(items);
+            }
             self.site_count += 1;
             if self.site_count >= Self::FLUSH_THRESHOLD {
                 self.flush_site();
@@ -442,24 +518,47 @@ impl LocalLeafBuffer {
         // would grow the site's wall total against an unchanged on-core
         // total, and the site would read as contended on precisely the
         // platforms that cannot measure contention.
-        if let (Some(start), Some(end)) =
+        // The same pair gives the batch its weight, so a batch recorded
+        // while its worker was off its core counts for the share of the
+        // interval it actually ran. A pair that measured nothing weighs
+        // a whole batch: no reading is not evidence of contention.
+        let weight = if let (Some(start), Some(end)) =
             (self.site_thread_at_start.ticks(), thread.ticks())
         {
-            site.add_pool_ticks(
-                end.saturating_sub(start),
-                wall.saturating_sub(self.site_wall_at_start),
-            );
-        }
+            let on_core = end.saturating_sub(start);
+            let elapsed = wall.saturating_sub(self.site_wall_at_start);
+            site.add_pool_ticks(on_core, elapsed);
+            // The pool ticks are recorded either way - they cost nothing
+            // beyond this pair, which is read regardless. Only the
+            // WEIGHTING is switched, so the occupancy a site reports
+            // does not depend on which arm is running.
+            crate::sched::levers::batch_weight()
+                .then(|| crate::sched::call_site::batch_weight_per_mille(on_core, elapsed))
+                .flatten()
+        } else {
+            None
+        };
         let (sum_ns, sumsq_scaled) =
             Self::as_nanos(self.site_sum_ns, self.site_sumsq_scaled);
         let (_, sumsq_per_item) = Self::as_nanos(0, self.site_sumsq_per_item);
-        site.record_batch_site_only(
+        site.record_batch_weighted(
             sum_ns,
             sumsq_scaled,
             self.site_count,
             self.site_items,
             sumsq_per_item,
+            weight,
         );
+        // Unconverted, unlike the wall sums above: these are the thread
+        // clock's own ticks and only a ratio is taken of them.
+        site.record_oncore_batch(
+            self.site_oncore_sum,
+            self.site_oncore_sumsq_per_item,
+            self.site_oncore_items,
+        );
+        self.site_oncore_sum = 0;
+        self.site_oncore_sumsq_per_item = 0;
+        self.site_oncore_items = 0;
         self.site_sum_ns = 0;
         self.site_sumsq_scaled = 0;
         self.site_count = 0;
@@ -819,8 +918,9 @@ fn adaptive_min_leaf(plan: &JobPlan, caller_floor: usize) -> usize {
 /// Every value is in nanoseconds and was measured, never assumed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostDispatchProfile {
-    /// The pool's cost of one dispatch: one join over two leaves of
-    /// a compute-bound body, dispatched minus serial.
+    /// The pool's cost of one dispatch: the wall time of one join whose
+    /// two halves are a single item each, median of `DIRECT_SAMPLES`.
+    /// Observed, not a difference between two larger timings.
     pub dispatch_cost_ns: u64,
     /// Total work below which a body runs faster on the calling
     /// thread than dispatched: the serial time at the crossover of
@@ -1006,8 +1106,25 @@ fn stored_or_measured() -> HostDispatchProfile {
         }
     };
     if let Some((cpu, _accel)) = store.read()
-        && cpu.is_trustworthy()
+        && stored_record_serves(&cpu, configured_max_age_s(), now_unix_s())
     {
+        // A read and a measurement produce the same three numbers and
+        // nothing else distinguished them, so a stale record looked
+        // exactly like a host that calibrates consistently. Said under
+        // the same variable that reports a draw, because the question
+        // a reader has is which of the two happened.
+        if std::env::var_os("FLYNNEL_OCCUPANCY").is_some() {
+            eprintln!(
+                "flynnel: host profile {},{},{} READ from the stored record, not \
+                 measured; it was drawn at {} per mille occupancy with spread {} per \
+                 mille and stands until the layout version changes",
+                cpu.dispatch_cost_ns,
+                cpu.collapse_threshold_ns,
+                cpu.jec_wake_threshold_ns,
+                cpu.occupancy().map_or_else(|| "an unrecorded".to_string(), |o| o.to_string()),
+                cpu.spread_per_mille,
+            );
+        }
         return HostDispatchProfile {
             dispatch_cost_ns: cpu.dispatch_cost_ns,
             collapse_threshold_ns: cpu.collapse_threshold_ns,
@@ -1022,13 +1139,29 @@ fn stored_or_measured() -> HostDispatchProfile {
     // describes whoever picked it.
     let occupancy_window = crate::sched::occupancy::OccupancyWindow::start();
     let (profile, spread) = measure_host_dispatch();
+    // Sampled once and both reported and stored, so the figure a reader
+    // sees on stderr is the one the record carries.
+    let drawn_at = occupancy_window.sample().per_mille();
     if std::env::var_os("FLYNNEL_OCCUPANCY").is_some() {
         // An unmeasured interval is reported as unmeasured. Printing a
         // number for it would tell a reader the calibration ran on a
         // quiet host when what happened is that nobody looked.
-        match occupancy_window.sample().percent() {
-            Some(percent) => eprintln!(
-                "flynnel: host calibration ran at {percent} percent occupancy, \
+        // The three figures are printed in the form
+        // FLYNNEL_HOST_PROFILE_NS takes, so a draw taken under known
+        // conditions can be pinned into a later process and compared
+        // against another draw. Without this the occupancy beside a
+        // draw is readable and the draw itself is not, so two draws
+        // cannot be told apart by anything except the line that says
+        // what they ran under.
+        eprintln!(
+            "flynnel: host profile {},{},{}",
+            profile.dispatch_cost_ns,
+            profile.collapse_threshold_ns,
+            profile.jec_wake_threshold_ns,
+        );
+        match drawn_at {
+            Some(share) => eprintln!(
+                "flynnel: host calibration ran at {share} per mille occupancy, \
                  spread {spread} per mille",
             ),
             None => eprintln!(
@@ -1040,16 +1173,47 @@ fn stored_or_measured() -> HostDispatchProfile {
     match store.try_acquire_writer() {
         Ok(writer) => {
             writer.beat();
-            writer.publish(
+            let outcome = writer.publish_if_better(
                 &CpuCalibration::new(
                     profile.dispatch_cost_ns,
                     profile.collapse_threshold_ns,
                     profile.jec_wake_threshold_ns,
                     spread,
                     SAMPLES as u32,
+                    drawn_at,
                 ),
                 &[],
             );
+            // This process still runs on what it measured; only the
+            // table keeps the older record. Said rather than passed
+            // over, because a measurement that was taken and then
+            // discarded is not the same event as one that was stored,
+            // and the two are indistinguishable from the outside.
+            use crate::sched::calibration_store::PublishOutcome;
+            match outcome {
+                PublishOutcome::KeptIncumbent { incumbent, offered, confirmations } => {
+                    eprintln!(
+                        "flynnel: this host's stored calibration dispatches in {incumbent} \
+                         ns and this one in {offered}; the cheaper record stands and this \
+                         process uses what it measured. It carries {confirmations} \
+                         agreeing draw(s){}",
+                        if confirmations == 0 {
+                            ", so it stays provisional and the next start measures again"
+                        } else {
+                            " and serves the next start"
+                        }
+                    );
+                }
+                PublishOutcome::Published { confirmations: 0 } => eprintln!(
+                    "flynnel: this draw is stored and provisional; nothing has agreed \
+                     with it yet, so the next start measures again and the two are \
+                     compared"
+                ),
+                PublishOutcome::Published { confirmations } => eprintln!(
+                    "flynnel: this draw is stored with {confirmations} agreeing draw(s) \
+                     and serves the next start"
+                ),
+            }
         }
         // Another process on this host is measuring the same table. Its
         // record serves the next start; this process keeps the profile
@@ -1062,6 +1226,105 @@ fn stored_or_measured() -> HostDispatchProfile {
         ),
     }
     profile
+}
+
+/// Whether a stored record is returned to the caller, or the host is
+/// measured again.
+///
+/// The decision, separate from the environment and the clock that feed
+/// it, so it can be exercised with any record at any age. What matters
+/// about it cannot be tested otherwise: a record this returns true for
+/// is returned to the caller before the branch that would offer one to
+/// `WriterGuard::publish_if_better`, so that guard's comparison never
+/// sees a record in this state.
+///
+/// `max_age_s` of `None` is the shipped behavior: a record that clears
+/// its trust check stands until the layout version changes. A bound of
+/// zero is read as no bound, since re-measuring at every start is what
+/// the store exists to avoid and is not something a caller asks for by
+/// typing a number.
+///
+/// A record stamped in the future is a clock that moved rather than a
+/// fresh draw, so saturating leaves it aged zero and it stands.
+#[cfg(feature = "persisted-calibration")]
+fn stored_record_serves(
+    cpu: &crate::sched::calibration_store::CpuCalibration,
+    max_age_s: Option<u64>,
+    now_s: u64,
+) -> bool {
+    if !crate::sched::levers::serve_policy().admits(cpu) {
+        return false;
+    }
+    match max_age_s {
+        None | Some(0) => true,
+        Some(max) => now_s.saturating_sub(cpu.measured_unix_s) <= max,
+    }
+}
+
+/// How long a stored calibration serves before a fresh draw is taken.
+///
+/// One day. A record that clears the trust check is otherwise permanent
+/// for its stamp, and that check passes more readily for a draw taken
+/// under load, whose samples agree because they were all slowed
+/// together. This bound is what limits how long such a draw can route.
+///
+/// The cost is one calibration sweep per process start whose record has
+/// aged out, so a day is short enough to cap the exposure and long
+/// enough that repeated starts read the stored record.
+#[cfg(feature = "persisted-calibration")]
+pub const DEFAULT_CALIBRATION_MAX_AGE_S: u64 = 86_400;
+
+/// The age bound: `FLYNNEL_CALIBRATION_MAX_AGE_S` when it parses,
+/// otherwise [`DEFAULT_CALIBRATION_MAX_AGE_S`]. Zero means no bound and
+/// a record then stands until [`crate::sched::calibration_store::LAYOUT_VERSION`]
+/// rises.
+///
+/// Every way of failing to read it says which one happened and falls
+/// back to the default rather than to no bound, so a mistyped value
+/// costs at most one extra sweep a day instead of restoring the
+/// permanence the bound exists to end.
+#[cfg(feature = "persisted-calibration")]
+fn configured_max_age_s() -> Option<u64> {
+    let Some(raw) = std::env::var_os("FLYNNEL_CALIBRATION_MAX_AGE_S") else {
+        return Some(DEFAULT_CALIBRATION_MAX_AGE_S);
+    };
+    let Some(text) = raw.to_str() else {
+        eprintln!(
+            "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S is not valid UTF-8; using the \
+             default of {DEFAULT_CALIBRATION_MAX_AGE_S}s"
+        );
+        return Some(DEFAULT_CALIBRATION_MAX_AGE_S);
+    };
+    match text.trim().parse::<u64>() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!(
+                "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S wants a whole number of \
+                 seconds and got {text:?} ({e}); using the default of \
+                 {DEFAULT_CALIBRATION_MAX_AGE_S}s"
+            );
+            Some(DEFAULT_CALIBRATION_MAX_AGE_S)
+        }
+    }
+}
+
+/// Seconds since the epoch, or zero where the clock reads before it.
+///
+/// Zero ages every record to nothing, so a host whose clock is that
+/// wrong keeps serving what it has rather than re-measuring at every
+/// start off a figure that cannot be trusted.
+#[cfg(feature = "persisted-calibration")]
+fn now_unix_s() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(e) => {
+            eprintln!(
+                "flynnel: this host's clock reads before the epoch ({e}), so a stored \
+                 calibration's age cannot be taken and it stands"
+            );
+            0
+        }
+    }
 }
 
 /// The measured profile, with nothing persisted.
@@ -1349,12 +1612,17 @@ fn measure_host_dispatch() -> (HostDispatchProfile, u32) {
         }
         samples.sort_unstable();
         if std::env::var_os("FLYNNEL_PROFILE_SAMPLES").is_some() {
+            // Both dispersion figures, so a set of draws taken across
+            // known conditions can be compared on either without being
+            // re-run. The spread is what the trust check reads today;
+            // the IQR is the candidate it would be read against.
             eprintln!(
-                "profile sweep: min {} median {} max {} spread {} per mille samples {samples:?}",
+                "profile sweep: min {} median {} max {} spread {} iqr {} per mille samples {samples:?}",
                 samples[0],
                 samples[SAMPLES / 2],
                 samples[SAMPLES - 1],
                 sample_spread_per_mille(&samples),
+                sample_iqr_per_mille(&samples),
             );
         }
         (samples[SAMPLES / 2], sample_spread_per_mille(&samples))
@@ -1429,6 +1697,46 @@ pub fn sample_spread_per_mille(sorted: &[u64]) -> u32 {
     let median = sorted[sorted.len() / 2].max(1);
     let span = sorted[sorted.len() - 1].saturating_sub(sorted[0]);
     (span.saturating_mul(1000) / median).min(u32::MAX as u64) as u32
+}
+
+/// Interquartile range of a sorted sample set, in parts per thousand of
+/// its median.
+///
+/// Reported beside [`sample_spread_per_mille`] because the two describe
+/// different things and the difference decides whether a record is
+/// usable. The full range is defined by the extremes, so a single
+/// scheduling hiccup in nine samples sets it; the median a calibration
+/// keeps is chosen precisely because it survives that sample. Judging
+/// the one by the other refuses records whose medians are reproducible.
+///
+/// Measured on a 99.9-percent idle guest: five independent draws agreed
+/// on their medians to within 8 percent while each reported a range of
+/// 160 to 272 percent. Those cannot both describe the same dispersion.
+///
+/// This does not solve that, and neither can any figure taken over one
+/// draw's samples. Across three load levels on two hosts it inverts
+/// exactly as the range does: under saturation every sample is slowed
+/// by about the same factor, so the samples agree with each other
+/// while the medians independent draws produce scatter by thousands of
+/// parts per thousand. On a Zen3 guest this read 128 quiet against 86
+/// saturated while the medians went 83 to 432,299. The property a
+/// bound wants is whether the median reproduces, and that is a
+/// statement about two draws rather than about nine samples.
+///
+/// Reported beside the range because the two together are what show
+/// the inversion belongs to within-draw dispersion rather than to the
+/// range in particular. Nothing gates on either.
+pub fn sample_iqr_per_mille(sorted: &[u64]) -> u32 {
+    if sorted.len() < 4 {
+        return 0;
+    }
+    let median = sorted[sorted.len() / 2].max(1);
+    // Nearest-rank quartiles. Exact interpolation would be a choice
+    // about a nine-sample set that the bound derivation should make, not
+    // this function.
+    let q1 = sorted[sorted.len() / 4];
+    let q3 = sorted[(sorted.len() * 3) / 4];
+    (q3.saturating_sub(q1).saturating_mul(1000) / median).min(u32::MAX as u64) as u32
 }
 
 /// True when this dispatch runs its body on the calling thread: the
@@ -2124,7 +2432,15 @@ fn record_leaf_sampled<F: FnOnce() -> R, R>(
         v >= LEAF_SAMPLE_STRIDE
     });
     if should_sample {
-        record_leaf(site, items, body)
+        // The on-core bracket is two thread-clock reads on every sampled
+        // leaf, which a dispatch pays once per sampled leaf and not once
+        // per dispatch. Off by default until a measurement says the
+        // spread it buys is worth that.
+        if crate::sched::levers::oncore_spread() {
+            record_leaf_on_core(site, items, body)
+        } else {
+            record_leaf(site, items, body)
+        }
     } else {
         // Unsampled leaves still appear in the trace (one cached
         // load each when tracing is off) so a traced dispatch shows
@@ -2133,6 +2449,68 @@ fn record_leaf_sampled<F: FnOnce() -> R, R>(
         let out = body();
         crate::sched::trace::emit(crate::sched::trace::TraceEvent::LeafEnd, 0);
         out
+    }
+}
+
+/// Advance a stride counter and say whether this call is the one in
+/// [`LEAF_SAMPLE_STRIDE`] that takes the bracket.
+///
+/// Separate from [`record_leaf_bracket_sampled`] because the cadence is
+/// the whole of what that recorder adds, and the switch it also
+/// consults is read once per process and cached. A test driving the
+/// recorder could only ever observe whichever arm the process started
+/// in, so the cadence would go unasserted while looking covered.
+#[inline(always)]
+fn advance_bracket_tick(prev: u32) -> (u32, bool) {
+    let v = prev.wrapping_add(1);
+    let take = v >= LEAF_SAMPLE_STRIDE;
+    (if take { 0 } else { v }, take)
+}
+
+/// Leaf recorder for the entries that time every leaf: the wall
+/// reading is taken on every call, the on-core bracket on one call in
+/// [`LEAF_SAMPLE_STRIDE`].
+///
+/// Those entries decline to sample for a reason that is about the wall
+/// cadence alone. The observer needs a reading from every leaf to
+/// converge on a workload's shape within the first few iterations, and
+/// a strided sample never accumulates enough flushes for
+/// auto-migration to fire on small-N workloads. That argument says
+/// nothing about how often a leaf is bracketed, so the two cadences
+/// can differ, and without a recorder that lets them differ these
+/// entries cannot reach the bracket at all.
+///
+/// [`record_leaf`] and [`record_leaf_on_core`] differ only by the
+/// bracket, which is two thread-clock reads and enters the kernel on
+/// Linux and FreeBSD. It is taken only while
+/// [`crate::sched::levers::oncore_spread`] is on.
+#[inline]
+fn record_leaf_bracket_sampled<F: FnOnce() -> R, R>(
+    site: Option<crate::sched::call_site::SiteRef>,
+    items: usize,
+    body: F,
+) -> R {
+    thread_local! {
+        static BRACKET_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    // The switch is read first and the counter only advances behind it.
+    // Both orders pick the same leaves, but the counter is a
+    // thread-local read, modify and write on every leaf of these
+    // entries, and with the switch off that is work the path did not
+    // used to do. Reading the switch first leaves one cached bool on
+    // the default path.
+    if !crate::sched::levers::oncore_spread() {
+        return record_leaf(site, items, body);
+    }
+    let bracket = BRACKET_TICK.with(|c| {
+        let (next, take) = advance_bracket_tick(c.get());
+        c.set(next);
+        take
+    });
+    if bracket {
+        record_leaf_on_core(site, items, body)
+    } else {
+        record_leaf(site, items, body)
     }
 }
 
@@ -2375,7 +2753,7 @@ where
     F: Fn(&mut [T1], &[T2], &[T3]) + Sync,
 {
     if out.len() <= min_leaf {
-        record_leaf(plan.site, out.len(), || op(out, a, b));
+        record_leaf_bracket_sampled(plan.site, out.len(), || op(out, a, b));
         return;
     }
     let cur_splits = if migrated { max_budget } else { splits };
@@ -2383,7 +2761,7 @@ where
     // splitting at cur_splits=1 emits two children each holding
     // 0 budget, both immediately leaf, doubling leaf count.
     if cur_splits <= 1 {
-        record_leaf(plan.site, out.len(), || op(out, a, b));
+        record_leaf_bracket_sampled(plan.site, out.len(), || op(out, a, b));
         return;
     }
     let mid = out.len() >> 1;
@@ -2722,14 +3100,14 @@ where
     F: Fn(usize, &mut [T]) + Sync,
 {
     if items.len() <= min_leaf {
-        // record_leaf rather than _sampled: the closing-loop auto-classifier
-        // observer needs every leaf timed so it can converge on the
-        // workload's shape (mean_ns + cv^2) within the first few
-        // iterations of a real workload, not after thousands. The
-        // sampled variant rate-limited to 1-in-8, which never
-        // accumulated enough flushes for the auto-migration to fire
-        // on realistic small-N workloads (e.g. 16-chunk grep).
-        record_leaf(plan.site, items.len(), || op(start, items));
+        // Every leaf is wall-timed here: the closing-loop auto-classifier
+        // observer converges on the workload's shape (mean_ns + cv^2)
+        // within the first few iterations only if it sees them all, and
+        // on a small-N workload such as a 16-chunk grep a strided sample
+        // never accumulates enough flushes for auto-migration to fire.
+        // The on-core bracket rides a stride of its own inside the
+        // recorder, which that requirement does not constrain.
+        record_leaf_bracket_sampled(plan.site, items.len(), || op(start, items));
         return;
     }
     let ctx_ptr = crate::sched::arena_local::current_worker_ctx();
@@ -2759,7 +3137,7 @@ where
         // No steal pressure observed, so the entire remaining slice
         // runs inline as one leaf rather than splitting further. This is the rayon continuation-stealing
         // pattern: only fork further when somebody is starving.
-        record_leaf(plan.site, items.len(), || op(start, items));
+        record_leaf_bracket_sampled(plan.site, items.len(), || op(start, items));
         return;
     }
     let mid = items.len() / 2;
@@ -2789,13 +3167,13 @@ where
     F: Fn(usize, &mut [T]) + Sync,
 {
     if items.len() <= min_leaf {
-        record_leaf(plan.site, items.len(), || op(start, items));
+        record_leaf_bracket_sampled(plan.site, items.len(), || op(start, items));
         return;
     }
     let cur_splits = if migrated { max_budget } else { splits };
     // Leaf at `<= 1` (see `bisect` for the doubling-bug rationale).
     if cur_splits <= 1 {
-        record_leaf(plan.site, items.len(), || op(start, items));
+        record_leaf_bracket_sampled(plan.site, items.len(), || op(start, items));
         return;
     }
     let mid = items.len() >> 1;
@@ -4204,6 +4582,139 @@ mod tests {
     }
 
     #[test]
+    fn one_outlier_moves_the_range_and_leaves_the_iqr_alone() {
+        // Why the two are reported side by side. Eight samples that
+        // agree and one that does not is the shape a scheduling hiccup
+        // produces, and it is the shape that refuses records whose
+        // medians are reproducible to a few percent.
+        let tight: Vec<u64> = vec![100, 101, 102, 103, 104, 105, 106, 107, 108];
+        assert!(
+            sample_spread_per_mille(&tight) < 100,
+            "samples that agree report a small range"
+        );
+
+        let mut hiccup = tight.clone();
+        hiccup[8] = 900;
+        assert!(
+            sample_spread_per_mille(&hiccup) > 7_000,
+            "one sample nine times the rest sets the whole range"
+        );
+        assert!(
+            sample_iqr_per_mille(&hiccup) < 100,
+            "the middle half is untouched by it, which is what the median keeps"
+        );
+
+        // And the case the range is right about: samples that genuinely
+        // disagree move both figures.
+        let scattered: Vec<u64> = vec![20, 50, 90, 140, 200, 260, 330, 410, 500];
+        assert!(sample_spread_per_mille(&scattered) > 2_000);
+        assert!(
+            sample_iqr_per_mille(&scattered) > 1_000,
+            "a spread that is real reaches the middle half too"
+        );
+    }
+
+    #[cfg(feature = "persisted-calibration")]
+    #[test]
+    fn a_record_that_serves_is_one_the_refusal_will_never_be_offered() {
+        use crate::sched::calibration_store::CpuCalibration;
+
+        // The decision the caller actually takes, which every other
+        // test of this feature skips by building a store and calling
+        // the guard directly. A record that serves is returned before
+        // the branch that offers one for comparison, so the refusal on
+        // the other side of that branch cannot act on it.
+        let now = 1_000_000u64;
+        let mut passes = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        passes.confirmations = 1;
+        assert!(
+            stored_record_serves(&passes, None, now),
+            "with no age bound a trustworthy record is returned, so nothing offers it"
+        );
+
+        let provisional = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        assert!(
+            !stored_record_serves(&provisional, None, now),
+            "a record nothing has agreed with is measured over, and a record in that \
+             state is the only kind the refusal is ever offered"
+        );
+    }
+
+    #[cfg(feature = "persisted-calibration")]
+    #[test]
+    fn the_default_bound_is_a_day_and_the_comparison_includes_it() {
+        use crate::sched::calibration_store::CpuCalibration;
+
+        assert_eq!(
+            DEFAULT_CALIBRATION_MAX_AGE_S,
+            24 * 60 * 60,
+            "this bound is how long a contended draw can keep routing, so a change \
+             to it fails here rather than passing quietly"
+        );
+
+        let now = 2_000_000_000u64;
+        let bound = Some(DEFAULT_CALIBRATION_MAX_AGE_S);
+
+        let mut at_the_bound = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        at_the_bound.measured_unix_s = now - DEFAULT_CALIBRATION_MAX_AGE_S;
+        at_the_bound.confirmations = 1;
+        assert!(
+            stored_record_serves(&at_the_bound, bound, now),
+            "a record exactly the bound's age serves, so the comparison is inclusive"
+        );
+
+        let mut past_it = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        past_it.measured_unix_s = now - DEFAULT_CALIBRATION_MAX_AGE_S - 1;
+        past_it.confirmations = 1;
+        assert!(
+            !stored_record_serves(&past_it, bound, now),
+            "a second past it is drawn again"
+        );
+    }
+
+    #[cfg(feature = "persisted-calibration")]
+    #[test]
+    fn an_age_bound_is_what_lets_a_trustworthy_record_be_drawn_again() {
+        use crate::sched::calibration_store::CpuCalibration;
+
+        // A record stamped an hour ago, read under three bounds.
+        let drawn_at = 1_000_000u64;
+        let now = drawn_at + 3_600;
+        // Built and then stamped, rather than through a struct update:
+        // the record carries a private padding field, so a functional
+        // update from outside its own module cannot name everything it
+        // would have to.
+        let mut aged = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        aged.measured_unix_s = drawn_at;
+        aged.confirmations = 1;
+
+        assert!(
+            stored_record_serves(&aged, Some(7_200), now),
+            "inside the bound it stands"
+        );
+        assert!(
+            !stored_record_serves(&aged, Some(1_800), now),
+            "past the bound it is drawn again, which is the only way a trustworthy \
+             record is ever displaced short of a layout change"
+        );
+        assert!(
+            stored_record_serves(&aged, Some(0), now),
+            "zero is read as no bound rather than as re-measure always"
+        );
+
+        // A clock that moved backwards, or a record stamped ahead of
+        // this host, must not re-measure at every start until the
+        // clock catches up.
+        let mut future = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
+        future.measured_unix_s = now + 10_000;
+        future.confirmations = 1;
+        assert!(
+            stored_record_serves(&future, Some(60), now),
+            "a record stamped in the future ages to nothing and stands"
+        );
+    }
+
+    #[test]
     fn a_pinned_profile_parses_all_three_fields_or_none() {
         let p = parse_pinned_profile("1000,5000,20000").expect("three counts parse");
         assert_eq!(p.dispatch_cost_ns, 1000);
@@ -4232,6 +4743,195 @@ mod tests {
         );
         assert!(parse_pinned_profile("1000,fast,20000").is_none(), "a non-count is refused");
         assert!(parse_pinned_profile("").is_none(), "an empty value is refused");
+    }
+
+    #[test]
+    fn the_sampled_path_reaches_the_site_with_an_on_core_reading() {
+        // The mechanism is worthless if it never populates, and a run
+        // that measured nothing would report as a mechanism that did not
+        // help. This asserts the whole chain the sampled path uses:
+        // bracket, thread-local buffer, flush, site.
+        static SITE: crate::sched::call_site::CallSiteState =
+            crate::sched::call_site::CallSiteState::new();
+        let site = crate::sched::call_site::SiteRef::new(&SITE);
+        assert_eq!(SITE.oncore_items(), 0, "a fresh site has taken no reading");
+
+        // Past FLUSH_THRESHOLD so the buffer reaches the site, with work
+        // in each leaf the compiler cannot discard: a body optimized
+        // away would leave a clock delta of zero, which is a reading a
+        // starved thread can genuinely have.
+        let mut sink = 0u64;
+        for i in 0..(LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4) {
+            sink = sink.wrapping_add(record_leaf_on_core(Some(site), 64, || {
+                let mut acc = 0u64;
+                for k in 0..4_096u64 {
+                    acc = acc.wrapping_add(std::hint::black_box(k ^ i as u64));
+                }
+                acc
+            }));
+        }
+        std::hint::black_box(sink);
+
+        // A platform without a thread clock takes no readings at all,
+        // and that is a correct outcome rather than a failure: the
+        // classifier falls back to wall time there. So the assertion is
+        // conditional on the platform reporting one, and says which case
+        // it took rather than passing silently in both.
+        let (thread, _) = crate::sched::occupancy::clock_pair();
+        if thread.ticks().is_some() {
+            assert!(
+                SITE.oncore_items() > 0,
+                "this platform has a thread clock, so the sampled path must have \
+                 carried a reading to the site"
+            );
+            assert!(
+                SITE.per_item_oncore_cv2_per_mille().is_some(),
+                "items were recorded, so a spread is computable from them"
+            );
+        } else {
+            assert_eq!(
+                SITE.oncore_items(),
+                0,
+                "with no thread clock the site must hold no on-core items rather \
+                 than a zero that reads as a measurement"
+            );
+            assert_eq!(SITE.per_item_oncore_cv2_per_mille(), None);
+        }
+    }
+
+    #[test]
+    fn one_call_in_the_stride_takes_the_bracket_and_the_rest_do_not() {
+        // Both halves of "one in N" are asserted: how many calls take
+        // the bracket, and how far apart they are. A counter that reset
+        // on every call would take all of them; one that never reset
+        // would take every call after the first N. The count alone
+        // separates neither from a correct stride, because a run long
+        // enough for the second to be wrong is also long enough for its
+        // count to look plausible.
+        let rounds = LEAF_SAMPLE_STRIDE as usize * 10;
+        let mut tick = 0u32;
+        let mut taken_at = Vec::new();
+        for call in 0..rounds {
+            let (next, take) = advance_bracket_tick(tick);
+            tick = next;
+            if take {
+                taken_at.push(call);
+            }
+        }
+
+        assert_eq!(
+            taken_at.len(),
+            10,
+            "one call in {LEAF_SAMPLE_STRIDE} over {rounds} calls is 10 brackets, \
+             got {} at {taken_at:?}",
+            taken_at.len()
+        );
+        for pair in taken_at.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                LEAF_SAMPLE_STRIDE as usize,
+                "brackets at {taken_at:?} are not one stride apart"
+            );
+        }
+    }
+
+    #[test]
+    fn the_indexed_path_times_every_leaf_and_leaves_the_bracket_to_the_switch() {
+        // The indexed entry records through `record_leaf_bracket_sampled`,
+        // which times every leaf and takes the bracket at the stride only
+        // while `levers::oncore_spread` is on. That switch is read once
+        // per process, and a test binary runs with it off, so what is
+        // assertable here is that the bracket stays behind it.
+        //
+        // Both halves are asserted. A dispatch that recorded no leaves
+        // at all would satisfy the second on its own, and would be a
+        // broken recorder rather than the arrangement this pins. The
+        // cadence itself is asserted by
+        // `one_call_in_the_stride_takes_the_bracket_and_the_rest_do_not`,
+        // which can reach it without the switch.
+        static SITE: crate::sched::call_site::CallSiteState =
+            crate::sched::call_site::CallSiteState::new();
+        let site = crate::sched::call_site::SiteRef::new(&SITE);
+
+        // Past the buffer's flush threshold so the counts reach the
+        // site, with work in each leaf the compiler cannot discard.
+        let n = 4 * MIN_LEAF_ITEMS;
+        let mut v: Vec<u64> = (0..n as u64).collect();
+        for _ in 0..(LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4) {
+            let plan = JobPlan::new(0, n as u32).with_site(site);
+            for_each_chunk_indexed_min_leaf(&plan, &mut v, MIN_LEAF_ITEMS, |_start, chunk| {
+                for slot in chunk.iter_mut() {
+                    let mut acc = *slot;
+                    for _ in 0..64 {
+                        acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    }
+                    *slot = std::hint::black_box(acc);
+                }
+            });
+        }
+
+        assert!(
+            SITE.leaf_count() > 0,
+            "the indexed entry records every leaf, so the site must have counts"
+        );
+        assert!(
+            SITE.oncore_items() > 0,
+            "the indexed entry reaches the bracket, which `oncore_spread` leaves on by \
+             default; a zero here means the recorder never takes it"
+        );
+        // That the bracket is gated by the switch rather than taken
+        // unconditionally is asserted by
+        // `one_call_in_the_stride_takes_the_bracket_and_the_rest_do_not` over
+        // `advance_bracket_tick`. The switch is a process-wide OnceLock, so a
+        // test binary sees one arm of it and cannot drive both.
+        assert!(SITE.per_item_oncore_cv2_per_mille().is_some());
+    }
+
+    #[test]
+    fn the_triple_path_times_every_leaf_and_leaves_the_bracket_to_the_switch() {
+        // The same arrangement as the indexed entry, asserted separately
+        // so a failure names which of the two changed. The triple
+        // bisect is what the slice ops route through, so this covers
+        // the other half of the production call sites that reach the
+        // on-core switch.
+        static SITE: crate::sched::call_site::CallSiteState =
+            crate::sched::call_site::CallSiteState::new();
+        let site = crate::sched::call_site::SiteRef::new(&SITE);
+
+        let n = 4 * MIN_LEAF_ITEMS;
+        let a: Vec<u64> = (0..n as u64).collect();
+        let b: Vec<u64> = (0..n as u64).map(|x| x ^ 0x5DEE_CE66).collect();
+        let mut out: Vec<u64> = vec![0; n];
+        for _ in 0..(LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4) {
+            let plan = JobPlan::new(0, n as u32).with_site(site);
+            for_each_chunk_triple_min_leaf(
+                &plan,
+                &mut out,
+                &a,
+                &b,
+                MIN_LEAF_ITEMS,
+                |out, a, b| {
+                    for i in 0..out.len() {
+                        let mut acc = a[i] ^ b[i];
+                        for _ in 0..64 {
+                            acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        }
+                        out[i] = std::hint::black_box(acc);
+                    }
+                },
+            );
+        }
+
+        assert!(
+            SITE.leaf_count() > 0,
+            "the triple entry records every leaf, so the site must have counts"
+        );
+        assert!(
+            SITE.oncore_items() > 0,
+            "the triple entry reaches the bracket, which `oncore_spread` leaves on by \
+             default; a zero here means the recorder never takes it"
+        );
+        assert!(SITE.per_item_oncore_cv2_per_mille().is_some());
     }
 
     #[test]

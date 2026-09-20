@@ -1,0 +1,419 @@
+"""Per-lever throughput, each switch read against its own null.
+
+Every lever has to clear the same two-part criterion: never slower with
+the host quiet, faster with it contended, against the same code without
+the lever. One binary runs both arms, so a row differs from its
+neighbor in the switch and in nothing else.
+
+The null arm is the same binary invoked a second time with the switch
+still off. It measures what two identical arms do in this rotation, and
+it is the floor the on/off ratio has to clear. Without it a 1.48 and a
+1.07 look alike, which is how an earlier reading here was called and
+then withdrawn.
+
+The engagement section is read before the throughput table. A switch
+that never reached its mechanism produces the same clean null as one
+that reached it and did not help, and the difference is not visible in
+a dispatch count.
+
+The arm-state block above it answers a different question: whether each
+arm ran the switch its label claims. `armstate_defect_sample.log` beside
+this file is a hand-written log where the off and null arms report the
+lever on, which is what a rotation produces when an arm expresses "off"
+by leaving the variable unset and the lever ships on. Running this
+report over it must name those two arms and refuse their cells, and must
+pass the lever whose arms differ:
+
+    python examples/lever_report.py examples/armstate_defect_sample.log
+"""
+
+import re
+import sys
+from collections import defaultdict
+
+# The pass is optional so a log taken before levels were visited twice
+# still parses; those rows read as pass 1 and their cells report one
+# visit, which is what they were.
+ARM = re.compile(
+    r"^ARM\s+([A-Z_]+)-(off|null|on)\s+load(\d+)(?:\s+p(\d+))?\s+t(\d+)"
+)
+ROW = re.compile(r"^throughput\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)\s*$")
+ENGAGE = re.compile(r"^engagement\s+(.*)$")
+LEVERS = re.compile(r"^levers:\s+(.*)$")
+
+# Where each lever's resolved state is reported, and under what name.
+# Four are switches the crate describes; the spin controller is not one
+# of them and states itself on the engagement line instead.
+LEVER_STATE = {
+    "ONCORE_SPREAD": ("levers", "oncore_spread"),
+    "BATCH_WEIGHT": ("levers", "batch_weight"),
+    "SMT_WINDOW": ("levers", "smt_window"),
+    "ALLOWED_WIDTH": ("levers", "allowed_width"),
+    "CALIBRATION_REFUSAL": ("levers", "calibration_refusal"),
+    "ADAPTIVE_SPIN": ("engage", "spin_adaptive"),
+}
+FAILED = re.compile(r"^ARM_FAILED\s+(\S+)\s+load(\d+)\s+t(\d+)\s+exit=(\d+)")
+
+# Behavior the lever changes, never the switch itself. A switch that
+# moved none of these across its own arms moved no decision, whatever
+# the dispatch counts did.
+#
+# spin_adaptive is excluded because it IS the switch: it differs between
+# the arms by construction, so including it makes this test pass for
+# every rotation of that lever whatever the controller went on to do.
+# The arm-state block reads it instead.
+#
+# class is the weakest member. It is decided from the per-window cv^2,
+# which is one classifier tick and spans its whole range within a run,
+# so class differing between two arms is as likely to be that flapping
+# as anything the lever did. Treat class alone as no evidence.
+DECISIONS = ("class", "smt", "workers", "allowed", "spin_window")
+# The fields those decisions are taken from. Counters and spreads,
+# reported as medians because each arm is one process.
+MEASURES = (
+    "leaves",
+    "oncore_items",
+    "per_item_ns",
+    "cv2_wall",
+    "cv2_oncore",
+    "cv2_window",
+    # The extremes over every classifier tick. cv2_window is the latest
+    # tick of what is often thousands and does not reproduce between
+    # runs of one configuration, so a maximum below the uniform edge is
+    # what says a spread-driven lever was never consulted in its own
+    # regime.
+    "cv2_window_min",
+    "cv2_window_max",
+    "window_ticks",
+    # How the window-driven smt switch decided, per dispatch. Both zero
+    # is a lever that never ran; a single smt=true or smt=false is one
+    # dispatch's answer and the window it reads moves between them.
+    "smt_declined",
+    "smt_allowed",
+    # Decisions the adaptive spin controller reached. Zero with
+    # spin_adaptive true means it never gathered the evidence, which
+    # spin_window alone cannot say because a rescue-dominated window
+    # grows and clamps to the default it started from.
+    "spin_adapts",
+    "idle_yields",
+)
+
+
+def median(v):
+    s = sorted(v)
+    n = len(s)
+    if n == 0:
+        return None
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def numeric_median(values):
+    """Median over the readings that are readings.
+
+    A dash is the harness saying it had nothing to report, which is not
+    a zero and must not be averaged with one. The count of dashes is
+    returned beside the median so a column built entirely out of them
+    cannot read as a measurement.
+    """
+    nums = [float(v) for v in values if v not in ("-", "")]
+    return median(nums), len(values) - len(nums)
+
+
+def parse(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = [ln.strip() for ln in fh if ln.strip()]
+
+    pending = None
+    cells = defaultdict(list)
+    per_visit = defaultdict(list)
+    engage = defaultdict(list)
+    switches = defaultdict(list)
+    failures = []
+    skipped = []
+    by_position = defaultdict(list)
+    seen_in_trial = defaultdict(int)
+
+    for line in lines:
+        if line.startswith("SKIPPED "):
+            skipped.append(line[len("SKIPPED "):])
+            continue
+        f = FAILED.match(line)
+        if f:
+            failures.append(line)
+            pending = None
+            continue
+        m = ARM.match(line)
+        if m:
+            pending = (
+                m.group(1),
+                m.group(2),
+                int(m.group(3)),
+                int(m.group(4) or 1),
+                int(m.group(5)),
+            )
+            continue
+        e = ENGAGE.match(line)
+        if e and pending is not None:
+            lever, arm, load, _pass, _trial = pending
+            fields = {}
+            for token in e.group(1).split():
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    fields[key] = value
+            engage[(lever, load, arm)].append(fields)
+            continue
+        s = LEVERS.match(line)
+        if s and pending is not None:
+            lever, arm, load, _pass, _trial = pending
+            fields = {}
+            for token in s.group(1).split():
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    fields[key] = value
+            switches[(lever, load, arm)].append(fields)
+            continue
+        r = ROW.match(line)
+        if r and pending is not None:
+            lever, arm, load, visit, trial = pending
+            if int(r.group(1)) != load:
+                raise SystemExit(
+                    f"MISMATCH: label load{load}, row load {r.group(1)}"
+                )
+            value = float(r.group(4))
+            cells[(lever, load, arm)].append(value)
+            per_visit[(lever, load, visit, arm)].append(value)
+            key = (lever, load, visit, trial)
+            seen_in_trial[key] += 1
+            by_position[(load, seen_in_trial[key])].append(value)
+    return cells, per_visit, engage, switches, failures, skipped, by_position
+
+
+def report_arm_states(switches, engage, levers, loads):
+    """Whether each arm ran the switch its label claims.
+
+    An off arm that leaves the variable unset takes whatever the crate
+    defaults to, and two levers ship on, so a rotation can compare an arm
+    with itself and produce a clean null while doing it. This reads the
+    state each process reported and says when it contradicts the label.
+    """
+    print()
+    print("ARM STATES, read before anything else:")
+    print("-" * 78)
+    wrong = 0
+    for lever in levers:
+        where = LEVER_STATE.get(lever)
+        if where is None:
+            print(f"  {lever:<20} no state field known; the label is all there is")
+            continue
+        source, key = where
+        table = switches if source == "levers" else engage
+        for arm, want in (("off", "false"), ("null", "false"), ("on", "true")):
+            seen = sorted(
+                {f.get(key, "-") for load in loads for f in table.get((lever, load, arm), [])}
+            )
+            if not seen:
+                print(f"  {lever:<20} {arm:<5} no {key} reported; cannot tell what ran")
+                wrong += 1
+            elif seen != [want]:
+                print(f"  {lever:<20} {arm:<5} {key}={seen}, and this arm means {want}")
+                wrong += 1
+    if wrong:
+        print()
+        print(
+            f"{wrong} arm(s) did not run the switch their label claims. Their cells "
+            "compare something with itself; do not read them."
+        )
+    else:
+        print("  every arm ran the switch its label claims")
+
+
+def report_engagement(engage, levers, loads):
+    print()
+    print("ENGAGEMENT, read before the throughput table:")
+    print("-" * 78)
+    for lever in levers:
+        for load in loads:
+            arms = {
+                arm: engage.get((lever, load, arm), []) for arm in ("off", "null", "on")
+            }
+            if not arms["off"] or not arms["on"]:
+                print(f"{lever} load{load}: no engagement line on one arm")
+                continue
+            moved = []
+            for field in DECISIONS:
+                # A dash where the log carries no such field, so a
+                # reader can tell a run that predates it from one whose
+                # value happened to be missing.
+                off_values = {f.get(field, "-") for f in arms["off"]}
+                on_values = {f.get(field, "-") for f in arms["on"]}
+                if off_values != on_values:
+                    moved.append(f"{field} {sorted(off_values)} -> {sorted(on_values)}")
+            # The load shape belongs beside the verdict: a weighting
+            # that only bites when batches differ reads as no effect
+            # under a load that never lets up, and the duty is the only
+            # record of which one this cell ran under.
+            shape = ", ".join(
+                f"{k}={sorted({f.get(k, '-') for f in arms['off']})}"
+                for k in ("duty_ms", "reps", "irregular")
+            )
+            print(f"{lever} load{load} {shape}:")
+            if moved:
+                for line in moved:
+                    print(f"    moved   {line}")
+            else:
+                held = ", ".join(
+                    f"{field}={sorted({f.get(field, '-') for f in arms['off']})}"
+                    for field in DECISIONS
+                )
+                print(f"    no decision moved between its own arms: {held}")
+                print("    the throughput row below is not a reading of this mechanism")
+            for field in MEASURES:
+                off_med, off_blank = numeric_median([f.get(field, "-") for f in arms["off"]])
+                on_med, on_blank = numeric_median([f.get(field, "-") for f in arms["on"]])
+                if off_med is None and on_med is None:
+                    print(f"    {field:<14} never reported on either arm")
+                    continue
+                off_text = "-" if off_med is None else f"{off_med:.1f}"
+                on_text = "-" if on_med is None else f"{on_med:.1f}"
+                note = ""
+                if off_blank or on_blank:
+                    note = f"  ({off_blank} and {on_blank} arms had no reading)"
+                print(f"    {field:<14} off {off_text:>12}   on {on_text:>12}{note}")
+            print()
+
+
+def repeatability(per_visit, levers, loads):
+    """Does a cell's on/off ratio survive being visited somewhere else.
+
+    Each load level is measured twice with the levels rotated between
+    passes, so a level that came early in one pass comes later in the
+    other. A ratio that reproduces across those two visits is following
+    the load; one that does not was following whatever else the box was
+    doing while that stretch of the run happened.
+
+    This is the test the shape of the curve cannot do. A lever that
+    genuinely helps only when cores are free and an artefact of an
+    unloaded box BOTH give a ratio that moves with load, so a moving
+    ratio is not evidence either way. Reproducing under a changed
+    visiting order is.
+    """
+    visits = sorted({k[2] for k in per_visit})
+    if len(visits) < 2:
+        return
+    print()
+    print("REPEATABILITY, the same cell visited twice in different positions:")
+    print(f"{'lever':<22} {'load':>5} {'visit 1':>9} {'visit 2':>9} {'agree':>8}")
+    print("-" * 60)
+    for lever in levers:
+        for load in loads:
+            ratios = []
+            for v in visits[:2]:
+                off = median(per_visit.get((lever, load, v, "off"), []))
+                on = median(per_visit.get((lever, load, v, "on"), []))
+                ratios.append(on / off if off and on else None)
+            a, b = ratios[0], ratios[1]
+            if a is None or b is None:
+                print(f"{lever:<22} {load:>5}   one visit only")
+                continue
+            # The gap between the two visits, against how far the
+            # smaller of them sits from 1. A cell whose two readings
+            # disagree by more than the effect either one claims has
+            # not measured an effect.
+            gap = abs(b - a)
+            claim = min(abs(a - 1.0), abs(b - 1.0))
+            verdict = "repeats" if gap <= claim else "DOES NOT REPEAT"
+            print(f"{lever:<22} {load:>5} {a:>9.3f} {b:>9.3f} {verdict:>8}")
+    print()
+    print("A cell marked DOES NOT REPEAT differs between its two visits")
+    print("by more than the effect either visit claims, so the reading is")
+    print("about when it ran rather than about the switch.")
+
+
+def main(path):
+    cells, per_visit, engage, switches, failures, skipped, by_position = parse(path)
+
+    if not cells:
+        print("NO ROWS PARSED")
+        return 1
+    total = sum(len(v) for v in cells.values())
+    print(f"parsed {total} rows from {path}", flush=True)
+
+    for line in skipped:
+        print(f"not measured: {line}")
+    for line in failures:
+        print(line)
+    if failures:
+        print(
+            f"{len(failures)} arm(s) exited non-zero. Their cells are short by that "
+            "many rows, which a median hides."
+        )
+
+    levers = sorted({k[0] for k in cells})
+    loads = sorted({k[1] for k in cells})
+
+    report_arm_states(switches, engage, levers, loads)
+    report_engagement(engage, levers, loads)
+
+    print()
+    print(f"{'lever':<22} {'load':>5} {'on/off':>8} {'null/off':>9} {'verdict':<28}")
+    print("-" * 78)
+    for lever in levers:
+        for load in loads:
+            off = median(cells.get((lever, load, "off"), []))
+            null = median(cells.get((lever, load, "null"), []))
+            on = median(cells.get((lever, load, "on"), []))
+            if not off or not null or not on:
+                print(f"{lever:<22} {load:>5}   incomplete cell")
+                continue
+            r_on, r_null = on / off, null / off
+            # The null's distance from 1.0 is the floor. A lever is only
+            # read as moving anything when it is further from 1.0 than
+            # the null is, and in the direction the criterion wants.
+            floor = abs(r_null - 1.0)
+            effect = r_on - 1.0
+            if abs(effect) <= floor:
+                verdict = "inside the null floor"
+            elif load == 0:
+                verdict = "REGRESSION" if effect < 0 else "faster (unloaded)"
+            else:
+                verdict = "SLOWER under load" if effect < 0 else "faster under load"
+            print(f"{lever:<22} {load:>5} {r_on:>8.3f} {r_null:>9.3f} {verdict:<28}")
+
+    repeatability(per_visit, levers, loads)
+
+    # Position, read before the levers are believed. If throughput
+    # drifts with position within a rotation then position is a variable
+    # the arms carry, and a design that did not rotate them measured it.
+    print()
+    print("THROUGHPUT BY POSITION IN THE ROTATION, arm ignored:")
+    print(f"{'load':>5} {'pos':>4} {'n':>4} {'median/s':>12} {'vs pos 1':>9}")
+    print("-" * 40)
+    drift = 0.0
+    for load in loads:
+        first = median(by_position.get((load, 1), []))
+        for pos in sorted(p for (l, p) in by_position if l == load):
+            v = by_position[(load, pos)]
+            m = median(v)
+            rel = (m / first) if first else float("nan")
+            drift = max(drift, abs(rel - 1.0))
+            print(f"{load:>5} {pos:>4} {len(v):>4} {m:>12.2f} {rel:>9.3f}")
+    print()
+    if drift > 0.05:
+        print(f"Position moves throughput by up to {drift * 100:.0f} percent.")
+        print("Read every verdict above against that. If the arms were not")
+        print("rotated across trials, position and arm are one variable and")
+        print("the table is measuring their sum.")
+    else:
+        print(f"Position moves throughput by at most {drift * 100:.1f} percent here,")
+        print("so the rotation is not carrying the result.")
+
+    print()
+    print("on/off and null/off are medians of the same binary in one")
+    print("rotation. A verdict of 'inside the null floor' means the")
+    print("switch moved the number by no more than two identical arms")
+    print("moved it, which is not a measurement of the switch.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1]))

@@ -617,9 +617,17 @@ fn load_window(
 }
 
 fn usage() -> ! {
-    eprintln!("usage: class_loop_cost <shape> <routing> [window_s] [load_s] [load_threads]");
+    eprintln!(
+        "usage: class_loop_cost <shape> <routing> [window_s] [load_s] [load_threads] \
+         [post_windows]"
+    );
     eprintln!("  shape:   fine, medium, heavy, huge, gather");
     eprintln!("  routing: adaptive, streaming, latency");
+    eprintln!(
+        "  post_windows: measured windows after the load, for the recovery column. \
+         The last column is the window the class came back in, counting the timed \
+         one as the first, or - if it had not come back by the last window."
+    );
     std::process::exit(2);
 }
 
@@ -647,10 +655,16 @@ fn main() {
     let window_s: u64 = arg(3, 8);
     let load_s: u64 = arg(4, 6);
     let load_threads: usize = arg(5, 12);
+    // Measured windows after the load, for reading how long a class that
+    // moved takes to come back. One is the shape every earlier row was
+    // printed in, so the default leaves those comparable; above one, the
+    // row gains a recovery column and nothing else moves.
+    let post_windows: usize = arg(6, 1).max(1);
 
     eprintln!(
         "shape {}  routing {}  window {window_s}s  load {load_s}s  \
-         load_threads {load_threads}  min_leaf {MIN_LEAF}  items {}",
+         load_threads {load_threads}  post_windows {post_windows}  \
+         min_leaf {MIN_LEAF}  items {}",
         shape.name(),
         routing.name(),
         shape.items()
@@ -671,6 +685,12 @@ fn main() {
         SITE.per_item_ns(),
         SITE.per_item_cv2_per_mille(),
     );
+    // Whether the on-core clock reached this site at all, beside what it
+    // read. Only the sampled path takes those readings, so a routing or
+    // a shape that never goes through it leaves the spread measured on
+    // wall time - and a row that did not say so would report a mechanism
+    // as ineffective when it was never engaged.
+    let oncore_pre = (SITE.oncore_items(), SITE.per_item_oncore_cv2_per_mille());
 
     load_window(
         shape,
@@ -690,14 +710,62 @@ fn main() {
     let class_post = SITE.learned_class();
     let global_post = active_workload_class();
 
+    // How many windows the class took to come back, counting the one
+    // just timed as the first. A class that never left is 1; one still
+    // away when the windows run out is "-", which is a censored
+    // observation rather than a large number - printing the window count
+    // there would read as a measurement of how long it took.
+    //
+    // Later windows are run for their effect on the classifier and their
+    // timings are deliberately not reported: the row's ratio is the
+    // first window against the pre-load one, and redefining it when an
+    // argument changes would make two rows incomparable without saying
+    // so.
+    let mut recovered_at = (class_post == class_pre).then_some(1usize);
+    let mut empty_windows = 0usize;
+    for n in 2..=post_windows {
+        if recovered_at.is_some() {
+            break;
+        }
+        let (_, dispatches, ..) = window(shape, routing, site, &mut buf, &table, measured);
+        // A window that dispatched nothing could not have moved the
+        // class, so it is not evidence that the class failed to return.
+        // Counted and reported rather than passed over, because a
+        // censored reading built out of empty windows says nothing at
+        // all and would look exactly like one built out of real ones.
+        if dispatches == 0 {
+            empty_windows += 1;
+            continue;
+        }
+        if SITE.learned_class() == class_pre {
+            recovered_at = Some(n);
+        }
+    }
+    if empty_windows > 0 {
+        eprintln!(
+            "{empty_windows} of the {post_windows} recovery windows ran no dispatches; \
+             raise the window length before reading the recovery column"
+        );
+    }
+    let recovery = match recovered_at {
+        Some(n) => n.to_string(),
+        None => "-".to_string(),
+    };
+
     let ratio = if pre_ms > 0.0 { post_ms / pre_ms } else { f64::NAN };
     // Trailing columns: what the site's latest classifier tick decided
     // from (window mean per-item ns, window cv^2 per mille) and the
     // site's lifetime per-item figures, after each window. A "-" is a
     // figure the site could not yet report.
+    //
+    // The last four are the on-core reading: items carried and per-item
+    // cv^2, before and after. Items of zero means no leaf at this site
+    // went through the sampled path, so the spread beside it was taken
+    // on wall time and reading it as the work's own irregularity would
+    // be wrong.
     let opt = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     println!(
-        "{} {} {:.4} {:.4} {:.4} {} {} {:?} {:?} {:.1} {:.1} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        "{} {} {:.4} {:.4} {:.4} {} {} {:?} {:?} {:.1} {:.1} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
         shape.name(),
         routing.name(),
         pre_ms,
@@ -723,6 +791,11 @@ fn main() {
         opt(SITE.window_cv2_per_mille()),
         opt(SITE.per_item_ns()),
         opt(SITE.per_item_cv2_per_mille()),
+        oncore_pre.0,
+        opt(oncore_pre.1),
+        SITE.oncore_items(),
+        opt(SITE.per_item_oncore_cv2_per_mille()),
+        recovery,
     );
     if pre_n == 0 || post_n == 0 {
         eprintln!("the windows ran {pre_n} dispatches before and {post_n} after; raise the window");

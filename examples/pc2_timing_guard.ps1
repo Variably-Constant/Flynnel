@@ -1,0 +1,183 @@
+# Wait for the box, announce the run, and release on every path out.
+#
+# Dot-sourced by each timing harness so the four of them cannot drift
+# apart on the part that affects other agents. pc2 is shared: one timing
+# job at a time is a constraint on the box, not on one agent's jobs.
+#
+#   . C:\Temp\pc2_timing_guard.ps1
+#   if (-not (Enter-TimingRun -What "what this measures" -Log $log `
+#             -Tree 'C:\Temp\the-tree-being-measured' -Who 'Your-Name')) { exit 3 }
+#   ... timed work ...
+#   Exit-TimingRun -Log $log
+#
+# -Tree is the tree whose commit the log records. It is read with git -C, so
+# a harness that sets no location still gets its own provenance rather than
+# the dot-sourcing directory's; a tree that gives no head is refused, since a
+# provenance line holding a git error attributes the numbers to nothing.
+#
+# -Who is the agent the presence claim names, so an operator reading the
+# presence list knows whose run is holding the box.
+#
+# -BoundOn says what the run's wall is bound on and picks the CPU ceiling from
+# it: host, the default, waits for a box quiet enough that its cores are not
+# deciding the answer; device waits only for a box that is not saturated,
+# because background CPU does not reach a wall read off device clocks. A
+# caller passing -MaxIdleCores gets that number and -BoundOn does not apply.
+#
+# Exit-TimingRun must also be called from the harness's trap. It is safe
+# to call when no claim is held and safe to call twice.
+
+$script:TimingClaimHeld = $false
+
+# Busy cores over a short interval, counting every process on the box.
+#
+# Lives here so every harness reports the same quantity. A count of
+# cargo, rustc, cl and link names reads near zero on a box saturated by
+# anything that is not a compile, observed at 99 per cent CPU with that
+# count at 1, and Win32_Processor LoadPercentage read 100 on the same
+# instant this read 4.33.
+#
+# PercentIdleTime on the _Total instance is a 100 ns counter, so the
+# idle fraction is its delta over the timestamp delta.
+function Get-BusyCores {
+    $q = "SELECT PercentIdleTime,Timestamp_Sys100NS FROM Win32_PerfRawData_PerfOS_Processor WHERE Name='_Total'"
+    $a = Get-CimInstance -Query $q
+    Start-Sleep -Milliseconds 250
+    $b = Get-CimInstance -Query $q
+    $dt = $b.Timestamp_Sys100NS - $a.Timestamp_Sys100NS
+    if ($dt -le 0) { return -1 }
+    $idle = ($b.PercentIdleTime - $a.PercentIdleTime) / $dt
+    # The idle fraction exceeds one by a sliver when the two samples
+    # straddle a counter update, and the busier the box the less room
+    # there is for that to happen - so a quiet box is where it shows.
+    # Busy cores cannot be negative. Floored at zero rather than
+    # returned negative, because a reader treating a negative as a
+    # failed sample discards the quietest trials it has: 28 of 136
+    # readings on one 40-trial rotation came back between -0.24 and
+    # -0.40 while only 7 were genuinely above the gate.
+    #
+    # -1 stays the failed read, returned above when the interval carried
+    # no ticks at all.
+    $busy = [int]$env:NUMBER_OF_PROCESSORS * (1 - $idle)
+    [Math]::Round([Math]::Max(0, $busy), 2)
+}
+
+function Enter-TimingRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$What,
+        [Parameter(Mandatory = $true)][string]$Log,
+        # The tree whose commit this log records. Read with git -C, so the
+        # provenance belongs to the tree being measured rather than to
+        # whatever directory the harness happened to be dot-sourced from.
+        # The default is that directory, which is what a harness that sets
+        # its location already gets; one that does not is refused below
+        # rather than given a git error where a commit should be.
+        [string]$Tree = (Get-Location).Path,
+        # The agent whose run this is, so the presence line says who to ask
+        # about it. A claim is worth keeping beside a measurement because it
+        # carries intent, and intent belongs to somebody.
+        [string]$Who = 'an agent that did not name itself',
+        # The caller's own pid. Defaults to this session's, which is the
+        # harness when this file is dot-sourced into it.
+        [int]$OwnerPid = $PID,
+        # What the run's wall is bound on, which is what decides how much
+        # background CPU it can carry. A host-bound run reads a wall the box's
+        # cores set. A device-bound one reads device clocks plus a short host
+        # tail, and background CPU does not reach it.
+        [ValidateSet('host', 'device')][string]$BoundOn = 'host',
+        # Below zero takes the ceiling from -BoundOn. A caller naming a number
+        # gets that number.
+        [double]$MaxIdleCores = -1,
+        # Ceiling on the wait. awaitquiet's own default is 180, which is
+        # right for a run nobody is watching and wrong for a smoke test.
+        [double]$WaitMinutes = 180
+    )
+
+    if ($MaxIdleCores -lt 0) {
+        $MaxIdleCores = if ($BoundOn -eq 'device') { 20.0 } else { 1.2 }
+    }
+
+    # What was actually measured, not what the tree is called.
+    #
+    # These trees are named for the commit they were cloned at and then
+    # have files pushed into them, so the name goes stale the first time
+    # a source file moves. A log naming only the path attributes its
+    # numbers to a commit the tree no longer holds. HEAD plus the
+    # modified paths says what the run really built.
+    # Read against the named tree rather than the current directory, and
+    # refused when no head comes back. A log whose provenance line holds a
+    # git error attributes its numbers to nothing, and every reader after
+    # it has to take the tree's name on trust - which is the one thing the
+    # name cannot be trusted for.
+    $head = (& git -C $Tree rev-parse --short HEAD 2>&1 | Out-String).Trim()
+    if ($head -notmatch '^[0-9a-f]{7,40}$') {
+        "NO_PROVENANCE $Tree gave no head ($head); declining to measure rather than measure unattributably" |
+            Add-Content -Path $Log
+        return $false
+    }
+    $dirty = @(& git -C $Tree status --porcelain --untracked-files=no 2>&1 |
+        ForEach-Object { $_.ToString().Trim() })
+    "SOURCE_STATE head=$head dirty=$($dirty.Count) in $Tree" |
+        Add-Content -Path $Log
+    foreach ($d in $dirty) { "SOURCE_DIRTY $d" | Add-Content -Path $Log }
+
+    # awaitquiet reads the presence file, the process table and a total
+    # CPU aggregate. -SelfRoot subtracts the caller's own subtree, since
+    # a harness that loads the box on purpose would defer to itself.
+    #
+    # Its output goes to its own file by redirection rather than through
+    # a pipeline into the run log. A pipeline is held until the child
+    # exits, so a wait of any length shows nothing at all while it lasts
+    # and a run deferring correctly cannot be told from one wedged on a
+    # lock. Redirection writes as it goes.
+    # -MaxIdleCores above this host's own floor. Sampled over five
+    # seconds with nothing of mine running, the persistent consumers are
+    # lql-server at 0.75 cores and System at 0.08, so a bare box sits
+    # near 0.83 and awaitquiet's 0.5 default can never be met here. A
+    # run left on the default waits out its whole timeout and then
+    # declines to measure, which reads as a busy host rather than as an
+    # unreachable threshold.
+    #
+    # 1.2 clears that floor and stays under the 1.4 a neighbour's gate
+    # uses, so this never measures on a box busier than they would take.
+    #
+    # A device-bound run takes 20.0 instead, which is where a load ladder
+    # stopped rather than where its numbers moved. Over rungs of 0, 1, 2, 4,
+    # 8, 12, 16 and 20 delivered cores and back down, 100 passes a rung, every
+    # one of the wave calibration's nine figures stayed inside the spread its
+    # unloaded rung produced, with the box at 22.05 of 24 busy at the top; the
+    # narrow lane's root step read 40960 ns on all 100 passes of every rung.
+    # Nothing is measured above 20 delivered cores, which is why the ceiling
+    # sits there and not higher.
+    $waitLog = [System.IO.Path]::ChangeExtension($Log, 'awaitquiet.log')
+    "AWAITING_QUIET $(Get-Date -Format o) bound_on=$BoundOn max_idle_cores=$MaxIdleCores progress in $waitLog" |
+        Add-Content -Path $Log
+    & powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Temp\awaitquiet.ps1' `
+        -SelfRoot $OwnerPid -MaxIdleCores $MaxIdleCores -Minutes $WaitMinutes > $waitLog 2>&1
+    $quiet = ($LASTEXITCODE -eq 0)
+    Get-Content $waitLog -ErrorAction SilentlyContinue | Select-Object -Last 4 |
+        Add-Content -Path $Log
+    if (-not $quiet) {
+        "NOT_QUIET awaitquiet gave up; declining to measure rather than measure badly" |
+            Add-Content -Path $Log
+        return $false
+    }
+    "QUIET_REACHED $(Get-Date -Format o)" | Add-Content -Path $Log
+
+    $claim = "$What, TIMINGS, needs a quiet box, and this line stands until it exits, $Who"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Temp\presence.ps1' `
+        -Claim $claim -OwnerPid $OwnerPid *>&1 | Add-Content -Path $Log
+    $script:TimingClaimHeld = $true
+    return $true
+}
+
+function Exit-TimingRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$Log,
+        [int]$OwnerPid = $PID
+    )
+    if (-not $script:TimingClaimHeld) { return }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Temp\presence.ps1' `
+        -Release -OwnerPid $OwnerPid *>&1 | Add-Content -Path $Log
+    $script:TimingClaimHeld = $false
+}

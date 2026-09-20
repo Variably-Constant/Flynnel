@@ -69,6 +69,39 @@ fn per_item_cv2(sumsq_per_item: u64, mean: u64, items: u64) -> u64 {
     (spread.saturating_mul(1000) / expected) as u64
 }
 
+/// The weight of a batch that spent its whole interval on a core.
+const FULL_WEIGHT: u64 = 1000;
+
+/// A batch's weight in parts per mille: the share of its interval the
+/// worker spent on a core, from the tick pair the recorder reads at both
+/// ends of the batch.
+///
+/// Formed from the two sums directly in 128 bits. The occupancy reported
+/// beside a dispatch is in hundredths, and taking the weight from that
+/// would move it in steps of ten per mille, which is the whole spread
+/// between a batch that got 99 percent of its cores and one that got
+/// 100.
+///
+/// Capped at [`FULL_WEIGHT`]. The two counts come from different clocks
+/// on Windows - executed cycles against a fixed-rate timestamp counter -
+/// so a boosted core reads over one, and a batch cannot count for more
+/// than one batch because its host was generous.
+///
+/// `None` where the pair describes no interval: a batch whose ends did
+/// not both carry an on-core count, or one whose elapsed count is zero.
+/// A caller decides what an unweighted batch means to it, at the point
+/// where it knows. Zero is not that answer: it is the weight of a batch
+/// that never got a core, which is a reading rather than the absence of
+/// one.
+pub(crate) fn batch_weight_per_mille(on_core_ticks: u64, wall_ticks: u64) -> Option<u64> {
+    if wall_ticks == 0 {
+        return None;
+    }
+    let share = (on_core_ticks as u128).saturating_mul(FULL_WEIGHT as u128)
+        / (wall_ticks as u128);
+    Some((share as u64).min(FULL_WEIGHT))
+}
+
 /// Policy-arm trial cadence: every Nth arm selection returns the
 /// non-preferred arm so its EWMA stays fresh enough to detect drift.
 const ARM_TRIAL_CADENCE: u32 = 16;
@@ -199,6 +232,27 @@ pub struct CallSiteState {
     leaf_sumsq_scaled: AtomicU64,
     leaf_items: AtomicU64,
     leaf_sumsq_per_item: AtomicU64,
+    // Summed weight of the batches those sums came from, in parts per
+    // mille of a batch. The sums above carry the same factor, so this is
+    // the count they divide by; `leaf_count` counts leaves and is what
+    // the sample guards and the tick quantum read.
+    leaf_weight_sum: AtomicU64,
+    // The same leaves timed on the thread's own clock, which advances
+    // only while the thread is on a core. Kept in raw counter ticks and
+    // never converted: on Windows the thread clock counts executed
+    // cycles against a fixed-rate elapsed counter, so a nanosecond
+    // conversion would carry the achieved-to-base clock ratio into every
+    // figure. A cv^2 is a ratio and a common factor cancels out of it,
+    // so these feed the SPREAD only and the mean stays on wall time,
+    // where the classifier's nanosecond boundaries are stated.
+    //
+    // Populated on the sampled path, where the cost of two extra clock
+    // reads is divided by the stride. A site whose leaves are all
+    // recorded off that path carries zero here and says so by its item
+    // count rather than by a spread of zero.
+    leaf_oncore_items: AtomicU64,
+    leaf_oncore_sum: AtomicU64,
+    leaf_oncore_sumsq_per_item: AtomicU64,
     // Snapshot of the cumulative counters at the previous classifier
     // tick; each tick classifies the delta window since then.
     last_count: AtomicU64,
@@ -206,12 +260,23 @@ pub struct CallSiteState {
     last_sumsq: AtomicU64,
     last_items: AtomicU64,
     last_sumsq_per_item: AtomicU64,
+    last_weight_sum: AtomicU64,
+    last_oncore_items: AtomicU64,
+    last_oncore_sum: AtomicU64,
+    last_oncore_sumsq_per_item: AtomicU64,
     // Mean leaf time in nanoseconds and cv^2 per mille of the delta
     // window the latest tick classified, and how many windows have been
     // classified.
     window_mean_ns: AtomicU64,
     window_cv2: AtomicU64,
     window_ticks: AtomicU64,
+    // Extremes of the per-window cv^2 across every tick, so a reader
+    // gets the range the classifier acted over rather than whichever
+    // tick happened to be last. A single tick's figure spans 0 to 527
+    // across identical runs, so one reading of it cannot say which
+    // regime a run was in.
+    window_cv2_min: AtomicU64,
+    window_cv2_max: AtomicU64,
     // Execution-policy A/B arms: per-arm EWMA wall time + sample
     // counts + a call counter driving the trial cadence.
     arm_ewma_ns: [AtomicU64; 2],
@@ -321,14 +386,24 @@ impl CallSiteState {
             leaf_sumsq_scaled: AtomicU64::new(0),
             leaf_items: AtomicU64::new(0),
             leaf_sumsq_per_item: AtomicU64::new(0),
+            leaf_weight_sum: AtomicU64::new(0),
+            leaf_oncore_items: AtomicU64::new(0),
+            leaf_oncore_sum: AtomicU64::new(0),
+            leaf_oncore_sumsq_per_item: AtomicU64::new(0),
+            last_oncore_items: AtomicU64::new(0),
+            last_oncore_sum: AtomicU64::new(0),
+            last_oncore_sumsq_per_item: AtomicU64::new(0),
             last_count: AtomicU64::new(0),
             last_sum_ns: AtomicU64::new(0),
             last_sumsq: AtomicU64::new(0),
             last_items: AtomicU64::new(0),
             last_sumsq_per_item: AtomicU64::new(0),
+            last_weight_sum: AtomicU64::new(0),
             window_mean_ns: AtomicU64::new(0),
             window_cv2: AtomicU64::new(0),
             window_ticks: AtomicU64::new(0),
+            window_cv2_min: AtomicU64::new(u64::MAX),
+            window_cv2_max: AtomicU64::new(0),
             arm_ewma_ns: [const { AtomicU64::new(0) }; 2],
             arm_samples: [const { AtomicU32::new(0) }; 2],
             arm_calls: AtomicU32::new(0),
@@ -542,15 +617,123 @@ impl CallSiteState {
         items: u64,
         sumsq_per_item: u64,
     ) {
-        self.leaf_sum_ns.fetch_add(sum_ns, Ordering::Relaxed);
-        self.leaf_sumsq_scaled.fetch_add(sumsq_scaled, Ordering::Relaxed);
-        self.leaf_items.fetch_add(items, Ordering::Relaxed);
-        self.leaf_sumsq_per_item.fetch_add(sumsq_per_item, Ordering::Relaxed);
+        self.record_batch_weighted(sum_ns, sumsq_scaled, count, items, sumsq_per_item, None)
+    }
+
+    /// [`Self::record_batch_site_only`] with the share of the batch's
+    /// interval its worker spent on a core, from
+    /// [`batch_weight_per_mille`].
+    ///
+    /// Every sum carries the weight as a factor and so does the count
+    /// they are divided by, so each statistic is a ratio of weighted
+    /// totals: a batch that held its cores counts for a whole batch and
+    /// one that got a third of them counts for a third. The means are
+    /// unchanged by the weighting and only the influence moves, which is
+    /// what a sample of unknown extra spread is worth.
+    ///
+    /// `None` records the batch at full weight. That is what a platform
+    /// with no thread clock, and a batch whose ends did not both carry a
+    /// reading, must contribute: an unweighted sample rather than a
+    /// suppressed one, because no reading is not evidence of contention.
+    ///
+    /// The sums scale by up to [`FULL_WEIGHT`] and are not divided back
+    /// down, which keeps the ratios exact rather than truncating a small
+    /// batch's items to zero. That costs ten bits of headroom on
+    /// counters that already saturate, and `leaf_sumsq_scaled` is the
+    /// one close enough to its ceiling for that to be reachable.
+    ///
+    /// `leaf_count` is left unweighted, because it is a count of leaves
+    /// rather than a quantity the statistics divide: it drives the
+    /// sample guards and the classifier quantum, and weighting it would
+    /// put both out by whatever the host was doing.
+    pub(crate) fn record_batch_weighted(
+        &'static self,
+        sum_ns: u64,
+        sumsq_scaled: u64,
+        count: u64,
+        items: u64,
+        sumsq_per_item: u64,
+        weight_per_mille: Option<u64>,
+    ) {
+        let w = weight_per_mille.unwrap_or(FULL_WEIGHT).min(FULL_WEIGHT);
+        let scale = |v: u64| v.saturating_mul(w);
+        self.leaf_sum_ns.fetch_add(scale(sum_ns), Ordering::Relaxed);
+        self.leaf_sumsq_scaled
+            .fetch_add(scale(sumsq_scaled), Ordering::Relaxed);
+        self.leaf_items.fetch_add(scale(items), Ordering::Relaxed);
+        self.leaf_sumsq_per_item
+            .fetch_add(scale(sumsq_per_item), Ordering::Relaxed);
+        self.leaf_weight_sum
+            .fetch_add(scale(count), Ordering::Relaxed);
         let prior = self.leaf_count.fetch_add(count, Ordering::Relaxed);
         let new_total = prior.wrapping_add(count);
         if (prior / SITE_CLASSIFY_QUANTUM) != (new_total / SITE_CLASSIFY_QUANTUM) {
             self.tick();
         }
+    }
+
+    /// Record a batch of leaves timed on the thread's own clock.
+    ///
+    /// Separate from [`Self::record_batch_weighted`] because these are
+    /// the same leaves measured against a different clock, not more
+    /// leaves: adding them to the leaf count would double it. They carry
+    /// their own item count, so a site that reaches this path for some
+    /// of its leaves and not others divides each figure by the items
+    /// that figure actually covers.
+    ///
+    /// Raw counter ticks, unconverted. See the field comment: only a
+    /// ratio is ever taken of these, and a ratio is what survives the
+    /// unit being different from the elapsed clock's.
+    pub(crate) fn record_oncore_batch(
+        &'static self,
+        oncore_sum: u64,
+        oncore_sumsq_per_item: u64,
+        items: u64,
+    ) {
+        if items == 0 {
+            return;
+        }
+        self.leaf_oncore_sum.fetch_add(oncore_sum, Ordering::Relaxed);
+        self.leaf_oncore_sumsq_per_item
+            .fetch_add(oncore_sumsq_per_item, Ordering::Relaxed);
+        self.leaf_oncore_items.fetch_add(items, Ordering::Relaxed);
+    }
+
+    /// cv^2 per mille of per-item cost measured on the thread's own
+    /// clock, or `None` where no leaf carried an on-core reading.
+    ///
+    /// This is the figure a neighbour cannot move. Wall time rises both
+    /// because the work is irregular and because the thread lost its
+    /// core, and preemption lands on some leaves and not others, so it
+    /// reaches a wall-time spread as variance that is indistinguishable
+    /// from the work's own. A thread's own clock does not advance while
+    /// the thread is off a core, so a preempted leaf reports what it
+    /// cost rather than what it waited.
+    ///
+    /// `None` rather than zero: zero is the spread of perfectly uniform
+    /// work, which is a reading, and a site whose leaves never reached
+    /// the sampled path has no reading at all.
+    pub fn per_item_oncore_cv2_per_mille(&self) -> Option<u64> {
+        let items = self.leaf_oncore_items.load(Ordering::Relaxed);
+        if items == 0 {
+            return None;
+        }
+        let mean = self.leaf_oncore_sum.load(Ordering::Relaxed) / items;
+        if mean == 0 {
+            return None;
+        }
+        let sumsq = self.leaf_oncore_sumsq_per_item.load(Ordering::Relaxed);
+        Some(per_item_cv2(sumsq, mean, items))
+    }
+
+    /// Leaves' worth of items that carried an on-core reading.
+    ///
+    /// Beside [`Self::per_item_oncore_cv2_per_mille`] so a reader can
+    /// weigh how much the spread rests on, and distinct from
+    /// [`Self::leaf_count`], which counts every leaf however it was
+    /// timed.
+    pub fn oncore_items(&self) -> u64 {
+        self.leaf_oncore_items.load(Ordering::Relaxed)
     }
 
     /// Coefficient-of-variation squared (parts-per-1000) over this
@@ -564,6 +747,10 @@ impl CallSiteState {
         }
         let sum = self.leaf_sum_ns.load(Ordering::Relaxed);
         let sumsq = self.leaf_sumsq_scaled.load(Ordering::Relaxed);
+        // The sums carry each batch's weight as a factor, so the count
+        // they divide by has to carry it too. `n` above is leaves, which
+        // is what the four-sample guard is about.
+        let n = self.leaf_weight_sum.load(Ordering::Relaxed).max(1);
         let mean_scaled = (sum >> 8) / n;
         if mean_scaled == 0 {
             return Some(0);
@@ -661,6 +848,27 @@ impl CallSiteState {
         self.window_ticks.load(Ordering::Relaxed)
     }
 
+    /// Smallest and largest per-window cv^2 the classifier has seen,
+    /// over every tick rather than the latest one.
+    ///
+    /// [`Self::window_cv2_per_mille`] reports one tick of what is often
+    /// thousands, and that figure spans 0 to 527 across identical runs,
+    /// so it cannot say which regimes a run passed through. The range
+    /// can: a maximum below the uniform edge says a spread-driven
+    /// mechanism was never consulted in its own regime, whatever the
+    /// last tick happened to hold. `None` until a tick has classified a
+    /// window.
+    pub fn window_cv2_range_per_mille(&self) -> Option<(u64, u64)> {
+        if self.window_ticks.load(Ordering::Relaxed) == 0 {
+            None
+        } else {
+            Some((
+                self.window_cv2_min.load(Ordering::Relaxed),
+                self.window_cv2_max.load(Ordering::Relaxed),
+            ))
+        }
+    }
+
     /// One classifier tick over the delta window since the previous
     /// tick. Same algorithm as the process-global
     /// `tick_auto_classify`: hysteresis [`SITE_MIGRATION_HYSTERESIS`]
@@ -683,6 +891,11 @@ impl CallSiteState {
         let ditems = items.saturating_sub(self.last_items.load(Ordering::Relaxed));
         let dsumsq_per_item =
             sumsq_per_item.saturating_sub(self.last_sumsq_per_item.load(Ordering::Relaxed));
+        let weight_sum = self.leaf_weight_sum.load(Ordering::Relaxed);
+        let dweight = weight_sum
+            .saturating_sub(self.last_weight_sum.load(Ordering::Relaxed))
+            .max(1);
+        self.last_weight_sum.store(weight_sum, Ordering::Relaxed);
         self.last_count.store(count, Ordering::Relaxed);
         self.last_sum_ns.store(sum, Ordering::Relaxed);
         self.last_sumsq.store(sumsq, Ordering::Relaxed);
@@ -698,16 +911,53 @@ impl CallSiteState {
         // A window whose samples carried no item count - the heartbeat's
         // serial spans - is classified on its leaf times, which is all
         // such a sample can say.
+        // The window's on-core deltas, taken over the same leaves on the
+        // thread's own clock. A spread computed from these is the work's
+        // own irregularity; the same spread computed from wall time also
+        // carries every leaf that lost its core, because preemption
+        // lands on some leaves and not others and so arrives as variance
+        // rather than as a level shift.
+        let oncore_items = self.leaf_oncore_items.load(Ordering::Relaxed);
+        let oncore_sum = self.leaf_oncore_sum.load(Ordering::Relaxed);
+        let oncore_sumsq = self.leaf_oncore_sumsq_per_item.load(Ordering::Relaxed);
+        let d_oncore_items =
+            oncore_items.saturating_sub(self.last_oncore_items.load(Ordering::Relaxed));
+        let d_oncore_sum =
+            oncore_sum.saturating_sub(self.last_oncore_sum.load(Ordering::Relaxed));
+        let d_oncore_sumsq = oncore_sumsq
+            .saturating_sub(self.last_oncore_sumsq_per_item.load(Ordering::Relaxed));
+        self.last_oncore_items.store(oncore_items, Ordering::Relaxed);
+        self.last_oncore_sum.store(oncore_sum, Ordering::Relaxed);
+        self.last_oncore_sumsq_per_item
+            .store(oncore_sumsq, Ordering::Relaxed);
+
+        // Ticks, not nanoseconds, and only ever a ratio is taken of
+        // them, so the clock's unit never reaches a threshold.
+        let oncore_cv2 = d_oncore_sum
+            .checked_div(d_oncore_items)
+            .filter(|mean| *mean > 0)
+            .map(|mean| per_item_cv2(d_oncore_sumsq, mean, d_oncore_items));
+
         let per_item = dsum.checked_div(ditems);
         let (mean_ns, cv2) = if let Some(mean) = per_item {
-            (mean, per_item_cv2(dsumsq_per_item, mean, ditems))
+            // The mean stays on wall time, where the classifier's
+            // nanosecond boundaries are stated. The spread comes from
+            // the on-core clock where the window carried one, and falls
+            // back to wall time where it did not, which is what a
+            // platform with no thread clock has always had.
+            let spread = oncore_cv2
+                .unwrap_or_else(|| per_item_cv2(dsumsq_per_item, mean, ditems));
+            (mean, spread)
         } else {
-            let mean = dsum / dcount;
-            let scaled_mean = (dsum >> 8) / dcount;
+            // Divided by the window's summed weight rather than its leaf
+            // count, because the sums carry each batch's weight as a
+            // factor and a leaf count does not.
+            let mean = dsum / dweight;
+            let scaled_mean = (dsum >> 8) / dweight;
             let spread = if scaled_mean == 0 {
                 0
             } else {
-                let sumsq_per_n = dsumsq / dcount;
+                let sumsq_per_n = dsumsq / dweight;
                 let mean_sq = scaled_mean.saturating_mul(scaled_mean);
                 let var = sumsq_per_n.saturating_sub(mean_sq);
                 var.saturating_mul(1000) / mean_sq.max(1)
@@ -717,6 +967,8 @@ impl CallSiteState {
         self.window_mean_ns.store(mean_ns, Ordering::Relaxed);
         self.window_cv2.store(cv2, Ordering::Relaxed);
         self.window_ticks.fetch_add(1, Ordering::Relaxed);
+        self.window_cv2_min.fetch_min(cv2, Ordering::Relaxed);
+        self.window_cv2_max.fetch_max(cv2, Ordering::Relaxed);
         let observed = classify_observed(mean_ns, cv2);
         let observed_tag = class_tag_encode(observed);
 
@@ -1178,6 +1430,87 @@ pub(crate) fn registry_len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_batch_that_held_its_cores_weighs_a_whole_batch() {
+        assert_eq!(batch_weight_per_mille(8_000, 8_000), Some(FULL_WEIGHT));
+        assert_eq!(batch_weight_per_mille(4_800, 8_000), Some(600));
+    }
+
+    #[test]
+    fn a_weight_resolves_a_single_part_per_mille() {
+        // The occupancy printed beside a dispatch is in hundredths, so a
+        // weight taken from it would move in steps of ten per mille and
+        // read both of these as zero. One percent of a batch is the
+        // difference between a pool that held its cores and one that did
+        // not, which is the distinction the weight exists to carry.
+        assert_eq!(batch_weight_per_mille(1, 1_000), Some(1));
+        assert_eq!(batch_weight_per_mille(999, 1_000), Some(999));
+    }
+
+    #[test]
+    fn a_boosted_clock_pair_weighs_one_batch_and_not_more() {
+        // On Windows the two counts come from different clocks: executed
+        // cycles against a fixed-rate timestamp counter, so a core above
+        // its base frequency reads over one. A generous host must not
+        // make a batch count for more than a batch.
+        assert_eq!(batch_weight_per_mille(12_000, 8_000), Some(FULL_WEIGHT));
+    }
+
+    #[test]
+    fn an_interval_that_never_elapsed_has_no_weight_rather_than_none_of_one() {
+        // Zero is the weight of a batch that got no core at all. Handing
+        // it back for a pair that measured nothing would make a platform
+        // without the clock read as permanently contended, which is the
+        // defect the ThreadTicks type exists to prevent.
+        assert_eq!(batch_weight_per_mille(0, 0), None);
+        assert_eq!(batch_weight_per_mille(5_000, 0), None);
+        assert_eq!(batch_weight_per_mille(0, 8_000), Some(0));
+    }
+
+    #[test]
+    fn the_range_keeps_a_tick_the_latest_reading_has_already_lost() {
+        // Two windows of different spread, in order. window_cv2 holds
+        // the second and nothing recoverable from it says the first
+        // happened, which is how a run through a high-variance regime
+        // reports as uniform. The range holds both.
+        static S: CallSiteState = CallSiteState::new();
+        const ITEMS: u64 = 1024;
+        let sq = |ns: u64| (ns >> 8).saturating_mul(ns >> 8);
+        let per_item_sq =
+            |ns: u64| ((ns as u128).saturating_mul(ns as u128) / ((ITEMS as u128) << 16)) as u64;
+
+        // Spread: half the leaves at 1280 ns an item, half at 1920.
+        let (fast, slow) = (1280u64 * ITEMS, 1920u64 * ITEMS);
+        S.record_batch_site_only(
+            8 * fast + 8 * slow,
+            8 * sq(fast) + 8 * sq(slow),
+            16,
+            16 * ITEMS,
+            8 * per_item_sq(fast) + 8 * per_item_sq(slow),
+        );
+        let spread_tick = S.window_cv2_per_mille().expect("a window was classified");
+        assert!(spread_tick > 0, "the first window carries a spread");
+
+        // Flat: every leaf the same, so this window's cv^2 is zero.
+        let flat = 1600u64 * ITEMS;
+        S.record_batch_site_only(
+            16 * flat,
+            16 * sq(flat),
+            16,
+            16 * ITEMS,
+            16 * per_item_sq(flat),
+        );
+        assert_eq!(
+            S.window_cv2_per_mille(),
+            Some(0),
+            "the latest reading is the flat window and says nothing of the first"
+        );
+
+        let (lo, hi) = S.window_cv2_range_per_mille().expect("two windows were classified");
+        assert_eq!(lo, 0, "the flat window is the smallest seen");
+        assert_eq!(hi, spread_tick, "and the spread one survives in the range");
+    }
 
     #[test]
     fn a_per_item_spread_is_read_at_its_own_value() {

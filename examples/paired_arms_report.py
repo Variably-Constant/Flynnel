@@ -1,0 +1,367 @@
+"""Two arms compared trial by trial, where both ran inside one trial.
+
+Comparing the arms' medians throws the pairing away. Both arms run
+within seconds of each other inside a trial, so whatever the box was
+doing is close to common between them, and the difference taken inside
+a trial removes it. Across trials that difference is what varies.
+
+Reports the per-trial ratio of the arm under test to the reference, on
+the loaded window and on the retained ratio. The sign convention: above
+one means the arm under test was FASTER.
+
+Prints how large an effect this many trials could have resolved, so a
+null reads as a bound rather than as an absence. A run that cannot see
+a ten per cent regression must not be quoted as evidence there is none.
+
+The arm-state block answers a separate question: whether each arm ran
+the switch its label claims. `paired_armstate_defect_sample.log` beside
+this file carries an off arm that left the switch unset and so ran it
+on, and is what the refusal is checked against:
+
+    python paired_arms_report.py paired_armstate_defect_sample.log \
+        oncore_spread=1 oncore_spread=0 1.4
+
+An arm that pins a state rather than flipping a switch names a width
+the `levers:` line does not carry. Its value is read from the
+engagement line under the same name and compared literally, so an arm
+labelled `spin_window=500` whose pin did not take is caught the same
+way a lever arm is. `paired_pinstate_defect_sample.log` carries one arm
+that took and one that did not:
+
+    python paired_arms_report.py paired_pinstate_defect_sample.log \
+        spin_window=500 spin_window=8 1.4
+
+A label naming a field neither line reports is reported as unverified
+rather than failed: the pin shows up in the decisions section instead,
+and refusing the table on it would discard a sound run.
+"""
+
+import re
+import sys
+from collections import defaultdict
+
+# Trailing fields are tolerated rather than anchored out. A harness that
+# starts recording one more thing about its conditions must not turn
+# every row into an unparsed line, which reads the same as a run that
+# produced none.
+ARM = re.compile(
+    r"^ARM (\S+) trial=(\d+) position=(\d+) foreign=(\d+)"
+    r"(?:\s+busy_cores=([\d.-]+))?"
+)
+# Busy cores on the way out of an arm. Kept beside the entry figure
+# rather than replacing it: a window is judged on the worse of its two
+# ends, since a trial that began clear and finished in a storm was
+# measured through the storm.
+ARM_END = re.compile(r"^ARM_END (\S+) trial=(\d+) busy_cores=([\d.-]+)")
+ROWS = {
+    "ctl": re.compile(r"^control (\d+) (\d+) (\d+) ([\d.]+)\s*$"),
+    "thr": re.compile(r"^throughput (\d+) (\d+) (\d+) ([\d.]+)\s*$"),
+    "ret": re.compile(r"^retained (\d+) (\d+) ([\d.]+)"),
+}
+ENGAGE = re.compile(r"^engagement\s+(.*)$")
+LEVERS = re.compile(r"^levers:\s+(.*)$")
+
+# Fields that are decisions rather than measurements. A switch that
+# moved none of these across its own arms moved no decision, and the
+# ratio below is then a comparison of one arm with itself.
+DECISIONS = {
+    "class",
+    "smt",
+    "workers",
+    "allowed",
+    "spin_window",
+}
+
+
+def median(v):
+    s = sorted(v)
+    n = len(s)
+    if n == 0:
+        return None
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def parse(path):
+    per = defaultdict(dict)
+    cur = None
+    unpinned = False
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if line.startswith("UNPINNED_PROFILE"):
+                unpinned = True
+                continue
+            m = ARM.match(line)
+            if m:
+                cur = (m.group(1), int(m.group(2)))
+                if m.group(5) is not None:
+                    per[int(m.group(2))].setdefault(m.group(1), {})["busy"] = float(
+                        m.group(5)
+                    )
+                continue
+            m = ARM_END.match(line)
+            if m:
+                slot = per[int(m.group(2))].setdefault(m.group(1), {})
+                slot["busy"] = max(slot.get("busy", 0.0), float(m.group(3)))
+                continue
+            if cur is None:
+                continue
+            arm, trial = cur
+            s = LEVERS.match(line)
+            if s:
+                fields = {}
+                for token in s.group(1).split():
+                    if "=" in token:
+                        key, value = token.split("=", 1)
+                        fields[key] = value
+                per[trial].setdefault(arm, {})["levers"] = fields
+                continue
+            e = ENGAGE.match(line)
+            if e:
+                fields = {}
+                for token in e.group(1).split():
+                    if "=" in token:
+                        key, value = token.split("=", 1)
+                        fields[key] = value
+                per[trial].setdefault(arm, {})["engage"] = fields
+                continue
+            for key, pattern in ROWS.items():
+                m = pattern.match(line)
+                if not m:
+                    continue
+                value = float(m.group(3))
+                per[trial].setdefault(arm, {})[key] = value
+                break
+    return per, unpinned
+
+
+def report_arm_states(per, arms):
+    """Whether each arm ran the switch its own label names.
+
+    These labels carry the value: `oncore_spread=1` is an arm that has
+    to run that lever on. An arm expressing off by leaving the switch
+    unset takes whatever the crate defaults to, and three levers default
+    on, so a rotation can compare an arm with itself and still produce
+    a clean paired null.
+    """
+    print()
+    wrong = 0
+    unchecked = 0
+    for name in arms:
+        if "=" not in name:
+            print(f"  {name:<28} label names no value; cannot be checked")
+            unchecked += 1
+            continue
+        field, raw = name.split("=", 1)
+        raw = raw.strip()
+        where = "levers"
+        seen = sorted({a[name]["levers"][field]
+                       for a in per.values()
+                       if field in a.get(name, {}).get("levers", {})})
+        if not seen:
+            # A pinned-state arm may name something the levers line does
+            # not carry; the engagement line reports it under the same
+            # name.
+            seen = sorted({a[name]["engage"][field]
+                           for a in per.values()
+                           if field in a.get(name, {}).get("engage", {})})
+            where = "engagement"
+        # An arm label writes a switch as 1 or 0 and a width as itself,
+        # and either line can carry either kind: spin_window reads 500 on
+        # the levers line beside booleans. What the field holds decides
+        # how to read the label, not which line it came from.
+        boolean = bool(seen) and set(seen) <= {"true", "false"}
+        want = ("true" if raw == "1" else "false") if boolean else raw
+        if not seen:
+            print(f"  {name:<28} neither line reports {field}; not checkable here")
+            unchecked += 1
+        elif seen != [want]:
+            print(f"  {name:<28} {field}={seen} on the {where} line, "
+                  f"and this arm means {want}")
+            wrong += 1
+        else:
+            print(f"  {name:<28} {field}={seen} on the {where} line, as labelled")
+    if wrong:
+        print(f"{wrong} arm(s) did not run the switch their label claims. Their "
+              "pairs compare something with itself; do not read the table below.")
+    if unchecked:
+        # An arm that pins a state rather than flipping a switch names a
+        # width, not a lever, and the `levers:` line has no such field.
+        # That is unverifiable HERE, which is not the same as wrong:
+        # refusing the table on it discards a sound run. The section
+        # below reads the state the arms actually ran, so the check moves
+        # there rather than being skipped.
+        print(f"{unchecked} arm label(s) name nothing either line reports. "
+              "That is unverified, not failed: confirm the arms differ from "
+              "the decisions section below before reading the table.")
+
+
+def report_engagement(per, under_test, reference):
+    """Which decisions moved between the two arms, before any ratio.
+
+    A mechanism that never ran produces the same clean rows as one that
+    ran and did not help, so a ratio is only a reading of a switch once
+    something the switch controls is seen to differ.
+    """
+    seen = defaultdict(lambda: defaultdict(set))
+    for arms in per.values():
+        for name in (under_test, reference):
+            for key, value in arms.get(name, {}).get("engage", {}).items():
+                seen[name][key].add(value)
+    if not seen:
+        print("no engagement line in this log; what the switch had to work "
+              "with is unrecorded and the ratio below is unattributable")
+        return
+    moved = [k for k in sorted(DECISIONS)
+             if seen[under_test].get(k) != seen[reference].get(k)
+             and (seen[under_test].get(k) or seen[reference].get(k))]
+    print()
+    if moved:
+        print("decisions that differ between the arms:")
+        for k in moved:
+            print(f"  {k:<14} {under_test}={sorted(seen[under_test].get(k, []))} "
+                  f"{reference}={sorted(seen[reference].get(k, []))}")
+    else:
+        print("NO DECISION MOVED between these arms. Every field the switch "
+              "controls reads alike on both, so the table below compares "
+              "something with itself.")
+
+
+def split_on(per, under_test, reference, field):
+    """Trials partitioned by whether `field` differs between the arms.
+
+    Some mechanisms fire in a run and not in the next one at identical
+    settings: the adaptive spin controller leaves its window at the
+    default in about three runs in four. A median over every trial then
+    averages the trials where the mechanism acted with the trials where
+    it did not, and reports neither.
+    """
+    moved, held, unknown = {}, {}, {}
+    for trial, arms in per.items():
+        a = arms.get(under_test, {}).get("engage", {}).get(field)
+        b = arms.get(reference, {}).get("engage", {}).get(field)
+        if a is None or b is None:
+            unknown[trial] = arms
+        elif a != b:
+            moved[trial] = arms
+        else:
+            held[trial] = arms
+    return moved, held, unknown
+
+
+def report(per, under_test, reference, max_busy=None, counters=(), unpinned=False):
+    if unpinned:
+        print("UNPINNED: every arm drew its own calibration, and the draw sets")
+        print("the routing this measures. That variance is in every ratio below")
+        print("and cannot be separated from the lever's afterwards.")
+    print("ARM STATES, read before anything else:")
+    report_arm_states(per, (under_test, reference))
+    report_engagement(per, under_test, reference)
+    print()
+    print(f"{under_test} against {reference}, per trial. Above 1.000 means "
+          f"{under_test} was faster.")
+    if max_busy is not None:
+        def quiet(arm):
+            # Both samplers answer -1 when their own reading failed, and
+            # a missing figure is no reading at all. Neither is a quiet
+            # box, and a bare `<= max_busy` admits the first as the
+            # quietest one possible.
+            b = arm.get("busy")
+            return b is not None and 0.0 <= b <= max_busy
+
+        kept = {t: a for t, a in per.items()
+                if all(quiet(a.get(n, {})) for n in (under_test, reference))}
+        print(f"Trials where either arm reached {max_busy} busy cores at either "
+              f"end, or failed to sample, are dropped: "
+              f"{len(per) - len(kept)} of {len(per)} gone.")
+        print("A window is judged on the worse of its two ends. A quiet gate is")
+        print("checked once at entry and says nothing about the rest of a run, so")
+        print("a trial can begin clear and be measured through a storm; a log")
+        print("without ARM_END rows is judged on its entry figure alone and")
+        print("cannot see that case.")
+        per = kept
+    print()
+    print(f"{'metric':<10} {'pairs':>5} {'median':>8} {'min':>8} {'max':>8} "
+          f"{'wins':>6} {'resolvable':>11}")
+    print("-" * 62)
+
+    # A counter from the engagement line is comparable the same way and
+    # is sometimes the only thing that reads. A count covers the whole
+    # run where throughput is a rate over one window, so where the load
+    # is duty-cycled the window carries the load's phase and the count
+    # does not.
+    metrics = [("thr", "loaded"), ("ret", "retained"), ("ctl", "control")]
+    metrics += [("engage:" + f, f) for f in counters]
+
+    for key, label in metrics:
+        ratios = []
+        for _, arms in sorted(per.items()):
+            a, b = arms.get(under_test), arms.get(reference)
+            if not a or not b:
+                continue
+            if key.startswith("engage:"):
+                f = key.split(":", 1)[1]
+                try:
+                    av = float(a.get("engage", {})[f])
+                    bv = float(b.get("engage", {})[f])
+                except (KeyError, ValueError):
+                    continue
+                if not bv:
+                    continue
+                ratios.append(av / bv)
+                continue
+            if key not in a or key not in b or not b[key]:
+                continue
+            ratios.append(a[key] / b[key])
+        if not ratios:
+            print(f"{label:<10} {'no pairs':>5}")
+            continue
+        med = median(ratios)
+        wins = sum(1 for r in ratios if r > 1.0)
+        # Spread of the per-trial ratios says what this many pairs could
+        # have seen. A median difference smaller than this is a number,
+        # not a finding.
+        spread = sorted(ratios)
+        lo, hi = spread[len(spread) // 10], spread[-1 - len(spread) // 10]
+        resolvable = (hi - lo) / (len(ratios) ** 0.5)
+        print(f"{label:<10} {len(ratios):>5} {med:>8.4f} {min(ratios):>8.4f} "
+              f"{max(ratios):>8.4f} {wins:>3}/{len(ratios):<2} {resolvable:>10.2%}")
+
+    print()
+    print("A median inside the resolvable column is not a difference. The")
+    print("column is the middle-eight-tenths spread of the per-trial ratios")
+    print("over the root of the pair count, so it falls as trials are added")
+    print("and says what the run could have caught rather than what it saw.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print(f"usage: {sys.argv[0]} <log> <arm_under_test> <reference_arm> "
+              f"[max_busy_cores] [split_on_field]", file=sys.stderr)
+        sys.exit(2)
+    data, unpinned = parse(sys.argv[1])
+    if not data:
+        print("NO ARM LINES PARSED. A log from a run that died before its")
+        print("first arm reads the same as one that never wrote them.")
+        sys.exit(1)
+    bound = float(sys.argv[4]) if len(sys.argv) > 4 else None
+    field = sys.argv[5] if len(sys.argv) > 5 else None
+    counters = sys.argv[6].split(",") if len(sys.argv) > 6 else ()
+    if field is None:
+        report(data, sys.argv[2], sys.argv[3], bound, counters, unpinned)
+    else:
+        moved, held, unknown = split_on(data, sys.argv[2], sys.argv[3], field)
+        print(f"Split on {field}: {len(moved)} trial(s) where it differs "
+              f"between the arms, {len(held)} where it does not, "
+              f"{len(unknown)} where one arm did not report it.")
+        print("A mechanism that fires in some runs and not others makes one")
+        print("median over every trial a average of two populations. The")
+        print("trials where it did not fire are a control for the ones where")
+        print("it did, taken on the same box in the same rotation.")
+        for label, group in (("MOVED", moved), ("HELD", held)):
+            print()
+            print(f"===== trials where {field} {label} =====")
+            if group:
+                report(group, sys.argv[2], sys.argv[3], bound, counters, unpinned)
+            else:
+                print("no trials in this group")
