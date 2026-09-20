@@ -45,14 +45,17 @@ not one item at a time.
 
 ### Two things decide what a call costs
 
-Measured on pc2, PowerShell 7.6, 200,000 doubles, in
-`bench/KernelShapes.ps1`:
+200,000 doubles, in `bench/KernelShapes.ps1`, on both hosts:
 
-| crossing | ns per element |
-|---|---|
-| typed array in | 0.7 |
-| typed array in and out | 25.0 |
-| `Object[]` in | 235.8 |
+| crossing | pc2, ns/elem | Zen 3 guest, ns/elem |
+|---|---|---|
+| typed array in | 1.3 | 1.6 |
+| typed array in and out | 1.8 | 9.4 |
+| `Object[]` in | 232.8 | 482.1 |
+
+The penalty for an untyped array is 185 times on one host and 296 on
+the other. It is large on both and its size is not a constant, so
+read the ratio rather than either number.
 
 **Pass a typed array.** `[double[]]$x` crosses as one pinned copy.
 Anything else, including the `Object[]` that
@@ -78,19 +81,25 @@ which is what filtering and formatting want, or with `-AsArray` one
 beside it. Bins is a number the caller picks and nothing else bounds,
 so at a large one the records cost more than the binning.
 
-Measured on pc2, PowerShell 7.6, the same binning over the same array
-both ways, control drift 1.75% across the run:
+The same binning over the same array both ways, so the only difference
+is what crosses back. Two hosts, each with its control drift beside it
+because a row without one is not readable:
 
-| 50,000 bins | ms |
-|---|---|
-| one record per bin | 22.29 |
-| one record for the histogram | 5.14 |
+| 50,000 bins | pc2, PowerShell 7.6 | Zen 3 guest, pwsh 7.6.5 |
+|---|---|---|
+| one record per bin | 22.29 ms | 37.29 ms |
+| one record for the histogram | 5.14 ms | 3.82 ms |
+| times | 4.3 | 9.8 |
+| one pipeline record | 343 ns | 669 ns |
+| control drift over the run | 1.75% | -2.6% |
 
-4.3 times, and the difference over the bin count puts one pipeline
-record at 343 ns on this host. That is the marginal cost of a record
-carrying a real object, which is the figure to reason with here; the
-1712 ns in the table above is a bare pipeline record with nothing
-behind it.
+**A record costs about twice as much on one of these hosts as on the
+other**, so 343 ns is a fact about pc2 rather than about the module,
+and the switch is worth more where records are dearer. Both figures
+are the marginal cost of a record carrying a real object, measured
+against its own alternative in the same process. The 1712 ns in the
+table above is a different thing again: a bare pipeline record with
+nothing behind it, from the sibling module's bench.
 
 **A kernel that only reads can change the array in place.**
 `Update-FlynnelArray` runs the same operations as `Invoke-FlynnelMap`
