@@ -297,9 +297,9 @@ reason = "unsafe-or-structural"
 note = "holds the table's single-writer lease and must be beaten on a cadence or the lease lapses mid-write. A script holding one across a pipeline would either block every other process's calibration or drop the lease with a half-written record behind it"
 
 [[entry]]
-item = "crate::sched::calibration_store::try_acquire_writer"
+item = "crate::sched::calibration_store::CalibrationStore::try_acquire_writer"
 reason = "unsafe-or-structural"
-note = "takes that lease"
+note = "takes that lease. It is a method on the store rather than a free function, and an entry naming the free path covered nothing at all - which the tool reported, because an entry matching no item is a claim about something that does not exist"
 
 [[entry]]
 item = "crate::sched::calibration_store::PublishOutcome"
