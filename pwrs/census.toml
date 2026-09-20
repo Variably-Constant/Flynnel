@@ -742,3 +742,53 @@ note = "takes a KernelHandle the backend issued; the same reasoning as the handl
 item = "crate::backend::accel_op::LAUNCH_AMORTIZATION_FACTOR"
 reason = "internal-to-another-surface"
 note = "a constant of the routing gate, read while deciding whether a transfer is worth making. The decision it feeds is what Get-FlynnelAccelTarget reports"
+
+# ---------------------------------------------------------------------
+# The levers: each accessor is a row rather than a cmdlet
+# ---------------------------------------------------------------------
+# Every switch reaches a script as a Flynnel.Lever row from
+# Get-FlynnelLever, which answers the value in force, the variable that
+# sets it, its default and its measured price in one crossing. A cmdlet
+# per accessor would be nine crossings for what one already carries,
+# and a caller reading one switch without the others cannot tell which
+# arm produced a figure.
+#
+# Written per item rather than as one subtree entry on crate::sched::levers.
+# A subtree would also swallow ServePolicy::admits, whose reason is not
+# this one, and that item is deliberately left failing the census
+# because a Test- form for it is work rather than an exclusion.
+
+[[entry]]
+item = "crate::sched::levers::oncore_spread"
+reason = "internal-to-another-surface"
+note = "the oncore_spread row of Get-FlynnelLever, which carries its measured price: paired at 4096 reps on three hosts, 0.9978 at a 0.22 per cent bound on bare metal, 0.9922 at 4.79 on a Linux guest, 0.9917 at 11.15 on FreeBSD"
+
+[[entry]]
+item = "crate::sched::levers::batch_weight"
+reason = "internal-to-another-surface"
+note = "the batch_weight row of Get-FlynnelLever. Defaults off and carries no price, because nothing has measured it and an empty column says so"
+
+[[entry]]
+item = "crate::sched::levers::smt_from_window"
+reason = "internal-to-another-surface"
+note = "the smt_window row of Get-FlynnelLever. Defaults off and carries no price for the same reason"
+
+[[entry]]
+item = "crate::sched::levers::calibration_refusal"
+reason = "internal-to-another-surface"
+note = "the calibration_refusal row of Get-FlynnelLever, with its measurement: 16 draws at each of three load levels on a 12-core host read 1300 to 1500 ns idle against 3.2 to 7.0 million saturated, with no overlap"
+
+[[entry]]
+item = "crate::sched::levers::occupancy_floor_per_mille"
+reason = "internal-to-another-surface"
+note = "the occupancy_floor row, which Get-FlynnelOccupancyFloor also answers on its own"
+
+[[entry]]
+item = "crate::sched::levers::describe"
+reason = "internal-to-another-surface"
+note = "builds one formatted line of every switch, for the crate's own logging. Get-FlynnelLever answers the same facts as rows a script can filter and compare, which a formatted string cannot be without parsing it"
+
+[[entry]]
+item = "crate::sched::host_width::allowed_parallelism"
+reason = "internal-to-another-surface"
+note = "the Width column of Get-FlynnelAllowedWidth, reported whether or not the allowed_width lever is on, because the lever decides whether a plan is capped by the number rather than whether the number is read"

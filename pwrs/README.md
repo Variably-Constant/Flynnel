@@ -5,7 +5,7 @@ scheduler as PowerShell commands and objects, bound straight to the
 Rust with [PWRS](https://crates.io/crates/PoWerRuSt). The cmdlets are
 the library. Nothing here shells out to anything.
 
-Eighty-four commands, fifty-eight object types and twenty-seven
+Eighty-nine commands, sixty-one object types and twenty-eight
 enumerations. Every command answers to a shorter name with the `Fly`
 prefix: `Measure-FlyReduce` is `Measure-FlynnelReduce`.
 
@@ -295,6 +295,35 @@ There is no `Register-FlynnelBackend`. Registering takes a Rust
 implementation of the backend trait, and registering an accelerator
 operation takes its CPU implementation as a closure; a script has
 neither. Both absences are decisions, not gaps.
+
+**Levers.** The runtime switches, the width this process may use, and
+the policy deciding which stored calibration it serves.
+`Get-FlynnelLever` writes every switch with the value in force, the
+variable that sets it, its default and what it was measured to cost.
+`Set-FlynnelLever` writes one. `Get-FlynnelAllowedWidth`,
+`Get-FlynnelServePolicy` and `Get-FlynnelOccupancyFloor` read the
+three that carry more than a boolean.
+
+**Every lever latches on its first read** and holds for the life of
+the process. Setting the variable after that changes the variable and
+not the behavior, which is why `Set-FlynnelLever` does not simply
+write and return: it writes, reads the effective value back, and warns
+by name when the two disagree. The row it returns is what is in force,
+never what was asked for.
+
+Reading also resolves. A switch nothing has touched is fixed at
+whatever its variable says the moment you read it, so a script that
+means to change one sets it first.
+
+No cmdlet claims to know whether a lever has already resolved, because
+nothing outside the function owning a `OnceLock` can ask it.
+`EffectiveMatchesVariable` is what they report instead: false is proof
+the lever resolved before the variable was last written, and true is
+not proof of the opposite. The column is named for what it measures.
+
+Each switch that ships on carries its measured price with the
+conditions of the measurement. The two that ship off carry none, which
+is the honest state rather than an omission.
 
 ## Two conventions worth knowing before you read a number
 

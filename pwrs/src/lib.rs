@@ -125,6 +125,11 @@ pwrs::export_module! {
         backends::TestFlynnelBackend,
         backends::GetFlynnelAccelOp,
         backends::GetFlynnelAccelTarget,
+        levers::GetFlynnelLever,
+        levers::SetFlynnelLever,
+        levers::GetFlynnelAllowedWidth,
+        levers::GetFlynnelServePolicy,
+        levers::GetFlynnelOccupancyFloor,
     ],
     classes: [
         host::CpuInfo,
@@ -185,6 +190,9 @@ pwrs::export_module! {
         backends::BackendProbe,
         backends::AccelOp,
         backends::AccelTarget,
+        levers::Lever,
+        levers::AllowedWidth,
+        levers::ServePolicyState,
     ],
     enums: [
         host::Vendor,
@@ -214,6 +222,7 @@ pwrs::export_module! {
         rings::PopKind,
         rings::RingRole,
         backends::BackendKind,
+        levers::ServePolicy,
     ],
 }
 
@@ -221,6 +230,7 @@ mod backends;
 mod calibration;
 mod host;
 mod kernels;
+mod levers;
 mod observe;
 mod plan;
 mod pool;
