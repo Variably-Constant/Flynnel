@@ -325,14 +325,23 @@ fn reachable_modules(src: &Path) -> BTreeSet<String> {
     }
 }
 
-/// The `pub mod` names declared by a module's own file.
+/// The `pub mod` names a module's own file declares that live in
+/// files of their own.
+///
+/// An inline `pub mod name { ... }` has no file and is not returned:
+/// its items are collected by the recursion in `collect`, at the
+/// deeper path, when the enclosing file is read. Returning it here
+/// would send the walk looking for a file that was never meant to
+/// exist, which is what `gpu_peer::linalg::cpu` did.
 fn pub_mods_of(src: &Path, module: &str) -> Vec<String> {
     let file = module_file(src, module);
     parse(&file)
         .items
         .iter()
         .filter_map(|item| match item {
-            syn::Item::Mod(m) if is_public(&m.vis) => Some(m.ident.to_string()),
+            syn::Item::Mod(m) if is_public(&m.vis) && m.content.is_none() => {
+                Some(m.ident.to_string())
+            }
             _ => None,
         })
         .collect()
