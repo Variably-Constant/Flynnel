@@ -124,6 +124,26 @@ Describe 'the spin dials' {
     It 'zeroes the counter on reset' {
         (Reset-FlynnelSpinStats).TotalIdleYields | Should -Be 0
     }
+
+    It 'reads back the controller state it was just set to' {
+        # A setter that writes a row without the field it changed gives
+        # a caller nothing to check the write against, which is the
+        # whole point of writing the row back.
+        (Set-FlynnelSpinAdaptive -Off).Adaptive | Should -BeFalse
+        (Get-FlynnelSpinWindow).Adaptive | Should -BeFalse
+        (Set-FlynnelSpinAdaptive -On).Adaptive | Should -BeTrue
+        (Get-FlynnelSpinWindow).Adaptive | Should -BeTrue
+    }
+
+    It 'counts controller decisions from process start, through a reset' {
+        # Reset-FlynnelSpinStats zeroes the yield counter. The decision
+        # count is not that counter and must survive it, or a caller
+        # cannot tell "the controller never decided" from "someone reset
+        # the other dial".
+        $before = (Get-FlynnelSpinWindow).AdaptDecisions
+        $null = Reset-FlynnelSpinStats
+        (Get-FlynnelSpinWindow).AdaptDecisions | Should -BeGreaterOrEqual $before
+    }
 }
 
 Describe 'the split dials' {
@@ -155,6 +175,21 @@ Describe 'the split dials' {
     It 'starts the observer once and is safe to call again' {
         $null = Start-FlynnelSplitObserver
         { Start-FlynnelSplitObserver } | Should -Not -Throw
+    }
+
+    It 'says when there is no IO pool for the observer to run on' {
+        # The observer runs on the IO pool and resubmits itself each
+        # window, so without one the crate's start is a silent no-op. A
+        # multiplier that nothing is retuning reads exactly like one
+        # that is, so the absence has to be said out loud.
+        $warnings = @()
+        $null = Start-FlynnelSplitObserver -WarningVariable warnings
+        $pool = Get-FlynnelIoPool -WarningVariable ignored
+        if ($null -eq $pool) {
+            $warnings.Count | Should -BeGreaterThan 0
+        } else {
+            $warnings.Count | Should -Be 0
+        }
     }
 }
 

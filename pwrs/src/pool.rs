@@ -217,12 +217,23 @@ pub struct SpinState {
     pub window_rounds: u32,
     /// Yields the pool has made since the counter was last reset.
     pub total_idle_yields: u64,
+    /// Whether the adaptive controller is deciding the window. False
+    /// means WindowRounds is pinned where someone set it.
+    pub adaptive: bool,
+    /// Times the controller has reached a decision, counted from
+    /// process start and never reset. Zero while Adaptive is true says
+    /// the workload never parked often enough to gather the evidence,
+    /// which is a different state from a controller that decided and
+    /// left the window where it found it.
+    pub adapt_decisions: u64,
 }
 
 fn spin_snapshot() -> SpinState {
     SpinState {
         window_rounds: flynnel::spin_window(),
         total_idle_yields: flynnel::total_idle_yields(),
+        adaptive: flynnel::sched::spin_adaptive(),
+        adapt_decisions: flynnel::spin_adapt_decisions(),
     }
 }
 
@@ -494,6 +505,11 @@ impl Cmdlet for ResetFlynnelSplitStats {
 /// Safe to call twice: the observer starts once per process, and a
 /// second call writes the state without starting another.
 ///
+/// The observer runs on the IO pool and resubmits itself each window,
+/// so without an IO pool it cannot start. The crate's own start is a
+/// silent no-op in that case; this warns instead, because a multiplier
+/// nothing is retuning reads exactly like one that is.
+///
 /// # Examples
 ///
 /// `Start-FlynnelSplitObserver`
@@ -508,7 +524,16 @@ pub struct StartFlynnelSplitObserver {}
 
 impl Cmdlet for StartFlynnelSplitObserver {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let has_io_pool = flynnel::sched::global_io_pool().is_some();
         flynnel::sched::split_observer::spawn_observer();
+        if !has_io_pool {
+            pwrs::warning!(
+                ps,
+                "there is no IO pool in this process, so the observer did not start and the \
+                 split multiplier will stay where it is; set FLYNNEL_SCHED_SMT_AS_IO=1 before \
+                 the pool starts, or build one with New-FlynnelIoPool"
+            )?;
+        }
         ps.write(split_snapshot())
     }
 }

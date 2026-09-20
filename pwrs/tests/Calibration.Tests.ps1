@@ -393,4 +393,36 @@ Describe 'Get-FlynnelAccelCalibration' {
             }
         }
     }
+
+    It 'carries the whole wave record rather than its width alone' {
+        # Asserted against the type, not a row: no device here means no
+        # stored wave costs to read, and a binding that keeps one field
+        # of an eight-field record drops seven with nothing to show it.
+        $names = @([Flynnel.AccelCalibration].GetProperties() | ForEach-Object Name)
+        foreach ($field in @(
+            'WaveWidth', 'WaveBarrierNs', 'WaveFixedNs', 'WaveSegmentPs',
+            'WaveRebalanceFixedNs', 'WaveCopyPsPerId', 'WaveSkewNs',
+            'WaveGenerationNs')) {
+            $names | Should -Contain $field
+        }
+    }
+
+    It 'nulls every wave figure together, or none of them' {
+        # The crate marks "no wave costs" with a zero width, and this
+        # module turns that into null. A row with a width and no timings,
+        # or timings and no width, would be a half-read record.
+        $rows = @(Get-FlynnelAccelCalibration -WarningAction SilentlyContinue `
+            -ErrorAction SilentlyContinue)
+        foreach ($row in $rows) {
+            $figures = @($row.WaveBarrierNs, $row.WaveFixedNs, $row.WaveSegmentPs,
+                         $row.WaveRebalanceFixedNs, $row.WaveCopyPsPerId,
+                         $row.WaveSkewNs, $row.WaveGenerationNs)
+            $present = @($figures | Where-Object { $null -ne $_ }).Count
+            if ($null -eq $row.WaveWidth) {
+                $present | Should -Be 0
+            } else {
+                $present | Should -Be 7
+            }
+        }
+    }
 }

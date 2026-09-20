@@ -964,9 +964,26 @@ mod store {
         pub spread_per_mille: u32,
         /// Whether it passes the crate's own trust check.
         pub is_trustworthy: bool,
-        /// The wave width it recorded. Null where no wave costs were
-        /// taken, which the crate marks with a zero width.
+        /// The team size the wave costs were measured at. Null where no
+        /// wave costs were taken, which the crate marks with a zero
+        /// width, and then every Wave field below is null with it.
         pub wave_width: Option<u32>,
+        /// One cross-block generation barrier, in nanoseconds.
+        pub wave_barrier_ns: Option<u64>,
+        /// The host round trip of a wave slice apart from its segments,
+        /// in nanoseconds.
+        pub wave_fixed_ns: Option<u64>,
+        /// One segment on the substrate, in picoseconds.
+        pub wave_segment_ps: Option<u64>,
+        /// One rebalance apart from the ids it moves, in nanoseconds.
+        pub wave_rebalance_fixed_ns: Option<u64>,
+        /// Moving one pending id in a rebalance, in picoseconds.
+        pub wave_copy_ps_per_id: Option<u64>,
+        /// A coupled slice's wait at the first barrier, in nanoseconds.
+        pub wave_skew_ns: Option<u32>,
+        /// The longest generation of the calibration waves, in
+        /// nanoseconds.
+        pub wave_generation_ns: Option<u64>,
         /// Where it came from, which for this row is always the table.
         pub source: Source,
     }
@@ -1014,6 +1031,7 @@ mod store {
                 .terminating());
             };
             for a in accels {
+                let wave = a.wave();
                 ps.write(AccelRecord {
                     kind: kind_of(a.kind),
                     kind_raw: a.kind,
@@ -1028,7 +1046,14 @@ mod store {
                     launch_ns: a.launch_ns,
                     spread_per_mille: a.spread_per_mille,
                     is_trustworthy: a.is_trustworthy(),
-                    wave_width: a.wave().map(|w| w.width),
+                    wave_width: wave.map(|w| w.width),
+                    wave_barrier_ns: wave.map(|w| w.barrier_ns),
+                    wave_fixed_ns: wave.map(|w| w.fixed_ns),
+                    wave_segment_ps: wave.map(|w| w.segment_ps),
+                    wave_rebalance_fixed_ns: wave.map(|w| w.rebalance_fixed_ns),
+                    wave_copy_ps_per_id: wave.map(|w| w.copy_ps_per_id),
+                    wave_skew_ns: wave.map(|w| w.skew_ns),
+                    wave_generation_ns: wave.map(|w| w.generation_ns),
                     source: Source::Stored,
                 })?;
             }
