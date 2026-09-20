@@ -1,5 +1,7 @@
-# Cargo build artifacts
-/target
+# Cargo build artifacts. Unanchored, so it covers the workspace root
+# and every crate under it: pwrs/ is its own cargo package and writes
+# pwrs/target.
+target/
 
 # Editor / IDE files
 .vscode/
