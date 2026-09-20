@@ -30,6 +30,25 @@
 #                                   commit is an ancestor of HEAD, so
 #                                   the reminder cannot be forgotten
 #
+# An entry covers the item it names and everything beneath it, so a
+# type's entry covers its methods and a module's entry covers its
+# contents. The longest matching entry wins, which is how one item is
+# carved out of a family and given its own reason.
+#
+# A subtree entry is a claim about every item under it, and the tool
+# prints how many each one covered so that claim can be checked. Do not
+# reach for one to make a number go down: the count is there to catch
+# exactly that.
+#
+# Note what is not excusable here. pwrs/Cargo.toml takes the scheduler
+# with default features, which is all of them, because a PowerShell
+# module ships as one artifact with no way to ask for an extra. So the
+# gpu_peer and backend::shared_mem families are compiled into this
+# module and reachable from nothing - about 450 public items between
+# them. That is the opposite of not-in-the-shipped-feature-set: they
+# are shipped and they are unbound, which makes them work to do rather
+# than entries to write.
+#
 # This file is a seed. It carries only entries established by reading
 # the crate directly. The rest come from running the tool and triaging
 # what it reports; an entry written before the tool has named the item

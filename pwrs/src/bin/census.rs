@@ -93,6 +93,32 @@ struct Entry {
     line: usize,
 }
 
+/// The entry covering `path`: the one naming it exactly, or the
+/// longest one naming something it sits inside.
+///
+/// Longest, so a specific entry beats the family entry above it. That
+/// is what lets a reader carve one item out of a subtree and give it
+/// its own reason without splitting the family into three hundred
+/// lines to do it.
+///
+/// A prefix only counts on a path boundary. Without that check
+/// `crate::sched::plan` would cover `crate::sched::planner`, which
+/// shares its text and none of its meaning.
+fn covering_entry<'a>(entries: &'a [Entry], path: &str) -> Option<&'a str> {
+    let mut best: Option<&'a str> = None;
+    for entry in entries {
+        let item = entry.item.as_str();
+        let covers = path == item
+            || (path.len() > item.len()
+                && path.starts_with(item)
+                && path[item.len()..].starts_with("::"));
+        if covers && best.is_none_or(|held| item.len() > held.len()) {
+            best = Some(item);
+        }
+    }
+    best
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -193,10 +219,29 @@ fn main() {
     }
 
     // Every public item is bound or censused.
-    let censused: BTreeSet<&str> = entries.iter().map(|e| e.item.as_str()).collect();
+    //
+    // An entry covers the item it names and everything beneath it, so
+    // a type's entry covers its methods and a module's entry covers
+    // its contents. Exact paths alone cannot express the fact that
+    // actually holds here - a whole family is behind a feature this
+    // module does not ship - and spelling that as three hundred
+    // identical entries would be a worse record of it, not a better
+    // one: nobody reads three hundred lines to learn one thing, and
+    // the next person to add a function to that family has to
+    // remember to add a line saying what every neighbouring line
+    // already says.
+    //
+    // How many items each entry covers is printed below, because a
+    // prefix that quietly swallows more than its author meant is the
+    // way this could go wrong.
+    let mut covered: BTreeMap<&str, usize> = BTreeMap::new();
+    for entry in &entries {
+        covered.insert(entry.item.as_str(), 0);
+    }
     if let Some(bound) = &bound {
         for item in &items {
-            if censused.contains(item.path.as_str()) {
+            if let Some(entry) = covering_entry(&entries, &item.path) {
+                *covered.entry(entry).or_insert(0) += 1;
                 continue;
             }
             if bound.iter().any(|b| binds(b, &item.path)) {
@@ -213,10 +258,32 @@ fn main() {
                 }
             ));
         }
+        // An entry that covers nothing names an item that no longer
+        // exists, or a prefix that never matched. Either way it is a
+        // record of something that is not there, which is the failure
+        // this tool exists to prevent, pointed at its own input.
+        for entry in &entries {
+            if covered.get(entry.item.as_str()).copied().unwrap_or(0) == 0 {
+                failures.push(format!(
+                    "census.toml:{} covers nothing: {} matches no public item and no subtree",
+                    entry.line, entry.item
+                ));
+            }
+        }
     }
 
     // The summary the release notes are built from, printed whether or
     // not the gate passes.
+    if bound.is_some() {
+        println!("census: what each entry covers");
+        for entry in &entries {
+            println!(
+                "  {}: {} item(s)",
+                entry.item,
+                covered.get(entry.item.as_str()).copied().unwrap_or(0)
+            );
+        }
+    }
     let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
     for entry in &entries {
         *by_reason.entry(entry.reason.as_str()).or_insert(0) += 1;
