@@ -134,6 +134,11 @@ reason = "internal-to-another-surface"
 note = "the statistic Get-FlynnelSpread reports over a caller's samples"
 
 [[entry]]
+item = "crate::sched::par_iter::sample_iqr_per_mille"
+reason = "internal-to-another-surface"
+note = "the IqrPerMille column beside it. Both are reported because they disagree exactly where it matters: the spread reads the extremes and one stalled sample moves it, the interquartile range reads the middle half and does not, so a wide spread with a narrow range is a steady run with an interruption in it"
+
+[[entry]]
 item = "crate::sched::par_iter::ReduceChunksPath"
 reason = "internal-to-another-surface"
 note = "the shape Get-FlynnelReducePath answers"
@@ -301,6 +306,11 @@ note = "the lease slot's empty value; part of the same protocol"
 item = "crate::sched::calibration_store::OCCUPANCY_UNRECORDED"
 reason = "unsafe-or-structural"
 note = "the stored encoding for a draw that recorded no occupancy. A reader never sees it: CpuCalibration::occupancy turns it into the null that Get-FlynnelCpuCalibration reports, which is the whole point of the encoding"
+
+[[entry]]
+item = "crate::sched::calibration_store::PROVISIONAL_SPREAD_PER_MILLE"
+reason = "internal-to-another-surface"
+note = "the TrustBoundPerMille column of Get-FlynnelCpuCalibration. It rides beside IsTrustworthy because the verdict alone cannot say whether a record missed the bound by a little or by ten times, and on at least one host here every draw fails it"
 
 [[entry]]
 item = "crate::sched::calibration_store::ACCEL_DOORBELL_OK"

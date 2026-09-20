@@ -234,6 +234,20 @@ Describe 'Get-FlynnelSpread' {
         $row.Median | Should -Be 5
         $row.Maximum | Should -Be 9
     }
+
+    It 'separates a steady run with one stall from an unsteady one' {
+        # The reason both statistics ride the row. A single outlier
+        # moves the spread, which reads the extremes, and leaves the
+        # interquartile range alone, which reads the middle half. A row
+        # carrying only the spread cannot tell those apart, and they
+        # are different findings about the box.
+        $steady = Get-FlynnelSpread -Sample @(100, 101, 100, 102, 101, 100, 101, 100)
+        $stalled = Get-FlynnelSpread -Sample @(100, 101, 100, 102, 101, 100, 101, 9000)
+        $unsteady = Get-FlynnelSpread -Sample @(100, 900, 200, 4000, 150, 3000, 250, 8000)
+
+        $stalled.SpreadPerMille | Should -BeGreaterThan $steady.SpreadPerMille
+        $stalled.IqrPerMille | Should -BeLessThan $unsteady.IqrPerMille
+    }
 }
 
 Describe 'Get-FlynnelCallSite' {

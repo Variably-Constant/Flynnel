@@ -28,7 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pwrs::prelude::*;
 
 use flynnel::sched::occupancy::{NoReading, OccupancySample, OccupancyWindow, ThreadTicks};
-use flynnel::sched::par_iter::{ReduceChunksPath, last_reduce_chunks_path, sample_spread_per_mille};
+use flynnel::sched::par_iter::{
+    ReduceChunksPath, last_reduce_chunks_path, sample_iqr_per_mille, sample_spread_per_mille,
+};
 use flynnel::sched::split_observer;
 use flynnel::sched::trace;
 use flynnel::sched::{dispatch_trace_snapshot, dispatch_trace_wait_snapshot};
@@ -606,6 +608,15 @@ pub struct Spread {
     pub count: u64,
     /// The spread in parts per thousand.
     pub spread_per_mille: u32,
+    /// The interquartile range, also in parts per thousand.
+    ///
+    /// Beside the spread rather than instead of it, because the two
+    /// disagree exactly when it matters. The spread reads the extremes
+    /// and a single stalled sample moves it; this reads the middle
+    /// half and does not. A run whose spread is wide and whose
+    /// interquartile range is narrow was steady with an interruption
+    /// in it, and one where both are wide was not steady.
+    pub iqr_per_mille: u32,
     /// The smallest sample. Null over no samples.
     pub minimum: Option<u64>,
     /// The median sample. Null over no samples.
@@ -631,6 +642,7 @@ impl Cmdlet for GetFlynnelSpread {
         ps.write(Spread {
             count: n as u64,
             spread_per_mille: sample_spread_per_mille(&samples),
+            iqr_per_mille: sample_iqr_per_mille(&samples),
             minimum,
             median,
             maximum,

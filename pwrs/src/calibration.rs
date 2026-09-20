@@ -604,8 +604,8 @@ mod store {
     use pwrs::prelude::*;
 
     use flynnel::sched::calibration_store::{
-        AccelKind as CrateAccelKind, CalibrationStore, HostStamp, LAYOUT_VERSION, calibration_dir,
-        table_path,
+        AccelKind as CrateAccelKind, CalibrationStore, HostStamp, LAYOUT_VERSION,
+        PROVISIONAL_SPREAD_PER_MILLE, calibration_dir, table_path,
     };
 
     /// What kind of device a stored accelerator record describes.
@@ -844,6 +844,14 @@ mod store {
         pub samples: u32,
         /// Whether it passes the crate's own trust check.
         pub is_trustworthy: bool,
+        /// The spread this record had to come in under to pass that
+        /// check, in parts per thousand.
+        ///
+        /// Beside IsTrustworthy because the verdict alone is half an
+        /// answer: a reader cannot tell a record that missed by a
+        /// little from one that missed by ten times without the bound
+        /// SpreadPerMille was judged against.
+        pub trust_bound_per_mille: u32,
         /// Where it came from, which for this row is always the table.
         pub source: Source,
     }
@@ -909,6 +917,7 @@ mod store {
                 },
                 samples: cpu.samples,
                 is_trustworthy: cpu.is_trustworthy(),
+                trust_bound_per_mille: PROVISIONAL_SPREAD_PER_MILLE,
                 source: Source::Stored,
             })
         }

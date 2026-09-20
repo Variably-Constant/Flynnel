@@ -374,6 +374,24 @@ Describe 'Get-FlynnelCpuCalibration' {
         }
         $record.Source | Should -Be ([Flynnel.Source]::Stored)
     }
+
+    It 'says what the trust verdict was judged against' {
+        # IsTrustworthy alone cannot say whether a record missed the
+        # bound by a little or by ten times, and on at least one host
+        # here every draw misses it. The bound has to ride beside the
+        # verdict for the verdict to mean anything.
+        $record = Get-FlynnelCpuCalibration -WarningAction SilentlyContinue `
+            -ErrorAction SilentlyContinue
+        if ($null -eq $record) {
+            Set-ItResult -Skipped -Because 'no stored record on this host'
+            return
+        }
+        $record.TrustBoundPerMille | Should -BeGreaterThan 0
+        if ($null -ne $record.SpreadPerMille) {
+            $within = $record.SpreadPerMille -le $record.TrustBoundPerMille
+            $record.IsTrustworthy | Should -Be $within
+        }
+    }
 }
 
 Describe 'Get-FlynnelAccelCalibration' {
