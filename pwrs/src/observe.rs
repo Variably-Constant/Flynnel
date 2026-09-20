@@ -844,7 +844,7 @@ impl Cmdlet for GetFlynnelCallSite {
     verb = "Reset",
     noun = "FlynnelCallSite",
     alias = "Reset-FlyCallSite",
-    should_process = true,
+    supports_should_process,
     confirm_impact = "High",
     output = ["System.UInt64"]
 )]
