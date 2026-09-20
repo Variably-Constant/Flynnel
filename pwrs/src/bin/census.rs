@@ -174,16 +174,24 @@ fn main() {
         }
     };
 
-    // Every entry names a real item.
-    let known: BTreeSet<&str> = items.iter().map(|i| i.path.as_str()).collect();
+    // Whether an entry names something real is checked by the
+    // covers-nothing pass further down, and only there.
+    //
+    // This used to also require the entry's path to be a public item
+    // exactly, which is wrong for the subtree entries the file's own
+    // header documents. A module is not among the public items this
+    // tool collects, so every module-level entry failed the check
+    // while covering its contents correctly. Ten of them did, across
+    // the ring family and the backend family, and the failure hid
+    // among the real gaps because the run fails on those anyway.
+    //
+    // The covers-nothing pass subsumes it. A misspelt leaf path covers
+    // nothing and is caught; a path whose item was deleted covers
+    // nothing and is caught; a module prefix that matches its contents
+    // is legitimate and is not. One check, and it is the one that asks
+    // the question that matters: does this entry describe anything
+    // that is here.
     for entry in &entries {
-        if !known.contains(entry.item.as_str()) {
-            failures.push(format!(
-                "census.toml:{} names {}, which is not a public item in the crate. Delete \
-                 the entry or fix the path.",
-                entry.line, entry.item
-            ));
-        }
         if !REASONS.contains(&entry.reason.as_str()) {
             failures.push(format!(
                 "census.toml:{} gives {} the reason {:?}, which is not one of: {}",

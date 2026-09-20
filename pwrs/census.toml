@@ -620,4 +620,125 @@ note = "parks the calling thread on a Parker captured at registration. From a sc
 [[entry]]
 item = "crate::sched::notify_ring::NotifyShutdownOnDrop"
 reason = "unsafe-or-structural"
-note = "a guard whose whole behaviour is its Drop, which fires at a scope end a script does not have. The equivalent from PowerShell is Shutdown in a finally block, which the sender's help shows"
+note = "a guard whose whole behavior is its Drop, which fires at a scope end a script does not have. The equivalent from PowerShell is Shutdown in a finally block, which the sender's help shows"
+
+# ---------------------------------------------------------------------
+# The backend family: bound as columns, or unreachable from a shell
+# ---------------------------------------------------------------------
+# pwrs/src/backends.rs binds the inspection surface. What is left falls
+# into two groups, kept apart on purpose: things a script cannot reach
+# because they take a Rust type it has no way to make, and things that
+# surface as a column or an enum rather than under a name of their own.
+#
+# Nothing here is excused for not being built yet. dispatch_accel and
+# AccelReport carry no entry and go on failing the census, because each
+# is work rather than an exclusion and an entry would hide that.
+#
+# cuda_sm_count was nearly hidden exactly that way. The detect subtree
+# entry below covers it, and the first draft of that entry claimed it
+# was carved out while no carve-out existed - a subtree quietly
+# swallowing an item its own note said it did not cover. The per-entry
+# coverage count is what showed it: detect covering ten items rather
+# than the nine its probes account for. It is bound now, as the SmCount
+# and SmCountKnown columns of Flynnel.Backend, so the subtree's reason
+# is true of it.
+
+[[entry]]
+item = "crate::backend::DispatchBackend"
+reason = "unsafe-or-structural"
+note = "a Rust trait. Implementing it is how a consumer crate adds a backend, and a script has no way to write one, so register_backend has no cmdlet and Get-FlynnelBackend's help says that is a property of the boundary rather than a gap"
+
+[[entry]]
+item = "crate::backend::BackendRef"
+reason = "unsafe-or-structural"
+note = "an Arc of that trait object; the same reasoning one indirection along"
+
+[[entry]]
+item = "crate::backend::registry::register_backend"
+reason = "unsafe-or-structural"
+note = "takes a BackendRef. Its counterpart reads: Get-FlynnelBackend answers what the registry holds"
+
+[[entry]]
+item = "crate::backend::Backend"
+reason = "internal-to-another-surface"
+note = "a data-carrying enum, so it crosses as Flynnel.BackendKind for the kind and a DeviceId column for the payload. Its name and is_simt methods are the Name and IsSimt columns of Flynnel.Backend"
+
+[[entry]]
+item = "crate::backend::BackendCapabilities"
+reason = "internal-to-another-surface"
+note = "the four capability columns of Flynnel.Backend, beside CapabilitiesKnown, which is what tells an unregistered backend's zeros from the CPU backend's measured zero for host-to-device bandwidth"
+
+[[entry]]
+item = "crate::backend::BackendError"
+reason = "internal-to-another-surface"
+note = "an error type, which per flynnel-109 crosses as an ErrorCategory and an error id rather than as a class. DeviceUnavailable on a host without the device is the expected answer and is a row with Available false, not a terminating error"
+
+[[entry]]
+item = "crate::backend::KernelArg"
+reason = "unsafe-or-structural"
+note = "carries raw host and device pointers whose lifetime and size the caller guarantees for the whole call. A script cannot hold one safely and nothing checks that it did"
+
+[[entry]]
+item = "crate::backend::KernelHandle"
+reason = "internal-to-another-surface"
+note = "an opaque u64 the backend issued; it reaches a script as the KernelHandle column of Flynnel.AccelTarget, which is the only place one is meaningful"
+
+[[entry]]
+item = "crate::backend::detect"
+reason = "internal-to-another-surface"
+note = "every probe here is the Available column of Flynnel.Backend and of Flynnel.BackendProbe, and detect_all is the Detected column; Test-FlynnelBackend runs them again on demand. cuda_sm_count is the SmCount and SmCountKnown columns of the Cuda row, asked of the device that row names rather than of device zero"
+
+[[entry]]
+item = "crate::backend::registry"
+reason = "internal-to-another-surface"
+note = "backends, backend_by_id, cpu_backend and ensure_default_registered are how Get-FlynnelBackend fills the Registered column and the capability columns; each is a read a cmdlet makes rather than a cmdlet of its own"
+
+[[entry]]
+item = "crate::backend::cpu::CpuBackend"
+reason = "internal-to-another-surface"
+note = "the always-registered implementation behind the Cpu row. A script reads its capabilities through Get-FlynnelBackend and never holds it"
+
+[[entry]]
+item = "crate::backend::cuda::CudaBackend"
+reason = "unsafe-or-structural"
+note = "its accessors hand out CUDA contexts, streams and per-slot streams: raw driver handles whose validity depends on the current device and on nothing this module can check. The Cuda row reports that it is registered and what it can do, which is the part a script can act on"
+
+[[entry]]
+item = "crate::backend::accel_op::AccelOpId"
+reason = "internal-to-another-surface"
+note = "an index into a private registry with a private field, so it cannot be built from a number. It reaches a script as the Name of Flynnel.AccelOp, which is the stable handle a caller can hold"
+
+[[entry]]
+item = "crate::backend::accel_op::RegisteredAccelOp"
+reason = "internal-to-another-surface"
+note = "the row registered_accel_ops answers, bound one for one as Flynnel.AccelOp"
+
+[[entry]]
+item = "crate::backend::accel_op::registered_accel_ops"
+reason = "internal-to-another-surface"
+note = "bound as Get-FlynnelAccelOp. It exists because the registry is private and had no reader at all: without it nothing outside the code that registered an op could name one"
+
+[[entry]]
+item = "crate::backend::accel_op::accel_op_name"
+reason = "internal-to-another-surface"
+note = "takes an id a script cannot hold. registered_accel_ops answers the name beside the id, so the pair is one call rather than two"
+
+[[entry]]
+item = "crate::backend::accel_op::register_accel_op"
+reason = "unsafe-or-structural"
+note = "takes the CPU implementation as a Fn closure. A script has none to give and this module never runs a script block off the pipeline thread, so there is no Register cmdlet and Get-FlynnelAccelOp's help says so"
+
+[[entry]]
+item = "crate::backend::accel_op::bind_accel_kernel"
+reason = "unsafe-or-structural"
+note = "takes device kernel source as bytes, PTX for CUDA, and compiles it on the device. A script handing over bytes it cannot validate, to be compiled by a driver, is not a boundary this module opens"
+
+[[entry]]
+item = "crate::backend::accel_op::bind_accel_kernel_handle"
+reason = "unsafe-or-structural"
+note = "takes a KernelHandle the backend issued; the same reasoning as the handle itself"
+
+[[entry]]
+item = "crate::backend::accel_op::LAUNCH_AMORTIZATION_FACTOR"
+reason = "internal-to-another-surface"
+note = "a constant of the routing gate, read while deciding whether a transfer is worth making. The decision it feeds is what Get-FlynnelAccelTarget reports"

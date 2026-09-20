@@ -92,6 +92,22 @@ Describe 'Get-FlynnelBackend' {
         }
     }
 
+    It 'reads the multiprocessor count only where there is one to read' {
+        # Zero with SmCountKnown false is an unread number; zero with
+        # it true would be a device claiming no multiprocessors, which
+        # is not a thing. Every non-CUDA row must be the former.
+        foreach ($row in $script:Rows | Where-Object Kind -ne 'Cuda') {
+            $row.SmCountKnown | Should -BeFalse -Because "$($row.Kind) has no multiprocessor count"
+            $row.SmCount | Should -Be 0
+        }
+        $cuda = $script:Rows | Where-Object Kind -eq 'Cuda' | Select-Object -First 1
+        if ($cuda.SmCountKnown) {
+            $cuda.SmCount | Should -BeGreaterThan 0 -Because 'a count that was read is a real count'
+        } else {
+            $cuda.SmCount | Should -Be 0
+        }
+    }
+
     It 'keeps Registered, Available and Detected as three columns' {
         foreach ($row in $script:Rows) {
             $row.Registered | Should -BeOfType [bool]

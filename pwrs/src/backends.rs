@@ -234,6 +234,14 @@ pub struct BackendRow {
     /// implementation. False means nothing is registered and they are
     /// zeros rather than measurements.
     pub capabilities_known: bool,
+    /// Streaming multiprocessors on this CUDA device, which is what a
+    /// launch geometry is sized against. Zero unless SmCountKnown.
+    pub sm_count: u32,
+    /// Whether SmCount was read. Only a CUDA device answers it, and
+    /// only when the driver loaded and reported one, so a zero here
+    /// with this false is an unread number rather than a device with
+    /// no multiprocessors.
+    pub sm_count_known: bool,
 }
 
 fn capabilities_into(row: &mut BackendRow, caps: &BackendCapabilities) {
@@ -260,6 +268,15 @@ fn row_for(backend: CrateBackend, detected: &[CrateBackend]) -> BackendRow {
     if let Some(implementation) = backend_by_id(&backend) {
         row.registered = true;
         capabilities_into(&mut row, &implementation.capabilities());
+    }
+    // Only a CUDA device has one, and only when the driver loaded and
+    // answered. Asked of the device this row names rather than of
+    // device zero, so a second card reports its own.
+    if kind == BackendKind::Cuda
+        && let Some(count) = detect::cuda_sm_count(row.device_id as usize)
+    {
+        row.sm_count = count;
+        row.sm_count_known = true;
     }
     row
 }
