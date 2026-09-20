@@ -349,7 +349,7 @@ pub struct Histogram {
 }
 
 /// Applies one operation to every element of an array on Flynnel's
-/// workers, through `par_map_in_place`.
+/// workers.
 ///
 /// The whole array crosses once and the whole answer crosses back
 /// once.
@@ -591,7 +591,7 @@ impl Cmdlet for UpdateFlynnelArray {
 }
 
 /// Applies one pairwise operation across two arrays on Flynnel's
-/// workers, through `par_zip_apply`.
+/// workers, in one crossing each way.
 ///
 /// # Examples
 ///
