@@ -84,6 +84,133 @@ item = "crate::sched::par_iter::par_zip_apply"
 reason = "internal-to-another-surface"
 note = "the per-index entry point to the work Invoke-FlynnelZip does through for_each_chunk_indexed, on the same measurement: 5.67 ms against 0.48 ms"
 
+# ---------------------------------------------------------------------
+# The dispatch profile, read through the calibration family
+# ---------------------------------------------------------------------
+
+[[entry]]
+item = "crate::sched::par_iter::HostDispatchProfile"
+reason = "internal-to-another-surface"
+note = "the shape Get-FlynnelHostDispatch reads; its three figures are Flynnel.HostDispatch columns"
+
+[[entry]]
+item = "crate::sched::par_iter::host_dispatch_profile"
+reason = "internal-to-another-surface"
+note = "read by Get-FlynnelHostDispatch, which also brackets it with measured_collapse_threshold_ns to say whether the call that produced the row is the one that paid for the measurement"
+
+[[entry]]
+item = "crate::sched::par_iter::calibrate_host_dispatch"
+reason = "internal-to-another-surface"
+note = "run by Measure-FlynnelHostDispatch"
+
+[[entry]]
+item = "crate::sched::par_iter::measured_collapse_threshold_ns"
+reason = "internal-to-another-surface"
+note = "the MeasuredCollapseThresholdNs column, and the crate's only answer to whether a figure was measured rather than defaulted"
+
+[[entry]]
+item = "crate::sched::par_iter::inline_collapse_threshold_ns"
+reason = "internal-to-another-surface"
+note = "one field of the profile Get-FlynnelHostDispatch reads whole. Reading it alone would trigger the same first-call calibration with no ThisCallMeasured beside it to say the call paid for it"
+
+[[entry]]
+item = "crate::sched::par_iter::pool_dispatch_cost_ns"
+reason = "internal-to-another-surface"
+note = "the DispatchCostNs column, on the same reasoning"
+
+[[entry]]
+item = "crate::sched::par_iter::jec_wake_threshold_ns"
+reason = "internal-to-another-surface"
+note = "the JecWakeThresholdNs column, on the same reasoning"
+
+[[entry]]
+item = "crate::sched::par_iter::set_seed_hysteresis"
+reason = "internal-to-another-surface"
+note = "Set-FlynnelSeedHysteresis, which answers the value the switch held before"
+
+[[entry]]
+item = "crate::sched::par_iter::sample_spread_per_mille"
+reason = "internal-to-another-surface"
+note = "the statistic Get-FlynnelSpread reports over a caller's samples"
+
+[[entry]]
+item = "crate::sched::par_iter::ReduceChunksPath"
+reason = "internal-to-another-surface"
+note = "the shape Get-FlynnelReducePath answers"
+
+[[entry]]
+item = "crate::sched::par_iter::last_reduce_chunks_path"
+reason = "internal-to-another-surface"
+note = "read by Get-FlynnelReducePath, which writes nothing at all when no reduce has run on the thread rather than a row of nulls"
+
+[[entry]]
+item = "crate::sched::par_iter::DEFAULT_CALIBRATION_MAX_AGE_S"
+reason = "unsafe-or-structural"
+note = "the age past which a stored calibration is re-measured; a constant the store is read against, not state a caller sets"
+
+# ---------------------------------------------------------------------
+# The chunking primitives no declared kernel uses
+# ---------------------------------------------------------------------
+# A script has no closure to give, so the only way any of these reaches
+# PowerShell is a kernel this module declares that calls one. The
+# chunked forms above are what the kernels use. Each below is a sibling
+# shape chosen by a different per-element weight or a different
+# progress discipline, and no declared kernel has that shape yet.
+#
+# These are honest entries rather than hidden work: binding one means
+# declaring a kernel whose per-element cost actually wants it, which is
+# a measurement rather than a wrapper.
+
+[[entry]]
+item = "crate::sched::par_iter::for_each_chunk_min_leaf"
+reason = "internal-to-another-surface"
+note = "for_each_chunk with the 256-item floor replaced by the caller's, for bodies heavy enough per element that a smaller leaf still amortizes. Every declared kernel here is light per element and takes the floor"
+
+[[entry]]
+item = "crate::sched::par_iter::for_each_fixed_chunk"
+reason = "internal-to-another-surface"
+note = "one task per fixed run of items, which is what par_map_in_place wraps at a run of one. The measurement recorded on that entry is why no kernel here uses either"
+
+[[entry]]
+item = "crate::sched::par_iter::for_each_chunk_triple"
+reason = "internal-to-another-surface"
+note = "three slices walked in lockstep for out = f(a, b). Invoke-FlynnelZip writes into its left operand instead and so needs two, which for_each_chunk_indexed covers"
+
+[[entry]]
+item = "crate::sched::par_iter::for_each_chunk_triple_min_leaf"
+reason = "internal-to-another-surface"
+note = "the same three slices with the caller's leaf floor"
+
+[[entry]]
+item = "crate::sched::par_iter::for_each_chunk_indexed_min_leaf"
+reason = "internal-to-another-surface"
+note = "for_each_chunk_indexed with the caller's floor, for a per-element cost heavy enough that the 256 floor would leave the pool serial"
+
+[[entry]]
+item = "crate::sched::par_iter::for_each_indexed"
+reason = "internal-to-another-surface"
+note = "per-index rather than per-chunk, so the closure runs once an item. The chunked forms exist because that shape costs 5.21 ms against 0.38 at 200,000 doubles"
+
+[[entry]]
+item = "crate::sched::par_iter::for_each_chunk_ref"
+reason = "internal-to-another-surface"
+note = "chunks a shared slice rather than a mutable one, for a body that only reads. Every kernel here either writes through its slice or reduces, and a reduce goes through reduce_chunks"
+
+[[entry]]
+item = "crate::sched::par_iter::collect_indexed_heartbeat"
+reason = "internal-to-another-surface"
+note = "collect_indexed with a heartbeat split instead of a leaf floor, for work whose per-item cost is unknown until it runs"
+
+[[entry]]
+item = "crate::sched::par_iter::collect_indexed_token_bucket"
+reason = "internal-to-another-surface"
+note = "collect_indexed paced by a caller's token bucket, for a body that must not run faster than something external allows"
+
+[[entry]]
+item = "crate::sched::par_iter::collect_indexed_tiny_tasks"
+reason = "internal-to-another-surface"
+note = "collect_indexed for items too cheap to carry a leaf each"
+
 [[entry]]
 item = "crate::sched::par_iter::reduce_chunks"
 reason = "takes-a-rust-closure"
