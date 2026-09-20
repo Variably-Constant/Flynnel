@@ -44,16 +44,26 @@
 # pwrs/src/kernels.rs.
 
 [[entry]]
-item = "crate::sched::par_iter::par_map_in_place"
+item = "crate::sched::par_iter::for_each_chunk"
 reason = "takes-a-rust-closure"
 reaches = "Invoke-FlynnelMap"
-note = "fourteen element-wise operations, one closure each"
+note = "fourteen element-wise operations, one closure each; also Update-FlynnelArray, which runs the same body over a pinned buffer"
+
+[[entry]]
+item = "crate::sched::par_iter::for_each_chunk_indexed"
+reason = "takes-a-rust-closure"
+reaches = "Invoke-FlynnelZip"
+note = "six pairwise operations; the chunk's start index is what reaches the right operand"
+
+[[entry]]
+item = "crate::sched::par_iter::par_map_in_place"
+reason = "internal-to-another-surface"
+note = "the per-element entry point to the work Invoke-FlynnelMap does through for_each_chunk. It dispatches one task an element, which the crate documents as the shape for few large units; measured at 200,000 doubles that cost 5.21 ms against 0.38 ms chunked, so no kernel here uses it and none should until one has per-element work heavy enough to want it"
 
 [[entry]]
 item = "crate::sched::par_iter::par_zip_apply"
-reason = "takes-a-rust-closure"
-reaches = "Invoke-FlynnelZip"
-note = "six pairwise operations over two slices of equal length"
+reason = "internal-to-another-surface"
+note = "the per-index entry point to the work Invoke-FlynnelZip does through for_each_chunk_indexed, on the same measurement: 5.67 ms against 0.48 ms"
 
 [[entry]]
 item = "crate::sched::par_iter::reduce_chunks"

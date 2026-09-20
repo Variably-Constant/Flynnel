@@ -68,6 +68,7 @@ pwrs::export_module! {
         pool::NewFlynnelIoPool,
         pool::GetFlynnelIoPool,
         kernels::InvokeFlynnelMap,
+        kernels::UpdateFlynnelArray,
         kernels::InvokeFlynnelZip,
         kernels::MeasureFlynnelReduce,
         kernels::GetFlynnelPrefixSum,

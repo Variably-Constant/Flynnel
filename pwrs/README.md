@@ -71,17 +71,25 @@ receives that array as a single item rather than one element at a time.
 The answer is also a typed array, so feeding one kernel's output into
 the next stays on the fast path.
 
-What that is worth, same bench, before and after the return was
-batched:
+**A kernel that only reads can change the array in place.**
+`Update-FlynnelArray` runs the same operations as `Invoke-FlynnelMap`
+over a pin of the caller's own buffer and writes nothing back. It
+needs a typed array and it refuses anything else rather than quietly
+copying.
 
-| kernel | per-record return | one array | times |
+What the three together are worth, same bench, 200,000 doubles:
+
+| kernel | first measured | now | times |
 |---|---|---|---|
-| Measure-FlynnelReduce Sum | 38.87 ms | 0.13 ms | 299 |
-| Get-FlynnelDotProduct | 75.43 ms | 0.19 ms | 397 |
-| Get-FlynnelHistogram | 39.11 ms | 0.27 ms | 145 |
-| Get-FlynnelPrefixSum | 91.17 ms | 0.68 ms | 134 |
-| Sort-FlynnelArray | 97.43 ms | 2.64 ms | 37 |
-| Invoke-FlynnelMap Square | 114.62 ms | 5.18 ms | 22 |
+| Measure-FlynnelReduce Sum | 38.87 ms | 0.11 ms | 353 |
+| Invoke-FlynnelZip Add | 145.90 ms | 0.48 ms | 304 |
+| Invoke-FlynnelMap Square | 114.62 ms | 0.38 ms | 302 |
+| Update-FlynnelArray Square | 114.62 ms | 0.09 ms | 1273 |
+
+Three separate things got it there: the return is one array instead of
+200,000 records, the input is a pinned typed array instead of a boxed
+collection, and the work is dispatched in chunks of at least 256
+elements instead of one task per element.
 
 ## What it does not do
 

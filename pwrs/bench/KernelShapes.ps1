@@ -230,6 +230,11 @@ for ($i = 0; $i -lt $n; $i++) {
 # The same numbers as a boxed Object[], for the cell that prices what
 # the convenient way costs.
 $dataUntyped = 1..$n | ForEach-Object { [double]($_ % 997) }
+# A buffer of its own for the in-place cell, which mutates what it is
+# given. Squaring it repeatedly overflows to infinity, which costs the
+# same to compute and keeps the cell comparable.
+$inPlace = [double[]]::new($n)
+for ($i = 0; $i -lt $n; $i++) { $inPlace[$i] = 1.0000001 }
 $serialPlan = New-FlynnelPlan -KOuter 10 -BatchSize $n -Workers 1
 
 $work = Join-Path ([System.IO.Path]::GetTempPath()) "flynnel-bench-$PID"
@@ -278,6 +283,14 @@ $kernels = @(
        Flynnel = { Invoke-FlynnelMap -InputObject $data -Operation Square }
        Serial  = { Invoke-FlynnelMap -InputObject $data -Operation Square -Plan $serialPlan }
        Native  = { $data | ForEach-Object { $_ * $_ } } }
+
+    # The same arithmetic as Map.Square with the return taken out.
+    # Its own buffer, because it mutates what it is given and the
+    # shared one feeds every other cell.
+    @{ Name = 'Map.Square.InPlace'; Straight = $true
+       Flynnel = { Update-FlynnelArray -InputObject $inPlace -Operation Square }
+       Serial  = { Update-FlynnelArray -InputObject $inPlace -Operation Square -Plan $serialPlan }
+       Native  = { for ($i = 0; $i -lt $n; $i++) { $inPlace[$i] = $inPlace[$i] * $inPlace[$i] } } }
 
     @{ Name = 'Zip.Add'; Straight = $true
        Flynnel = { Invoke-FlynnelZip -Left $data -Right $other -Operation Add }

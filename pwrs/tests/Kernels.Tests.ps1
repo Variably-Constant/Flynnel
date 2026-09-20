@@ -160,6 +160,51 @@ Describe 'Invoke-FlynnelMap' {
     }
 }
 
+Describe 'Update-FlynnelArray' {
+    It 'changes the caller''s own array' {
+        $x = [double[]]@(2.0, 3.0, 4.0)
+        Update-FlynnelArray -InputObject $x -Operation Square
+        $x | Should -Be @(4.0, 9.0, 16.0)
+    }
+
+    It 'writes nothing to the pipeline' {
+        # The whole point: the answer is the buffer, not a return.
+        $x = [double[]]@(1.0, 2.0)
+        $out = @(Update-FlynnelArray -InputObject $x -Operation Negate)
+        $out.Count | Should -Be 0
+    }
+
+    It 'agrees with the copying form' {
+        $source = [double[]](1..500 | ForEach-Object { [double]$_ })
+        $copied = Invoke-FlynnelMap -InputObject $source -Operation Sqrt
+        $inPlace = [double[]]::new(500)
+        [Array]::Copy($source, $inPlace, 500)
+        Update-FlynnelArray -InputObject $inPlace -Operation Sqrt
+        (Compare-Object $inPlace $copied -SyncWindow 0).Count | Should -Be 0
+    }
+
+    It 'refuses an untyped collection rather than quietly copying it' {
+        # A silent copy would answer correctly and cost exactly what
+        # this cmdlet exists to avoid, and the caller's array would
+        # not change, which is worse than an error.
+        $boxed = 1..4 | ForEach-Object { [double]$_ }
+        { Update-FlynnelArray -InputObject $boxed -Operation Square -ErrorAction Stop } |
+            Should -Throw -ExpectedMessage '*typed double array*'
+    }
+
+    It 'takes the same operands as the copying form' {
+        $x = [double[]]@(-5.0, 0.5, 20.0)
+        Update-FlynnelArray -InputObject $x -Operation Clamp -Min 0 -Max 1
+        $x | Should -Be @(0.0, 0.5, 1.0)
+    }
+
+    It 'refuses Clamp without both bounds' {
+        $x = [double[]]@(1.0)
+        { Update-FlynnelArray -InputObject $x -Operation Clamp -Min 0 -ErrorAction Stop } |
+            Should -Throw -ExpectedMessage '*both Min and Max*'
+    }
+}
+
 Describe 'Invoke-FlynnelZip' {
     It 'adds two arrays elementwise' {
         $got = Invoke-FlynnelZip -Left $script:Data -Right $script:Other -Operation Add

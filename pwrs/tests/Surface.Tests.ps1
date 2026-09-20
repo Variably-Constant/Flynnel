@@ -134,9 +134,12 @@ Describe 'what a cmdlet declares' {
         # A cmdlet that emits an object without declaring its type
         # cannot be completed against, and Get-Command cannot say what
         # a pipeline will carry.
+        # Update-FlynnelArray is here deliberately: it changes the
+        # caller's buffer in place and writing the array back would
+        # cost the very crossing it exists to avoid.
         $emitNothing = @('Clear-FlynnelTrace', 'Reset-FlynnelLeafStat',
                          'Reset-FlynnelSpinStats', 'Reset-FlynnelSplitStats',
-                         'Start-FlynnelSplitObserver')
+                         'Start-FlynnelSplitObserver', 'Update-FlynnelArray')
         $missing = @()
         foreach ($cmdlet in $script:Cmdlets) {
             if ($cmdlet.Name -in $emitNothing) { continue }
