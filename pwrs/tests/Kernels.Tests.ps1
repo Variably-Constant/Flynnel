@@ -88,7 +88,28 @@ Describe 'the types this family exports' {
         $a = @(4.0, -9.0, 0.25)
         $b = @(2.0, 3.0, 0.5)
         foreach ($op in [Enum]::GetValues([Flynnel.ZipOp])) {
-            @(Invoke-FlynnelZip -Left $a -Right $b -Operation $op).Count | Should -Be 3
+            # Not wrapped in @(): a bulk cmdlet answers one array
+            # object, so @() would give an array holding that array
+            # and count one. Assigning takes the array itself.
+            $got = Invoke-FlynnelZip -Left $a -Right $b -Operation $op
+            $got.Count | Should -Be 3
+        }
+    }
+
+    It 'answers one array rather than a stream, for every bulk kernel' {
+        # The module's own rule, made testable. A per-item return
+        # costs 1712 ns an element in this host; one array costs one
+        # crossing. The array is typed, so it is also the fast input
+        # path for the next kernel, which is what makes chaining cheap.
+        $x = [double[]]@(1, 2, 3, 4)
+        foreach ($call in
+            { Invoke-FlynnelMap -InputObject $x -Operation Square },
+            { Invoke-FlynnelZip -Left $x -Right $x -Operation Add },
+            { Get-FlynnelPrefixSum -InputObject $x },
+            { Sort-FlynnelArray -InputObject $x }) {
+            $out = @(& $call)
+            $out.Count | Should -Be 1 -Because 'the pipeline carries one array, not four doubles'
+            $out[0].Count | Should -Be 4
         }
     }
 }
@@ -621,7 +642,7 @@ Describe 'Measure-FlynnelTextCount' {
 Describe 'Split-FlynnelText' {
     It 'splits exactly as the .NET string does' {
         $text = (1..5000 | ForEach-Object { "field$_" }) -join ','
-        $got = @(Split-FlynnelText -Text $text -Separator ',')
+        $got = Split-FlynnelText -Text $text -Separator ','
         $want = $text.Split(',')
         $got.Count | Should -Be $want.Count
         $got[0] | Should -Be $want[0]
@@ -630,17 +651,17 @@ Describe 'Split-FlynnelText' {
     }
 
     It 'keeps the empty pieces two separators produce' {
-        $got = @(Split-FlynnelText -Text 'a,,b' -Separator ',')
+        $got = Split-FlynnelText -Text 'a,,b' -Separator ','
         $got.Count | Should -Be 3
         $got[1] | Should -Be ''
     }
 
     It 'drops them for NoEmpty' {
-        @(Split-FlynnelText -Text 'a,,b' -Separator ',' -NoEmpty).Count | Should -Be 2
+        (Split-FlynnelText -Text 'a,,b' -Separator ',' -NoEmpty).Count | Should -Be 2
     }
 
     It 'splits on a multi-character separator' {
-        $got = @(Split-FlynnelText -Text 'a<->b<->c' -Separator '<->')
+        $got = Split-FlynnelText -Text 'a<->b<->c' -Separator '<->'
         $got | Should -Be @('a', 'b', 'c')
     }
 

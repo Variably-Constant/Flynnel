@@ -10,9 +10,36 @@
 //!
 //! # The shape every kernel shares
 //!
-//! The whole input crosses in one call. A per-item crossing costs 1907
-//! nanoseconds in PowerShell 7.6 against 4.5 amortized, so an array
-//! arrives as an array and a file list arrives as a list.
+//! The whole input crosses in one call, and the whole answer crosses
+//! back in one. A per-item crossing costs 1907 nanoseconds in
+//! PowerShell 7.6 against 4.5 amortized, so an array arrives as an
+//! array and a file list arrives as a list.
+//!
+//! # Both directions, and the return is the one that is easy to lose
+//!
+//! A `Vec` handed to the pipeline is enumerated by default: one
+//! record per element, at 1712 ns each in PowerShell 7.6 and 7955 in
+//! Windows PowerShell. Every bulk answer here is therefore wrapped in
+//! `PsArray`, which writes it as one object.
+//!
+//! Measured on pc2 before the wrap: Invoke-FlynnelMap over 200,000
+//! elements cost 114.62 ms while Measure-FlynnelReduce over the same
+//! input cost 38.87 ms. Both pay the same input crossing and the same
+//! trivial arithmetic; the 75 ms between them was the return, one
+//! record at a time.
+//!
+//! What this changes for a caller: `$y = Invoke-FlynnelMap ...` gives
+//! the array, as before. `Invoke-FlynnelMap ... | ForEach-Object` now
+//! receives the array as one item rather than a stream of elements.
+//! That is the trade the module is built around, and piping 200,000
+//! doubles one at a time is the cost it exists to avoid.
+//!
+//! # The input has a fast path too, and it is silent
+//!
+//! A typed array crosses as one pinned copy. Anything else, including
+//! the `Object[]` that `1..$n | ForEach-Object { ... }` produces, is
+//! read element by element. Pass `[double[]]$x` rather than `$x` where
+//! the array was built in the shell.
 //!
 //! `-Plan` is optional everywhere. Without one the kernel builds a plan
 //! whose band comes from the item count, capped at the Hierarchical
@@ -314,7 +341,7 @@ impl Cmdlet for InvokeFlynnelMap {
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Invoke-FlynnelMap")?;
         if n == 0 {
-            return ps.write(Vec::<f64>::new());
+            return ps.write(PsArray(Vec::<f64>::new()));
         }
 
         // Every operand the operation needs is read once here rather
@@ -354,7 +381,7 @@ impl Cmdlet for InvokeFlynnelMap {
             MapOp::Floor => par_map_in_place(&plan, &mut items, |x| *x = x.floor()),
             MapOp::Ceiling => par_map_in_place(&plan, &mut items, |x| *x = x.ceil()),
         }
-        ps.write(items)
+        ps.write(PsArray(items))
     }
 }
 
@@ -403,7 +430,7 @@ impl Cmdlet for InvokeFlynnelZip {
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Invoke-FlynnelZip")?;
         if n == 0 {
-            return ps.write(Vec::<f64>::new());
+            return ps.write(PsArray(Vec::<f64>::new()));
         }
         match self.operation {
             ZipOp::Add => par_zip_apply(&plan, &mut lhs, &rhs, |a, b| *a += *b),
@@ -413,7 +440,7 @@ impl Cmdlet for InvokeFlynnelZip {
             ZipOp::Min => par_zip_apply(&plan, &mut lhs, &rhs, |a, b| *a = a.min(*b)),
             ZipOp::Max => par_zip_apply(&plan, &mut lhs, &rhs, |a, b| *a = a.max(*b)),
         }
-        ps.write(lhs)
+        ps.write(PsArray(lhs))
     }
 }
 
@@ -607,7 +634,7 @@ impl Cmdlet for GetFlynnelPrefixSum {
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Get-FlynnelPrefixSum")?;
         if n == 0 {
-            return ps.write(Vec::<f64>::new());
+            return ps.write(PsArray(Vec::<f64>::new()));
         }
         let (n_chunks, chunk_len) = chunking(&plan, n);
 
@@ -638,7 +665,7 @@ impl Cmdlet for GetFlynnelPrefixSum {
         for part in parts {
             out.extend_from_slice(&part);
         }
-        ps.write(out)
+        ps.write(PsArray(out))
     }
 }
 
@@ -865,7 +892,7 @@ impl Cmdlet for SortFlynnelArray {
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Sort-FlynnelArray")?;
         if n <= 1 {
-            return ps.write(items);
+            return ps.write(PsArray(items));
         }
         let (n_chunks, chunk_len) = chunking(&plan, n);
 
@@ -898,7 +925,7 @@ impl Cmdlet for SortFlynnelArray {
         if self.descending {
             out.reverse();
         }
-        ps.write(out)
+        ps.write(PsArray(out))
     }
 }
 
@@ -1820,7 +1847,7 @@ impl Cmdlet for SplitFlynnelText {
         if self.no_empty {
             out.retain(|s| !s.is_empty());
         }
-        ps.write(out)
+        ps.write(PsArray(out))
     }
 }
 

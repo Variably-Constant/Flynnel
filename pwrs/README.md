@@ -43,6 +43,46 @@ $total   = Measure-FlynnelReduce -InputObject $numbers -Operation Sum
 
 not one item at a time.
 
+### Two things decide what a call costs
+
+Measured on pc2, PowerShell 7.6, 200,000 doubles, in
+`bench/KernelShapes.ps1`:
+
+| crossing | ns per element |
+|---|---|
+| typed array in | 0.7 |
+| typed array in and out | 25.0 |
+| `Object[]` in | 235.8 |
+
+**Pass a typed array.** `[double[]]$x` crosses as one pinned copy.
+Anything else, including the `Object[]` that
+`1..$n | ForEach-Object { ... }` produces, is read element by element
+and costs 337 times as much. If the array was built in the shell, cast
+it once:
+
+```powershell
+$x = [double[]]$x      # once, then every call is on the fast path
+```
+
+**A bulk cmdlet answers one array, not a stream.** `$y = Invoke-FlynnelMap ...`
+gives the array as before. `Invoke-FlynnelMap ... | ForEach-Object`
+receives that array as a single item rather than one element at a time.
+
+The answer is also a typed array, so feeding one kernel's output into
+the next stays on the fast path.
+
+What that is worth, same bench, before and after the return was
+batched:
+
+| kernel | per-record return | one array | times |
+|---|---|---|---|
+| Measure-FlynnelReduce Sum | 38.87 ms | 0.13 ms | 299 |
+| Get-FlynnelDotProduct | 75.43 ms | 0.19 ms | 397 |
+| Get-FlynnelHistogram | 39.11 ms | 0.27 ms | 145 |
+| Get-FlynnelPrefixSum | 91.17 ms | 0.68 ms | 134 |
+| Sort-FlynnelArray | 97.43 ms | 2.64 ms | 37 |
+| Invoke-FlynnelMap Square | 114.62 ms | 5.18 ms | 22 |
+
 ## What it does not do
 
 It never runs a PowerShell script block on a Flynnel worker.

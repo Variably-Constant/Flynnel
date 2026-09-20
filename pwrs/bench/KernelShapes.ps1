@@ -168,9 +168,17 @@ function Stop-Burners {
 # A burner left running would hold the box against every other agent on
 # it, so the stop is bound to the script ending rather than only to the
 # happy path.
+#
+# The error is printed and then rethrown by value. A bare `throw` in a
+# trap does not rethrow what arrived: it raises ScriptHalted, which
+# replaces the diagnostic with a word that names nothing. The first
+# version of this trap did exactly that and cost a whole bench run's
+# evidence.
 trap {
     Stop-Burners
-    throw
+    Write-Host ("FAULT " + $_.Exception.GetType().Name + ": " + $_.Exception.Message)
+    Write-Host ("FAULT_AT " + $_.InvocationInfo.PositionMessage)
+    throw $_
 }
 
 # ----------------------------------------------------------------------
@@ -208,8 +216,20 @@ Start-Cooldown
 # ----------------------------------------------------------------------
 
 $n = 200000
-$data = 1..$n | ForEach-Object { [double]($_ % 997) }
-$other = 1..$n | ForEach-Object { [double](($_ * 7) % 501) }
+# Typed arrays, built by index. A typed array crosses as one pinned
+# copy; anything else, including the Object[] that
+# `1..$n | ForEach-Object {...}` produces, is read element by element.
+# Building the data the convenient way measured the slow path and
+# called it the kernel's cost.
+$data = [double[]]::new($n)
+$other = [double[]]::new($n)
+for ($i = 0; $i -lt $n; $i++) {
+    $data[$i] = $i % 997
+    $other[$i] = ($i * 7) % 501
+}
+# The same numbers as a boxed Object[], for the cell that prices what
+# the convenient way costs.
+$dataUntyped = 1..$n | ForEach-Object { [double]($_ % 997) }
 $serialPlan = New-FlynnelPlan -KOuter 10 -BatchSize $n -Workers 1
 
 $work = Join-Path ([System.IO.Path]::GetTempPath()) "flynnel-bench-$PID"
@@ -221,6 +241,32 @@ foreach ($i in 1..64) {
     $files += $p
 }
 $textBody = (1..40000 | ForEach-Object { "row $_ value ABCD trailing" }) -join "`n"
+
+# ----------------------------------------------------------------------
+# What the boundary costs at the kernels' own width
+# ----------------------------------------------------------------------
+#
+# The empty call above prices a cmdlet with no arguments. It says
+# nothing about carrying 200,000 doubles, and without these three the
+# array rows read as statements about the pool when most of each one
+# is the crossing. That is an instrument whose absence reads as data,
+# so it is measured rather than reasoned about.
+#
+#   in       the array in, one number back. Input crossing plus one
+#            add an element.
+#   inOut    the array in, the array back. Adds the return.
+#   untyped  the same as `in` over a boxed Object[], which is what the
+#            convenient way of building an array in the shell gives.
+
+Write-Host 'crossing cells'
+$crossingIn = Measure-Cell -Body { Measure-FlynnelReduce -InputObject $data -Operation Sum }
+Start-Cooldown
+$crossingInOut = Measure-Cell -Body { Invoke-FlynnelMap -InputObject $data -Operation Abs }
+Start-Cooldown
+$crossingUntyped = Measure-Cell -Body {
+    Measure-FlynnelReduce -InputObject $dataUntyped -Operation Sum
+}
+Start-Cooldown
 
 # Straight records whether this row's shape is the anchor's shape. The
 # anchor is a straight scan, so it speaks for the kernels whose inner
@@ -286,7 +332,9 @@ $kernels = @(
     @{ Name = 'FileLine'; Straight = $false
        Flynnel = { Measure-FlynnelFileLine -Path $files }
        Serial  = { Measure-FlynnelFileLine -Path $files -Plan $serialPlan }
-       Native  = { $files | ForEach-Object { (Get-Content -LiteralPath $_).Count } } }
+       # Wrapped in @(): a one-line file makes Get-Content answer a
+       # bare string, which has no Count under strict mode.
+       Native  = { $files | ForEach-Object { @(Get-Content -LiteralPath $_).Count } } }
 
     @{ Name = 'SearchFile'; Straight = $false
        Flynnel = { Search-FlynnelFile -Pattern 'payload' -Path $files }
@@ -301,7 +349,11 @@ $kernels = @(
     @{ Name = 'TextCount'; Straight = $false
        Flynnel = { Measure-FlynnelTextCount -Text $textBody }
        Serial  = { Measure-FlynnelTextCount -Text $textBody -Plan $serialPlan }
-       Native  = { $textBody.Split(@(' ', "`n"), 'RemoveEmptyEntries').Count } }
+       # The separators are cast: an untyped array picks the
+       # Split(char[], int) overload and the options argument lands on
+       # a count parameter.
+       Native  = { $textBody.Split([string[]]@(' ', "`n"),
+                       [System.StringSplitOptions]::RemoveEmptyEntries).Count } }
 
     @{ Name = 'SplitText'; Straight = $false
        Flynnel = { Split-FlynnelText -Text $textBody -Separator ' ' }
@@ -380,12 +432,15 @@ if ($LoadThreads -gt 0) {
 foreach ($row in $rows) {
     $cell = $loaded[$row.Kernel]
     if ($cell) {
-        $row | Add-Member -NotePropertyName LoadedMs -NotePropertyValue (
-            [Math]::Round($cell.MedianMs, 4))
-        $row | Add-Member -NotePropertyName LoadCost -NotePropertyValue (
-            if ($row.FlynnelMs -gt 0) {
-                [Math]::Round($cell.MedianMs / $row.FlynnelMs, 3)
-            } else { $null })
+        # Computed before the call: an if is a statement, and as an
+        # argument it has to be assigned first or wrapped in $().
+        $loadedMs = [Math]::Round($cell.MedianMs, 4)
+        $cost = $null
+        if ($row.FlynnelMs -gt 0) {
+            $cost = [Math]::Round($cell.MedianMs / $row.FlynnelMs, 3)
+        }
+        $row | Add-Member -NotePropertyName LoadedMs -NotePropertyValue $loadedMs
+        $row | Add-Member -NotePropertyName LoadCost -NotePropertyValue $cost
     } else {
         # Named rather than left absent, so a table without the load
         # arm cannot be read as one where load cost nothing.
@@ -456,13 +511,18 @@ foreach ($row in $rows) {
 # a zero spread, because a single point has no spread and a zero would
 # read as a tight one.
 
-$runStore = @()
+# Named runRows and not runStore: PowerShell variable names are case
+# insensitive, so a local $runStore and the $RunStore parameter are one
+# variable, and assigning the local destroys the path the parameter
+# held. The same collision is why the rows below read back without
+# their properties.
+$runRows = @()
 if (Test-Path $RunStore) {
-    $runStore = @(Get-Content -LiteralPath $RunStore -Raw | ConvertFrom-Json)
+    $runRows = @(Get-Content -LiteralPath $RunStore -Raw | ConvertFrom-Json)
 }
 $runId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
 foreach ($row in $rows) {
-    $runStore = @($runStore) + [PSCustomObject]@{
+    $runRows = @($runRows) + [PSCustomObject]@{
         RunId     = $runId
         Commit    = $commit
         Machine   = $hostInfo.Machine
@@ -474,7 +534,7 @@ foreach ($row in $rows) {
     }
 }
 foreach ($row in $rows) {
-    $mine = @($runStore | Where-Object {
+    $mine = @($runRows | Where-Object {
         $_.Commit -eq $commit -and $_.Machine -eq $hostInfo.Machine -and
         $_.Edition -eq $hostInfo.Edition -and $_.Kernel -eq $row.Kernel -and
         $null -ne $_.FlynnelMs -and $_.FlynnelMs -gt 0
@@ -490,7 +550,7 @@ foreach ($row in $rows) {
             [Math]::Round($values[-1] / $values[0], 3))
     }
 }
-$runStore | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $RunStore -Encoding utf8
+$runRows | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $RunStore -Encoding utf8
 
 # ----------------------------------------------------------------------
 # Report
@@ -508,6 +568,9 @@ $result = [PSCustomObject]@{
     ControlLastMs   = [Math]::Round($controlLast.MedianMs, 4)
     ControlDriftPct = $controlDriftPct
     EmptyCallMs     = [Math]::Round($empty.MedianMs, 6)
+    CrossingInMs    = [Math]::Round($crossingIn.MedianMs, 4)
+    CrossingInOutMs = [Math]::Round($crossingInOut.MedianMs, 4)
+    CrossingUntypedMs = [Math]::Round($crossingUntyped.MedianMs, 4)
     LoadThreads     = $LoadThreads
     LoadedControlFirstMs = if ($loadedControlFirst) {
                                [Math]::Round($loadedControlFirst.MedianMs, 4)
@@ -544,6 +607,11 @@ Write-Host ("host {0} {1} {2}, {3} cpu(s), commit {4}{5}" -f
 Write-Host ("control {0} ms then {1} ms, drift {2}%" -f
     $result.ControlFirstMs, $result.ControlLastMs, $controlDriftPct)
 Write-Host ("empty call {0} ms" -f $result.EmptyCallMs)
+Write-Host ("crossing at {0} elements: {1} ms in, {2} ms in and out, {3} ms in untyped" -f
+    $n, $result.CrossingInMs, $result.CrossingInOutMs, $result.CrossingUntypedMs)
+Write-Host ("  so a typed array costs {0} ns an element in, and an untyped one {1} ns" -f
+    [Math]::Round($result.CrossingInMs * 1e6 / $n, 1),
+    [Math]::Round($result.CrossingUntypedMs * 1e6 / $n, 1))
 if ($null -ne $anchorDriftPct) {
     Write-Host ("anchor {0} ms, {1}% from {2}" -f
         $result.AnchorMs, $anchorDriftPct, $previous.Commit)
