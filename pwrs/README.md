@@ -5,7 +5,7 @@ scheduler as PowerShell commands and objects, bound straight to the
 Rust with [PWRS](https://crates.io/crates/PoWerRuSt). The cmdlets are
 the library. Nothing here shells out to anything.
 
-Eighty-nine commands, sixty-one object types and twenty-eight
+Ninety-three commands, sixty-five object types and twenty-nine
 enumerations. Every command answers to a shorter name with the `Fly`
 prefix: `Measure-FlyReduce` is `Measure-FlynnelReduce`.
 
@@ -324,6 +324,39 @@ not proof of the opposite. The column is named for what it measures.
 Each switch that ships on carries its measured price with the
 conditions of the measurement. The two that ship off carry none, which
 is the honest state rather than an omission.
+
+**Verification.** `New-FlynnelVerifyChain` makes a chain that absorbs
+chunks and answers one 32-byte root; two chains fed the same bytes in
+the same order root the same, which is how a CPU trace and a device
+trace are checked for being bit-exact without holding both in memory.
+`Compare-FlynnelVerifyChain` says not just that two chains disagree
+but where: the first index whose chunks differ.
+
+The index is exact. The crate's chain answers a root and nothing
+else, so the module keeps a BLAKE3 digest of each chunk beside it:
+32 bytes a chunk, and the chunks themselves are not kept. Two chains
+of different lengths that agree on everything they both hold is a
+different finding from a chunk that differs, and the row separates
+them.
+
+A chain answers its root once and then holds it. The crate's
+`finalize` consumes the hasher, so asking twice would answer
+thirty-two zero bytes, which reads as a root and is not one.
+
+**The mode region.** `run_in_region` enters a tile mode, runs a
+bounded body and exits, with the exit paired to the enter by a guard
+that fires on an unwinding panic as well as a normal return.
+`Test-FlynnelModeRegion` checks that pairing rather than assuming it,
+including through a body that panics on purpose, because a guard that
+has never seen a panic is untested. It counts through a backend of
+the module's own: the scalar fallback's enter and exit are no-ops, so
+a run through it cannot tell a paired exit from no exit at all.
+
+`Get-FlynnelMatrixBackend` writes one row today, the scalar fallback.
+The crate carries the substrate and no tile backend implements it
+yet, so a host with AMX or SME has nothing here to select, and that
+is a row saying so rather than an empty listing, which would read as
+a family that failed to enumerate.
 
 ## Two conventions worth knowing before you read a number
 

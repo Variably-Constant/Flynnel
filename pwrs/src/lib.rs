@@ -130,6 +130,10 @@ pwrs::export_module! {
         levers::GetFlynnelAllowedWidth,
         levers::GetFlynnelServePolicy,
         levers::GetFlynnelOccupancyFloor,
+        verify::NewFlynnelVerifyChain,
+        verify::CompareFlynnelVerifyChain,
+        verify::GetFlynnelMatrixBackend,
+        verify::TestFlynnelModeRegion,
     ],
     classes: [
         host::CpuInfo,
@@ -193,6 +197,10 @@ pwrs::export_module! {
         levers::Lever,
         levers::AllowedWidth,
         levers::ServePolicyState,
+        verify::VerifyChainHandle,
+        verify::VerifyComparison,
+        verify::MatrixBackend,
+        verify::ModeRegionCheck,
     ],
     enums: [
         host::Vendor,
@@ -223,6 +231,7 @@ pwrs::export_module! {
         rings::RingRole,
         backends::BackendKind,
         levers::ServePolicy,
+        verify::VerifyHasherKind,
     ],
 }
 
@@ -236,3 +245,4 @@ mod plan;
 mod pool;
 mod rings;
 mod types;
+mod verify;

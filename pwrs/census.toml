@@ -792,3 +792,53 @@ note = "builds one formatted line of every switch, for the crate's own logging. 
 item = "crate::sched::host_width::allowed_parallelism"
 reason = "internal-to-another-surface"
 note = "the Width column of Get-FlynnelAllowedWidth, reported whether or not the allowed_width lever is on, because the lever decides whether a plan is capped by the number rather than whether the number is read"
+
+# ---------------------------------------------------------------------
+# The verify chain and the mode region
+# ---------------------------------------------------------------------
+
+[[entry]]
+item = "crate::sched::verify_chain::VerifyChain"
+reason = "internal-to-another-surface"
+note = "bound as Flynnel.VerifyChain, with submit_chunk as Add and AddMany, pending_count as Pending and finalize as Root. Root holds its answer because finalize consumes the hasher and a second call answers thirty-two zero bytes, which reads as a root and is not one"
+
+[[entry]]
+item = "crate::sched::verify_chain::VerifyHasher"
+reason = "unsafe-or-structural"
+note = "a Rust trait, and a script cannot write one. Its two implementations reach a script as the Flynnel.VerifyHasher enum, which is the choice a caller actually has"
+
+[[entry]]
+item = "crate::sched::verify_chain::FxFallbackHasher"
+reason = "internal-to-another-surface"
+note = "the FxFallback member of Flynnel.VerifyHasher, selected by New-FlynnelVerifyChain -Hasher"
+
+[[entry]]
+item = "crate::sched::verify_chain::default_hasher"
+reason = "internal-to-another-surface"
+note = "what New-FlynnelVerifyChain uses for the Blake3 member. The BLAKE3 hasher itself lives in a private module, so this is the only way to reach it and the enum is the only way a script names it"
+
+[[entry]]
+item = "crate::sched::mode_region::MatrixModeBackend"
+reason = "unsafe-or-structural"
+note = "a Rust trait whose enter and exit change instruction-level processor state. A script cannot implement one, and the module's own counting implementation exists only so Test-FlynnelModeRegion can observe the pairing, which the scalar fallback's no-op enter and exit cannot"
+
+[[entry]]
+item = "crate::sched::mode_region::run_in_region"
+reason = "takes-a-rust-closure"
+reaches = "Test-FlynnelModeRegion"
+note = "runs a caller's body inside an entered mode. Test-FlynnelModeRegion reaches it three times with bodies this module owns: one that returns, one that panics on purpose, and one through the scalar fallback. The panicking arm is the point, because the guard that pairs exit to enter is only tested by a panic"
+
+[[entry]]
+item = "crate::sched::mode_region::ScalarFallback"
+reason = "internal-to-another-surface"
+note = "the one row Get-FlynnelMatrixBackend writes, marked as the fallback. Its enter and exit are no-ops, which is why the pairing is checked through a counting backend instead"
+
+[[entry]]
+item = "crate::sched::mode_region::ScalarContext"
+reason = "internal-to-another-surface"
+note = "the fallback's empty context, handed to a body that runs inside the region and never to a script"
+
+[[entry]]
+item = "crate::sched::mode_region::ScalarConfig"
+reason = "internal-to-another-surface"
+note = "the fallback's empty config; there are no tile shapes to set, so there is nothing for a caller to choose"
