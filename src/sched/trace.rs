@@ -100,8 +100,16 @@ thread_local! {
 /// it is already inside.
 ///
 /// The cost of that is one atomic load on a path consulted twice per
-/// leaf, on top of the `Once` guard that the latch also paid. What it
-/// measures at is recorded on the work item; it is not assumed.
+/// leaf, on top of the `Once` guard that the latch also paid.
+///
+/// Measured on the Zen 3 guest with `examples/trace_predicate_cost`,
+/// which times both shapes interleaved in one process against a
+/// plain-bool control, five hundred million calls a cell, median of
+/// seven. Two readable runs put the difference at +0.0059 and
+/// -0.0350 ns a call: it straddles zero, so the change is not
+/// resolvable and is bounded at 0.014 per cent of a 200,000-element
+/// dispatch. Both shapes sit about 0.08 ns above the control, which
+/// is under a cycle, so the pipeline absorbs either one.
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Reads `FLYNNEL_TRACE` once, before the flag is first answered.
