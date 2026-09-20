@@ -199,6 +199,9 @@ name = "trace_dispatch"
 name = "trace_mailbox_hang"
 
 [[example]]
+name = "trace_predicate_cost"
+
+[[example]]
 name = "adaptive_dispatcher_demo"
 
 [[example]]
