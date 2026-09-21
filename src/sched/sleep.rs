@@ -283,16 +283,17 @@ const PROBE_EVERY_MAX: u32 = 4096;
 /// A thread's place in the probe cycle.
 #[derive(Clone, Copy)]
 struct ProbeCursor {
-    /// Parks since this thread last started a pair.
+    /// Parks since this thread last completed a pair.
     since: u32,
     /// Interval it is counting to, refreshed when a pair starts.
     every: u32,
-    /// Slot the second half of the current pair owes, or [`NO_PAIR`].
-    owed: u32,
+    /// Slots the open pair still owes a reading, as a bitmask. Zero
+    /// when no pair is open.
+    pending: u32,
 }
 
-/// No pair is open, so the next park is counted rather than timed.
-const NO_PAIR: u32 = u32::MAX;
+/// Both halves of a pair are owed.
+const BOTH_SLOTS: u32 = (1 << SLOT_BASELINE) | (1 << SLOT_CHALLENGER);
 
 thread_local! {
     /// Where this thread is in the probe cycle.
@@ -307,7 +308,7 @@ thread_local! {
         core::cell::Cell::new(ProbeCursor {
             since: 0,
             every: PROBE_EVERY_MIN,
-            owed: NO_PAIR,
+            pending: 0,
         })
     };
 }
@@ -389,25 +390,34 @@ impl WaitController {
         // are, which is what lets the interval widen.
         let slot = PROBE.with(|p| {
             let mut c = p.get();
-            if c.owed != NO_PAIR {
-                let owed = c.owed;
-                c.owed = NO_PAIR;
-                c.since = 0;
-                p.set(c);
-                return Some(owed);
+            if c.pending == 0 {
+                c.since += 1;
+                if c.since < c.every {
+                    p.set(c);
+                    return None;
+                }
+                c.pending = BOTH_SLOTS;
+                c.every = self.probe_every.load(Ordering::Relaxed);
             }
-            c.since += 1;
-            if c.since < c.every {
-                p.set(c);
-                return None;
-            }
-            // Which arm leads alternates across probes, so neither is
-            // always the one measured first out of a cold cache.
-            let first = (self.parks.fetch_add(1, Ordering::Relaxed) % 2) as u32;
-            c.owed = 1 - first;
-            c.every = self.probe_every.load(Ordering::Relaxed);
+            // A slot stays owed until it has produced a reading. A
+            // park can end with nothing to report, because the wake
+            // it was armed for never came, and only the kernel park
+            // does that often: the monitor arms re-enter their wait
+            // until the counter actually moves, while `thread::park`
+            // is documented to return spuriously and the caller
+            // re-enters. Dropping the slot there would sample the
+            // baseline less often than the challenger, and the pair
+            // is the whole control.
+            let slot = if c.pending == BOTH_SLOTS {
+                // Which arm leads alternates across probes, so
+                // neither is always measured first out of a cold
+                // cache.
+                (self.parks.fetch_add(1, Ordering::Relaxed) % 2) as u32
+            } else {
+                u32::from(c.pending == (1 << SLOT_CHALLENGER))
+            };
             p.set(c);
-            Some(first)
+            Some(slot)
         })?;
 
         Some((
@@ -420,8 +430,24 @@ impl WaitController {
         ))
     }
 
+    /// Note that a slot of the open pair has produced its reading.
+    ///
+    /// The pair closes only when both have, and the interval to the
+    /// next one is counted from there.
+    fn probe_served(slot: u32) {
+        PROBE.with(|p| {
+            let mut c = p.get();
+            c.pending &= !(1u32 << slot);
+            if c.pending == 0 {
+                c.since = 0;
+            }
+            p.set(c);
+        });
+    }
+
     /// Fold one timed wake into a slot's mean and re-decide.
     fn record(&self, slot: u32, wake_ns: u64) {
+        Self::probe_served(slot);
         let i = slot as usize;
         let n = self.samples[i].fetch_add(1, Ordering::Relaxed) + 1;
         let prev = self.mean_ns[i].load(Ordering::Relaxed);
