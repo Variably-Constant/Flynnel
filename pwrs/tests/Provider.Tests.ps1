@@ -279,6 +279,45 @@ Describe 'the calibration and trace levels' {
     }
 }
 
+Describe 'the peer level' {
+    It 'exists whether or not a peer does' {
+        # The distinction the spec calls out. A missing path and a
+        # missing device read alike to a script, and only one of them
+        # is worth retrying after starting a peer.
+        Test-Path 'Flynnel:\peer' | Should -BeTrue
+        (Get-Item Flynnel:\peer).PSIsContainer | Should -BeTrue
+    }
+
+    It 'enumerates nothing while no peer is running' {
+        if ((Get-FlynnelGpuPeer).Running) {
+            Set-ItResult -Skipped -Because 'a peer is running in this process'
+            return
+        }
+        @(Get-ChildItem Flynnel:\peer).Count | Should -Be 0
+        Test-Path 'Flynnel:\peer\summary' | Should -BeFalse
+    }
+
+    It 'answers the same summary as Get-FlynnelGpuPeer once one runs' {
+        $cuda = Get-FlynnelBackend | Where-Object { $_.Kind -eq 'Cuda' -and $_.Available }
+        if (-not $cuda) {
+            Set-ItResult -Skipped -Because 'no loadable CUDA driver on this host'
+            return
+        }
+        try {
+            New-FlynnelGpuPeer | Out-Null
+            Test-Path 'Flynnel:\peer\summary' | Should -BeTrue
+            $d = Test-SameRow -Left (Get-FlynnelGpuPeer) `
+                -Right (Get-Item Flynnel:\peer\summary)
+            $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
+        } finally {
+            Remove-FlynnelGpuPeer -WarningAction SilentlyContinue | Out-Null
+        }
+        # And it goes away again, so the level tracks the peer rather
+        # than remembering that one once existed.
+        Test-Path 'Flynnel:\peer\summary' | Should -BeFalse
+    }
+}
+
 Describe 'a reading this host cannot take' {
     It 'is a leaf that exists and holds nothing, not a missing path' {
         # The distinction a script cannot make for itself: "this host

@@ -43,7 +43,7 @@ use pwrs::prelude::*;
 /// Held as a path list rather than built per call so enumerating a
 /// container is one pass over this table, and so a path that is not
 /// here is not there.
-const CONTAINERS: [&str; 7] = [
+const CONTAINERS: [&str; 8] = [
     "host",
     "pool",
     "pool/workers",
@@ -51,6 +51,7 @@ const CONTAINERS: [&str; 7] = [
     "backends",
     "calibration",
     "trace",
+    "peer",
 ];
 
 /// Every leaf whose path is fixed, by its normalized path.
@@ -145,6 +146,13 @@ impl FlynnelDrive {
             "calibration/summary" => Some(crate::calibration::calibration_row().into_ps()?),
             "calibration/thresholds" => Some(crate::calibration::threshold_row().into_ps()?),
             "trace/state" => Some(crate::observe::trace_state_row().into_ps()?),
+            // Present only while a peer is. The container above stays
+            // either way, so a script can tell "no peer is running"
+            // from "this module has no peer level".
+            "peer/summary" => match crate::gpupeer::running_peer_row() {
+                Some(row) => Some(row.into_ps()?),
+                None => None,
+            },
             _ => None,
         })
     }
@@ -222,6 +230,14 @@ impl FlynnelDrive {
                 out.push((format!("backends/{name}"), false));
             }
         }
+        // The peer level exists whether or not a peer does. A host
+        // with no GPU gets a container that enumerates nothing, not a
+        // missing path, because a missing path and a missing device
+        // read alike to a script and only one of them is worth
+        // retrying.
+        if path == "peer" && crate::gpupeer::peer_is_running() {
+            out.push(("peer/summary".to_string(), false));
+        }
         out
     }
 
@@ -264,6 +280,9 @@ impl FlynnelDrive {
     fn is_leaf(path: &str) -> bool {
         if LEAVES.contains(&path) {
             return true;
+        }
+        if path == "peer/summary" {
+            return crate::gpupeer::peer_is_running();
         }
         if let Some(name) = path.strip_prefix("pool/workers/") {
             return Self::worker_by_name(name).is_some();

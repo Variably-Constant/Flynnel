@@ -744,6 +744,29 @@ impl Cmdlet for GetFlynnelGpuPeer {
     }
 }
 
+/// Whether a peer is running, for the Flynnel drive's peer level.
+///
+/// Separate from the row because the drive asks the question far more
+/// often than it needs the answer: enumerating a container, testing a
+/// path and checking a leaf all ask, and building a full row to
+/// answer a boolean would read the calibration and the pool each
+/// time.
+pub(crate) fn peer_is_running() -> bool {
+    peer_slot().is_some()
+}
+
+/// The running peer's row, or None when none is, so the drive's
+/// `peer\summary` leaf answers the same object Get-FlynnelGpuPeer
+/// writes rather than a second rendering of it.
+pub(crate) fn running_peer_row() -> Option<PeerRow> {
+    let requested = *requested_blocks();
+    let slot = peer_slot();
+    if slot.is_none() {
+        return None;
+    }
+    Some(peer_row(&slot, requested))
+}
+
 /// Starts the GPU peer: maps the shared region, registers it with the
 /// driver, launches the resident poller and calibrates this host.
 ///
