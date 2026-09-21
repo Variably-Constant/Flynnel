@@ -40,9 +40,8 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, DriverError, LaunchConfig, PushKernelArg};
@@ -70,11 +69,12 @@ pub struct CudaBackend {
     secondary_stream: Arc<CudaStream>,
     caps: BackendCapabilities,
     next_handle: AtomicU64,
-    /// Loaded modules keyed by handle, kept alive for the
-    /// lifetime of any function pointers we hand out.
-    modules: Mutex<HashMap<u64, Arc<CudaModule>>>,
-    /// Function pointers keyed by handle, ready to launch.
-    functions: Mutex<HashMap<u64, CudaFunction>>,
+    /// Loaded kernels indexed by the handle the registration handed
+    /// out. `next_handle` counts up from zero, so the handle IS the
+    /// index and there is nothing to hash. Nothing is ever removed:
+    /// entries live until the backend drops, which is what keeps a
+    /// module alive for as long as any function pointer taken from it.
+    kernels: Box<[AtomicPtr<LoadedKernel>; MAX_KERNELS]>,
     /// Persistent worker thread that processes `dispatch_one`
     /// work items. Routed through a flynnel notify hub
     /// (FlynnelRing + Parker); `Drop` calls `hub.shutdown()` to
@@ -83,9 +83,23 @@ pub struct CudaBackend {
     /// Cached sender handle so `dispatch_one` does not pay the
     /// `Arc::clone` per call.
     worker_tx: NotifySender<WorkItem>,
-    /// Join handle for the persistent worker; taken in `Drop`.
-    worker_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Join handle for the persistent worker; taken in `Drop`, which
+    /// holds `&mut self` and so needs nothing to guard it.
+    worker_handle: Option<JoinHandle<()>>,
 }
+
+/// A loaded module and the entry point taken from it, kept together
+/// because the function borrows the module's lifetime.
+struct LoadedKernel {
+    /// Held so the module outlives the function pointer taken from it.
+    _module: Arc<CudaModule>,
+    function: CudaFunction,
+}
+
+/// Kernels one backend can register. Registration is a startup act
+/// per distinct kernel source, and the table costs one pointer per
+/// slot whether or not it is used.
+const MAX_KERNELS: usize = 1024;
 
 impl std::fmt::Debug for CudaBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -96,6 +110,24 @@ impl std::fmt::Debug for CudaBackend {
 }
 
 impl CudaBackend {
+    /// The kernel registered under `handle`.
+    ///
+    /// The borrow is the backend's: entries are never replaced or
+    /// removed, and they are freed in `Drop`, which cannot run while
+    /// a caller holds `&self`.
+    fn loaded(&self, handle: KernelHandle) -> Result<&LoadedKernel, BackendError> {
+        let unknown =
+            || BackendError::Launch(format!("unknown kernel handle {handle:?}"));
+        let slot = self.kernels.get(handle.0 as usize).ok_or_else(unknown)?;
+        let published = slot.load(Ordering::Acquire);
+        if published.is_null() {
+            return Err(unknown());
+        }
+        // SAFETY: a published slot holds a Box this backend owns and
+        // does not free before Drop.
+        Ok(unsafe { &*published })
+    }
+
     /// Initialize the CUDA driver on the primary device (id 0).
     /// Returns [`BackendError::DeviceUnavailable`] when the runtime
     /// is not loadable or the device cannot be opened.
@@ -158,11 +190,10 @@ impl CudaBackend {
             secondary_stream,
             caps,
             next_handle: AtomicU64::new(1),
-            modules: Mutex::new(HashMap::new()),
-            functions: Mutex::new(HashMap::new()),
+            kernels: Box::new([const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_KERNELS]),
             worker_hub,
             worker_tx,
-            worker_handle: Mutex::new(Some(worker_handle)),
+            worker_handle: Some(worker_handle),
         })
     }
 
@@ -215,16 +246,7 @@ impl CudaBackend {
         count: u32,
         args: &[KernelArg<'_>],
     ) -> Result<(), BackendError> {
-        let function = {
-            let guard = self
-                .functions
-                .lock()
-                .map_err(|_| BackendError::Launch("functions mutex poisoned".into()))?;
-            guard
-                .get(&handle.0)
-                .cloned()
-                .ok_or_else(|| BackendError::Launch(format!("unknown kernel handle {handle:?}")))?
-        };
+        let function = self.loaded(handle)?.function.clone();
         let block = 256u32.min(count.max(1));
         let grid = count.div_ceil(block);
         let cfg = LaunchConfig {
@@ -359,14 +381,20 @@ impl DispatchBackend for CudaBackend {
             .load_function(name)
             .map_err(|e| BackendError::KernelCompile(format!("function lookup `{name}`: {e:?}")))?;
         let handle_id = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.modules
-            .lock()
-            .map_err(|_| BackendError::KernelCompile("modules mutex poisoned".into()))?
-            .insert(handle_id, module);
-        self.functions
-            .lock()
-            .map_err(|_| BackendError::KernelCompile("functions mutex poisoned".into()))?
-            .insert(handle_id, function);
+        let index = handle_id as usize;
+        if index >= MAX_KERNELS {
+            return Err(BackendError::KernelCompile(format!(
+                "this backend holds {MAX_KERNELS} kernels and `{name}` would be the {index}th"
+            )));
+        }
+        let entry = Box::into_raw(Box::new(LoadedKernel {
+            _module: module,
+            function,
+        }));
+        // The counter handed this index to this call alone, so nothing
+        // else writes this slot, and the entry is complete before the
+        // pointer that publishes it.
+        self.kernels[index].store(entry, Ordering::Release);
         Ok(KernelHandle(handle_id))
     }
 
@@ -376,16 +404,7 @@ impl DispatchBackend for CudaBackend {
         count: u32,
         args: &[KernelArg<'_>],
     ) -> Result<(), BackendError> {
-        let function = {
-            let guard = self
-                .functions
-                .lock()
-                .map_err(|_| BackendError::Launch("functions mutex poisoned".into()))?;
-            guard
-                .get(&handle.0)
-                .cloned()
-                .ok_or_else(|| BackendError::Launch(format!("unknown kernel handle {handle:?}")))?
-        };
+        let function = self.loaded(handle)?.function.clone();
         // Launch geometry: pick a sensible block size (256) and
         // grid size to cover `count` work-items. Consumers that
         // need precise launch configuration ship their own backend
@@ -466,7 +485,7 @@ impl DispatchBackend for CudaBackend {
         // storage Vecs above; the Vecs live until this function
         // returns, after the launch returns. The kernel function
         // pointer comes from a cudarc-loaded module also kept alive
-        // by `self.modules`. Argument count / type correctness is
+        // by the kernel table. Argument count / type correctness is
         // a contract with the kernel author (the safety hole cudarc
         // documents on launch()).
         unsafe { builder.launch(cfg) }
@@ -517,11 +536,36 @@ impl Drop for CudaBackend {
         // Shut down the notify hub: the worker thread's recv()
         // returns None and it exits cleanly.
         self.worker_hub.shutdown();
-        if let Ok(mut guard) = self.worker_handle.lock()
-            && let Some(handle) = guard.take()
+        if let Some(handle) = self.worker_handle.take()
+            && let Err(panicked) = handle.join()
         {
-            drop(handle.join());
+            // A worker that died of a panic took its work with it, and
+            // a drop cannot return that to anyone. Saying so is the
+            // only thing left; dropping it reports a clean shutdown.
+            eprintln!(
+                "flynnel: CUDA backend worker thread panicked: {}",
+                panic_message(&panicked)
+            );
         }
+        for slot in self.kernels.iter() {
+            let published = slot.swap(core::ptr::null_mut(), Ordering::AcqRel);
+            if !published.is_null() {
+                // SAFETY: this is the last owner of the backend, so no
+                // caller can be holding a reference into the entry.
+                drop(unsafe { Box::from_raw(published) });
+            }
+        }
+    }
+}
+
+/// Whatever a panicking thread carried, as text.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    match payload.downcast_ref::<String>() {
+        Some(s) => s.clone(),
+        None => "a payload of an unknown type".to_string(),
     }
 }
 
