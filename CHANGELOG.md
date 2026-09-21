@@ -210,8 +210,36 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 - **`MONITORX`/`MWAITX`, so AMD parts before Zen 5 stop falling back
   to the kernel.** `cpu_info::has_monitorx` reads CPUID `Fn8000_0001`
-  ECX bit 29, and the worker parker gained a third arm: it picks
-  WAITPKG, then MONITORX, then `std::thread::park`.
+  ECX bit 29, and the worker parker gained a third arm.
+
+  **Which wait a worker uses is measured, not decided.** A monitor
+  wait beats a kernel park on some parts and loses on others, and on
+  a Ryzen 7 2700 it does both: five to nine times faster on an idle
+  host and twenty times slower on a loaded one. Nothing readable at
+  construction separates those, because CPUID reports the instruction
+  and not what it costs, and the cost moves with the load.
+
+  So `WaitController` times the parks the pool performs anyway. One
+  park in sixty-four, per thread, is timed; the unparker stamps its
+  TSC only when the waiter armed it, out of the cache line it is
+  already writing `wake_counter` into, so an unsampled wake pays one
+  relaxed load and no clock read, and a host with no second strategy
+  never touches the controller at all. Each arm needs 32 samples
+  before its mean counts and the cheaper must win by a fifth.
+
+  **Sampled parks alternate strictly between the arms**, so every
+  baseline reading has a challenger reading beside it in time. That
+  pairing is the control, and it is not decoration: a quiet draw and
+  a loaded draw of one quantity differ on these hosts by 350 to 4000
+  times, far more than the two waits differ from each other, so means
+  gathered over different stretches would compare the machine's mood.
+  Alternation never stops, so no verdict outlives its evidence and
+  the choice moves back when a host gets busy.
+
+  A process starts on WAITPKG or the kernel park, exactly as before,
+  and leaves that only on measurement. `Parker::with_strategy` pins an
+  arm and is never sampled, so the benches that hold one still cannot
+  move the default they inform.
 
   **The URD thief has the arm and does not default to it.** Its spin
   is already the fastest wake there is, because it never stopped
@@ -256,7 +284,11 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
   So the wait checks that it held. Four arms inside 50,000 RDTSC
   cycles is a monitor that never armed, and the wait then ends in
-  `thread::park`.
+  `thread::park`. This answers a narrower question than the
+  controller above and sits underneath it: whether the instruction
+  does anything at all on this host, which decides whether there is a
+  second strategy worth timing. Which of two working waits is cheaper
+  is the controller's job, and no threshold can answer it.
 
   **There are three cases and the threshold has to separate all
   three**, which is why that figure is measured rather than argued.
