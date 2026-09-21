@@ -221,6 +221,18 @@ fn bench_all(c: &mut Criterion) {
             }
         }
     }
+
+    // Printed after the arms, because it is only knowable once a wait
+    // has run. A MONITORX row that matches the StdPark row beside it
+    // has usually fallen back to exactly that, and without this line
+    // that is indistinguishable from the monitor wait being no
+    // faster.
+    if monitorx && !flynnel::sched::sleep::monitor_wait_held() {
+        eprintln!(
+            "parker_wait_strategy: the monitor did not hold on this host, so the MONITORX \
+             rows above are partly or wholly the kernel park it falls back to."
+        );
+    }
 }
 
 criterion_group!(benches, bench_all);

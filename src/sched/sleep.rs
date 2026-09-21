@@ -69,6 +69,42 @@ pub enum WaitStrategy {
     Monitorx,
 }
 
+/// Whether a monitor wait on this host actually suspends the core.
+///
+/// A CPUID bit says the instruction pair exists and decodes. It does
+/// not say the monitor survives long enough to be waited on, and on
+/// at least one part it does not: on a Ryzen 7 2700 under load,
+/// MWAITX returns straight back, so re-arming becomes a spin over a
+/// two-thousand-cycle instruction pair. Nothing reports that, and
+/// only the length of an actual wait reveals it.
+///
+/// Set false by the first parker to see it, and never set back. A
+/// wrong false costs the kernel park that was there before; a wrong
+/// true costs that regression on every park, so the two directions
+/// are not worth the same.
+static MONITOR_HOLDS: AtomicBool = AtomicBool::new(true);
+
+/// Whether re-arming a monitor is still believed to be worth it.
+fn monitor_holds() -> bool {
+    MONITOR_HOLDS.load(Ordering::Relaxed)
+}
+
+/// Record that a monitor wait did not suspend the core on this host,
+/// so later parks go straight to the kernel.
+fn note_monitor_does_not_hold() {
+    MONITOR_HOLDS.store(false, Ordering::Relaxed);
+}
+
+/// Whether any wait has found this host's monitor not to hold.
+///
+/// Exposed for the bench and for diagnostics: a MONITORX run whose
+/// numbers look like the StdPark ones beside it has usually fallen
+/// back, and without this that is indistinguishable from the wait
+/// being no faster.
+pub fn monitor_wait_held() -> bool {
+    monitor_holds()
+}
+
 impl WaitStrategy {
     /// Pick the best wait strategy for this host: WAITPKG where the
     /// silicon has it, else MONITORX, else
@@ -389,6 +425,25 @@ impl Parker {
         // count bounds that case on its own, without assuming any
         // iteration actually waits.
         const MAX_ARMS: u32 = 256;
+        // Consecutive returns far shorter than the timeout asked for
+        // before this stops re-arming and parks in the kernel.
+        //
+        // A monitor wait that comes straight back did not hold, and
+        // re-arming it is a spin over an instruction pair costing
+        // about two thousand cycles a turn. Measured on a Ryzen 7
+        // 2700 under load, where the monitor does not hold and the
+        // full 256 arms ran: the parker took 444 to 755 us against 15
+        // to 25 us for the kernel park it replaced, a regression of
+        // 20 to 40 times on the scheduler's own idle path. Four turns
+        // caps the waste at roughly ten thousand cycles before this
+        // falls back to what it is meant to beat.
+        const SHORT_RETURNS_BEFORE_PARK: u32 = 4;
+        // A return is short when it lasted under an eighth of what it
+        // asked for. One EBX unit is at most one RDTSC cycle, so a
+        // wait that held returns at or above half the request even
+        // where the unit is halved; an eighth is clear of both cases
+        // and of the noise around them.
+        const SHORT_RETURN_SHIFT: u32 = 3;
 
         let budget = WAIT_DEADLINE_NS.saturating_mul(TSC_HZ_ESTIMATE / 1_000_000_000);
         // SAFETY: `_rdtsc` is a no-side-effect read of the TSC
@@ -398,6 +453,17 @@ impl Parker {
 
         let addr = (&raw const self.wake_counter).cast::<u8>();
 
+        // A host whose monitor does not hold has already been found
+        // out, by this parker or another. The finding is a property
+        // of the part rather than of one wait, so it is read once
+        // here and never re-tested: the cost of being wrong the other
+        // way is the regression above, on every park.
+        if !monitor_holds() {
+            thread::park();
+            return;
+        }
+
+        let mut short_returns = 0u32;
         for _ in 0..MAX_ARMS {
             // MONITORX rax: arm the monitor on the line holding
             // wake_counter. ECX carries extensions and EDX hints, both
@@ -439,6 +505,7 @@ impl Parker {
             // the longest wait the register can express and the next
             // iteration asks for the rest.
             let ask = u32::try_from(left).unwrap_or(u32::MAX);
+            let before = unsafe { core::arch::x86_64::_rdtsc() };
 
             // MWAITX: EAX = 0 requests C0, the light state matching
             // the WAITPKG arm's C0.1 hint; ECX bit 1 enables the EBX
@@ -468,6 +535,21 @@ impl Parker {
                 return;
             }
             if self.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+
+            // Whether that wait held. Counted consecutively, so a
+            // single interrupt does not condemn the host, and reset
+            // by any wait that did hold.
+            let waited = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(before);
+            if waited < u64::from(ask) >> SHORT_RETURN_SHIFT {
+                short_returns += 1;
+            } else {
+                short_returns = 0;
+            }
+            if short_returns >= SHORT_RETURNS_BEFORE_PARK {
+                note_monitor_does_not_hold();
+                thread::park();
                 return;
             }
         }
