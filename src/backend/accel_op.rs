@@ -211,12 +211,10 @@ pub fn bind_accel_kernel_handle(op: AccelOpId, backend: Backend, handle: KernelH
 pub fn accel_target(plan: &JobPlan, op: AccelOpId) -> Option<(Backend, KernelHandle)> {
     let op = op_by_id(op);
     let guard = BINDINGS.protect(binding_reader(), &op.kernels);
-    let bound = match guard.get() {
-        Some(bindings) => bindings,
-        // The list is installed when the op is registered, so this is
-        // unreachable rather than an empty binding set.
-        None => return None,
-    };
+    // The list is installed when the op is registered, so an absent
+    // one is unreachable rather than an empty binding set, and either
+    // way it routes to the CPU.
+    let bound = guard.get()?;
     let bound_and_registered = |b: Backend| -> Option<(Backend, KernelHandle)> {
         let handle = bound.iter().find(|(k, _)| *k == b).map(|(_, h)| *h)?;
         backend_by_id(&b)?;
