@@ -87,16 +87,30 @@ pub enum WaitStrategy {
     Monitorx,
 }
 
+/// Polls a thief spins before it hands the core back.
+///
+/// The first stage of [`UrdDeque::wait_and_drain`]. A publish already
+/// in flight lands inside this for a few hundred nanoseconds of
+/// spinning; a wait that outlasts it was going to be expensive
+/// whatever the thief did, and is better spent not holding a logical
+/// CPU. Same order as the parker's spin floor.
+pub const SPIN_BEFORE_WAIT: u32 = 512;
+
 impl WaitStrategy {
-    /// Returns the wait strategy for this host: WAITPKG where the
-    /// silicon has it, otherwise the PAUSE-spin.
+    /// What a thief waits on after its spin floor: the best monitor
+    /// wait this host has, or more spinning where it has none.
     ///
-    /// # MONITORX is implemented and is deliberately not picked here
+    /// # This does not compete with the spin
     ///
-    /// The thief's spin is already the fastest wake there is, because
-    /// it never stopped looking, and the measurement says a monitor
-    /// wait does not beat it. On a Ryzen 9 7900X, best median of
-    /// three runs of `benches/urd_thief_wait.rs`, publish to drained:
+    /// The spin runs first and always, and is what makes a short wait
+    /// fast. This is the second stage and its job is to stop a long
+    /// wait holding a core. Treating the two as alternatives, and
+    /// picking between them on one measurement, was the earlier
+    /// mistake here.
+    ///
+    /// Measured on a 7900X with NO floor, so the monitor wait was
+    /// doing the spin's job as well as its own, publish to drained,
+    /// best median of three:
     ///
     /// ```text
     ///                PAUSE-spin   MONITORX
@@ -106,21 +120,17 @@ impl WaitStrategy {
     ///   load  500us     1.63 us    1.85 us
     /// ```
     ///
-    /// Slower in three cells of four, so it does not pass a rule that
-    /// nothing may get slower anywhere, and it is not the default.
-    ///
-    /// What a monitor wait would buy the thief is the core it stops
-    /// occupying, and that bench cannot see it: it times the thief's
-    /// own wake, not the throughput of whatever else could have used
-    /// the core meanwhile. Establishing the benefit needs a harness
-    /// that measures the co-runner, and until one exists the trade is
-    /// unmeasured in the direction that would justify it.
-    ///
-    /// [`UrdDeque::set_wait_strategy`] still selects it, which is how
-    /// the numbers above were taken.
+    /// Slower in three cells of four, which is what a monitor wait
+    /// costs when it has to catch wakes the spin would have caught.
+    /// With the floor in front of it those never reach it. What it
+    /// buys in exchange, the core a long wait gives back, is the
+    /// co-runner group in `benches/urd_thief_wait.rs` and not the
+    /// rows above, which time the thief rather than its neighbours.
     pub fn pick() -> Self {
         if has_waitpkg() {
             Self::Waitpkg
+        } else if has_monitorx() {
+            Self::Monitorx
         } else {
             Self::PauseSpin
         }
@@ -477,26 +487,59 @@ impl UrdDeque {
         Drain::Success(result)
     }
 
-    /// Thief-side: block (per the host's [`WaitStrategy`]) until
-    /// the mailbox transitions to READY, then drain it.
+    /// Thief-side: block until the mailbox transitions to READY,
+    /// then drain it.
     ///
-    /// On WAITPKG-capable hardware the thief uses `UMONITOR` +
-    /// `UMWAIT` to halt; otherwise it uses `PAUSE`-spin. The
-    /// deadline is expressed as the absolute TSC value at which
-    /// `UMWAIT` should return even if the line hasn't transitioned;
-    /// `u64::MAX` means "no deadline" (wait indefinitely - protocol
-    /// risk if the owner never publishes).
+    /// # A spin floor, then a wait that gives the core back
+    ///
+    /// The two are not alternatives and choosing between them was the
+    /// mistake. A `PAUSE`-spin is the fastest wake there is, because
+    /// it never stopped looking, and it is also the most expensive
+    /// way to be idle, because it holds a logical CPU and issues into
+    /// the pipeline for as long as it waits. Which matters depends
+    /// entirely on how long this particular wait turns out to be, and
+    /// that is not knowable when it starts.
+    ///
+    /// So the thief spins for [`SPIN_BEFORE_WAIT`] polls, which
+    /// covers a publish already in flight at the cost of a few
+    /// hundred nanoseconds, and then hands the core back through
+    /// whatever monitor wait the host has. A wait that ends quickly
+    /// never reaches the second stage; one that does not was going to
+    /// be expensive either way and now costs a core less. This is the
+    /// shape [`crate::sched::sleep::Parker`] already uses, where the
+    /// spin floor precedes the park.
+    ///
+    /// Measured against the unbounded spin on a 7900X, publish to
+    /// drained, the monitor wait alone was slower in three cells of
+    /// four (1.54 against 2.00 us idle at a 50 us inter-arrival).
+    /// That measured the first stage's job and said nothing about the
+    /// second's, which is the core a long wait returns; the spin
+    /// floor keeps the former and the monitor wait supplies the
+    /// latter.
+    ///
+    /// `deadline_tsc` bounds a single monitor wait, not the call:
+    /// `u64::MAX` means no bound, and the loop re-checks the state
+    /// byte after every wait however it ended.
     pub fn wait_and_drain(&self, mailbox_idx: usize, deadline_tsc: u64) -> Drain {
         if mailbox_idx >= self.n_mailboxes {
             return Drain::Empty;
         }
         let mb = self.mailbox(mailbox_idx);
         let state_addr = (&raw const mb.state).cast::<u8>();
+        let mut spins = 0u32;
         loop {
             let s = mb.state.load(Ordering::Acquire);
             if s & 0xFFFF == CLAIM_READY {
                 break;
             }
+            // The floor: a publish already on its way lands here and
+            // the thief never reaches a monitor wait at all.
+            if spins < SPIN_BEFORE_WAIT {
+                spins += 1;
+                std::hint::spin_loop();
+                continue;
+            }
+
             match self.wait_strategy {
                 WaitStrategy::PauseSpin => std::hint::spin_loop(),
                 WaitStrategy::Waitpkg => {
@@ -714,12 +757,14 @@ mod tests {
         let path = temp_path("strategy");
         let u = UrdDeque::create(&path, 2).expect("create");
         let s = u.wait_strategy();
-        // WAITPKG where the host has it, the spin otherwise. MONITORX
-        // is never picked, and that is asserted below rather than
-        // left implicit, because it is a measurement result and not
-        // an oversight.
+        // The order is the assertion: WAITPKG, then MONITORX, then
+        // the spin, which is what remains on a host with neither.
+        // This names the stage after the spin floor, so the spin
+        // appearing here means the host has no monitor wait at all.
         if has_waitpkg() {
             assert_eq!(s, WaitStrategy::Waitpkg);
+        } else if has_monitorx() {
+            assert_eq!(s, WaitStrategy::Monitorx);
         } else {
             assert_eq!(s, WaitStrategy::PauseSpin);
         }
@@ -727,22 +772,29 @@ mod tests {
     }
 
     #[test]
-    fn monitorx_is_available_to_ask_for_and_is_never_chosen_on_its_own() {
-        // It loses to the spin on latency, so defaulting to it would
-        // be a regression; it stays reachable because the bench that
-        // found that out selects it, and because the trade it makes
-        // has not been measured in the direction that would justify
-        // it. A later measurement changes `pick`, and this test is
-        // what will notice.
-        assert_ne!(WaitStrategy::pick(), WaitStrategy::Monitorx);
+    fn the_second_stage_is_the_best_monitor_wait_the_host_has() {
+        // pick() names what follows the spin floor, not what competes
+        // with it, so on a host with a monitor wait it is that wait.
+        // The floor is why this is not the regression the
+        // latency-only comparison suggested: wakes the spin would
+        // have caught never reach here.
+        let want = if has_waitpkg() {
+            WaitStrategy::Waitpkg
+        } else if has_monitorx() {
+            WaitStrategy::Monitorx
+        } else {
+            WaitStrategy::PauseSpin
+        };
+        assert_eq!(WaitStrategy::pick(), want);
+    }
 
-        if has_monitorx() {
-            let path = temp_path("strategy_monitorx");
-            let mut u = UrdDeque::create(&path, 2).expect("create");
-            u.set_wait_strategy(WaitStrategy::Monitorx);
-            assert_eq!(u.wait_strategy(), WaitStrategy::Monitorx);
-            remove_temp(&path);
-        }
+    #[test]
+    fn the_spin_floor_is_long_enough_to_be_worth_having() {
+        // A floor of nothing makes the second stage catch every wake,
+        // which is the configuration measured slower in three cells
+        // of four. Pinned so it cannot be tuned to zero without the
+        // reason being revisited.
+        assert!(SPIN_BEFORE_WAIT >= 64);
     }
 
     #[test]
@@ -753,13 +805,8 @@ mod tests {
         // probe, which is the direction that catches a `pick` whose
         // arms have been reordered out from under the detections.
         //
-        // The spin carries no precondition, and asserting one here
-        // would be asserting something else entirely: this host has
-        // MONITORX and is picked onto the spin anyway, because the
-        // spin measured faster. That is a choice and not a failure to
-        // detect, so the executability test must not encode it.
-        // `monitorx_is_available_to_ask_for_and_is_never_chosen_on_its_own`
-        // is where the choice is pinned.
+        // The spin carries no precondition of its own, so its arm
+        // asserts only that neither monitor wait was available.
         let path = temp_path("strategy_executable");
         let u = UrdDeque::create(&path, 2).expect("create");
         match u.wait_strategy() {
