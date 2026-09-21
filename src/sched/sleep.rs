@@ -23,7 +23,7 @@
 //! `Parker` accepts the spin-round count at construction so it
 //! works across tiers without conditional plumbing.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::thread::{self, Thread};
 
 /// Selects how the [`Parker`] waits after the spin floor is exhausted.
@@ -213,13 +213,23 @@ impl WaitStrategy {
 /// pairing is the control: on this project's hosts a quiet draw and a
 /// loaded draw of one quantity differ by hundreds to thousands of
 /// times, which is far more than the two arms differ from each other,
-/// so two means gathered over different stretches would compare the
+/// so readings gathered over different stretches would compare the
 /// machine's mood and not the waits.
 ///
+/// **The pair is also what decides.** Each one credits a point to
+/// whichever arm was cheaper in it, and the running count is the
+/// verdict. Comparing the two means instead answers to their largest
+/// draws, and a wake latency has a long tail: on a 7900X this
+/// controller read its challenger at 17939 ns over 100 samples while
+/// a pinned arm measured the same wait at 888 ns under the same
+/// conditions, because a handful of draws near 340 us carried the
+/// average, and it declined a wait nearly seven times cheaper. The
+/// means are still kept, and reported, because the tail is worth
+/// seeing; they are not what moves the process.
+///
 /// Probing never stops, so there is no verdict that outlives its
-/// evidence. Both means keep moving with an exponential weight once
-/// they are established, and a host that gets busy is noticed because
-/// both arms feel it and the cheaper one may change.
+/// evidence. A host that gets busy is noticed because the pairs stop
+/// falling the same way and the count walks back.
 ///
 /// What does change is how often. Each probe spends one park on the
 /// arm not in use, which on a host that settled against the monitor
@@ -257,7 +267,26 @@ pub struct WaitController {
     /// Parks a thread takes between probes, between
     /// [`PROBE_EVERY_MIN`] and [`PROBE_EVERY_MAX`].
     probe_every: AtomicU32,
+    /// Completed pairs the challenger has won less those the
+    /// baseline has won, saturating at [`SCORE_CAP`] either way.
+    score: AtomicI32,
 }
+
+/// How far the running score can run in either direction.
+///
+/// It is what bounds recovery: a host that changes character has to
+/// win this many pairs back before the count even reaches zero, so a
+/// cap far above [`SWITCH_AT`] would buy confidence with a verdict
+/// that takes too long to leave.
+const SCORE_CAP: i32 = 64;
+
+/// Net pairs one arm must be ahead by before the process moves to it.
+///
+/// A margin already keeps a pair from being scored at all unless the
+/// two readings separate, so every point here is a pair where one
+/// arm was clearly cheaper. Wanting this many of them is what stops
+/// a short run of luck moving the process.
+const SWITCH_AT: i32 = 24;
 
 /// Parks between probes while a verdict is forming or contested.
 ///
@@ -290,10 +319,17 @@ struct ProbeCursor {
     /// Slots the open pair still owes a reading, as a bitmask. Zero
     /// when no pair is open.
     pending: u32,
+    /// Slot of the pair's first reading, or [`NO_SLOT`].
+    held_slot: u32,
+    /// That reading, nanoseconds, waiting for its partner.
+    held_ns: u64,
 }
 
 /// Both halves of a pair are owed.
 const BOTH_SLOTS: u32 = (1 << SLOT_BASELINE) | (1 << SLOT_CHALLENGER);
+
+/// No half of a pair is being held.
+const NO_SLOT: u32 = u32::MAX;
 
 thread_local! {
     /// Where this thread is in the probe cycle.
@@ -309,17 +345,19 @@ thread_local! {
             since: 0,
             every: PROBE_EVERY_MIN,
             pending: 0,
+            held_slot: NO_SLOT,
+            held_ns: 0,
         })
     };
 }
 
-/// Samples each strategy needs before its mean is allowed to decide
-/// anything.
+/// Samples after which an arm's mean stops accumulating and starts
+/// following an exponential weight.
 ///
-/// The spin controller waits for 256 events before it moves, for the
-/// same reason: a wake latency has a long tail and a handful of
-/// samples is mostly tail.
-const SAMPLES_BEFORE_VERDICT: u32 = 32;
+/// The mean is reported rather than obeyed, so this sets how quickly
+/// the reported figure tracks a change in load and nothing about the
+/// verdict, which comes from [`WaitController::score_pair`].
+const SAMPLES_BEFORE_EWMA: u32 = 32;
 
 /// How much cheaper the challenger must be before the process moves.
 ///
@@ -337,6 +375,7 @@ static WAIT_CONTROLLER: WaitController = WaitController {
     current: AtomicU32::new(SLOT_BASELINE),
     switches: AtomicU64::new(0),
     probe_every: AtomicU32::new(PROBE_EVERY_MIN),
+    score: AtomicI32::new(0),
 };
 
 /// Slot of [`WaitStrategy::baseline`], whatever that resolves to.
@@ -430,24 +469,57 @@ impl WaitController {
         ))
     }
 
-    /// Note that a slot of the open pair has produced its reading.
-    ///
-    /// The pair closes only when both have, and the interval to the
-    /// next one is counted from there.
-    fn probe_served(slot: u32) {
+    /// Open a probe pair on this thread, so a test can drive
+    /// [`Self::record`] down the path a probe takes.
+    #[cfg(test)]
+    fn open_pair() {
         PROBE.with(|p| {
             let mut c = p.get();
-            c.pending &= !(1u32 << slot);
-            if c.pending == 0 {
-                c.since = 0;
-            }
+            c.pending = BOTH_SLOTS;
+            c.held_slot = NO_SLOT;
             p.set(c);
         });
     }
 
-    /// Fold one timed wake into a slot's mean and re-decide.
+    /// Note that a slot of the open pair has produced its reading,
+    /// and hand back the partner reading once both are in.
+    ///
+    /// The pair closes only when both have reported, and the interval
+    /// to the next one is counted from there.
+    fn probe_served(slot: u32, wake_ns: u64) -> Option<u64> {
+        PROBE.with(|p| {
+            let mut c = p.get();
+            c.pending &= !(1u32 << slot);
+            if c.pending != 0 {
+                // First half. Hold it for its partner rather than
+                // comparing against a mean, so the two readings
+                // being compared are the two this thread took next
+                // to each other.
+                c.held_slot = slot;
+                c.held_ns = wake_ns;
+                p.set(c);
+                return None;
+            }
+            c.since = 0;
+            let partner = (c.held_slot != NO_SLOT && c.held_slot != slot).then_some(c.held_ns);
+            c.held_slot = NO_SLOT;
+            c.held_ns = 0;
+            p.set(c);
+            partner
+        })
+    }
+
+    /// Fold one timed wake into a slot's mean, score the pair it
+    /// completes, and re-decide.
     fn record(&self, slot: u32, wake_ns: u64) {
-        Self::probe_served(slot);
+        if let Some(partner_ns) = Self::probe_served(slot, wake_ns) {
+            let (base, chal) = if slot == SLOT_CHALLENGER {
+                (partner_ns, wake_ns)
+            } else {
+                (wake_ns, partner_ns)
+            };
+            self.score_pair(base, chal);
+        }
         let i = slot as usize;
         let n = self.samples[i].fetch_add(1, Ordering::Relaxed) + 1;
         let prev = self.mean_ns[i].load(Ordering::Relaxed);
@@ -461,7 +533,7 @@ impl WaitController {
         // the worst draw each happened to take.
         let next = if prev == 0 {
             wake_ns
-        } else if n <= SAMPLES_BEFORE_VERDICT {
+        } else if n <= SAMPLES_BEFORE_EWMA {
             let prev_i = prev as i64;
             (prev_i + (wake_ns as i64 - prev_i) / i64::from(n)).max(0) as u64
         } else {
@@ -471,42 +543,65 @@ impl WaitController {
         self.decide();
     }
 
-    /// Adopt whichever side is cheaper by more than the margin.
-    fn decide(&self) {
-        let base_n = self.samples[SLOT_BASELINE as usize].load(Ordering::Relaxed);
-        let chal_n = self.samples[SLOT_CHALLENGER as usize].load(Ordering::Relaxed);
-        if base_n < SAMPLES_BEFORE_VERDICT || chal_n < SAMPLES_BEFORE_VERDICT {
-            return;
-        }
-        let base = self.mean_ns[SLOT_BASELINE as usize].load(Ordering::Relaxed);
-        let chal = self.mean_ns[SLOT_CHALLENGER as usize].load(Ordering::Relaxed);
-        if base == 0 || chal == 0 {
-            return;
-        }
-        let want = if chal * 100 < base * (100 - MARGIN_PER_CENT) {
-            SLOT_CHALLENGER
-        } else if base * 100 < chal * (100 - MARGIN_PER_CENT) {
-            SLOT_BASELINE
+    /// Credit one completed pair to whichever arm was cheaper in it.
+    ///
+    /// A pair is one comparison, not two measurements: both readings
+    /// were taken by one thread moments apart, so the slower of them
+    /// is the slower wait under the conditions that applied to both.
+    /// Counting those outcomes is what keeps a tail from deciding.
+    /// A wake latency has a long one, and a mean over it answers to
+    /// its largest draws: on a 7900X the controller read its
+    /// challenger at 17939 ns over 100 samples while a pinned arm
+    /// measured the same wait at 888 ns under the same conditions,
+    /// because a handful of draws near 340 us carried the average.
+    /// It declined a wait almost seven times cheaper on that.
+    fn score_pair(&self, base_ns: u64, chal_ns: u64) {
+        let step = if chal_ns * 100 < base_ns * (100 - MARGIN_PER_CENT) {
+            1
+        } else if base_ns * 100 < chal_ns * (100 - MARGIN_PER_CENT) {
+            -1
         } else {
-            // Inside the margin the two are close enough that the
-            // order could change on the next shift in load, and the
-            // probe is cheap for the same reason: the arm not in use
-            // costs about what the one in use costs. Look often.
-            self.probe_every.store(PROBE_EVERY_MIN, Ordering::Relaxed);
+            // Inside the margin this pair separates nothing, and
+            // scoring it either way would be scoring noise.
             return;
         };
-        if self.current.swap(want, Ordering::Relaxed) != want {
-            self.switches.fetch_add(1, Ordering::Relaxed);
-            self.probe_every.store(PROBE_EVERY_MIN, Ordering::Relaxed);
-        } else {
-            // The same answer again. Widen the gap between probes, so
-            // a settled host stops paying to rediscover what it
-            // already knows.
+        self.score
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+                Some((s + step).clamp(-SCORE_CAP, SCORE_CAP))
+            })
+            .expect("the update closure returns Some on every call");
+    }
+
+    /// Adopt whichever side has won enough pairs to be worth moving
+    /// to, and set how soon to look again.
+    fn decide(&self) {
+        let score = self.score.load(Ordering::Relaxed);
+
+        if score >= SWITCH_AT || score <= -SWITCH_AT {
+            let want = if score > 0 {
+                SLOT_CHALLENGER
+            } else {
+                SLOT_BASELINE
+            };
+            if self.current.swap(want, Ordering::Relaxed) != want {
+                self.switches.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // How soon to look again follows how settled the answer is,
+        // because a probe spends one park on the arm not in use and
+        // that park costs what it costs. A saturated score is an arm
+        // that has won every recent pair, and a score back inside
+        // the switching threshold is the order coming apart, which
+        // is the moment to watch closely rather than after it flips.
+        if score.abs() >= SCORE_CAP {
             let e = self.probe_every.load(Ordering::Relaxed);
             if e < PROBE_EVERY_MAX {
                 self.probe_every
                     .store((e * 2).min(PROBE_EVERY_MAX), Ordering::Relaxed);
             }
+        } else if score.abs() < SWITCH_AT {
+            self.probe_every.store(PROBE_EVERY_MIN, Ordering::Relaxed);
         }
     }
 
@@ -525,6 +620,7 @@ impl WaitController {
             in_use: self.choose(),
             switches: self.switches.load(Ordering::Relaxed),
             probe_every: self.probe_every.load(Ordering::Relaxed),
+            score: self.score.load(Ordering::Relaxed),
         }
     }
 }
@@ -548,6 +644,12 @@ pub struct WaitControllerReport {
     /// [`PROBE_EVERY_MIN`] while the answer is unsettled and reaches
     /// [`PROBE_EVERY_MAX`] once it stops changing.
     pub probe_every: u32,
+    /// Pairs the monitor wait has won less those the baseline has
+    /// won, saturating at [`SCORE_CAP`]. This is what decides; the
+    /// two means above are what it cost, and they can disagree
+    /// because a mean answers to its largest draws and this does
+    /// not.
+    pub score: i32,
 }
 
 /// A cycle counter reading, or 0 where the target has none.
@@ -1276,6 +1378,7 @@ mod tests {
             current: AtomicU32::new(SLOT_BASELINE),
             switches: AtomicU64::new(0),
             probe_every: AtomicU32::new(PROBE_EVERY_MIN),
+            score: AtomicI32::new(0),
         }
     }
 
@@ -1286,6 +1389,7 @@ mod tests {
         // a long tail and a handful of samples is mostly tail.
         let c = fresh_controller();
         for _ in 0..3 {
+            WaitController::open_pair();
             c.record(SLOT_CHALLENGER, 100);
             c.record(SLOT_BASELINE, 100_000);
         }
@@ -1299,16 +1403,19 @@ mod tests {
         // directions. A controller that could only adopt would be the
         // permanent verdict again, wearing a mean.
         let c = fresh_controller();
-        for _ in 0..SAMPLES_BEFORE_VERDICT {
+        for _ in 0..SWITCH_AT {
+            WaitController::open_pair();
             c.record(SLOT_BASELINE, 6_000);
             c.record(SLOT_CHALLENGER, 1_000);
         }
         assert_eq!(c.current.load(Ordering::Relaxed), SLOT_CHALLENGER);
 
         // The host gets busy and the monitor wait stops paying. The
-        // means are exponential once established, so this takes more
-        // than one contrary sample, which is the intent.
-        for _ in 0..SAMPLES_BEFORE_VERDICT * 4 {
+        // score has to be won back from wherever it saturated before
+        // the process moves, which is the intent: one contrary pair
+        // is not a change of character.
+        for _ in 0..SCORE_CAP + SWITCH_AT {
+            WaitController::open_pair();
             c.record(SLOT_CHALLENGER, 300_000);
             c.record(SLOT_BASELINE, 6_000);
         }
@@ -1322,12 +1429,14 @@ mod tests {
         // buys nothing. Ten per cent apart is inside the twenty the
         // controller demands.
         let c = fresh_controller();
-        for _ in 0..SAMPLES_BEFORE_VERDICT * 2 {
+        for _ in 0..SCORE_CAP * 2 {
+            WaitController::open_pair();
             c.record(SLOT_BASELINE, 5_000);
             c.record(SLOT_CHALLENGER, 4_600);
         }
         assert_eq!(c.current.load(Ordering::Relaxed), SLOT_BASELINE);
         assert_eq!(c.switches.load(Ordering::Relaxed), 0);
+        assert_eq!(c.score.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1342,7 +1451,7 @@ mod tests {
             c.mean_ns[SLOT_CHALLENGER as usize].load(Ordering::Relaxed),
             300_000
         );
-        for _ in 0..SAMPLES_BEFORE_VERDICT - 1 {
+        for _ in 0..SAMPLES_BEFORE_EWMA - 1 {
             c.record(SLOT_CHALLENGER, 1_000);
         }
         // One 300us draw among thirty-one of 1us averages near 10us.
@@ -1359,11 +1468,43 @@ mod tests {
         let c = fresh_controller();
         let base = [5_000u64, 6_500, 5_200, 40_000, 5_800, 6_100];
         let chal = [1_100u64, 1_400, 1_200, 30_000, 1_300, 1_250];
-        for i in 0..SAMPLES_BEFORE_VERDICT as usize {
+        for i in 0..(SWITCH_AT as usize) {
+            WaitController::open_pair();
             c.record(SLOT_BASELINE, base[i % base.len()]);
             c.record(SLOT_CHALLENGER, chal[i % chal.len()]);
         }
         assert_eq!(c.current.load(Ordering::Relaxed), SLOT_CHALLENGER);
+    }
+
+    #[test]
+    fn a_rare_enormous_draw_does_not_decide_against_an_arm() {
+        // Measured on a 7900X: the controller read its challenger at
+        // 17939 ns over 100 samples while a pinned arm measured the
+        // same wait at 888 ns under the same conditions, and it
+        // declined a wait nearly seven times cheaper. A handful of
+        // draws near 340 us carried that average, which is what a
+        // mean does with a long tail.
+        //
+        // The pair is what answers it: the challenger loses the rare
+        // pair it stalls in and wins every other, and the count of
+        // those outcomes does not care how large the loss was.
+        let c = fresh_controller();
+        for i in 0..SWITCH_AT * 2 {
+            WaitController::open_pair();
+            c.record(SLOT_BASELINE, 6_000);
+            // One draw in twenty stalls, far above anything the
+            // baseline does.
+            let chal = if i % 20 == 19 { 340_000 } else { 900 };
+            c.record(SLOT_CHALLENGER, chal);
+        }
+        assert_eq!(c.current.load(Ordering::Relaxed), SLOT_CHALLENGER);
+        // The mean it reports still carries the tail, which is why
+        // it is reported and not obeyed.
+        assert!(
+            c.mean_ns[SLOT_CHALLENGER as usize].load(Ordering::Relaxed)
+                > c.mean_ns[SLOT_BASELINE as usize].load(Ordering::Relaxed),
+            "the tail should still show in the reported mean"
+        );
     }
 
     #[test]
@@ -1373,19 +1514,23 @@ mod tests {
         // sixth of every park for the life of the process, which is
         // the cost this widening exists to remove.
         let c = fresh_controller();
-        for _ in 0..SAMPLES_BEFORE_VERDICT * 2 {
+        for _ in 0..SCORE_CAP * 2 {
+            WaitController::open_pair();
             c.record(SLOT_BASELINE, 6_000);
             c.record(SLOT_CHALLENGER, 1_000);
         }
         assert_eq!(c.current.load(Ordering::Relaxed), SLOT_CHALLENGER);
+        assert_eq!(c.score.load(Ordering::Relaxed), SCORE_CAP);
         assert_eq!(c.probe_every.load(Ordering::Relaxed), PROBE_EVERY_MAX);
 
-        // The arms converge. The gap falls inside the margin before
-        // the order flips, and that is the point to look often again
-        // rather than after the verdict is already stale.
-        for _ in 0..SAMPLES_BEFORE_VERDICT {
-            c.record(SLOT_CHALLENGER, 5_800);
-            c.record(SLOT_BASELINE, 6_000);
+        // The arms converge, so the pairs stop separating and the
+        // score walks back toward zero. Crossing inside the
+        // switching threshold is the order coming apart, and that is
+        // the point to look often again rather than after it flips.
+        for _ in 0..(SCORE_CAP - SWITCH_AT) + 1 {
+            WaitController::open_pair();
+            c.record(SLOT_CHALLENGER, 6_000);
+            c.record(SLOT_BASELINE, 4_000);
         }
         assert_eq!(c.current.load(Ordering::Relaxed), SLOT_CHALLENGER);
         assert_eq!(c.probe_every.load(Ordering::Relaxed), PROBE_EVERY_MIN);
@@ -1398,9 +1543,7 @@ mod tests {
         // execute. A monitor wait is reached by evidence or not at
         // all.
         let r = wait_controller().report();
-        if r.baseline_samples < SAMPLES_BEFORE_VERDICT
-            || r.challenger_samples < SAMPLES_BEFORE_VERDICT
-        {
+        if r.switches == 0 {
             assert_eq!(r.in_use, WaitStrategy::baseline());
         }
     }

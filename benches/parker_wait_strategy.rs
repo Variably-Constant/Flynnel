@@ -382,14 +382,16 @@ fn bench_repeat(
         let r = flynnel::sched::sleep::wait_controller().report();
         eprintln!(
             "parker_wait_strategy: after {name}, controller has baseline {} ns over {} samples, \
-             challenger {} ns over {} samples, in use {:?}, {} switch(es), probing every {} parks",
+             challenger {} ns over {} samples, in use {:?}, {} switch(es), probing every {} \
+             parks, paired score {}",
             r.baseline_ns,
             r.baseline_samples,
             r.challenger_ns,
             r.challenger_samples,
             r.in_use,
             r.switches,
-            r.probe_every
+            r.probe_every,
+            r.score
         );
     }
 }
