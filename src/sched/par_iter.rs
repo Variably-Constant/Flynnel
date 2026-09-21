@@ -100,9 +100,12 @@ fn read_tsc() -> u64 {
 /// the tick rates this runs on: a 3.6 GHz counter is 57.6 sixteenths.
 static TSC_PER_NS_16: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// One probe at a time; a second caller waits and takes the installed
-/// rate.
-static TSC_RATE_PROBE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// The rate needs no exclusion to install. Two callers arriving before
+// it is measured both measure and both store, and they store the same
+// thing: the counter's rate is a property of the machine and does not
+// depend on who asked. So the race is benign and costs one extra
+// measurement, once in a process, against an acquire on every caller
+// forever.
 
 /// Ticks per nanosecond in sixteenths, measured once per process.
 ///
@@ -120,13 +123,6 @@ pub(crate) fn tsc_per_ns_16() -> u64 {
     let installed = TSC_PER_NS_16.load(Ordering::Relaxed);
     if installed != 0 {
         return installed;
-    }
-    let _one_at_a_time = TSC_RATE_PROBE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let already = TSC_PER_NS_16.load(Ordering::Relaxed);
-    if already != 0 {
-        return already;
     }
     let rate = measure_tsc_per_ns_16();
     TSC_PER_NS_16.store(rate, Ordering::Relaxed);
@@ -945,9 +941,16 @@ pub struct HostDispatchProfile {
 static HOST_DISPATCH_COST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HOST_COLLAPSE_THRESHOLD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HOST_JEC_WAKE_THRESHOLD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// One calibration at a time; a second caller waits and takes the
-/// installed values.
-static HOST_DISPATCH_CALIBRATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// The three are published rather than guarded. The collapse threshold
+// is written last with Release and read first with Acquire, so a
+// reader that sees it set is guaranteed the other two alongside it.
+//
+// That is a stronger guarantee than the exclusion it replaces: the
+// reader below never took the lock, so two relaxed loads could see a
+// freshly published threshold beside a dispatch cost still at zero,
+// and excluding a second calibration never fixed that. Two racing
+// calibrations each publish a whole triple and the later one wins; a
+// reader sees one of them entire or neither.
 
 /// This host's dispatch profile, measured once per process by the
 /// first query (10-40 ms on the bench hosts) or earlier by
@@ -957,7 +960,10 @@ static HOST_DISPATCH_CALIBRATION: std::sync::Mutex<()> = std::sync::Mutex::new((
 /// dispatch cost.
 pub fn host_dispatch_profile() -> HostDispatchProfile {
     use std::sync::atomic::Ordering;
-    let collapse = HOST_COLLAPSE_THRESHOLD_NS.load(Ordering::Relaxed);
+    // Acquire, and first: it pairs with the Release in
+    // calibrate_host_dispatch, so a non-zero read here is what makes
+    // the other two safe to read relaxed.
+    let collapse = HOST_COLLAPSE_THRESHOLD_NS.load(Ordering::Acquire);
     if collapse != 0 {
         return HostDispatchProfile {
             dispatch_cost_ns: HOST_DISPATCH_COST_NS.load(Ordering::Relaxed),
@@ -1064,16 +1070,15 @@ pub fn jec_wake_threshold_ns() -> u64 {
 /// host differs from one taken on an idle host.
 pub fn calibrate_host_dispatch() -> HostDispatchProfile {
     use std::sync::atomic::Ordering;
-    let _one_at_a_time = HOST_DISPATCH_CALIBRATION
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let p = match pinned_host_profile() {
         Some(pinned) => pinned,
         None => stored_or_measured(),
     };
     HOST_DISPATCH_COST_NS.store(p.dispatch_cost_ns, Ordering::Relaxed);
     HOST_JEC_WAKE_THRESHOLD_NS.store(p.jec_wake_threshold_ns, Ordering::Relaxed);
-    HOST_COLLAPSE_THRESHOLD_NS.store(p.collapse_threshold_ns, Ordering::Relaxed);
+    // Last, and Release: this is the one the reader tests, so it is
+    // what makes the other two visible.
+    HOST_COLLAPSE_THRESHOLD_NS.store(p.collapse_threshold_ns, Ordering::Release);
     p
 }
 
