@@ -178,10 +178,22 @@ fn bench_strategy(
         });
     });
     group.finish();
+    report_latch(&name, held_before);
+}
+
+/// Names the group a fallback fired in, and how fast the arms were
+/// that triggered it.
+///
+/// The span is what separates the two causes the verdict cannot: a
+/// few thousand cycles is a monitor that never armed, hundreds of
+/// thousands is one that armed and was ended by something else.
+fn report_latch(name: &str, held_before: bool) {
     if held_before && !flynnel::sched::sleep::monitor_wait_held() {
+        let (doubts, span) = flynnel::sched::sleep::monitor_doubts();
         eprintln!(
-            "parker_wait_strategy: the monitor stopped holding during {name}. Rows from here \
-             on are the kernel park, whatever their label says."
+            "parker_wait_strategy: the monitor stopped holding during {name} after {doubts} \
+             doubts, the last spanning {span} cycles. Rows from here on are the kernel park, \
+             whatever their label says."
         );
     }
 }
@@ -258,12 +270,7 @@ fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
         });
     });
     group.finish();
-    if held_before && !flynnel::sched::sleep::monitor_wait_held() {
-        eprintln!(
-            "parker_wait_strategy: the monitor stopped holding during {name}. Rows from here \
-             on are the kernel park, whatever their label says."
-        );
-    }
+    report_latch(&name, held_before);
 }
 
 fn bench_all(c: &mut Criterion) {

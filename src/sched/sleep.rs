@@ -101,12 +101,36 @@ fn monitor_holds() -> bool {
     MONITOR_HOLDS.load(Ordering::Relaxed)
 }
 
+/// How long the arms took in the most recent wait that doubted the
+/// monitor, in RDTSC cycles.
+///
+/// The verdict says a wait got nowhere; this says how fast. Arms
+/// totalling about four times the instruction pair mean the monitor
+/// never armed at all, while hundreds of thousands of cycles mean it
+/// armed and something ended it, and those want different answers.
+/// Nothing in the verdict distinguishes them.
+static LAST_DOUBT_CYCLES: AtomicU64 = AtomicU64::new(0);
+
 /// Record that one wait did not suspend the core, and stop trying
 /// once enough separate waits have said so.
-fn note_monitor_does_not_hold() {
+fn note_monitor_does_not_hold(span_cycles: u64) {
+    LAST_DOUBT_CYCLES.store(span_cycles, Ordering::Relaxed);
     if MONITOR_DOUBTS.fetch_add(1, Ordering::Relaxed) + 1 >= DOUBTS_BEFORE_GIVING_UP {
         MONITOR_HOLDS.store(false, Ordering::Relaxed);
     }
+}
+
+/// Waits that have found the monitor not holding, and how long the
+/// arms took in the most recent of them.
+///
+/// For benches and diagnostics. A run that reports the monitor gave
+/// up says nothing about why, and the two causes it cannot separate
+/// need different fixes.
+pub fn monitor_doubts() -> (u32, u64) {
+    (
+        MONITOR_DOUBTS.load(Ordering::Relaxed),
+        LAST_DOUBT_CYCLES.load(Ordering::Relaxed),
+    )
 }
 
 /// Whether any wait has found this host's monitor not to hold.
@@ -541,11 +565,9 @@ impl Parker {
             // return: an interrupt lengthens some returns, so a rule
             // over consecutive short ones never fires on a host whose
             // monitor is not holding.
-            if arms >= ARMS_BEFORE_JUDGING
-                && unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start)
-                    < ARMS_TOO_FAST_CYCLES
-            {
-                note_monitor_does_not_hold();
+            let span = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start);
+            if arms >= ARMS_BEFORE_JUDGING && span < ARMS_TOO_FAST_CYCLES {
+                note_monitor_does_not_hold(span);
                 thread::park();
                 return;
             }
