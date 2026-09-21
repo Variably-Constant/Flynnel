@@ -211,7 +211,7 @@ pub struct Topology {
     pub source: NumaSource,
 }
 
-fn topology_snapshot() -> Topology {
+pub(crate) fn topology_snapshot() -> Topology {
     let topo = flynnel::numa_topology::numa_topology();
     Topology {
         node_count: topo.num_nodes,

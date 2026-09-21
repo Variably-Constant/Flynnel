@@ -34,14 +34,21 @@ use pwrs::prelude::*;
 /// Held as a path list rather than built per call so enumerating a
 /// container is one pass over this table, and so a path that is not
 /// here is not there.
-const CONTAINERS: [&str; 1] = ["host"];
+const CONTAINERS: [&str; 3] = ["host", "pool", "pool/workers"];
 
-/// Every leaf, by its normalized path.
-const LEAVES: [&str; 4] = [
+/// Every leaf whose path is fixed, by its normalized path.
+///
+/// `pool/workers` has children too, but how many is a reading rather
+/// than a shape, so they are not here; [`FlynnelDrive::children_of`]
+/// asks the pool.
+const LEAVES: [&str; 7] = [
     "host/topology",
     "host/cpu",
     "host/latency",
     "host/cache",
+    "pool/summary",
+    "pool/spin",
+    "pool/split",
 ];
 
 /// A provider path in internal form: forward slashes, no leading or
@@ -72,6 +79,14 @@ impl FlynnelDrive {
     /// The object at one leaf, or None where the host cannot take that
     /// reading.
     fn leaf_value(path: &str) -> PsResult<Option<PsObject>> {
+        // A worker's name is its index, so it is matched before the
+        // fixed paths.
+        if let Some(name) = path.strip_prefix("pool/workers/") {
+            return match Self::worker_by_name(name) {
+                Some(w) => Ok(Some(w.into_ps()?)),
+                None => Ok(None),
+            };
+        }
         Ok(match path {
             "host/topology" => Some(crate::host::topology_snapshot().into_ps()?),
             "host/cpu" => Some(crate::host::cpu_info_row().into_ps()?),
@@ -83,14 +98,36 @@ impl FlynnelDrive {
                 Some(row) => Some(row.into_ps()?),
                 None => None,
             },
+            "pool/summary" => Some(crate::pool::pool_snapshot().into_ps()?),
+            "pool/spin" => Some(crate::pool::spin_snapshot().into_ps()?),
+            "pool/split" => Some(crate::pool::split_snapshot().into_ps()?),
             _ => None,
         })
+    }
+
+    /// The worker a child name spells, or None when no child of that
+    /// name is there.
+    ///
+    /// Matched against the name each row enumerates under rather than
+    /// by parsing the segment, so the only names that resolve are the
+    /// ones the level lists: "5" finds worker five and "05" finds
+    /// nothing, which is what Get-ChildItem showed.
+    ///
+    /// The external slots a foreign thread pushes through are left out
+    /// of the drive. They are real rows and they are not workers, and
+    /// a level called `workers` holding some things that are not is
+    /// worse than one that omits them; Get-FlynnelWorker takes them
+    /// with a switch, which is where a caller who wants them asks.
+    fn worker_by_name(name: &str) -> Option<crate::pool::WorkerStat> {
+        crate::pool::worker_rows(false)
+            .into_iter()
+            .find(|w| w.index.to_string() == name)
     }
 
     /// The object shown for a container, which names it and says what
     /// it holds rather than being empty.
     fn container_value(path: &str) -> PsResult<PsObject> {
-        let obj = pwrs::object::new();
+        let obj = pwrs::object::new_psobject("Flynnel.DriveContainer");
         let name = if path.is_empty() {
             "Flynnel".to_string()
         } else {
@@ -109,6 +146,11 @@ impl FlynnelDrive {
 
     /// Every child of one container, containers and leaves together,
     /// in one pass over the tree.
+    ///
+    /// `pool\workers` is the one level whose children are a reading,
+    /// and it is built from one call into the pool rather than one per
+    /// child: a boundary crossing per worker would make enumerating a
+    /// large pool cost more than the answer is worth.
     fn children_of(path: &str) -> Vec<(String, bool)> {
         let mut out = Vec::new();
         for c in CONTAINERS {
@@ -121,6 +163,11 @@ impl FlynnelDrive {
                 out.push((l.to_string(), false));
             }
         }
+        if path == "pool/workers" {
+            for w in crate::pool::worker_rows(false) {
+                out.push((format!("pool/workers/{}", w.index), false));
+            }
+        }
         out
     }
 
@@ -129,7 +176,13 @@ impl FlynnelDrive {
     }
 
     fn is_leaf(path: &str) -> bool {
-        LEAVES.contains(&path)
+        if LEAVES.contains(&path) {
+            return true;
+        }
+        match path.strip_prefix("pool/workers/") {
+            Some(name) => Self::worker_by_name(name).is_some(),
+            None => false,
+        }
     }
 }
 
@@ -186,7 +239,7 @@ impl Provider for FlynnelDrive {
         let value = match Self::leaf_value(&p)? {
             Some(v) => v,
             None => {
-                let obj = pwrs::object::new();
+                let obj = pwrs::object::new_psobject("Flynnel.DriveUnavailable");
                 pwrs::object::add_note(
                     &obj,
                     "Name",

@@ -37,7 +37,7 @@ pub struct Pool {
     pub has_pushed: bool,
 }
 
-fn pool_snapshot() -> Pool {
+pub(crate) fn pool_snapshot() -> Pool {
     let arena = flynnel::sched::arena::global_local_arena();
     let pushed: u64 = arena
         .iter_worker_stats()
@@ -172,34 +172,49 @@ pub struct GetFlynnelWorker {
     pub include_external_slot: bool,
 }
 
+/// Every worker's counters, and optionally the external slots behind
+/// them.
+///
+/// The stats table is longer than the pool: the entries past the
+/// worker count belong to the external slots a foreign thread pushes
+/// through. They are real rows and they are not workers, and emitting
+/// them unmarked gives a caller a set of permanently idle workers that
+/// do not exist. They are named rather than dropped, and left out
+/// unless asked for.
+///
+/// Built here rather than inside the cmdlet so the Flynnel drive's
+/// `pool\workers` level answers the same rows, and builds the whole
+/// level in one pass rather than one call into Rust per child.
+pub(crate) fn worker_rows(include_external_slot: bool) -> Vec<WorkerStat> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let arena = flynnel::sched::arena::global_local_arena();
+    let workers = arena.total_workers();
+    let mut out = Vec::new();
+    for (index, s) in arena.iter_worker_stats().enumerate() {
+        let is_worker = index < workers;
+        if !is_worker && !include_external_slot {
+            continue;
+        }
+        out.push(WorkerStat {
+            index: index as u64,
+            is_worker,
+            local_pops: s.local_pops.load(Relaxed),
+            peer_steal_hits: s.peer_steal_hits.load(Relaxed),
+            peer_steal_misses: s.peer_steal_misses.load(Relaxed),
+            times_stolen_from: s.times_stolen_from.load(Relaxed),
+            single_pushes: s.single_pushes.load(Relaxed),
+            burst_pushes: s.burst_pushes.load(Relaxed),
+            push_refusals: s.push_refusals.load(Relaxed),
+            burst_ratio: s.burst_ratio(),
+        });
+    }
+    out
+}
+
 impl Cmdlet for GetFlynnelWorker {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let arena = flynnel::sched::arena::global_local_arena();
-        // The stats table is longer than the pool: the entries past
-        // the worker count belong to the external slots a foreign
-        // thread pushes through. They are real rows and they are not
-        // workers, and emitting them unmarked gives a caller a set of
-        // permanently idle workers that do not exist. They are named
-        // rather than dropped, and left out unless asked for.
-        let workers = arena.total_workers();
-        for (index, s) in arena.iter_worker_stats().enumerate() {
-            let is_worker = index < workers;
-            if !is_worker && !self.include_external_slot {
-                continue;
-            }
-            ps.write(WorkerStat {
-                index: index as u64,
-                is_worker,
-                local_pops: s.local_pops.load(Relaxed),
-                peer_steal_hits: s.peer_steal_hits.load(Relaxed),
-                peer_steal_misses: s.peer_steal_misses.load(Relaxed),
-                times_stolen_from: s.times_stolen_from.load(Relaxed),
-                single_pushes: s.single_pushes.load(Relaxed),
-                burst_pushes: s.burst_pushes.load(Relaxed),
-                push_refusals: s.push_refusals.load(Relaxed),
-                burst_ratio: s.burst_ratio(),
-            })?;
+        for row in worker_rows(self.include_external_slot) {
+            ps.write(row)?;
         }
         Ok(())
     }
@@ -228,7 +243,7 @@ pub struct SpinState {
     pub adapt_decisions: u64,
 }
 
-fn spin_snapshot() -> SpinState {
+pub(crate) fn spin_snapshot() -> SpinState {
     SpinState {
         window_rounds: flynnel::spin_window(),
         total_idle_yields: flynnel::total_idle_yields(),
@@ -393,7 +408,7 @@ pub struct SplitState {
     pub leaf_cv2_per_mille: Option<u64>,
 }
 
-fn split_snapshot() -> SplitState {
+pub(crate) fn split_snapshot() -> SplitState {
     let stats = flynnel::sched::split_observer::snapshot_leaf_stats();
     SplitState {
         multiplier: flynnel::sched::split_observer::split_multiplier(),

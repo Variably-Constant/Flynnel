@@ -114,6 +114,69 @@ Describe 'a leaf is the object its cmdlet writes' {
     }
 }
 
+Describe 'the pool level' {
+    BeforeAll {
+        # A pool has to exist before it has workers to enumerate, and
+        # starting it deliberately keeps the start out of any later
+        # measurement.
+        Start-FlynnelPool -WarningAction SilentlyContinue | Out-Null
+    }
+
+    It 'has the three fixed leaves and the workers container' {
+        $names = @(Get-ChildItem Flynnel:\pool | ForEach-Object { $_.Name })
+        $names | Should -Contain 'summary'
+        $names | Should -Contain 'spin'
+        $names | Should -Contain 'split'
+        $names | Should -Contain 'workers'
+    }
+
+    It 'answers the same summary as Get-FlynnelPool' {
+        $d = Test-SameRow -Left (Get-FlynnelPool) -Right (Get-Item Flynnel:\pool\summary)
+        $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
+    }
+
+    It 'answers the same spin state as Get-FlynnelSpinWindow' {
+        $d = Test-SameRow -Left (Get-FlynnelSpinWindow) -Right (Get-Item Flynnel:\pool\spin)
+        $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
+    }
+
+    It 'enumerates one child per worker' {
+        $fromDrive = @(Get-ChildItem Flynnel:\pool\workers)
+        $fromCmdlet = @(Get-FlynnelWorker)
+        $fromDrive.Count | Should -Be $fromCmdlet.Count
+        $fromDrive.Count | Should -BeGreaterThan 0
+    }
+
+    It 'leaves the external slots out of the workers level' {
+        # They are real rows and they are not workers. A level called
+        # workers holding some things that are not is worse than one
+        # that omits them, and Get-FlynnelWorker takes them with a
+        # switch for a caller who wants them.
+        $withExternal = @(Get-FlynnelWorker -IncludeExternalSlot).Count
+        $onDrive = @(Get-ChildItem Flynnel:\pool\workers).Count
+        $onDrive | Should -Be @(Get-FlynnelWorker).Count
+        if ($withExternal -gt @(Get-FlynnelWorker).Count) {
+            $onDrive | Should -BeLessThan $withExternal
+        }
+    }
+
+    It 'answers a worker by its index' {
+        $first = @(Get-FlynnelWorker)[0]
+        $d = Test-SameRow -Left $first -Right (Get-Item "Flynnel:\pool\workers\$($first.Index)")
+        $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
+    }
+
+    It 'resolves only the names it enumerated' {
+        # Matched against the names the level lists rather than by
+        # parsing the segment, so a padded index is not a second way
+        # to spell a worker.
+        Test-Path 'Flynnel:\pool\workers\0' | Should -BeTrue
+        Test-Path 'Flynnel:\pool\workers\00' | Should -BeFalse
+        Test-Path 'Flynnel:\pool\workers\not-a-number' | Should -BeFalse
+        Test-Path 'Flynnel:\pool\workers\99999' | Should -BeFalse
+    }
+}
+
 Describe 'a reading this host cannot take' {
     It 'is a leaf that exists and holds nothing, not a missing path' {
         # The distinction a script cannot make for itself: "this host
