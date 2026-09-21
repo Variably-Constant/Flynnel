@@ -208,6 +208,74 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- **A PowerShell module, `pwrs/`, binding the scheduler surface
+  directly to the Rust.** 107 cmdlets, 78 classes and 36 enumerations
+  over PWRS, plus a read-only `Flynnel:` drive. It is a binary module:
+  no marshalling layer, no second implementation, and the objects a
+  cmdlet writes are the crate's own readings.
+
+  The families: the host's topology, CPU facts, inter-core latency
+  table and cache allocation; job plans that resolve a worker count,
+  leaf shape and execution tier; the worker pool with its spin, split
+  and IO dials; kernels over arrays, files and text that run on the
+  scheduler's own threads; the trace ring, leaf statistics, occupancy
+  and call sites; the calibration store; the nine in-process ring
+  shapes; backends and accelerator ops; the hybrid CPU-and-device
+  shapes; the verify chain and the CGRA mode region; the GPU peer's
+  watchdog, wave planner, linear-algebra chooser and peer lifecycle;
+  and the cross-process router and pass registry.
+
+  **Anything over many items crosses in one call.** Measured at this
+  boundary: a method call costs 1907 ns on PowerShell 7.6 and 651 ns
+  on Windows PowerShell 5.1, the same call batched a thousand at a
+  time costs 4.5 and 3.0 ns, and one pipeline record costs 1712 and
+  7955 ns. So every cmdlet that can take many items takes them all at
+  once, and a per-record form exists only where a script wants to
+  interleave, with its cost in its own help.
+
+  **No cmdlet runs a script block on a worker.** A script block runs
+  only on the thread owning the pipeline: the binding framework's
+  pipeline token is `!Send` and the managed side refuses a stream call
+  from another thread. Work that runs on the pool is therefore work
+  the module declares.
+
+  **A completeness gate, `pwrs/src/bin/census.rs`, reads the crate and
+  fails on any public item neither bound nor recorded in
+  `census.toml` with one of six fixed reasons.** A binding missing a
+  function is invisible otherwise: the module imports, every suite
+  passes, and the gap shows up when someone needs the thing. A test
+  written against the module cannot find it, because the module is
+  what is incomplete. 368 items remain uncovered, all of them in the
+  GPU-peer and cross-process families and in the racing arms that need
+  a body able to decline or disagree.
+
+  528 tests pass on a Linux guest under PowerShell 7.6.5, and the
+  suites run on Windows PowerShell 5.1 as well; each prints the host
+  and edition before it asserts, because one pipeline record costs
+  three times more on 5.1 and a figure without its edition cannot be
+  compared with one from the other.
+
+- `benches/verify_chain_fold.rs`, which measures what ordering the
+  verify chain's fold costs, per chunk and per byte, with a quiet arm
+  and a loaded arm in one process.
+
+  Measured on the 24-thread bare-metal box under the measurement
+  lease, three arms - a baseline, the same code against that baseline,
+  and the unordered fold patched back. The ordering costs about 11 per
+  cent on a sequential stream of 64-byte chunks and about 43 per cent
+  on a four-producer fan-out of them; at 4 KiB and above it disappears
+  into the hasher.
+
+  Only two of the five cells are readable and the control is what says
+  which. Identical code against its own baseline moved +3.05, +0.92,
+  +5.16, +10.46 and +7.45 per cent, four of them at p = 0.00, so
+  criterion's own significance test cannot see between-run drift at
+  all: it is computed from the spread within one run. The three cells
+  reporting the unordered fold as slower are mechanically impossible -
+  it does strictly less work - and all three sit in the drift
+  direction. A comparison taken this way resolves nothing below about
+  ten per cent on either host.
+
 - `tests/affinity_follows_process_mask.rs` holds what
   `FLYNNEL_LEVER_ALLOWED_WIDTH` does. It starts the arena at full width,
   narrows the process affinity mask to two CPUs, and asserts that
@@ -254,6 +322,53 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   before the width, so a mask that never took and a mask the platform
   ignored fail with different messages. Without that the two arrive as
   the same assertion, which is how the Windows result read at first.
+
+### Fixed
+
+- **`VerifyChain` rooted over the order chunks finished, not the order
+  they were submitted.** A hash chain is ordered: `update(a)` then
+  `update(b)` is not `update(b)` then `update(a)`. Submitting to the IO
+  pool means tasks complete in whatever order the pool runs them, and
+  each folded itself in as its own task finished, so two runs over
+  identical chunks could root differently. A chain whose entire purpose
+  is deciding whether a CPU trace and a device trace are bit-exact
+  would have reported a mismatch between identical ones.
+
+  The index is now taken on the submitting thread and a ready prefix is
+  folded as it completes, with `finalize` folding whatever is left.
+  Proved to fire by restoring the old behaviour: both new tests fail
+  on it - `arrivals [3, 1, 0, 2] rooted differently from submission
+  order`, and `nothing folds while index 0 is missing` - and pass on
+  the fix. Its cost is in Added, above.
+
+- Two intra-doc links in `JobPlan::k_inner_log2` pointed at items
+  behind the `gpu-peer` feature, so they resolved with that feature on
+  and dangled with it off. Neither `cargo check` configuration saw it,
+  because neither runs rustdoc, and rustdoc's own default for the lint
+  is a warning a gate reading exit codes cannot act on. The crate now
+  denies `rustdoc::broken_intra_doc_links`, which found both, and the
+  doc leg of the gate can fail.
+
+- `registered_accel_ops()` is new, because the accelerator-op registry
+  could not be read at all: `registry()` was private, `AccelOp` was
+  private, and `AccelOpId`'s field was private, so a caller holding no
+  id from `register_accel_op` had no way to reach an op. That is the
+  position anything inspecting the process from outside is in. It
+  returns the id, name, per-item byte estimate and bound backends
+  under one read lock, with two tests: that a registered op appears
+  with its bytes and bindings, and that every listed id resolves back
+  to the name it was listed under, since the id is an index into a
+  private vector and a mispaired listing would send every later
+  `accel_target` at the wrong op.
+
+- `watchdog::detect_with_model()` is new. `detect` read the device's
+  driver model and threw it away, so a caller reporting both the model
+  and the watchdog state would have loaded NVML twice for a fact that
+  cannot change under a running process. Both entry points share one
+  cache.
+
+- `.gitignore` ignored `/target` only at the workspace root, so
+  `pwrs/target` was untracked and unignored.
 
 ## 0.6.0 - 2026-09-13
 
