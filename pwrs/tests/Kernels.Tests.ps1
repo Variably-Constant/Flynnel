@@ -469,6 +469,37 @@ Describe 'Measure-FlynnelFileHash' {
         $rows[2].Path | Should -Be $script:Empty
     }
 
+    It 'answers the same roots whichever pool the reads ran on' {
+        # The route changes where a file is read, never what it
+        # hashes to. Compared against the arena answer on the same
+        # files rather than against a stored constant, so the two
+        # paths are held to each other.
+        $onArena = @(Measure-FlynnelFileHash -Path @($script:A, $script:B, $script:Empty))
+        $onPool = @(Measure-FlynnelFileHash -Path @($script:A, $script:B, $script:Empty) -UseIoPool)
+        $onPool.Count | Should -Be $onArena.Count
+        for ($i = 0; $i -lt $onArena.Count; $i++) {
+            $onPool[$i].Path | Should -Be $onArena[$i].Path
+            $onPool[$i].Hash | Should -Be $onArena[$i].Hash
+            $onPool[$i].Bytes | Should -Be $onArena[$i].Bytes
+        }
+    }
+
+    It 'says so when it is asked for a pool the process does not have' {
+        # A pool exists only when FLYNNEL_SCHED_SMT_AS_IO was set
+        # before the first dispatch, so the default session has none
+        # and this is the branch a script actually meets. The warning
+        # is the whole point: the crate's own submit helper runs the
+        # task inline when there is no pool, which would leave the
+        # rows identical and the route unreported.
+        $warnings = @()
+        $rows = @(Measure-FlynnelFileHash -Path $script:A -UseIoPool -WarningVariable +warnings)
+        $rows.Count | Should -Be 1
+        $rows[0].Hash | Should -Not -BeNullOrEmpty
+        if (-not [bool]$env:FLYNNEL_SCHED_SMT_AS_IO) {
+            ($warnings -join ' ') | Should -Match 'no IO pool'
+        }
+    }
+
     It 'gives identical content the same root and different content a different one' {
         $rows = @(Measure-FlynnelFileHash -Path @($script:A, $script:ACopy, $script:B))
         $rows[0].Hash | Should -Be $rows[1].Hash
