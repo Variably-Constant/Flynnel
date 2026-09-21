@@ -1010,3 +1010,137 @@ item = "crate::sched::dispatch"
 reason = "takes-a-rust-closure"
 reaches = "Invoke-FlynnelMap"
 note = "the declarative front door: the caller describes the workload and it picks the Flynn-axis entry point. What it dispatches is still a closure. New-FlynnelPlan and Resolve-FlynnelPlan are the part a script can hold, which is the description rather than the body"
+
+# ---------------------------------------------------------------------
+# The plan, and the readings a plan is built from
+# ---------------------------------------------------------------------
+# These modules are bound, but not under their own names: a Rust
+# builder becomes a parameter and a Rust reader becomes a column. The
+# census matches cmdlet names, so each module says here which cmdlet
+# carries it.
+
+[[entry]]
+item = "crate::sched::plan"
+reason = "internal-to-another-surface"
+note = "JobPlan and its builders are Flynnel.Plan. New-FlynnelPlan makes one, Update-FlynnelPlan carries one parameter per builder, and Resolve-FlynnelPlan answers what the resolved methods compute: the workers, the leaves, the chunk count, the estimate and the backend. A cmdlet per builder would be a 1907 ns crossing each to set one field of an object the caller already holds. The free functions are read the same way: kband_for as Get-FlynnelKBand, pick_tier and promotes_on_tile_count and smt_window_decisions as columns on the resolved plan"
+
+[[entry]]
+item = "crate::sched::hybrid"
+reason = "internal-to-another-surface"
+note = "join_hybrid, hybrid_auto, hybrid_auto_split_ranges and hybrid_pipeline are Measure-FlynnelHybridJoin, Measure-FlynnelHybridPlacement, Measure-FlynnelHybridSplit and Measure-FlynnelHybridPipeline, each with the declared bodies this module owns. SplitReport is Flynnel.HybridSplit"
+
+[[entry]]
+item = "crate::sched::call_site"
+reason = "internal-to-another-surface"
+note = "the per-site learned state: Get-FlynnelCallSite writes a row per site and Reset-FlynnelCallSite clears them. Placement is exported as Flynnel.Placement now that the hybrid cmdlets produce one. site_for_location takes a source location a script does not have, and the two constants are the model's own shape rather than a setting"
+
+[[entry]]
+item = "crate::sched::occupancy"
+reason = "internal-to-another-surface"
+note = "Measure-FlynnelOccupancy answers the sample and Get-FlynnelThreadTick the raw ticks. Both distinguish a reading from an absent one by a reason rather than by a zero, which is what the NoReading enum is for and why the column is nullable"
+
+[[entry]]
+item = "crate::sched::numa_latency"
+reason = "internal-to-another-surface"
+note = "Get-FlynnelLatencyTable writes the table and Get-FlynnelNumaDistance one pair of it. The iteration bounds and the calibration budget are the measurement's own shape; force_calibrate re-measures, which Get-FlynnelLatencyTable does when asked to"
+
+[[entry]]
+item = "crate::sched::adaptive_profile"
+reason = "internal-to-another-surface"
+note = "the auto-classifier behind Get-FlynnelDispatchProfile and Get-FlynnelWorkloadClass. LeafShape is exported as Flynnel.LeafShape and set on a plan; the tick and reset entry points are the classifier's own loop, driven by dispatches rather than by a caller"
+
+[[entry]]
+item = "crate::sched::io_pool"
+reason = "internal-to-another-surface"
+note = "New-FlynnelIoPool makes one and Get-FlynnelIoPool reports it. submit takes a boxed task, which is a Rust closure; what a script submits is a declared kernel, and the pool it lands on is this one"
+
+[[entry]]
+item = "crate::sched::cat"
+reason = "internal-to-another-surface"
+note = "Get-FlynnelCacheAllocation reports whether this host has cache allocation technology and what it can carve; New-FlynnelCacheReservation reserves ways and hands back a reservation that releases on dispose. The schemata string is what the kernel interface takes and is a column on the reservation"
+
+[[entry]]
+item = "crate::sched::deque_tier"
+reason = "internal-to-another-surface"
+note = "the coherence-distance tier a plan hints at, exported as Flynnel.DequeTier and set by Update-FlynnelPlan. peer_distance and thief_may_steal are the steal policy reading that tier, which happens inside a dispatch"
+
+[[entry]]
+item = "crate::sched::workload_shape"
+reason = "internal-to-another-surface"
+note = "the shape a caller declares on a plan, exported as Flynnel.WorkloadShapeKind and set by Update-FlynnelPlan. The hints it derives are read by the dispatcher rather than by a caller"
+
+[[entry]]
+item = "crate::sched::adaptive_variant_routing"
+reason = "internal-to-another-surface"
+note = "VariantRouting is exported and set on a plan; cpuid_default_routing is what this host answers when nothing is set, which Get-FlynnelHwClass reports"
+
+[[entry]]
+item = "crate::sched::adaptive_cooperative"
+reason = "internal-to-another-surface"
+note = "CooperativeRouting is exported and set on a plan by Update-FlynnelPlan"
+
+[[entry]]
+item = "crate::sched::bg_calibration"
+reason = "takes-a-rust-closure"
+reaches = "Measure-FlynnelHostDispatch"
+note = "spawns the background calibration and times a closure for it. The calibration a script asks for is taken in the foreground by the Measure- cmdlets, which report the figure and the conditions rather than leaving it in a store"
+
+[[entry]]
+item = "crate::sched::prefetch"
+reason = "unsafe-or-structural"
+note = "processor prefetch hints over a raw address. A script has no address to hint about, and the hint's whole value is that it is issued a fixed number of instructions before the load"
+
+[[entry]]
+item = "crate::sched::par_iter::calibrate_inline_collapse_threshold"
+reason = "internal-to-another-surface"
+note = "re-measures the threshold below which a dispatch runs inline. Measure-FlynnelHostDispatch takes that measurement and reports it with its conditions"
+
+[[entry]]
+item = "crate::sched::levers::ServePolicy::admits"
+reason = "internal-to-another-surface"
+note = "whether the policy in force admits a stored calibration. Get-FlynnelServePolicy answers the policy and what it admits in one row"
+
+# ---------------------------------------------------------------------
+# The host readings, and the taxonomy enums
+# ---------------------------------------------------------------------
+
+[[entry]]
+item = "crate::numa_topology"
+reason = "internal-to-another-surface"
+note = "Get-FlynnelTopology writes the whole topology in one crossing, Get-FlynnelNodeCpu the CPUs of a node. NumaSource and ClusterSource are exported as Flynnel.NumaSource and Flynnel.ClusterSource, because where a reading came from decides what it is worth: a detected topology and a fallback single node look the same in the counts and are not the same fact. detect and fallback are the two paths behind that column rather than a choice a caller makes"
+
+[[entry]]
+item = "crate::cpu_info"
+reason = "internal-to-another-surface"
+note = "Get-FlynnelCpuInfo writes the vendor, the features and the counts in one row, with Vendor exported as Flynnel.Vendor. has_waitpkg is the feature column behind the spin window's ability to use a monitor-wait, and small_host_dispatch_factor is the correction Get-FlynnelHostDispatch reports applying"
+
+[[entry]]
+item = "crate::foundation"
+reason = "internal-to-another-surface"
+note = "the taxonomy enums, exported as Flynnel.HwClass, Flynnel.SchedTier and Flynnel.Variant and set on a plan. Their methods answer one property each of the variant the caller already holds, so each is a column rather than a crossing"
+
+[[entry]]
+item = "crate::dispatch_profile::DispatchProfile::deque_tier_hint"
+reason = "internal-to-another-surface"
+note = "which deque tier a profile prefers. Get-FlynnelDispatchProfile writes it as a column beside the rest of the profile"
+
+[[entry]]
+item = "crate::op_class::OpClass"
+reason = "generic-over-caller-type"
+note = "a trait a caller's own operation type implements so the dispatcher can classify it. A script has no Rust type to implement it on; what it can say instead is the workload shape, which Update-FlynnelPlan sets"
+
+[[entry]]
+item = "crate::flat"
+reason = "takes-a-rust-closure"
+reaches = "Invoke-FlynnelMap"
+note = "the flat re-export of join and the two par_for_each helpers, for callers who want the scheduler without the module path. Same closures as sched::arena and sched::par_iter, reached the same way"
+
+[[entry]]
+item = "crate::backend::tpu_jax"
+reason = "unsafe-or-structural"
+note = "constructing one binds a JAX runtime this process must already host, and its device list is that runtime's. Get-FlynnelBackend reports whether the Tpu kind is registered, available and detected on this host, which is the question a script can act on; registering a backend is not"
+
+[[entry]]
+item = "crate::backend::wasm"
+reason = "unsafe-or-structural"
+note = "the same shape as the JAX backend: constructing one registers a runtime rather than reading it. Get-FlynnelBackend writes the Wasm row"

@@ -381,6 +381,16 @@ through a thread hand-off. Both halves still run concurrently and the
 timings are real; what they are not is a device reading, so every row
 carries `BackendIsCpu`.
 
+`Measure-FlynnelHybridSplit` divides by the ratio of the two measured
+per-item costs, so on a deviceless host it settles at an even split
+and stays there: the backend side is the CPU backend running the same
+body, and each side's clock starts inside its own half, so the thread
+hand-off falls outside both readings. `-BackendRepetitions` is how to
+see the model respond, by making the backend side dearer per item.
+The recorded cost is a whole number of nanoseconds, so at the default
+of one repetition both sides truncate to the same integer and no
+difference can be resolved whatever the real one is.
+
 The placement model races a cold size bucket and times both sides,
 runs only the cheaper side once the bucket is warm, and re-races every
 thirty-second call so it tracks drift. Racing is the calibration: a

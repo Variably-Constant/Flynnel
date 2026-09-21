@@ -359,7 +359,7 @@ pub struct HybridPlacement {
 #[cmdlet(
     verb = "Measure",
     noun = "FlynnelHybridPlacement",
-    alias = "Measure-FlyPlacement",
+    alias = "Measure-FlyHybridPlacement",
     output = ["Flynnel.HybridPlacement"]
 )]
 #[derive(Default)]
@@ -462,11 +462,25 @@ pub struct HybridSplit {
 /// per-item throughputs this call site has measured, runs both sides
 /// concurrently, and reports the division.
 ///
-/// The share moves with what the last calls measured, so the useful
-/// reading is a sequence rather than a single row: run it several times
-/// at one Count and watch CpuSharePerMille settle. It starts at an even
-/// split, because until both sides have been timed at a size there is
-/// nothing to be uneven about.
+/// The share is the ratio of the two measured per-item costs, so it
+/// stays even while both sides cost the same per item. On a host with
+/// no device that is the ordinary case, because the backend side is
+/// the CPU backend running the same body, and each side's clock starts
+/// inside its own half so the thread hand-off is outside both
+/// readings. An even split holding there is the model working.
+///
+/// -BackendRepetitions is how to see it move. It applies the body more
+/// times on the backend side than on the CPU side, which is a backend
+/// with a different per-item cost and is the thing the split model
+/// exists to track. It deliberately breaks the rule that both sides
+/// compute the same result, so the two sides' outputs are no longer
+/// comparable; nothing here compares them.
+///
+/// The model records per-item cost as a whole number of nanoseconds,
+/// so at a per-item cost of a few nanoseconds both sides truncate to
+/// the same integer and the share cannot move whatever the real
+/// difference is. -Repetitions is the lever that lifts a per-item cost
+/// far enough above that floor to be resolved.
 ///
 /// The learned state is this module's, shared by every caller in the
 /// session and keyed by size bucket, the same as
@@ -476,6 +490,9 @@ pub struct HybridSplit {
 ///
 /// `1..10 | ForEach-Object { Measure-FlynnelHybridSplit -Count 200000 -Operation Sqrt } |
 ///     Select-Object CpuSharePerMille, CpuNs, BackendNs`
+///
+/// `1..10 | ForEach-Object { Measure-FlynnelHybridSplit -Count 65536 -Operation Exp
+///     -Repetitions 8 -BackendRepetitions 32 } | Select-Object CpuSharePerMille`
 #[cmdlet(
     verb = "Measure",
     noun = "FlynnelHybridSplit",
@@ -490,9 +507,16 @@ pub struct MeasureFlynnelHybridSplit {
     /// The declared operation each item goes through.
     #[param(position = 1)]
     pub operation: MapOp,
-    /// How many times to apply it per item.
+    /// How many times to apply it per item on the CPU side, and on
+    /// the backend side unless BackendRepetitions says otherwise.
     #[param(position = 2)]
     pub repetitions: Option<u32>,
+    /// How many times to apply it per item on the backend side, which
+    /// is how a backend with a different per-item cost is modelled.
+    /// Same as Repetitions when unset, which is the case where the
+    /// share has no reason to move.
+    #[param]
+    pub backend_repetitions: Option<u32>,
     /// The plan whose backend hint chooses the device side.
     #[param]
     pub plan: Option<crate::plan::Plan>,
@@ -529,6 +553,7 @@ impl Cmdlet for MeasureFlynnelHybridSplit {
 
         let for_backend = std::sync::Arc::clone(&each);
         let t0 = std::time::Instant::now();
+        let backend_reps = self.backend_repetitions.unwrap_or(reps).max(1);
         let report: SplitReport = hybrid_auto_split_ranges(
             &plan,
             n,
@@ -536,7 +561,12 @@ impl Cmdlet for MeasureFlynnelHybridSplit {
                 std::hint::black_box(run_range(r.start, r.end, reps, each.as_ref()));
             },
             move |r| {
-                std::hint::black_box(run_range(r.start, r.end, reps, for_backend.as_ref()));
+                std::hint::black_box(run_range(
+                    r.start,
+                    r.end,
+                    backend_reps,
+                    for_backend.as_ref(),
+                ));
             },
         );
         let total_ns = t0.elapsed().as_nanos() as u64;
@@ -609,7 +639,7 @@ pub struct HybridPipelineRun {
 #[cmdlet(
     verb = "Measure",
     noun = "FlynnelHybridPipeline",
-    alias = "Measure-FlyPipeline",
+    alias = "Measure-FlyHybridPipeline",
     output = ["Flynnel.HybridPipeline"]
 )]
 #[derive(Default)]

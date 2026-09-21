@@ -202,16 +202,41 @@ Describe 'Measure-FlynnelHybridSplit' {
         }
     }
 
-    It 'moves the share off the even split once both sides are measured' {
-        # The two sides run the same body, but one of them pays a thread
-        # hand-off, so the measured per-item costs differ and the model
-        # has something to act on. A share that never moved would mean
-        # the measurements are not reaching it.
-        $shares = 1..12 | ForEach-Object {
-            (Measure-FlynnelHybridSplit -Count 65536 -Operation Sqrt).CpuSharePerMille
+    It 'holds the split near even while both sides cost the same per item' {
+        # Measured on zen3: eight calls at one size with the same body
+        # on both sides never leave 500. That is the model working, not
+        # the model asleep. Each side's clock starts inside its own
+        # half, so the backend side's thread hand-off falls outside both
+        # readings and the two per-item costs come out the same.
+        #
+        # A band rather than an exact 500, because the recorded cost is
+        # a whole number of nanoseconds and two sides that differ by one
+        # of them give 508 rather than 500.
+        $shares = 1..8 | ForEach-Object {
+            (Measure-FlynnelHybridSplit -Count 32768 -Operation Sqrt -Repetitions 8).CpuSharePerMille
         }
-        @($shares | Select-Object -Unique).Count |
-            Should -BeGreaterThan 1 -Because 'the model updates from what it measured'
+        foreach ($s in $shares) {
+            $s | Should -BeGreaterOrEqual 450
+            $s | Should -BeLessOrEqual 550
+        }
+    }
+
+    It 'moves the share when the backend side costs more per item' {
+        # The other direction, and the one that shows the model reads
+        # its inputs at all. BackendRepetitions makes the backend side
+        # several times dearer per item, which is what a split model
+        # exists to track, so the share has to move toward the CPU.
+        #
+        # Repetitions is high on purpose. The model records per-item
+        # cost as a whole number of nanoseconds, so at the default of
+        # one repetition every side of every call truncates to the same
+        # integer and no real difference can be resolved at all.
+        $shares = 1..8 | ForEach-Object {
+            (Measure-FlynnelHybridSplit -Count 8192 -Operation Exp `
+                -Repetitions 16 -BackendRepetitions 64).CpuSharePerMille
+        }
+        ($shares | Select-Object -Last 1) | Should -BeGreaterThan 550 `
+            -Because 'the dearer side should be given fewer items'
     }
 
     It 'times both sides' {
