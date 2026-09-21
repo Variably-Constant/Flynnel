@@ -811,9 +811,11 @@ impl Sleep {
             state.handle.get_or_init(thread::current);
             state.state.store(SLEEPING, Ordering::SeqCst);
             if self.shutdown.load(Ordering::SeqCst) {
-                if state.state.swap(AWAKE, Ordering::SeqCst) == SLEEPING {
-                    self.counters.sub_sleeping_thread();
-                }
+                // The swap only stops a later waker unparking a thread
+                // that has gone; whichever side it finds, the sleeping
+                // count is this thread's to give back.
+                state.state.swap(AWAKE, Ordering::SeqCst);
+                self.counters.sub_sleeping_thread();
                 idle.wake_fully();
                 return;
             }
@@ -823,6 +825,10 @@ impl Sleep {
             while state.state.load(Ordering::Acquire) == SLEEPING {
                 thread::park();
             }
+            // Given back here, on this thread, before anything below
+            // can take work and decrement inactive. The waker does not
+            // touch it.
+            self.counters.sub_sleeping_thread();
         }
         idle.wake_fully();
     }
@@ -883,12 +889,15 @@ impl Sleep {
         // this caller stored before calling; one of the two always
         // holds, which is what the mutex used to buy.
         if state.state.swap(AWAKE, Ordering::SeqCst) == SLEEPING {
-            // Only the party that wins the swap unparks and decrements,
-            // so a sleeper racing its own waker cannot double-count.
+            // Only the party that wins the swap unparks. The sleeper
+            // gives the sleeping count back itself when it leaves the
+            // park loop, on its own thread and before it can take
+            // work. A decrement made here would land after the unpark,
+            // and an unparked worker that found work first would take
+            // inactive below sleeping.
             if let Some(handle) = state.handle.get() {
                 handle.unpark();
             }
-            self.counters.sub_sleeping_thread();
             true
         } else {
             false
