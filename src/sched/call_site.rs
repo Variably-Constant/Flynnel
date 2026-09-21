@@ -913,6 +913,20 @@ impl CallSiteState {
         self.leaf_count.load(Ordering::Relaxed)
     }
 
+    /// Summed wall time of the leaves recorded against this site, in
+    /// nanoseconds, over its cumulative history: the batch-weighted
+    /// mean leaf time times the leaf count, so a batch measured at
+    /// partial occupancy counts for less. Zero while no batch has
+    /// carried weight.
+    pub fn leaf_sum_ns(&self) -> u64 {
+        let weight = self.leaf_weight_sum.load(Ordering::Relaxed);
+        if weight == 0 {
+            return 0;
+        }
+        let mean = self.leaf_sum_ns.load(Ordering::Relaxed) / weight;
+        mean.saturating_mul(self.leaf_count.load(Ordering::Relaxed))
+    }
+
     /// Mean cost of one item at this site, in nanoseconds, over its
     /// cumulative history. `None` below 4 leaves, and `None` while no
     /// recorded leaf carried an item count.

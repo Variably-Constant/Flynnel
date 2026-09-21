@@ -515,64 +515,88 @@ mod tests {
         );
     }
 
+    // The counters are process-global and every dispatch in the suite
+    // writes them, so a test that resets them, records, and reads back
+    // an exact total is reading whatever else was running as well. The
+    // readings below are computed over a `LeafStats` value built the way
+    // `record_leaf_time_ns` builds the counters, which no other test can
+    // touch; the one test that goes through the global recorder asserts
+    // deltas as floors, since a neighbour's leaves can only add.
+    fn stats_of_leaf_times(leaf_ns: &[u64]) -> LeafStats {
+        let mut s = LeafStats {
+            count: 0,
+            sum_ns: 0,
+            sumsq_scaled: 0,
+            items: 0,
+            sumsq_per_item: 0,
+        };
+        for &nanos in leaf_ns {
+            let scaled = nanos >> 8;
+            s.count += 1;
+            s.sum_ns += nanos;
+            s.sumsq_scaled += scaled.saturating_mul(scaled);
+        }
+        s
+    }
+
     #[test]
-    fn leaf_stats_record_and_reset() {
-        reset_leaf_stats();
+    fn recording_a_leaf_adds_its_time_and_one_to_the_counters() {
+        let before = snapshot_leaf_stats();
         record_leaf_time_ns(1_000);
         record_leaf_time_ns(2_000);
         record_leaf_time_ns(3_000);
-        let s = snapshot_leaf_stats();
-        assert_eq!(s.count, 3);
-        assert_eq!(s.sum_ns, 6_000);
-        reset_leaf_stats();
-        let s2 = snapshot_leaf_stats();
-        assert_eq!(s2.count, 0);
-        assert_eq!(s2.sum_ns, 0);
-        assert_eq!(s2.sumsq_scaled, 0);
+        let after = snapshot_leaf_stats();
+        let expected = stats_of_leaf_times(&[1_000, 2_000, 3_000]);
+        assert!(
+            after.count.wrapping_sub(before.count) >= expected.count,
+            "three leaves recorded, the count rose by {}",
+            after.count.wrapping_sub(before.count)
+        );
+        assert!(
+            after.sum_ns.wrapping_sub(before.sum_ns) >= expected.sum_ns,
+            "{} ns recorded, the sum rose by {}",
+            expected.sum_ns,
+            after.sum_ns.wrapping_sub(before.sum_ns)
+        );
+        assert!(
+            after.sumsq_scaled.wrapping_sub(before.sumsq_scaled) >= expected.sumsq_scaled,
+            "the scaled squares rose by {} against {} recorded",
+            after.sumsq_scaled.wrapping_sub(before.sumsq_scaled),
+            expected.sumsq_scaled
+        );
     }
 
     #[test]
     fn leaf_cv_squared_handles_insufficient_samples() {
-        reset_leaf_stats();
-        for _ in 0..3 {
-            record_leaf_time_ns(1_000);
-        }
-        let s = snapshot_leaf_stats();
-        assert!(leaf_cv_squared_per_mille(s).is_none(),
-            "fewer than 4 leaves should return None");
-        reset_leaf_stats();
+        let s = stats_of_leaf_times(&[1_000, 1_000, 1_000]);
+        assert!(
+            leaf_cv_squared_per_mille(s).is_none(),
+            "fewer than 4 leaves should return None"
+        );
     }
 
     #[test]
     fn leaf_cv_squared_zero_for_uniform_leaves() {
-        reset_leaf_stats();
         // 8 leaves, identical time = 0 variance.
-        for _ in 0..8 {
-            record_leaf_time_ns(10_000);
-        }
-        let s = snapshot_leaf_stats();
+        let s = stats_of_leaf_times(&[10_000; 8]);
         let cv2 = leaf_cv_squared_per_mille(s).unwrap();
         // Allow small fixed-point rounding error from the >>8 scaling.
         assert!(cv2 < 20, "uniform leaves should have cv^2 ~ 0; got {cv2}");
-        reset_leaf_stats();
     }
 
     #[test]
     fn leaf_cv_squared_high_for_spread_leaves() {
-        reset_leaf_stats();
         // Mix of fast and slow leaves: half at 1us, half at 100us.
         // cv = sqrt(((100-50.5)^2 + (1-50.5)^2)/2) / 50.5 ~ 49.5/50.5 ~ 0.98.
         // cv^2 ~ 0.96 ~ 960 per mille.
-        for _ in 0..4 {
-            record_leaf_time_ns(1_000);
-        }
-        for _ in 0..4 {
-            record_leaf_time_ns(100_000);
-        }
-        let s = snapshot_leaf_stats();
+        let s = stats_of_leaf_times(&[
+            1_000, 1_000, 1_000, 1_000, 100_000, 100_000, 100_000, 100_000,
+        ]);
         let cv2 = leaf_cv_squared_per_mille(s).unwrap();
-        assert!(cv2 >= 500, "spread leaves should have cv^2 >= 500; got {cv2}");
-        reset_leaf_stats();
+        assert!(
+            cv2 >= 500,
+            "spread leaves should have cv^2 >= 500; got {cv2}"
+        );
     }
 
     #[test]

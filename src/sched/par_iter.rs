@@ -4956,10 +4956,17 @@ mod tests {
 
         // Past the buffer's flush threshold so the counts reach the
         // site, with work in each leaf the compiler cannot discard.
+        //
+        // The estimate keeps every dispatch on the pool. Without one
+        // the entry probes the body, and a probe that reads the whole
+        // call under the host's collapse threshold runs it on the
+        // caller as one leaf, through a recorder that never brackets.
         let n = 4 * MIN_LEAF_ITEMS;
         let mut v: Vec<u64> = (0..n as u64).collect();
         for _ in 0..(LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4) {
-            let plan = JobPlan::new(0, n as u32).with_site(site);
+            let plan = JobPlan::new(0, n as u32)
+                .with_site(site)
+                .with_estimated_per_item_ns(5_000);
             for_each_chunk_indexed_min_leaf(&plan, &mut v, MIN_LEAF_ITEMS, |_start, chunk| {
                 for slot in chunk.iter_mut() {
                     let mut acc = *slot;
@@ -4999,12 +5006,16 @@ mod tests {
             crate::sched::call_site::CallSiteState::new();
         let site = crate::sched::call_site::SiteRef::new(&SITE);
 
+        // The estimate keeps every dispatch on the pool, for the reason
+        // the indexed test gives.
         let n = 4 * MIN_LEAF_ITEMS;
         let a: Vec<u64> = (0..n as u64).collect();
         let b: Vec<u64> = (0..n as u64).map(|x| x ^ 0x5DEE_CE66).collect();
         let mut out: Vec<u64> = vec![0; n];
         for _ in 0..(LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4) {
-            let plan = JobPlan::new(0, n as u32).with_site(site);
+            let plan = JobPlan::new(0, n as u32)
+                .with_site(site)
+                .with_estimated_per_item_ns(5_000);
             for_each_chunk_triple_min_leaf(
                 &plan,
                 &mut out,
@@ -5392,89 +5403,88 @@ mod tests {
 
     #[test]
     fn for_each_chunk_records_leaf_time_stats() {
-        // 2way wire-in: `record_leaf` brackets every bisect leaf and
-        // forwards the TSC delta into the variance counters. After a
-        // for_each_chunk run with N > MIN_LEAF_ITEMS, the LEAF_COUNT
-        // must be >= 1 (at least one leaf fires) and SUM_NS must be
-        // strictly positive (every leaf body takes some non-zero
-        // time). Run this following a reset so the counts are this
-        // call's contribution alone.
-        use crate::sched::split_observer::{
-            acquire_test_lock, reset_leaf_stats, snapshot_leaf_stats,
-        };
+        // `record_leaf` brackets a leaf with the timestamp counter and
+        // the flush converts the delta to nanoseconds. Every recorded
+        // leaf lands in two places: the plan's site, which only this
+        // test's dispatches feed, and the process-global counters,
+        // which every dispatch in the suite feeds. The exact checks
+        // read the site. The global counters are checked as floors,
+        // because a neighbour's leaves can only add to them.
+        //
+        // One worker, so each dispatch is one leaf run on this thread
+        // inside the wall time measured around the loop. The summed
+        // leaf time then cannot exceed that wall time by more than the
+        // recorder's own cost per leaf, and a total past twice the wall
+        // time is the leaf clock and the wall clock not sharing a unit:
+        // the timestamp counter runs at over two ticks a nanosecond on
+        // every host this runs on, so a delta recorded in ticks lands
+        // above the ceiling.
+        use crate::sched::split_observer::snapshot_leaf_stats;
 
-        let _stats_lock = acquire_test_lock();
-        reset_leaf_stats();
-        let n = 5_000usize;
+        static SITE: crate::sched::call_site::CallSiteState =
+            crate::sched::call_site::CallSiteState::new();
+        let site = crate::sched::call_site::SiteRef::new(&SITE);
+        let n = 8 * MIN_LEAF_ITEMS;
         let mut v: Vec<u32> = (0..n as u32).collect();
-        let plan = JobPlan::new(6, n as u32);
+        let plan = JobPlan::new(6, n as u32).with_site(site).with_workers(1);
+        // Past the buffer's flush threshold, so the counts reach the
+        // site and the global counters before the reads below.
+        let dispatches = LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4;
+        let before = snapshot_leaf_stats();
         let dispatch_start = std::time::Instant::now();
-        for_each_chunk(&plan, &mut v, |slice| {
-            // Force a non-trivial body so the TSC delta is well
-            // above the rdtsc-pair resolution (~20 cycles).
-            let mut acc: u64 = 0;
-            for &x in slice.iter() {
-                acc = acc.wrapping_add((x as u64).wrapping_mul(0x9E3779B97F4A7C15));
-            }
-            std::hint::black_box(acc);
-        });
-        let stats = snapshot_leaf_stats();
-        assert!(stats.count >= 1,
-            "expected at least one leaf recorded, got {}", stats.count);
-        let dispatch_ns = dispatch_start.elapsed().as_nanos() as u64;
-        assert!(stats.sum_ns > 0,
-            "expected a positive total leaf time in nanoseconds, got {}", stats.sum_ns);
-        // The leaves of one dispatch run inside it, on at most every
-        // worker at once, so their summed time cannot exceed the
-        // dispatch's own wall time times the worker count.
-        //
-        // Two different faults break that and the counts tell them
-        // apart, which is why they are all in the message. Leaf times
-        // recorded in counter ticks rather than nanoseconds inflate
-        // the total while leaving the number of leaves right, so the
-        // mean per leaf comes out too high by the tick rate. Counters
-        // carrying leaves from another dispatch inflate the total and
-        // the number of leaves together, because the writer that
-        // escaped brought its own leaves with it.
-        //
-        // The second is the one seen in practice: the leaf counters
-        // are process-global, this test holds the leaf-stats lock, and
-        // a run that still exceeds the ceiling means some writer
-        // reached them without taking it.
-        // Every leaf of this dispatch holds at least one of the n
-        // items, so this dispatch cannot have produced more than n of
-        // them. A count above that is somebody else's work in the
-        // counters, and the counters are the only channel: leaves are
-        // recorded on worker threads, so a reader cannot tell its own
-        // from a peer's without the writer tagging them, and the
-        // per-site counters hold sampled leaves rather than all of
-        // them. So the sample is checked for being ours and the unit
-        // check is skipped when it is not, rather than failing on
-        // another test's leaves.
-        //
-        // This tolerates rather than scopes. Over 200 tests across
-        // fourteen modules dispatch into these same counters and take
-        // no lock, so a clean sample is the common case and not a
-        // guaranteed one; the check runs on the runs that can carry it.
-        let ours = stats.count <= n as u64;
-        if ours {
-            let workers = global_local_arena().total_workers().max(1) as u64;
-            let ceiling = dispatch_ns.saturating_mul(workers).saturating_mul(2).max(1);
-            assert!(
-                stats.sum_ns <= ceiling,
-                "{} ns of leaf time over {} leaves ({} ns each) against a {} ns dispatch on {} \
-                 workers, ceiling {}. The count fits this dispatch, so the leaf clock and the \
-                 wall clock are not sharing a unit",
-                stats.sum_ns,
-                stats.count,
-                stats.sum_ns / stats.count.max(1),
-                dispatch_ns,
-                workers,
-                ceiling
-            );
+        for _ in 0..dispatches {
+            for_each_chunk_indexed_min_leaf(&plan, &mut v, MIN_LEAF_ITEMS, |_start, slice| {
+                // Work the compiler cannot discard, heavy enough that a
+                // leaf's time is well above the resolution of a pair of
+                // counter reads.
+                for x in slice.iter_mut() {
+                    let mut acc = *x as u64;
+                    for _ in 0..64 {
+                        acc = acc.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                    }
+                    *x = std::hint::black_box(acc) as u32;
+                }
+            });
         }
-        // Cleanup so this test's data doesn't pollute neighbours.
-        reset_leaf_stats();
+        let dispatch_ns = dispatch_start.elapsed().as_nanos() as u64;
+        let after = snapshot_leaf_stats();
+
+        let count = SITE.leaf_count();
+        assert!(
+            count >= LocalLeafBuffer::FLUSH_THRESHOLD,
+            "{dispatches} single-leaf dispatches should have flushed at least one batch to \
+             the site, which holds {count} leaves"
+        );
+        let sum_ns = SITE.leaf_sum_ns();
+        assert!(
+            sum_ns > 0,
+            "expected a positive total leaf time in nanoseconds at the site"
+        );
+        let ceiling = dispatch_ns.saturating_mul(2).max(1);
+        assert!(
+            sum_ns <= ceiling,
+            "{} ns of leaf time over {} leaves ({} ns each) on one thread inside {} ns of wall \
+             time, ceiling {}: the leaf clock and the wall clock are not sharing a unit",
+            sum_ns,
+            count,
+            sum_ns / count.max(1),
+            dispatch_ns,
+            ceiling
+        );
+
+        // The global half flushes on its own cadence from whatever
+        // residue this thread carried in, so its rise can trail the
+        // site's by one batch less a leaf, and neighbours' leaves can
+        // only raise it.
+        let global_count = after.count.wrapping_sub(before.count);
+        assert!(
+            global_count + LocalLeafBuffer::FLUSH_THRESHOLD > count,
+            "the global counters rose by {global_count} leaves while the site recorded {count}"
+        );
+        assert!(
+            after.sum_ns.wrapping_sub(before.sum_ns) > 0,
+            "the global leaf time did not rise while the site recorded {sum_ns} ns"
+        );
     }
 
     #[test]
