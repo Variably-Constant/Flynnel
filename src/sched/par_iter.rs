@@ -5035,19 +5035,24 @@ mod tests {
         let chunk = 64;
         let mut v: Vec<u32> = vec![0; n];
         let plan = JobPlan::new(6, n as u32);
-        let sizes_seen = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
-        let sizes_clone = Arc::clone(&sizes_seen);
+        use std::sync::atomic::AtomicUsize;
+        // The assertion is over the largest chunk, so the largest is
+        // what the leaves record. Collecting every size to look at the
+        // maximum is a Vec and a lock for a number fetch_max already
+        // holds.
+        let widest = Arc::new(AtomicUsize::new(0));
+        let widest_clone = Arc::clone(&widest);
         for_each_fixed_chunk(&plan, &mut v, chunk, |slice| {
-            sizes_clone.lock().unwrap().push(slice.len());
+            widest_clone.fetch_max(slice.len(), Ordering::Relaxed);
             for x in slice {
                 *x = 7;
             }
         });
-        // Every chunk passed to op must be <= chunk size.
-        for size in sizes_seen.lock().unwrap().iter() {
-            assert!(*size <= chunk,
-                "chunk size {} exceeded the {chunk}-item ceiling", size);
-        }
+        let widest = widest.load(Ordering::Relaxed);
+        assert!(
+            widest <= chunk,
+            "chunk size {widest} exceeded the {chunk}-item ceiling"
+        );
         // Every element was touched.
         assert!(v.iter().all(|&x| x == 7));
     }
@@ -5441,11 +5446,20 @@ mod tests {
         let width = 64usize;
         let v: Vec<u32> = (0..n as u32).collect();
         let seen: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
-        let widths = Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
-        let widths_clone = Arc::clone(&widths);
+        use std::sync::atomic::AtomicUsize;
+        // One slot per tile, each written by the one chunk that covers
+        // it, so nothing contends and nothing needs a lock. The length
+        // is stored plus one, which leaves zero meaning never covered
+        // and lets a tile claimed twice be caught where it happens
+        // rather than inferred afterwards from a list that still
+        // sorts.
+        let tiles = n.div_ceil(width);
+        let lens: Vec<AtomicUsize> = (0..tiles).map(|_| AtomicUsize::new(0)).collect();
         let plan = JobPlan::new(6, n as u32);
         for_each_chunk_ref(&plan, &v, width, |start, chunk| {
-            widths_clone.lock().unwrap().push((start, chunk.len()));
+            assert_eq!(start % width, 0, "chunk at {start} does not begin a tile");
+            let prior = lens[start / width].swap(chunk.len() + 1, Ordering::Relaxed);
+            assert_eq!(prior, 0, "tile {} was covered twice", start / width);
             for (k, &x) in chunk.iter().enumerate() {
                 assert_eq!(x as usize, start + k, "chunk at {start} holds the wrong items");
                 seen[start + k].fetch_add(1, Ordering::Relaxed);
@@ -5454,13 +5468,11 @@ mod tests {
         for (i, s) in seen.iter().enumerate() {
             assert_eq!(s.load(Ordering::Relaxed), 1, "item {i} covered {} times", s.load(Ordering::Relaxed));
         }
-        let mut widths = widths.lock().unwrap().clone();
-        widths.sort_unstable();
-        assert_eq!(widths.len(), n.div_ceil(width), "one chunk per width-sized tile");
-        for (k, &(start, len)) in widths.iter().enumerate() {
-            assert_eq!(start, k * width, "chunk {k} starts at the wrong index");
-            let expected = if k + 1 == widths.len() { n - k * width } else { width };
-            assert_eq!(len, expected, "chunk {k} has the wrong width");
+        for (k, slot) in lens.iter().enumerate() {
+            let stored = slot.load(Ordering::Relaxed);
+            assert_ne!(stored, 0, "tile {k} was never covered");
+            let expected = if k + 1 == tiles { n - k * width } else { width };
+            assert_eq!(stored - 1, expected, "chunk {k} has the wrong width");
         }
     }
 
@@ -5479,19 +5491,30 @@ mod tests {
     #[test]
     fn a_worker_cap_of_one_keeps_every_entry_on_the_calling_thread() {
         let _stats_lock = crate::sched::split_observer::acquire_test_lock();
-        use std::sync::Mutex;
         // The dispatches below record heavy leaves into the global
         // classifier, which can migrate the process profile under a
         // test that pins it. Hold the same lock those tests hold.
         let _profile = crate::sched::adaptive_profile::global_profile_test_lock();
         let caller = std::thread::current().id();
-        let seen: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+        use std::sync::atomic::AtomicUsize;
+        // Two counters rather than the thread ids themselves. The
+        // assertion is that no body ran anywhere but here, and a count
+        // of the ones that did answers it; the ids were collected only
+        // to be compared one at a time against this thread's.
+        let bodies = AtomicUsize::new(0);
+        let elsewhere = AtomicUsize::new(0);
+        let note = |caller: std::thread::ThreadId| {
+            bodies.fetch_add(1, Ordering::Relaxed);
+            if std::thread::current().id() != caller {
+                elsewhere.fetch_add(1, Ordering::Relaxed);
+            }
+        };
         let n = 4096usize;
 
         let mut v: Vec<u32> = (0..n as u32).collect();
         let plan = JobPlan::new(6, n as u32).with_workers(1).with_estimated_per_item_ns(5_000);
         for_each_chunk(&plan, &mut v, |c| {
-            seen.lock().unwrap().push(std::thread::current().id());
+            note(caller);
             for x in c.iter_mut() {
                 *x += 1;
             }
@@ -5501,7 +5524,7 @@ mod tests {
         let b: Vec<u32> = vec![2; n];
         let mut out: Vec<u32> = vec![0; n];
         for_each_chunk_triple_min_leaf(&plan, &mut out, &a, &b, 1, |o, x, y| {
-            seen.lock().unwrap().push(std::thread::current().id());
+            note(caller);
             for ((o, x), y) in o.iter_mut().zip(x).zip(y) {
                 *o = x + y;
             }
@@ -5509,17 +5532,20 @@ mod tests {
 
         let mut idx: Vec<u32> = vec![0; n];
         for_each_chunk_indexed_min_leaf(&plan, &mut idx, 1, |start, chunk| {
-            seen.lock().unwrap().push(std::thread::current().id());
+            note(caller);
             for (k, slot) in chunk.iter_mut().enumerate() {
                 *slot = (start + k) as u32;
             }
         });
 
-        let threads = seen.lock().unwrap().clone();
-        assert!(!threads.is_empty(), "the bodies must have run");
-        for t in threads {
-            assert_eq!(t, caller, "a worker cap of one must not leave the caller");
-        }
+        assert!(bodies.load(Ordering::Relaxed) > 0, "the bodies must have run");
+        assert_eq!(
+            elsewhere.load(Ordering::Relaxed),
+            0,
+            "a worker cap of one must not leave the caller, and {} of {} bodies did",
+            elsewhere.load(Ordering::Relaxed),
+            bodies.load(Ordering::Relaxed)
+        );
         assert_eq!(out[0], 3, "the triple entry still computed its output");
         assert_eq!(idx[n - 1], (n - 1) as u32, "the indexed entry still filled its output");
     }
