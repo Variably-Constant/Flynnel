@@ -144,15 +144,19 @@ pub fn monitor_wait_held() -> bool {
 }
 
 impl WaitStrategy {
-    /// Pick the wait strategy for this host: WAITPKG where the
-    /// silicon has it, otherwise [`WaitStrategy::StdPark`].
+    /// The strategy a parker built by [`Parker::new`] starts on, and
+    /// the one it returns to whenever the controller has no verdict.
     ///
-    /// # MONITORX is implemented and is deliberately not picked
+    /// WAITPKG where the silicon has it, because UMWAIT takes the
+    /// deadline this parker wants directly. Otherwise the kernel
+    /// park, which is what shipped before any of this and is
+    /// therefore the floor a measurement has to beat.
     ///
-    /// It wins on an idle host and loses badly on a loaded one, and
-    /// which of those a worker meets is not knowable at construction.
-    /// Wake latency, unpark to observable return, medians of two runs
-    /// on a Ryzen 9 7900X and one on a Ryzen 7 2700:
+    /// MONITORX is never the starting point even where present. It is
+    /// reached only by [`wait_controller`] measuring it cheaper here,
+    /// because whether it is cheaper depends on the load and not only
+    /// on the part. Wake latency, unpark to observable return, in
+    /// microseconds:
     ///
     /// ```text
     ///                 7900X                  2700
@@ -163,30 +167,299 @@ impl WaitStrategy {
     ///   load 500   6.5       0.5          16.5    319.2
     /// ```
     ///
-    /// Four to fourteen times better on the 7900X in every cell, and
-    /// twenty times worse on the 2700 under load. The 2700 has eight
-    /// cores against the twelve of the 7900X and the load arm busies
-    /// half the host either way, so the loaded 2700 is the more
-    /// oversubscribed of the two; a halted core there competes to be
-    /// scheduled again where `thread::park` hands the decision to the
-    /// kernel.
-    ///
-    /// The not-holding guard does not catch it. Under that load the
-    /// arms are slow enough to clear the threshold while the wake
-    /// still costs 319 us, so the guard reports the monitor holding
-    /// and it does, uselessly.
-    ///
-    /// Nothing may get slower anywhere, so it is not the default
-    /// until a guard exists that separates those two hosts.
-    /// [`Parker::with_strategy`] selects it, which is how the numbers
-    /// above were taken.
-    pub fn pick() -> Self {
+    /// Better on the 7900X everywhere, better on an idle 2700 by five
+    /// to nine times, and twenty times worse on a loaded one. No
+    /// property of the host settles that, which is why the choice is
+    /// measured per process and revisited rather than decided here.
+    pub fn baseline() -> Self {
         if crate::cpu_info::has_waitpkg() {
             Self::Waitpkg
         } else {
             Self::StdPark
         }
     }
+
+    /// The strategy to use for the next park on this host.
+    ///
+    /// [`Self::baseline`] until the controller has measured something
+    /// cheaper. Kept as the name the rest of the crate calls, so a
+    /// caller that just wants "the right one" is unaffected by where
+    /// the answer comes from.
+    pub fn pick() -> Self {
+        wait_controller().choose()
+    }
+}
+
+/// Which wait is cheapest on this host right now, learned by timing
+/// the waits the scheduler was going to do anyway.
+///
+/// # Why this is measured rather than decided
+///
+/// A monitor wait beats a kernel park on some parts and loses on
+/// others, and on at least one part it does both depending on how
+/// busy the host is. Nothing readable at construction separates
+/// those: CPUID reports the instruction, not what it costs, and the
+/// cost moves with the load. So the strategies are raced against each
+/// other in the parks the pool performs anyway, and the cheaper one
+/// is used until it stops being cheaper.
+///
+/// # Shape
+///
+/// The same explore-then-exploit the hybrid dispatcher uses for CPU
+/// against device, and the same evidence gate the spin controller
+/// uses before it moves its window. While a strategy is unmeasured
+/// the controller alternates to gather samples; once both have
+/// enough it takes the lower mean; every so often it re-alternates so
+/// a host that got busy is noticed.
+///
+/// # Cost on the path that does not use it
+///
+/// [`Self::choose`] is one relaxed load. Timing happens on sampled
+/// parks only, and the sample flag is read by `unpark` out of a cache
+/// line it is already writing, so an unsampled wake pays nothing it
+/// was not already paying. A park is the slow path by construction:
+/// the cheapest outcome measured here is about half a microsecond and
+/// the timing costs two clock reads, so a sampled park pays a few per
+/// cent and one park in [`SAMPLE_EVERY`] is sampled.
+pub struct WaitController {
+    /// Mean observed wake cost in nanoseconds, indexed by
+    /// [`Self::slot`]. Zero means unmeasured.
+    mean_ns: [AtomicU64; 2],
+    /// Samples folded into each mean.
+    samples: [AtomicU32; 2],
+    /// Parks begun, for the sample and re-probe cadences.
+    parks: AtomicU64,
+    /// The strategy [`Self::choose`] currently returns, as a slot.
+    current: AtomicU32,
+    /// Times a verdict changed which strategy is in use.
+    switches: AtomicU64,
+}
+
+/// One park in this many is timed.
+///
+/// Low enough that a verdict arrives inside a second of ordinary
+/// scheduling and high enough that the two clock reads it costs are
+/// spread thin. A park is already microseconds, so the sampled ones
+/// pay single-digit per cent and the rest pay nothing.
+const SAMPLE_EVERY: u64 = 64;
+
+/// Samples each strategy needs before its mean is allowed to decide
+/// anything.
+///
+/// The spin controller waits for 256 events before it moves, for the
+/// same reason: a wake latency has a long tail and a handful of
+/// samples is mostly tail.
+const SAMPLES_BEFORE_VERDICT: u32 = 32;
+
+/// Parks between re-probes of the strategy not currently in use.
+///
+/// Without this the first verdict is permanent, which is the defect
+/// that made the earlier one-shot guard useless: a host that was idle
+/// when the pool started and is loaded now needs the answer revisited.
+/// The hybrid dispatcher re-races every 32nd call for the same reason.
+const REPROBE_EVERY: u64 = 8192;
+
+/// How much cheaper the challenger must be before the process moves.
+///
+/// A switch costs nothing directly, but a strategy that flaps spends
+/// its life exploring, and two means within noise of each other carry
+/// no information worth acting on. A fifth is well outside the spread
+/// seen between repeat runs on both hosts and well inside the four to
+/// fourteen times the arms actually differ by when they differ.
+const MARGIN_PER_CENT: u64 = 20;
+
+static WAIT_CONTROLLER: WaitController = WaitController {
+    mean_ns: [AtomicU64::new(0), AtomicU64::new(0)],
+    samples: [AtomicU32::new(0), AtomicU32::new(0)],
+    parks: AtomicU64::new(0),
+    current: AtomicU32::new(SLOT_BASELINE),
+    switches: AtomicU64::new(0),
+};
+
+/// Slot of [`WaitStrategy::baseline`], whatever that resolves to.
+const SLOT_BASELINE: u32 = 0;
+/// Slot of the monitor wait being raced against it.
+const SLOT_CHALLENGER: u32 = 1;
+
+/// The process-wide wait controller.
+pub fn wait_controller() -> &'static WaitController {
+    &WAIT_CONTROLLER
+}
+
+impl WaitController {
+    /// The strategy the next park should use.
+    fn choose(&self) -> WaitStrategy {
+        if self.current.load(Ordering::Relaxed) == SLOT_CHALLENGER
+            && let Some(c) = challenger()
+        {
+            return c;
+        }
+        WaitStrategy::baseline()
+    }
+
+    /// Whether this park should be timed, and which slot it will
+    /// report against. Called once per park, before the wait.
+    ///
+    /// Also drives exploration: while either side is short of
+    /// evidence, or a re-probe is due, the sampled park is steered to
+    /// the side that needs it rather than to whichever is in use.
+    fn sample_plan(&self) -> Option<(WaitStrategy, u32)> {
+        let n = self.parks.fetch_add(1, Ordering::Relaxed);
+        if n % SAMPLE_EVERY != 0 {
+            return None;
+        }
+        let challenger = challenger()?;
+
+        let base_n = self.samples[SLOT_BASELINE as usize].load(Ordering::Relaxed);
+        let chal_n = self.samples[SLOT_CHALLENGER as usize].load(Ordering::Relaxed);
+        let reprobe = n % REPROBE_EVERY == 0;
+
+        // The side with less evidence, so a cold controller fills both
+        // means rather than confirming the one it started on.
+        let slot = if reprobe {
+            if self.current.load(Ordering::Relaxed) == SLOT_BASELINE {
+                SLOT_CHALLENGER
+            } else {
+                SLOT_BASELINE
+            }
+        } else if chal_n < base_n {
+            SLOT_CHALLENGER
+        } else {
+            SLOT_BASELINE
+        };
+
+        Some((
+            if slot == SLOT_CHALLENGER {
+                challenger
+            } else {
+                WaitStrategy::baseline()
+            },
+            slot,
+        ))
+    }
+
+    /// Fold one timed wake into a slot's mean and re-decide.
+    fn record(&self, slot: u32, wake_ns: u64) {
+        let i = slot as usize;
+        let n = self.samples[i].fetch_add(1, Ordering::Relaxed) + 1;
+        let prev = self.mean_ns[i].load(Ordering::Relaxed);
+        // Cumulative mean while the sample count is small, then an
+        // exponential one, so early samples are not swamped and a
+        // later shift in load still moves the figure.
+        let next = if prev == 0 {
+            wake_ns
+        } else if n <= SAMPLES_BEFORE_VERDICT {
+            prev + (wake_ns.saturating_sub(prev)) / u64::from(n)
+        } else {
+            (prev * 7 + wake_ns) / 8
+        };
+        self.mean_ns[i].store(next, Ordering::Relaxed);
+        self.decide();
+    }
+
+    /// Adopt whichever side is cheaper by more than the margin.
+    fn decide(&self) {
+        let base_n = self.samples[SLOT_BASELINE as usize].load(Ordering::Relaxed);
+        let chal_n = self.samples[SLOT_CHALLENGER as usize].load(Ordering::Relaxed);
+        if base_n < SAMPLES_BEFORE_VERDICT || chal_n < SAMPLES_BEFORE_VERDICT {
+            return;
+        }
+        let base = self.mean_ns[SLOT_BASELINE as usize].load(Ordering::Relaxed);
+        let chal = self.mean_ns[SLOT_CHALLENGER as usize].load(Ordering::Relaxed);
+        if base == 0 || chal == 0 {
+            return;
+        }
+        let want = if chal * 100 < base * (100 - MARGIN_PER_CENT) {
+            SLOT_CHALLENGER
+        } else if base * 100 < chal * (100 - MARGIN_PER_CENT) {
+            SLOT_BASELINE
+        } else {
+            return;
+        };
+        if self.current.swap(want, Ordering::Relaxed) != want {
+            self.switches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// What the controller has measured: the two mean wake costs in
+    /// nanoseconds, their sample counts, which slot is in use, and
+    /// how many times that has changed.
+    ///
+    /// Zero samples on a side means it has never been tried, which is
+    /// a different state from having been tried and found slow.
+    pub fn report(&self) -> WaitControllerReport {
+        WaitControllerReport {
+            baseline_ns: self.mean_ns[SLOT_BASELINE as usize].load(Ordering::Relaxed),
+            challenger_ns: self.mean_ns[SLOT_CHALLENGER as usize].load(Ordering::Relaxed),
+            baseline_samples: self.samples[SLOT_BASELINE as usize].load(Ordering::Relaxed),
+            challenger_samples: self.samples[SLOT_CHALLENGER as usize].load(Ordering::Relaxed),
+            in_use: self.choose(),
+            switches: self.switches.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// What [`WaitController::report`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitControllerReport {
+    /// Mean wake cost of the baseline wait, nanoseconds, 0 if untried.
+    pub baseline_ns: u64,
+    /// Mean wake cost of the monitor wait, nanoseconds, 0 if untried.
+    pub challenger_ns: u64,
+    /// Timed wakes folded into `baseline_ns`.
+    pub baseline_samples: u32,
+    /// Timed wakes folded into `challenger_ns`.
+    pub challenger_samples: u32,
+    /// The strategy a park would use now.
+    pub in_use: WaitStrategy,
+    /// Times the verdict changed which strategy is in use.
+    pub switches: u64,
+}
+
+/// A cycle counter reading, or 0 where the target has none.
+///
+/// Never the wall clock: this times a span of microseconds between
+/// two threads on one host, which is what a cycle counter is for, and
+/// the crate already assumes an invariant TSC elsewhere.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn tsc_now() -> u64 {
+    // SAFETY: `_rdtsc` is a no-side-effect read of the TSC counter,
+    // available on every x86_64 CPU produced this century.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn tsc_now() -> u64 {
+    0
+}
+
+/// Cycles as nanoseconds, against the rate this host measured for
+/// itself rather than any figure derived from its model.
+///
+/// The controller compares two of its own readings, so a wrong rate
+/// scales both and changes no verdict. It is converted anyway because
+/// the report is read by people and a cycle count means nothing
+/// without the part it was counted on.
+fn cycles_to_ns(cycles: u64) -> u64 {
+    let per_ns_16 = crate::sched::par_iter::tsc_per_ns_16();
+    if per_ns_16 == 0 {
+        return cycles;
+    }
+    cycles.saturating_mul(16) / per_ns_16
+}
+
+/// The monitor wait this host could race against the baseline, or
+/// `None` where it has none or has been found not to hold.
+fn challenger() -> Option<WaitStrategy> {
+    if !monitor_holds() {
+        return None;
+    }
+    if crate::cpu_info::has_monitorx() && !crate::cpu_info::has_waitpkg() {
+        return Some(WaitStrategy::Monitorx);
+    }
+    None
 }
 
 /// Per-worker park primitive. One `Parker` per worker thread; the
@@ -225,37 +498,72 @@ pub struct Parker {
     /// the WAITPKG path snapshots before park + UMONITOR-watches
     /// the counter's cache line.
     wake_counter: AtomicU64,
-    /// Wait strategy chosen at construction time.
-    wait_strategy: WaitStrategy,
+    /// Strategy this parker is pinned to, or `None` to take whatever
+    /// [`wait_controller`] currently measures cheapest.
+    ///
+    /// Pinned only by [`Self::with_strategy`], which exists so a
+    /// bench can hold one arm still. A worker built by [`Self::new`]
+    /// follows the controller, so a verdict reached while it is
+    /// parked applies to its next park.
+    pinned: Option<WaitStrategy>,
+    /// When a park is being timed, the unparker stamps its TSC here
+    /// and the waking thread differences it. [`SAMPLE_ARMED`] means a
+    /// stamp is wanted, 0 means this park is not timed.
+    ///
+    /// The unparker reads this out of the cache line it is already
+    /// writing `wake_counter` into, so an untimed wake pays one
+    /// relaxed load and no clock read.
+    wake_stamp: AtomicU64,
 }
+
+/// `wake_stamp` value meaning a timed park wants a stamp. Not a
+/// plausible TSC, so it cannot be mistaken for one.
+const SAMPLE_ARMED: u64 = 1;
 
 impl Parker {
     /// Construct a Parker owned by the calling thread. Captures
     /// the current `Thread` handle for later cross-thread unpark.
-    /// Wait strategy is auto-picked via [`WaitStrategy::pick`].
+    ///
+    /// Follows [`wait_controller`] rather than fixing a strategy, so
+    /// a verdict reached after this worker started applies to it.
     pub fn new(spin_rounds: u32) -> Self {
-        Self::with_strategy(spin_rounds, WaitStrategy::pick())
+        Self {
+            thread: thread::current(),
+            shutdown: AtomicBool::new(false),
+            spin_rounds,
+            wake_counter: AtomicU64::new(0),
+            pinned: None,
+            wake_stamp: AtomicU64::new(0),
+        }
     }
 
-    /// Construct a Parker with an explicit wait strategy. Used by
-    /// benches + tests that need to A/B against the auto-picked
-    /// strategy. Callers must not pass [`WaitStrategy::Waitpkg`] on
-    /// a host where [`crate::cpu_info::has_waitpkg`] returns false
-    /// (the inline `UMONITOR`/`UMWAIT` opcodes would raise `#UD`).
+    /// Construct a Parker pinned to one wait strategy, which the
+    /// controller will not move. Used by benches and tests that need
+    /// one arm held still.
+    ///
+    /// Callers must not pass a strategy this host cannot execute:
+    /// [`WaitStrategy::Waitpkg`] without
+    /// [`crate::cpu_info::has_waitpkg`], or
+    /// [`WaitStrategy::Monitorx`] without
+    /// [`crate::cpu_info::has_monitorx`], raise `#UD`.
     pub fn with_strategy(spin_rounds: u32, wait_strategy: WaitStrategy) -> Self {
         Self {
             thread: thread::current(),
             shutdown: AtomicBool::new(false),
             spin_rounds,
             wake_counter: AtomicU64::new(0),
-            wait_strategy,
+            pinned: Some(wait_strategy),
+            wake_stamp: AtomicU64::new(0),
         }
     }
 
-    /// Observable wait strategy. Used by benches + diagnostics to
-    /// confirm which path the Parker is on.
+    /// The strategy this parker would use for a park starting now.
+    ///
+    /// Its pinned one, or the controller's current verdict. Not fixed
+    /// for an unpinned parker, so two calls either side of a verdict
+    /// legitimately differ.
     pub fn wait_strategy(&self) -> WaitStrategy {
-        self.wait_strategy
+        self.pinned.unwrap_or_else(WaitStrategy::pick)
     }
 
     /// Block the calling thread until `is_ready` returns `true`,
@@ -299,11 +607,27 @@ impl Parker {
             return true;
         }
 
+        // The strategy for this park, and whether it is one of the
+        // sampled ones. A pinned parker is never sampled: it exists
+        // so a bench can hold an arm still, and feeding its timings
+        // to the controller would let the bench move the default it
+        // is measuring.
+        let (strategy, sampling) = match self.pinned {
+            Some(p) => (p, None),
+            None => match wait_controller().sample_plan() {
+                Some((s, slot)) => {
+                    self.wake_stamp.store(SAMPLE_ARMED, Ordering::Relaxed);
+                    (s, Some(slot))
+                }
+                None => (WaitStrategy::pick(), None),
+            },
+        };
+
         // Dispatch on wait strategy. Either path returns to the
         // caller on wake (real or spurious); the caller's loop
         // re-attempts the work search and re-enters park_until
         // when still empty.
-        match self.wait_strategy {
+        match strategy {
             WaitStrategy::StdPark => {
                 thread::park();
             }
@@ -312,7 +636,7 @@ impl Parker {
             // re-entered. Only a wake, a shutdown or a ready
             // predicate returns to the caller.
             WaitStrategy::Waitpkg | WaitStrategy::Monitorx => loop {
-                match self.wait_strategy {
+                match strategy {
                     WaitStrategy::Monitorx => self.wait_via_monitorx(initial_wake),
                     _ => self.wait_via_waitpkg(initial_wake),
                 }
@@ -326,6 +650,19 @@ impl Parker {
                     break;
                 }
             },
+        }
+
+        // A sampled park reports what its wake cost, measured from
+        // the unparker's stamp rather than from entering the wait, so
+        // the figure is the wake and not how long there was nothing
+        // to do. A park that ended without an unpark leaves the stamp
+        // armed and reports nothing, because there is no wake to time.
+        if let Some(slot) = sampling {
+            let stamp = self.wake_stamp.swap(0, Ordering::Relaxed);
+            if stamp > SAMPLE_ARMED {
+                let now = tsc_now();
+                wait_controller().record(slot, cycles_to_ns(now.wrapping_sub(stamp)));
+            }
         }
 
         // Final shutdown check before returning so a shutdown
@@ -352,6 +689,14 @@ impl Parker {
         // Release-store on wake_counter happens-before the parked
         // observer's Acquire-load post-UMWAIT, so the observer sees
         // any state the producer published prior to unpark.
+        // Stamped before the counter moves, so the figure covers the
+        // whole wake rather than starting after the store the waiter
+        // is watching for. The load is of a field in the line this is
+        // about to write anyway, so an untimed unpark pays no clock
+        // read and no extra line.
+        if self.wake_stamp.load(Ordering::Relaxed) == SAMPLE_ARMED {
+            self.wake_stamp.store(tsc_now(), Ordering::Relaxed);
+        }
         self.wake_counter.fetch_add(1, Ordering::Release);
         self.thread.unpark();
     }
@@ -766,33 +1111,77 @@ mod tests {
     }
 
     #[test]
-    fn wait_strategy_pick_matches_cpuid() {
-        // WAITPKG where the host has it, the kernel park otherwise.
-        // MONITORX is never picked and that is asserted separately,
-        // because it is a measurement result rather than an
-        // oversight.
+    fn the_baseline_is_what_the_silicon_supports_and_nothing_learned() {
+        // baseline() is the floor a measurement has to beat, so it
+        // reads CPUID and nothing else. pick() may differ from it
+        // once the controller has evidence, which is the whole point,
+        // and is asserted separately.
         let want = if crate::cpu_info::has_waitpkg() {
             WaitStrategy::Waitpkg
         } else {
             WaitStrategy::StdPark
         };
-        assert_eq!(WaitStrategy::pick(), want);
+        assert_eq!(WaitStrategy::baseline(), want);
     }
 
     #[test]
-    fn monitorx_is_available_to_ask_for_and_is_never_chosen_on_its_own() {
-        // It wins on an idle host and is twenty times worse on a
-        // loaded eight-core one, and the not-holding guard cannot
-        // separate those, so defaulting to it would make the
-        // scheduler's idle path slower on a real part. It stays
-        // reachable because the benches that found that out select
-        // it. A later guard that can tell the two hosts apart
-        // changes `pick`, and this test is what will notice.
-        assert_ne!(WaitStrategy::pick(), WaitStrategy::Monitorx);
+    fn a_cold_controller_starts_on_the_baseline() {
+        // Before anything is measured the process must behave as it
+        // did before the controller existed, whatever the host can
+        // execute. A monitor wait is reached by evidence or not at
+        // all.
+        let r = wait_controller().report();
+        if r.baseline_samples < SAMPLES_BEFORE_VERDICT
+            || r.challenger_samples < SAMPLES_BEFORE_VERDICT
+        {
+            assert_eq!(r.in_use, WaitStrategy::baseline());
+        }
+    }
 
-        if crate::cpu_info::has_monitorx() {
-            let p = Parker::with_strategy(0, WaitStrategy::Monitorx);
-            assert_eq!(p.wait_strategy(), WaitStrategy::Monitorx);
+    #[test]
+    fn the_controller_never_offers_a_wait_this_host_cannot_execute() {
+        // Its verdict names an instruction, so a wrong one is a `#UD`
+        // on the idle path. Read from the answer toward the probe,
+        // which is the direction that catches a challenger chosen for
+        // a host that does not have it.
+        match WaitStrategy::pick() {
+            WaitStrategy::Waitpkg => assert!(crate::cpu_info::has_waitpkg()),
+            WaitStrategy::Monitorx => assert!(crate::cpu_info::has_monitorx()),
+            WaitStrategy::StdPark => {}
+        }
+    }
+
+    #[test]
+    fn a_challenger_is_only_offered_where_it_could_win() {
+        // No monitor wait, or one already found not to hold, leaves
+        // nothing to race and the controller must not spend sampled
+        // parks exploring it.
+        match challenger() {
+            Some(c) => {
+                assert_eq!(c, WaitStrategy::Monitorx);
+                assert!(crate::cpu_info::has_monitorx());
+                assert!(monitor_wait_held());
+            }
+            None => assert!(
+                !crate::cpu_info::has_monitorx()
+                    || crate::cpu_info::has_waitpkg()
+                    || !monitor_wait_held()
+            ),
+        }
+    }
+
+    #[test]
+    fn a_pinned_parker_ignores_the_controller() {
+        // The benches hold one arm still to measure it. A pinned
+        // parker that drifted onto the controller's verdict would
+        // measure whatever the controller had decided, which is the
+        // thing the bench is trying to inform.
+        let p = Parker::with_strategy(0, WaitStrategy::StdPark);
+        assert_eq!(p.wait_strategy(), WaitStrategy::StdPark);
+
+        if crate::cpu_info::has_monitorx() && !crate::cpu_info::has_waitpkg() {
+            let m = Parker::with_strategy(0, WaitStrategy::Monitorx);
+            assert_eq!(m.wait_strategy(), WaitStrategy::Monitorx);
         }
     }
 
@@ -808,20 +1197,12 @@ mod tests {
 
     #[test]
     fn the_parker_never_picks_a_wait_its_host_cannot_execute() {
-        // The strategy names an instruction, so picking one the CPUID
-        // probe did not confirm is a `#UD` on the idle path rather
-        // than a wrong answer. Read from the strategy toward the
-        // probe, which is the direction that catches a `pick` whose
-        // arms have been reordered out from under the detections.
-        match WaitStrategy::pick() {
+        // Asserted through a Parker as well as through pick(),
+        // because the parker is what actually executes the
+        // instruction and it has its own pinned path.
+        match Parker::new(0).wait_strategy() {
             WaitStrategy::Waitpkg => assert!(crate::cpu_info::has_waitpkg()),
             WaitStrategy::Monitorx => assert!(crate::cpu_info::has_monitorx()),
-            // The kernel park carries no precondition, and asserting
-            // one would assert something else: this host has MONITORX
-            // and is picked onto the park anyway, because MONITORX
-            // loses badly under load on at least one part. That is a
-            // choice, pinned in the test below, not a detection
-            // failure.
             WaitStrategy::StdPark => assert!(!crate::cpu_info::has_waitpkg()),
         }
     }

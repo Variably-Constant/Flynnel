@@ -115,7 +115,7 @@ static TSC_RATE_PROBE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Off x86_64 the counter is already a nanosecond clock, so this is
 /// one sixteenth-per-nanosecond times sixteen and the conversion is
 /// the identity.
-fn tsc_per_ns_16() -> u64 {
+pub(crate) fn tsc_per_ns_16() -> u64 {
     use std::sync::atomic::Ordering;
     let installed = TSC_PER_NS_16.load(Ordering::Relaxed);
     if installed != 0 {
