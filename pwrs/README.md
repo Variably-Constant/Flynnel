@@ -358,6 +358,46 @@ yet, so a host with AMX or SME has nothing here to select, and that
 is a row saying so rather than an empty listing, which would read as
 a family that failed to enumerate.
 
+**The hybrid shapes, which measure rather than transform.**
+`Measure-FlynnelHybridJoin` runs two halves of one declared operation
+concurrently, the first on the calling thread and the second on the
+plan's backend, and reports what each cost and what the pair cost.
+`Measure-FlynnelHybridPlacement` runs the side the call site has
+learned to prefer at this size and says which that was.
+`Measure-FlynnelHybridSplit` divides a range by the per-item
+throughputs it has measured and reports the division.
+`Measure-FlynnelHybridPipeline` runs a three-stage CPU-device-CPU
+pipeline over a sequence and reports the cost per input.
+
+`Measure-` is the verb because these do not transform your data. A
+hybrid shape splits one call between the calling thread and one
+backend thread; `Invoke-FlynnelMap` puts the whole pool on the same
+work. The work these run is declared and synthetic, sized by `-Count`
+and weighted by `-Repetitions`, and nothing crosses the boundary but
+the report.
+
+With no device registered the backend half is the CPU backend reached
+through a thread hand-off. Both halves still run concurrently and the
+timings are real; what they are not is a device reading, so every row
+carries `BackendIsCpu`.
+
+The placement model races a cold size bucket and times both sides,
+runs only the cheaper side once the bucket is warm, and re-races every
+thirty-second call so it tracks drift. Racing is the calibration: a
+bucket pays double work once rather than needing an offline pass. The
+learned state hangs off the caller's source location, which for these
+cmdlets is one file, so every script in a session shares one site per
+cmdlet keyed by `log2(Count)`. `Get-FlynnelCallSite` reads it and
+`Reset-FlynnelCallSite` clears it.
+
+There is no `Invoke-FlynnelAccelOp`. Every accelerator op the crate
+registers takes its arguments as host pointers that its CPU
+implementation dereferences, under a contract that the buffers stay
+live, correctly sized and unaliased for the whole call. Invoking one
+from a script means handing over the address of a pinned array.
+`Get-FlynnelAccelTarget` answers where an op would route, which is the
+part of the question that needs no pointer.
+
 ## Two conventions worth knowing before you read a number
 
 **An unmeasured figure is null, never zero.** A thread clock the

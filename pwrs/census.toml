@@ -861,3 +861,152 @@ note = "the fallback's empty context, handed to a body that runs inside the regi
 item = "crate::sched::mode_region::ScalarConfig"
 reason = "internal-to-another-surface"
 note = "the fallback's empty config; there are no tile shapes to set, so there is nothing for a caller to choose"
+
+# ---------------------------------------------------------------------
+# The deque family
+# ---------------------------------------------------------------------
+# Six axes of work-stealing deque, their WorkerCtx adapters and the
+# latch they synchronize on. A script reaches all of it through the
+# pool: Start-FlynnelPool makes one, Get-FlynnelPool and
+# Get-FlynnelWorker read it, and the DequeTier hint on a plan says
+# which family a dispatch should prefer. Nothing here is a thing a
+# caller builds. Each is one entry over the whole module because the
+# module is the unit: a deque's slot type, its push, its steal and its
+# owner half are one design and binding a part of one would hand a
+# script half a protocol.
+
+[[entry]]
+item = "crate::sched::latch"
+reason = "internal-to-another-surface"
+note = "the four-state latch every join waits on, with the self-invalidation discipline that makes a set safe against the waiter's own frame going away. A script cannot hold a frame for one to point at"
+
+[[entry]]
+item = "crate::sched::chase_lev_local"
+reason = "internal-to-another-surface"
+note = "the generic Chase-Lev deque the other families specialize. Forked from crossbeam to expose slot_ptr for prefetch targeting and a generic slot type, both of which are decisions inside a steal"
+
+[[entry]]
+item = "crate::sched::fcl_local"
+reason = "internal-to-another-surface"
+note = "Fat Chase-Lev: three jobs per cache-line slot behind one shared bottom counter. Which of this and KHL a worker runs is the K_gating calibration's answer, read through Get-FlynnelKGating"
+
+[[entry]]
+item = "crate::sched::fcl_worker"
+reason = "internal-to-another-surface"
+note = "the WorkerCtx adapter over fcl_local, turning a three-job body into the one-job-per-call shape find_work expects"
+
+[[entry]]
+item = "crate::sched::khl_local"
+reason = "internal-to-another-surface"
+note = "the per-slot Vyukov publication deque, spreading steal coherence across lines instead of concentrating it on one bottom counter"
+
+[[entry]]
+item = "crate::sched::khl_worker"
+reason = "internal-to-another-surface"
+note = "the WorkerCtx adapter over khl_local, the counterpart of fcl_worker"
+
+[[entry]]
+item = "crate::sched::adaptive_worker"
+reason = "internal-to-another-surface"
+note = "carries both backings and picks one from a tag, so a host whose calibration changes migrates without a rebuild. Measured at 10.98 ns against 10.96 for a direct call, which is why the choice can be made per worker at all"
+
+[[entry]]
+item = "crate::sched::adaptive_backend"
+reason = "internal-to-another-surface"
+note = "the tag adaptive_worker reads. Get-FlynnelKGating reports which way the calibration went"
+
+[[entry]]
+item = "crate::sched::private_deque"
+reason = "internal-to-another-surface"
+note = "the LIFO deque a worker keeps to itself and donates from, which no thief touches"
+
+[[entry]]
+item = "crate::sched::dual_deque"
+reason = "internal-to-another-surface"
+note = "one in-heap deque for closures that capture their environment and one mapped-file deque for jobs that can cross a process. The cross-process half is the shared-memory worker surface, which a script reaches as a peer rather than as a deque"
+
+[[entry]]
+item = "crate::sched::k_gating"
+reason = "internal-to-another-surface"
+note = "the publication-signal axis itself. Its measured answer for this host is what Get-FlynnelKGating and Measure-FlynnelKGating report"
+
+[[entry]]
+item = "crate::sched::job"
+reason = "internal-to-another-surface"
+note = "JobRef is a data pointer beside a function pointer, executed by whichever worker steals it. A script has no function pointer to give and this module never runs a script block off the pipeline thread"
+
+[[entry]]
+item = "crate::sched::idempotent"
+reason = "internal-to-another-surface"
+note = "a marker trait asserting a body is safe to run twice, which pairs with the fence-free steal variants. Asserting it is a claim about Rust code; there is nothing for a script to mark"
+
+[[entry]]
+item = "crate::sched::marshal"
+reason = "internal-to-another-surface"
+note = "a marker trait for jobs whose captured state can cross a process. A script's body cannot cross one at all, so the trait has nothing to say about it; the cross-process surface a script does reach is the peer worker, filed as its own family"
+
+# ---------------------------------------------------------------------
+# The arena's own internals
+# ---------------------------------------------------------------------
+
+[[entry]]
+item = "crate::sched::arena_local"
+reason = "internal-to-another-surface"
+note = "the single-node pool: its workers, their deques and their parkers. Start-FlynnelPool makes one, Get-FlynnelPool reports its shape and Get-FlynnelWorker reports each worker"
+
+[[entry]]
+item = "crate::sched::arena_numa"
+reason = "internal-to-another-surface"
+note = "one sub-arena per NUMA node, collapsing to a single local arena on a one-node host. Get-FlynnelTopology and Get-FlynnelNodeCpu report the nodes it composes over"
+
+[[entry]]
+item = "crate::sched::sleep"
+reason = "internal-to-another-surface"
+note = "the parker a worker sleeps on and the strategy that decides how long it spins first. The policy is the part a caller acts on and it has cmdlets of its own: Get-FlynnelSpinWindow, Set-FlynnelSpinWindow and Set-FlynnelSpinAdaptive. Parking a worker by hand is not a thing to offer"
+
+[[entry]]
+item = "crate::sched::numa_alloc"
+reason = "unsafe-or-structural"
+note = "a page allocator that places large buffers on a chosen node. It hands back raw pages whose lifetime the caller owns, and the placement it exists for is invisible to a script that cannot pin the thread reading them"
+
+[[entry]]
+item = "crate::sched::bg_zero"
+reason = "internal-to-another-surface"
+note = "zeroes and first-touches pages ahead of an allocation that will need them. It has no answer to report and no decision to take; what it changes is the cost of an allocation some later dispatch makes"
+
+# ---------------------------------------------------------------------
+# The entry points that take a body
+# ---------------------------------------------------------------------
+# Each of these runs a caller's Rust closure. A script has none, and
+# this module never runs a script block on a worker, so the way a shell
+# reaches them is to name a body the module already owns. The kernels
+# family is those bodies.
+
+[[entry]]
+item = "crate::sched::arena"
+reason = "takes-a-rust-closure"
+reaches = "Invoke-FlynnelMap"
+note = "join and its conveniences: the two-way fork every bisect is built from. Every array kernel reaches it through for_each_chunk, and Measure-FlynnelHybridJoin reaches the hybrid form of the same shape"
+
+[[entry]]
+item = "crate::sched::cooperative"
+reason = "takes-a-rust-closure"
+reaches = "Invoke-FlynnelMap"
+note = "the N-way cooperative fork, which picks a tree below twelve ways and a flat fan-out above it. A kernel's bisect reaches it through the same dispatch; Get-FlynnelPlan reports the routing it chose"
+
+[[entry]]
+item = "crate::sched::k_join"
+reason = "generic-over-caller-type"
+note = "const-generic in the recursion depth, so each K is a separate monomorphization chosen at compile time. There is no runtime value a script could pass for it"
+
+[[entry]]
+item = "crate::sched::pipeline"
+reason = "takes-a-rust-closure"
+reaches = "Measure-FlynnelHybridPipeline"
+note = "the N-stage classify-while-stream pipeline, one closure a stage. The hybrid pipeline cmdlet reaches the three-stage form with declared bodies at each stage"
+
+[[entry]]
+item = "crate::sched::dispatch"
+reason = "takes-a-rust-closure"
+reaches = "Invoke-FlynnelMap"
+note = "the declarative front door: the caller describes the workload and it picks the Flynn-axis entry point. What it dispatches is still a closure. New-FlynnelPlan and Resolve-FlynnelPlan are the part a script can hold, which is the description rather than the body"

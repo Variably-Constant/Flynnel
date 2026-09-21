@@ -86,11 +86,15 @@ impl From<CratePlacement> for PlacementKind {
     }
 }
 
+/// What both halves call. Shared rather than cloned because the two
+/// run at the same time and a `Box` cannot be in two places.
+type Body = std::sync::Arc<dyn Fn(&mut f64) + Send + Sync>;
+
 /// Builds the declared body once and refuses a missing operand before
 /// any half starts, so a bad argument is an error rather than a half
 /// that panics on a backend thread.
-fn body(op: MapOp, operands: MapOperands) -> PsResult<Box<dyn Fn(&mut f64) + Send + Sync>> {
-    map_each(op, operands)
+fn body(op: MapOp, operands: MapOperands) -> PsResult<Body> {
+    Ok(map_each(op, operands)?.into())
 }
 
 /// One half's work: build its own range of items, put each through the
@@ -264,7 +268,7 @@ impl Cmdlet for MeasureFlynnelHybridJoin {
             return Err(arg_err("CpuShare is parts per thousand, so at most 1000").terminating());
         }
         let reps = self.repetitions.unwrap_or(1).max(1);
-        let each = std::sync::Arc::from(body(self.operation, self.operands())?);
+        let each = body(self.operation, self.operands())?;
         let plan = hybrid_plan(self.plan.as_ref(), self.count)?;
         let (kind, is_cpu) = resolved_backend(&plan);
 
@@ -400,7 +404,7 @@ impl Cmdlet for MeasureFlynnelHybridPlacement {
             factor: self.factor,
             addend: self.addend,
         };
-        let each = std::sync::Arc::from(body(self.operation, operands)?);
+        let each = body(self.operation, operands)?;
         let plan = hybrid_plan(self.plan.as_ref(), self.count)?;
         let (kind, is_cpu) = resolved_backend(&plan);
 
@@ -519,7 +523,7 @@ impl Cmdlet for MeasureFlynnelHybridSplit {
             factor: self.factor,
             addend: self.addend,
         };
-        let each = std::sync::Arc::from(body(self.operation, operands)?);
+        let each = body(self.operation, operands)?;
         let plan = hybrid_plan(self.plan.as_ref(), self.count)?;
         let (kind, is_cpu) = resolved_backend(&plan);
 
@@ -639,9 +643,12 @@ impl Cmdlet for MeasureFlynnelHybridPipeline {
         // Every stage's body is built here, before a thread exists, so
         // an operand a stage needs and has not got is an error record
         // rather than a panic three threads deep.
-        let pre = body(self.pre_operation, MapOperands::default())?;
-        let dev = body(self.device_operation, MapOperands::default())?;
-        let post = body(self.post_operation, MapOperands::default())?;
+        //
+        // Boxed rather than shared, because each body goes to exactly
+        // one stage and a Box is callable where an Arc is not.
+        let pre = map_each(self.pre_operation, MapOperands::default())?;
+        let dev = map_each(self.device_operation, MapOperands::default())?;
+        let post = map_each(self.post_operation, MapOperands::default())?;
         let plan = JobPlan::bare(0, self.count);
 
         let t0 = std::time::Instant::now();
