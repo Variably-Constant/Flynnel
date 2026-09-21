@@ -8,11 +8,12 @@
 //!
 //! ## API shape
 //!
-//! [`VerifyChain`] owns an `Arc<Mutex<HashState>>`. Submitting a
-//! chunk via [`VerifyChain::submit_chunk`] schedules a hash-update
-//! task onto the IoPool; the task takes the mutex briefly to update
-//! the running state. [`VerifyChain::finalize`] blocks until all
-//! submitted chunks have been processed and returns the root.
+//! [`VerifyChain`] owns shared fold state behind an `Arc`. Submitting
+//! a chunk via [`VerifyChain::submit_chunk`] takes its index and
+//! schedules a task onto the IoPool; the task deposits its bytes and
+//! then folds in whatever unbroken prefix is ready, if it wins the
+//! fold token. [`VerifyChain::finalize`] blocks until all submitted
+//! chunks have been processed and returns the root.
 //!
 //! ## Hashing back-end
 //!
@@ -24,8 +25,9 @@
 //! MUST use the BLAKE3 path (enable `verify-chain`).
 //!
 
-use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use core::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::sched::io_pool::global_io_pool;
 
@@ -135,22 +137,32 @@ pub fn default_hasher() -> Box<dyn VerifyHasher> {
     Box::new(FxFallbackHasher::new())
 }
 
-/// Internal shared state for a chain: the running hasher, a
-/// pending-chunks counter for the finalize barrier, and a
-/// condition variable that submit/finalize use to coordinate.
+/// Internal shared state for a chain: the ordered fold state, a
+/// pending-chunks counter for the finalize barrier, and the handle
+/// `root` parks on.
 struct ChainShared {
-    hasher: Mutex<Option<Box<dyn VerifyHasher>>>,
     pending: AtomicUsize,
-    /// (signalled flag, condvar) for finalize to wait on. Workers
-    /// pulse the condvar when they decrement pending to zero.
+    /// The index the next submission takes. Taken on the submitting
+    /// thread, because submission order is the order the caller means
+    /// and the order the pool runs the tasks in is not.
+    submitted: AtomicUsize,
     /// The thread blocked in `root`, stored once when it starts
     /// waiting. The task that drives `pending` to zero unparks it.
     ///
     /// One waiter: `root` consumes the chain. A second caller would
     /// find the slot taken and never be woken.
     waiter: OnceLock<std::thread::Thread>,
-    /// Chunks that have arrived and not yet been folded in, by the
-    /// index they were submitted at, and how far the fold has got.
+    /// Chunks that have arrived and not yet been taken into the fold,
+    /// newest first. A task pushes its own and then tries for the
+    /// fold token; pushing is a compare-exchange and never waits.
+    arrived: AtomicPtr<Arrival>,
+    /// Held by whichever task is folding. A task that does not get it
+    /// RETURNS rather than waiting: what it deposited is already on
+    /// `arrived`, so the holder will take it, and the holder rechecks
+    /// after releasing so a deposit cannot be stranded.
+    folding: AtomicBool,
+    /// The hasher and the out-of-order chunks waiting on a
+    /// predecessor. Touched only by the holder of `folding`.
     ///
     /// A hash chain is ordered: `update(a)` then `update(b)` is not
     /// `update(b)` then `update(a)`. Submitting to the IO pool means
@@ -161,52 +173,63 @@ struct ChainShared {
     /// traces are bit-exact would report a mismatch between identical
     /// ones.
     ///
-    /// So a task deposits its bytes at its own index and then folds
-    /// in whatever unbroken prefix is ready, under the hasher lock.
+    /// So a task deposits its bytes under its own index and whoever
+    /// holds the token folds in whatever unbroken prefix is ready.
     /// The hashing still leaves the caller's thread; only the order
-    /// is pinned.
-    arrivals: Mutex<Arrivals>,
+    /// is pinned. The token is exclusion, and it is not pretending
+    /// otherwise: an ordered hash cannot be folded by two threads at
+    /// once. What it buys over a lock is that a producer never waits
+    /// on it.
+    fold: UnsafeCell<FoldState>,
 }
 
-/// Chunks waiting to be folded in, and how far the fold has got.
+// SAFETY: every field is Send, and `fold` is reached only by the
+// thread that has won `folding`, which exactly one thread holds at a
+// time. `arrived` is a compare-exchange stack of owned boxes.
+unsafe impl Sync for ChainShared {}
+
+/// One deposited chunk and the index it was submitted at.
+struct Arrival {
+    index: usize,
+    bytes: Vec<u8>,
+    next: *mut Arrival,
+}
+
+/// The hasher and the chunks still waiting on a predecessor.
 #[derive(Default)]
-struct Arrivals {
+struct FoldState {
+    hasher: Option<Box<dyn VerifyHasher>>,
     /// One slot per submitted chunk, taken as soon as it is folded
     /// in so the bytes are dropped the moment they are spent.
-    slots: Vec<Option<Vec<u8>>>,
+    waiting: Vec<Option<Vec<u8>>>,
     /// The next index the hasher wants. Everything below it is in.
     next: usize,
 }
 
-/// The arrival table, recovering a lock a panicking fold poisoned.
+/// Run `act` holding the fold token, or answer `None` when another
+/// thread holds it.
 ///
-/// Refusing here would strand every later chunk, and the state behind
-/// the lock is a vector of byte slots with an index into it: a panic
-/// leaves it consistent, because nothing is half-written across the
-/// two fields except inside this lock.
-fn lock_arrivals(inner: &ChainShared) -> std::sync::MutexGuard<'_, Arrivals> {
-    match inner.arrivals.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+/// The token is the exclusion an ordered hash needs. What it is not is
+/// a wait: a caller that does not get it returns, having already put
+/// its chunk somewhere the holder will find.
+fn with_fold<R>(inner: &ChainShared, act: impl FnOnce(&mut FoldState) -> R) -> Option<R> {
+    if inner
+        .folding
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
     }
+    // SAFETY: the compare-exchange above makes this the only thread
+    // reaching the fold state until the store below releases it.
+    let state = unsafe { &mut *inner.fold.get() };
+    let out = act(state);
+    inner.folding.store(false, Ordering::Release);
+    Some(out)
 }
 
-/// The hasher, recovering a lock a panicking fold poisoned.
-///
-/// Dropping the update on a poisoned lock is what the first version
-/// of this function did, and it is the same failure this whole
-/// rewrite is about: a chunk that never enters the chain gives a root
-/// that is wrong and looks fine. Recovering means a panic during one
-/// fold costs the panicking chunk and not every chunk after it.
-fn lock_hasher(inner: &ChainShared) -> std::sync::MutexGuard<'_, Option<Box<dyn VerifyHasher>>> {
-    match inner.hasher.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-/// Put a chunk in its slot and fold in whatever unbroken prefix is
-/// now ready.
+/// Put a chunk where the fold will find it and fold whatever unbroken
+/// prefix is now ready.
 ///
 /// Separate from the task that calls it so a test can drive arrivals
 /// in any order it likes. The global IO pool is behind a `OnceLock`
@@ -215,29 +238,70 @@ fn lock_hasher(inner: &ChainShared) -> std::sync::MutexGuard<'_, Option<Box<dyn 
 /// that matters is that the fold order does not depend on arrival
 /// order, and that is testable here directly.
 fn deposit_and_fold(inner: &ChainShared, index: usize, chunk: Vec<u8>) {
-    {
-        let mut arrivals = lock_arrivals(inner);
-        arrivals.slots[index] = Some(chunk);
+    let node = Box::into_raw(Box::new(Arrival {
+        index,
+        bytes: chunk,
+        next: core::ptr::null_mut(),
+    }));
+    loop {
+        let head = inner.arrived.load(Ordering::Acquire);
+        // SAFETY: this box is not published until the compare-exchange
+        // below succeeds, so nothing else reaches it.
+        unsafe { (*node).next = head };
+        if inner
+            .arrived
+            .compare_exchange(head, node, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
     }
     fold_ready_prefix(inner);
 }
 
 /// Fold in every chunk from the fold cursor up to the first gap.
 ///
-/// Whichever caller finds the prefix ready does the work, so none
-/// waits on a particular peer and the hasher still sees submission
-/// order.
+/// Whichever caller wins the token does the work, so none waits on a
+/// particular peer and the hasher still sees submission order.
 fn fold_ready_prefix(inner: &ChainShared) {
-    let mut arrivals = lock_arrivals(inner);
-    let mut hasher = lock_hasher(inner);
-    let Some(h) = hasher.as_mut() else { return };
-    let mut next = arrivals.next;
-    while let Some(slot) = arrivals.slots.get_mut(next) {
-        let Some(bytes) = slot.take() else { break };
-        h.update(&bytes);
-        next += 1;
+    loop {
+        let folded = with_fold(inner, |state| {
+            // Take the whole deposit stack in one swap, then order it
+            // by the index each chunk was submitted at.
+            let mut chain = inner.arrived.swap(core::ptr::null_mut(), Ordering::AcqRel);
+            while !chain.is_null() {
+                // SAFETY: a node on the stack was built by
+                // deposit_and_fold and is taken exactly once, by the
+                // swap above.
+                let Arrival { index, bytes, next } = *unsafe { Box::from_raw(chain) };
+                chain = next;
+                if state.waiting.len() <= index {
+                    state.waiting.resize_with(index + 1, || None);
+                }
+                state.waiting[index] = Some(bytes);
+            }
+            if let Some(h) = state.hasher.as_mut() {
+                let mut next = state.next;
+                while let Some(slot) = state.waiting.get_mut(next) {
+                    let Some(bytes) = slot.take() else { break };
+                    h.update(&bytes);
+                    next += 1;
+                }
+                state.next = next;
+            }
+        });
+        if folded.is_none() {
+            // Someone else holds the token. What this caller deposited
+            // is on the stack, and the holder rechecks before leaving.
+            return;
+        }
+        // A deposit that landed while the token was held, whose
+        // depositor found the token taken and returned, would sit here
+        // until the next submission. Take it now.
+        if inner.arrived.load(Ordering::Acquire).is_null() {
+            return;
+        }
     }
-    arrivals.next = next;
 }
 
 /// Running hash-chain over a sequence of stripe outputs. Submit
@@ -264,10 +328,16 @@ impl VerifyChain {
     pub fn with_hasher(hasher: Box<dyn VerifyHasher>) -> Self {
         Self {
             inner: Arc::new(ChainShared {
-                hasher: Mutex::new(Some(hasher)),
                 pending: AtomicUsize::new(0),
+                submitted: AtomicUsize::new(0),
                 waiter: OnceLock::new(),
-                arrivals: Mutex::new(Arrivals::default()),
+                arrived: AtomicPtr::new(core::ptr::null_mut()),
+                folding: AtomicBool::new(false),
+                fold: UnsafeCell::new(FoldState {
+                    hasher: Some(hasher),
+                    waiting: Vec::new(),
+                    next: 0,
+                }),
             }),
         }
     }
@@ -280,11 +350,7 @@ impl VerifyChain {
         // The index is taken here, on the submitting thread, because
         // submission order is the order the caller means and the
         // order the pool happens to run the tasks in is not.
-        let index = {
-            let mut arrivals = lock_arrivals(&self.inner);
-            arrivals.slots.push(None);
-            arrivals.slots.len() - 1
-        };
+        let index = self.inner.submitted.fetch_add(1, Ordering::AcqRel);
         let inner = Arc::clone(&self.inner);
         let task = move || {
             deposit_and_fold(&inner, index, chunk);
@@ -327,16 +393,23 @@ impl VerifyChain {
             }
             std::thread::park();
         }
-        // Every task has run, so every slot is filled; fold in any
-        // prefix a task left behind because its own predecessor had
-        // not arrived when it held the lock. Without this, a chain
+        // Every task has run, so every chunk has been deposited; fold
+        // in any prefix a task left behind because its own predecessor
+        // had not arrived when it held the token. Without this, a chain
         // whose last task finished before an earlier one would root
         // over a short prefix and say nothing about it.
         fold_ready_prefix(&self.inner);
-        let mut guard = lock_hasher(&self.inner);
-        match guard.take() {
-            Some(hasher) => hasher.finalize(),
-            None => [0u8; 32],
+        // Every task has returned, so nothing else wants the token.
+        // Taking it rather than assuming that is what makes the read of
+        // the hasher sound on its own terms.
+        loop {
+            if let Some(root) = with_fold(&self.inner, |state| match state.hasher.take() {
+                Some(hasher) => hasher.finalize(),
+                None => [0u8; 32],
+            }) {
+                return root;
+            }
+            std::hint::spin_loop();
         }
     }
 
@@ -344,6 +417,20 @@ impl VerifyChain {
     /// or backpressure decisions in the producer.
     pub fn pending_count(&self) -> usize {
         self.inner.pending.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ChainShared {
+    fn drop(&mut self) {
+        // A chain dropped without a finalize can still hold deposits
+        // nothing folded. The stack owns those boxes.
+        let mut chain = *self.arrived.get_mut();
+        while !chain.is_null() {
+            // SAFETY: this is the last owner of the chain, so no task
+            // can be reaching the stack.
+            let node = *unsafe { Box::from_raw(chain) };
+            chain = node.next;
+        }
     }
 }
 
@@ -449,10 +536,6 @@ mod tests {
         // last-to-first, which is what a pool is free to do.
         for arrival in [[3usize, 1, 0, 2], [3, 2, 1, 0], [1, 3, 2, 0]] {
             let chain = VerifyChain::new();
-            {
-                let mut arrivals = lock_arrivals(&chain.inner);
-                arrivals.slots.resize_with(chunks.len(), || None);
-            }
             for &i in &arrival {
                 deposit_and_fold(&chain.inner, i, chunks[i].clone());
             }
@@ -478,21 +561,19 @@ mod tests {
         let want = in_order.finalize();
 
         let chain = VerifyChain::new();
-        {
-            let mut arrivals = lock_arrivals(&chain.inner);
-            arrivals.slots.resize_with(2, || None);
-        }
         // Only the second arrives, so nothing can fold yet.
         deposit_and_fold(&chain.inner, 1, chunks[1].clone());
-        {
-            let arrivals = lock_arrivals(&chain.inner);
-            assert_eq!(arrivals.next, 0, "nothing folds while index 0 is missing");
-        }
+        let cursor = with_fold(&chain.inner, |state| state.next)
+            .expect("no task holds the fold token in this test");
+        assert_eq!(cursor, 0, "nothing folds while index 0 is missing");
         // The first arrives without anyone folding after it.
-        {
-            let mut arrivals = lock_arrivals(&chain.inner);
-            arrivals.slots[0] = Some(chunks[0].clone());
-        }
+        with_fold(&chain.inner, |state| {
+            if state.waiting.is_empty() {
+                state.waiting.push(None);
+            }
+            state.waiting[0] = Some(chunks[0].clone());
+        })
+        .expect("no task holds the fold token in this test");
         assert_eq!(chain.finalize(), want, "finalize must sweep what is left");
     }
 
