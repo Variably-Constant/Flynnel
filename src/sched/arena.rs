@@ -284,6 +284,59 @@ fn push_with_tier_hint(ctx: &WorkerCtx, job: JobRef, plan: &JobPlan) -> Result<(
 static JOIN_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 static JOIN_A_BODY_NS: AtomicU64 = AtomicU64::new(0);
 static JOIN_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+/// How deep the calling thread is nested inside join wait loops that
+/// are running work found for somebody else, and the deepest any
+/// thread in this process has reached.
+///
+/// A worker waiting on its own join runs whatever `find_work` hands
+/// it, which can be a peer's job, which can itself join and wait and
+/// run another. The task tree does not bound that chain. A stack
+/// overflow in a worker is what running out of room looks like, and
+/// this counter is what says how close a normal run gets.
+///
+/// It is a thread-local read and write plus one relaxed maximum, paid
+/// once per job executed from a wait loop. That path is about to run a
+/// whole job, so the counter is not measurable against it, and it is
+/// not on the leaf path, the dispatch path, or the join fast path.
+struct HelpDepth;
+
+thread_local! {
+    static HELP_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+static HELP_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
+
+impl HelpDepth {
+    fn enter() -> Self {
+        let depth = HELP_DEPTH.with(|d| {
+            let next = d.get() + 1;
+            d.set(next);
+            next
+        });
+        HELP_DEPTH_MAX.fetch_max(u64::from(depth), Relaxed);
+        Self
+    }
+}
+
+impl Drop for HelpDepth {
+    fn drop(&mut self) {
+        // In Drop so an unwinding job leaves the count right: a job
+        // that panicked still gave this frame's stack back.
+        HELP_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// The deepest chain of nested helping any thread has reached since
+/// the process started.
+///
+/// Workers are spawned with an 8 MiB stack, which is roughly fifty
+/// thousand frames, so a figure in the tens says this chain is not
+/// what exhausts a worker's stack and a figure in the thousands says
+/// it is.
+pub fn help_depth_max() -> u64 {
+    HELP_DEPTH_MAX.load(Relaxed)
+}
+
 // Sub-split of JOIN_WAIT_NS: time inside `unsafe { job.execute() }`
 // (productive stealing of cross-worker jobs while waiting) vs time
 // in the idle path (no work available: the latch poll, a spin until
@@ -511,6 +564,14 @@ where
             let t_steal_start = if traced { dispatch_tsc() } else { 0 };
             // SAFETY: JobRef contract; execute the popped job
             // exactly once.
+            // This is the nesting point. `job` came from find_work,
+            // which probes six tiers including peer steals, so it can
+            // be another worker's job, and running it here can reach
+            // join_context, which waits, which runs another. The task
+            // tree does not bound that chain; how often a worker is
+            // pressed into helping does, and nothing caps it.
+            let _depth = HelpDepth::enter();
+            // SAFETY: JobRef contract; execute the popped job
             unsafe { job.execute() };
             if traced {
                 JOIN_WAIT_STEAL_NS.fetch_add(
