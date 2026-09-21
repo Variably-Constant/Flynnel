@@ -898,11 +898,29 @@ impl Sleep {
     /// Wake every worker (for shutdown). Called once when the
     /// arena is being torn down.
     pub(crate) fn wake_all_for_shutdown(&self) {
-        // Stored before the sweep, never after. A worker that takes
-        // its mutex after its own slot has been swept has to find the
-        // flag already set, or it parks behind the wake and stays
-        // there.
-        self.shutdown.store(true, Ordering::Release);
+        // Stored before the sweep, never after. A worker whose slot has
+        // already been swept has to find the flag set, or it parks
+        // behind the wake and stays there.
+        //
+        // SeqCst rather than Release, and the difference is the whole
+        // guarantee. This store and the swap below are one half of a
+        // Dekker pair whose other half is in `sleep`: publish, then
+        // read what the other side published. The argument only holds
+        // when all four operations are in the one total order. A
+        // Release store is not in it, which leaves this interleaving
+        // legal on a weakly ordered target:
+        //
+        //   waker    stores shutdown, not yet visible
+        //   waker    swaps state, reads AWAKE, so unparks nobody
+        //   sleeper  stores SLEEPING
+        //   sleeper  reads shutdown, sees false
+        //   sleeper  parks, and nothing will wake it
+        //
+        // which is the wedge this flag exists to prevent. x86 hides it
+        // because the locked swap drains the store buffer; aarch64 does
+        // not. Teardown runs once per arena, so the ordering costs
+        // nothing anyone measures.
+        self.shutdown.store(true, Ordering::SeqCst);
         for i in 0..self.worker_states.len() {
             self.wake_specific_thread(i);
         }
