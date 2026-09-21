@@ -1298,6 +1298,47 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    /// How long a test waits for a parking thread before calling it a
+    /// lost wakeup.
+    const PARK_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// The result a parking thread published, waited for under
+    /// [`PARK_DEADLINE`].
+    ///
+    /// `recv_timeout` fails two ways and only one of them is the
+    /// failure these tests look for. A thread that panics drops its
+    /// sender, so the wait ends at once with `Disconnected` rather
+    /// than after the deadline with `Timeout`. Reporting that as a
+    /// lost wakeup would name a failure that did not happen and bury
+    /// the panic that did, so the two are separated and the panic is
+    /// re-raised by the join with its own message.
+    ///
+    /// The join is done here rather than left to the caller, so a call
+    /// site cannot report a result while the thread that produced it
+    /// is still running, and cannot forget the panic path.
+    fn parked_result<T: Send + 'static>(
+        rx: &std::sync::mpsc::Receiver<T>,
+        owner: thread::JoinHandle<T>,
+        what: &str,
+    ) -> T {
+        match rx.recv_timeout(PARK_DEADLINE) {
+            Ok(value) => {
+                // The thread published before this, so it is returning
+                // and the join cannot be what blocks.
+                owner.join().expect("the thread reported before this join");
+                value
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "{what} did not reach the parked thread within {PARK_DEADLINE:?}, \
+                 which is the lost wakeup this test exists to catch"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                owner.join().expect("the parking thread panicked without reporting");
+                unreachable!("a join over a dropped sender re-raises the panic that dropped it")
+            }
+        }
+    }
+
     #[test]
     fn park_until_returns_immediately_when_ready() {
         let p = Parker::new(8);
@@ -1333,11 +1374,7 @@ mod tests {
         let p = rx.recv().expect("owner must send its parker");
         thread::sleep(Duration::from_millis(50));
         p.shutdown();
-        let ok = done_rx.recv_timeout(Duration::from_secs(10)).expect(
-            "shutdown did not wake the parked thread within ten seconds, which is the \
-             lost wakeup this test exists to catch",
-        );
-        owner.join().expect("the owner thread reported before this join");
+        let ok = parked_result(&done_rx, owner, "the shutdown");
         assert!(!ok, "park_until must return false after shutdown");
     }
 
@@ -1372,11 +1409,7 @@ mod tests {
         ready_clone.store(1, Ordering::Release);
         p_owner.unpark();
 
-        let (ok, elapsed) = done_rx.recv_timeout(Duration::from_secs(10)).expect(
-            "the unpark did not wake the parked thread within ten seconds, which is the \
-             lost wakeup this test exists to catch",
-        );
-        owner.join().expect("the owner thread reported before this join");
+        let (ok, elapsed) = parked_result(&done_rx, owner, "the unpark");
         assert!(ok, "park_until must return true after ready becomes true");
         // Should wake within ~100 ms.
         assert!(elapsed < Duration::from_millis(500),
@@ -1754,11 +1787,7 @@ mod tests {
         ready.store(1, Ordering::Release);
         p.unpark();
 
-        let ok = done_rx.recv_timeout(Duration::from_secs(10)).expect(
-            "the unpark did not reach the parked thread within ten seconds, which is the \
-             misdirected permit this test exists to catch",
-        );
-        owner.join().expect("the owner thread reported before this join");
+        let ok = parked_result(&done_rx, owner, "the unpark");
         assert!(ok, "park_until must report a wake rather than a shutdown");
         assert_eq!(woke.load(Ordering::Acquire), 1);
     }
@@ -1835,11 +1864,7 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         ready_clone.store(1, Ordering::Release);
         p_owner.unpark();
-        let (ok, elapsed) = done_rx.recv_timeout(Duration::from_secs(10)).expect(
-            "the WAITPKG wait did not observe the unpark within ten seconds, which is the \
-             missed wake this test exists to catch",
-        );
-        owner.join().expect("the owner thread reported before this join");
+        let (ok, elapsed) = parked_result(&done_rx, owner, "the unpark under WAITPKG");
         assert!(ok, "Waitpkg park_until must return true on unpark");
         // Cap should be well under 100ms; the 10ms UMWAIT deadline
         // bounds the worst case to ~10ms even if UMWAIT misses the
@@ -1881,13 +1906,7 @@ mod tests {
         let p_owner = rx.recv().expect("owner must send its parker");
         thread::sleep(Duration::from_millis(50));
         p_owner.shutdown();
-        let ok = done_rx.recv_timeout(Duration::from_secs(10)).expect(
-            "shutdown did not wake the parked thread within ten seconds, which is the \
-             lost wakeup this test exists to catch",
-        );
-        // Reached only once the thread has published its result, so it
-        // is about to return and this cannot be the call that blocks.
-        owner.join().expect("the owner thread reported before this join");
+        let ok = parked_result(&done_rx, owner, "the shutdown");
         assert!(!ok, "shutdown must surface as park_until -> false");
     }
 }
