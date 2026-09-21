@@ -49,6 +49,7 @@ pub mod urd_backend;
 pub mod lcrq_lifo;
 pub mod loh_backend;
 pub mod pass_registry;
+pub mod stager;
 pub mod variant_dispatch;
 pub mod wire;
 
