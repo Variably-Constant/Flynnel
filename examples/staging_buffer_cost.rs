@@ -87,7 +87,13 @@ const LOADED_CALLS: u64 = 2_000_000;
 const REAL_CALLS: u64 = 100_000;
 
 /// Publication lines in the deque the shipped-path cell stages into.
-const REAL_CAPACITY: usize = 65_536;
+///
+/// Derived rather than written down. Every repeat stages `REAL_CALLS`
+/// items and publishes one line per `LINE_ITEMS` of them, and nothing
+/// drains the ring, so every repeat of the run has to fit rather than
+/// just one. A fixed 65536 covered one repeat and the seventh filled
+/// the ring, which surfaced as `PushError::Full`.
+const REAL_CAPACITY: usize = REPEATS * (REAL_CALLS as usize).div_ceil(LINE_ITEMS) + REPEATS;
 
 /// Timed cells per shape. The median is taken, so an odd count has a
 /// middle.
