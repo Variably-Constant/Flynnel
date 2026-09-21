@@ -67,8 +67,17 @@ use std::time::Instant;
 /// driver loop that runs a handful of kernels over a few shapes.
 const SITES: usize = 64;
 
-/// Lookups per timed cell.
+/// Lookups per timed cell in the quiet row.
 const CALLS: u64 = 20_000_000;
+
+/// Lookups per timed cell in the loaded row.
+///
+/// Ten times smaller than the quiet count, because the contended map
+/// cell runs at over a microsecond per lookup where the quiet one runs
+/// at a few nanoseconds. At the quiet count the loaded row alone took
+/// the better part of an hour on a leased box over a difference that
+/// is three orders of magnitude wide and resolved in seconds.
+const LOADED_CALLS: u64 = 2_000_000;
 
 /// Timed cells per shape. The median is taken, so an odd count has a
 /// middle.
@@ -214,19 +223,19 @@ fn resolve_one(which: usize) -> usize {
 
 /// The four cells, interleaved, against the key set already loaded
 /// into both registries.
-fn measure(keys: &[u64], map: &RwLock<HashMap<u64, usize>>) -> [Vec<f64>; 4] {
+fn measure(calls: u64, keys: &[u64], map: &RwLock<HashMap<u64, usize>>) -> [Vec<f64>; 4] {
     let mut control = Vec::with_capacity(REPEATS);
     let mut map_cell = Vec::with_capacity(REPEATS);
     let mut table_cell = Vec::with_capacity(REPEATS);
     let mut real_cell = Vec::with_capacity(REPEATS);
 
     for _ in 0..REPEATS {
-        control.push(cell(CALLS, |i| {
+        control.push(cell(calls, |i| {
             black_box(keys[(i as usize) % SITES]) as usize & 1
         }));
-        map_cell.push(cell(CALLS, |i| map_lookup(map, keys[(i as usize) % SITES])));
-        table_cell.push(cell(CALLS, |i| table_lookup(keys[(i as usize) % SITES])));
-        real_cell.push(cell(CALLS / 8, |i| resolve_one((i as usize) % SITES)));
+        map_cell.push(cell(calls, |i| map_lookup(map, keys[(i as usize) % SITES])));
+        table_cell.push(cell(calls, |i| table_lookup(keys[(i as usize) % SITES])));
+        real_cell.push(cell(calls / 8, |i| resolve_one((i as usize) % SITES)));
     }
     [control, map_cell, table_cell, real_cell]
 }
@@ -296,10 +305,11 @@ fn main() {
     }
 
     println!(
-        "call_site_registry_cost threads={threads} sites={SITES} calls={CALLS} repeats={REPEATS}"
+        "call_site_registry_cost threads={threads} sites={SITES} calls={CALLS} \
+         loaded_calls={LOADED_CALLS} repeats={REPEATS}"
     );
 
-    report("quiet", measure(&keys, &map));
+    report("quiet", measure(CALLS, &keys, &map));
 
     let stop = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(threads));
@@ -326,7 +336,7 @@ fn main() {
     if threads > 1 {
         barrier.wait();
     }
-    report("loaded", measure(&keys, &map));
+    report("loaded", measure(LOADED_CALLS, &keys, &map));
     stop.store(true, Ordering::Relaxed);
     for h in helpers {
         h.join().expect("a helper thread panicked");
