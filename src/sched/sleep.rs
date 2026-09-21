@@ -425,39 +425,28 @@ impl Parker {
         // count bounds that case on its own, without assuming any
         // iteration actually waits.
         const MAX_ARMS: u32 = 256;
-        // Consecutive returns that did not wait at all before this
-        // stops re-arming and parks in the kernel.
+        // How many arms may be spent, and how quickly, before this
+        // concludes the monitor is not holding and parks instead.
         //
-        // A monitor wait that comes straight back did not hold, and
-        // re-arming it is a spin over an instruction pair costing
-        // about two thousand cycles a turn. Measured on a Ryzen 7
-        // 2700 under load, where the monitor does not hold and the
-        // full 256 arms ran: the parker took 444 to 755 us against 15
-        // to 25 us for the kernel park it replaced, a regression of
-        // 20 to 40 times on the scheduler's own idle path.
-        const SHORT_RETURNS_BEFORE_PARK: u32 = 8;
-        // What counts as not waiting, in RDTSC cycles.
+        // The test is the pair together: many arms in very little
+        // time. A monitor that holds cannot produce that, because one
+        // arm covers the whole budget and reaching a fourth means
+        // three full budgets have elapsed. A monitor that does not
+        // hold reaches the fourth in a few thousand cycles, since
+        // each turn costs only what the instruction pair costs, about
+        // 2369 cycles on a 7900X and 1606 on a 2700.
         //
-        // Absolute, and deliberately not a fraction of the request.
-        // A fraction cannot tell the two cases apart: asking for a
-        // 10 ms budget and being woken by a store after 50 us is a
-        // return at a fifty-thousandth of the request, and so is a
-        // monitor that never armed. What separates them is how long
-        // the instruction itself took. A pair that did not wait costs
-        // about what the pair costs, measured at 2369 cycles on a
-        // 7900X and 1606 on a 2700; a wake after any real waiting is
-        // hundreds of thousands. This sits an order of magnitude
-        // above the first and an order below the second.
-        //
-        // A fraction was tried and is why this comment is long: at a
-        // quarter-million cycles for a 50 us wake against a
-        // three-million-cycle eighth of the budget, every ordinary
-        // wake counted as a non-wait, the fallback tripped on a host
-        // whose monitor holds perfectly well, and the sticky flag
-        // then spent the rest of the process in the kernel park. The
-        // MONITORX rows came back level with the StdPark rows beside
-        // them, which is exactly what the diagnostic exists to name.
-        const NOT_A_WAIT_CYCLES: u64 = 16_384;
+        // Measured on a Ryzen 7 2700 under load, where the monitor
+        // does not hold and the full 256 arms ran: the parker took
+        // 444 to 755 us against 15 to 25 us for the kernel park it
+        // replaced, a regression of 20 to 40 times on the scheduler's
+        // own idle path.
+        const ARMS_BEFORE_JUDGING: u32 = 4;
+        // Below this, that many arms is impossibly fast for a wait
+        // that held. Roughly a quarter of a millisecond, against the
+        // tens of milliseconds four honoured budgets would take and
+        // the few thousand cycles four unheld ones do.
+        const ARMS_TOO_FAST_CYCLES: u64 = 1_000_000;
 
         let budget = WAIT_DEADLINE_NS.saturating_mul(TSC_HZ_ESTIMATE / 1_000_000_000);
         // SAFETY: `_rdtsc` is a no-side-effect read of the TSC
@@ -477,8 +466,9 @@ impl Parker {
             return;
         }
 
-        let mut short_returns = 0u32;
+        let mut arms = 0u32;
         for _ in 0..MAX_ARMS {
+            arms += 1;
             // MONITORX rax: arm the monitor on the line holding
             // wake_counter. ECX carries extensions and EDX hints, both
             // zero, which is the only defined combination.
@@ -519,7 +509,6 @@ impl Parker {
             // the longest wait the register can express and the next
             // iteration asks for the rest.
             let ask = u32::try_from(left).unwrap_or(u32::MAX);
-            let before = unsafe { core::arch::x86_64::_rdtsc() };
 
             // MWAITX: EAX = 0 requests C0, the light state matching
             // the WAITPKG arm's C0.1 hint; ECX bit 1 enables the EBX
@@ -552,16 +541,18 @@ impl Parker {
                 return;
             }
 
-            // Whether that wait held. Counted consecutively, so a
-            // single interrupt does not condemn the host, and reset
-            // by any wait that did hold.
-            let waited = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(before);
-            if waited < NOT_A_WAIT_CYCLES {
-                short_returns += 1;
-            } else {
-                short_returns = 0;
-            }
-            if short_returns >= SHORT_RETURNS_BEFORE_PARK {
+            // Whether this loop is getting anywhere. Judged on the
+            // arms and the clock together rather than on how long any
+            // one return lasted: under load some returns are
+            // lengthened by an interrupt, so a rule counting only
+            // consecutive short ones keeps resetting and never fires
+            // while the loop is still spinning. Measured on the 2700,
+            // where that version reached the fallback only after
+            // spending 291 us in one group.
+            if arms >= ARMS_BEFORE_JUDGING
+                && unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start)
+                    < ARMS_TOO_FAST_CYCLES
+            {
                 note_monitor_does_not_hold();
                 thread::park();
                 return;
