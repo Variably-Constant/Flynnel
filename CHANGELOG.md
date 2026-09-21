@@ -254,11 +254,21 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   CPUID reports bit 29 on both parts and distinguishes them not at
   all; only the length of a real wait does.
 
-  So the wait checks that it held. Four arms inside a million RDTSC
-  cycles is a monitor that is not holding: four honoured budgets take
-  tens of milliseconds, four unheld ones take about four times the
-  instruction pair, which measures 2369 cycles on a 7900X and 1606 on
-  a 2700. The wait then ends in `thread::park`.
+  So the wait checks that it held. Four arms inside 50,000 RDTSC
+  cycles is a monitor that never armed, and the wait then ends in
+  `thread::park`.
+
+  **There are three cases and the threshold has to separate all
+  three**, which is why that figure is measured rather than argued.
+  Four arms on a monitor that never armed cost about four times the
+  instruction pair: 9,476 cycles on a 7900X, 6,424 on a 2700. Four
+  arms on a monitor that armed and was cut short by something else
+  measured 420,791 cycles on a 7900X under load, about 22
+  microseconds each. A monitor that holds covers the whole budget in
+  one arm. The middle case is a monitor doing its job while the host
+  is busy, and an earlier threshold of a million cycles swallowed it:
+  a working monitor was condemned for being woken by exactly the load
+  the arm exists to survive.
 
   **The verdict is not taken on one wait.** It is permanent and
   process-wide, so eight separate waits have to agree before the
