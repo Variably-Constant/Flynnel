@@ -1155,6 +1155,69 @@ mod tests {
         assert_eq!(WaitStrategy::baseline(), want);
     }
 
+    /// A controller of its own, so a test can drive the decision
+    /// without moving the one the process parks on.
+    fn fresh_controller() -> WaitController {
+        WaitController {
+            mean_ns: [AtomicU64::new(0), AtomicU64::new(0)],
+            samples: [AtomicU32::new(0), AtomicU32::new(0)],
+            parks: AtomicU64::new(0),
+            current: AtomicU32::new(SLOT_BASELINE),
+            switches: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn evidence_short_of_the_gate_decides_nothing() {
+        // One arm looking wonderful over three samples must not move
+        // a process off the wait it shipped with. A wake latency has
+        // a long tail and a handful of samples is mostly tail.
+        let c = fresh_controller();
+        for _ in 0..3 {
+            c.record(SLOT_CHALLENGER, 100);
+            c.record(SLOT_BASELINE, 100_000);
+        }
+        assert_eq!(c.current.load(Ordering::Relaxed), SLOT_BASELINE);
+        assert_eq!(c.switches.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_clear_win_moves_the_verdict_and_a_clear_loss_moves_it_back() {
+        // The whole point: the choice follows the measurement in both
+        // directions. A controller that could only adopt would be the
+        // permanent verdict again, wearing a mean.
+        let c = fresh_controller();
+        for _ in 0..SAMPLES_BEFORE_VERDICT {
+            c.record(SLOT_BASELINE, 6_000);
+            c.record(SLOT_CHALLENGER, 1_000);
+        }
+        assert_eq!(c.current.load(Ordering::Relaxed), SLOT_CHALLENGER);
+
+        // The host gets busy and the monitor wait stops paying. The
+        // means are exponential once established, so this takes more
+        // than one contrary sample, which is the intent.
+        for _ in 0..SAMPLES_BEFORE_VERDICT * 4 {
+            c.record(SLOT_CHALLENGER, 300_000);
+            c.record(SLOT_BASELINE, 6_000);
+        }
+        assert_eq!(c.current.load(Ordering::Relaxed), SLOT_BASELINE);
+        assert!(c.switches.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[test]
+    fn two_arms_within_the_margin_leave_the_verdict_alone() {
+        // Switching on noise costs a process its exploitation and
+        // buys nothing. Ten per cent apart is inside the twenty the
+        // controller demands.
+        let c = fresh_controller();
+        for _ in 0..SAMPLES_BEFORE_VERDICT * 2 {
+            c.record(SLOT_BASELINE, 5_000);
+            c.record(SLOT_CHALLENGER, 4_600);
+        }
+        assert_eq!(c.current.load(Ordering::Relaxed), SLOT_BASELINE);
+        assert_eq!(c.switches.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn a_cold_controller_starts_on_the_baseline() {
         // Before anything is measured the process must behave as it
