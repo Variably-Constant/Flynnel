@@ -1120,9 +1120,96 @@ reason = "internal-to-another-surface"
 note = "the taxonomy enums, exported as Flynnel.HwClass, Flynnel.SchedTier and Flynnel.Variant and set on a plan. Their methods answer one property each of the variant the caller already holds, so each is a column rather than a crossing"
 
 [[entry]]
-item = "crate::dispatch_profile::DispatchProfile::deque_tier_hint"
+item = "crate::dispatch_profile::DispatchProfile"
 reason = "internal-to-another-surface"
-note = "which deque tier a profile prefers. Get-FlynnelDispatchProfile writes it as a column beside the rest of the profile"
+note = "the profile itself is exported as Flynnel.DispatchProfile and set on a plan. Each of its methods answers one property of the profile the caller already holds - the deque tier it prefers, its default per-element cost and oversubscription, whether it is latency bound and whether it routes through the mailbox - so Get-FlynnelDispatchProfile writes them as columns of one row rather than as five crossings"
+
+# ---------------------------------------------------------------------
+# Racing
+# ---------------------------------------------------------------------
+# MISD: several instructions over one datum. The line through this
+# family is whether an arm has to be able to DECLINE, REFUTE or
+# DISAGREE with another arm. Every body this module can offer is a
+# declared deterministic kernel, which can do none of the three, so
+# an arm needing one of them is absent rather than bound to a body
+# that cannot fail.
+#
+# race_any and explore_select have no entry on purpose. They take the
+# attempt index, so candidate PLANS over one declared kernel fits them
+# exactly and they are bindable; leaving them uncovered is what keeps
+# that work visible instead of letting a reason absorb it.
+
+[[entry]]
+item = "crate::sched::race::race_variants"
+reason = "takes-a-rust-closure"
+reaches = "Measure-FlynnelHybridPlacement"
+note = "needs a Fast and a Faithful body that can decline by answering None when their accuracy contract is not met. foundation's Variant is that ladder: Correct is bit-exact, Faithful within one ulp, Fast bounded but unspecified. The declared kernels are f64 operations with no accuracy tiers - Sqrt is the hardware's sqrt and there is no faster body to decline - so every arm would answer Some and the race would degenerate to the first one while reporting a tier it never tested. The two-way learned form of the same idea is bound as Measure-FlynnelHybridPlacement"
+
+[[entry]]
+item = "crate::sched::race::race_refute"
+reason = "takes-a-rust-closure"
+reaches = "Measure-FlynnelHybridPlacement"
+note = "needs a prover and a refuter that can reach opposite conclusions about one question. A declared kernel computes a number; it has nothing to refute"
+
+[[entry]]
+item = "crate::sched::race::race_agree"
+reason = "takes-a-rust-closure"
+reaches = "Measure-FlynnelHybridPlacement"
+note = "needs explorers that can disagree, and a threshold over how many agreed. Every declared kernel here is deterministic, so every arm agrees by construction and the threshold is met at one arm whatever it is set to. A cmdlet over this would always answer unanimous, which would be a property of the binding and not of the work"
+
+[[entry]]
+item = "crate::sched::race::race_quorum"
+reason = "takes-a-rust-closure"
+reaches = "Measure-FlynnelHybridPlacement"
+note = "the same reasoning as race_agree: k of n attempts succeeding is not a question a deterministic body can answer differently from one run to the next"
+
+[[entry]]
+item = "crate::sched::race::race_statistical"
+reason = "takes-a-rust-closure"
+reaches = "Measure-FlynnelHybridPlacement"
+note = "takes a sampler whose draws vary, and stops when the samples settle. The declared kernels do not vary, so the stopping rule would fire on the first draw every time"
+
+[[entry]]
+item = "crate::sched::race::race_deadline"
+reason = "takes-a-rust-closure"
+reaches = "Measure-FlynnelHybridPlacement"
+note = "runs explorers until a budget expires and answers the best so far. It needs a body whose answer improves with time, which a fixed-size declared kernel's does not: it finishes or it does not"
+
+[[entry]]
+item = "crate::sched::race::race_tournament"
+reason = "takes-a-rust-closure"
+reaches = "Measure-FlynnelHybridPlacement"
+note = "pairs explorers off under a caller's comparator. The comparator is a second closure, and the explorers are the same declared bodies that cannot differ in quality"
+
+[[entry]]
+item = "crate::sched::race::Settled"
+reason = "internal-to-another-surface"
+note = "what race_refute answers: proved, refuted, or neither. It follows the arm it belongs to"
+
+[[entry]]
+item = "crate::sched::race::Agreement"
+reason = "internal-to-another-surface"
+note = "what race_agree answers. It follows the arm it belongs to"
+
+[[entry]]
+item = "crate::sched::race::StatOpts"
+reason = "internal-to-another-surface"
+note = "the stopping rule race_statistical reads. It follows the arm it belongs to"
+
+[[entry]]
+item = "crate::sched::race::StatOutcome"
+reason = "internal-to-another-surface"
+note = "what race_statistical answers. It follows the arm it belongs to"
+
+[[entry]]
+item = "crate::sched::race::Anytime"
+reason = "internal-to-another-surface"
+note = "the deadline-bounded submitter race_deadline runs its explorers through. It follows the arm it belongs to"
+
+[[entry]]
+item = "crate::sched::race::CancelToken"
+reason = "internal-to-another-surface"
+note = "how a losing arm learns a peer has won, polled at checkpoints inside a body. A script holds no body to poll it, and a token nothing reads is a handle with no effect; the early exit it drives is what makes a race cost the winner's time rather than the slowest arm's"
 
 [[entry]]
 item = "crate::op_class::OpClass"
