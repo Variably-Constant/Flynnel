@@ -578,13 +578,27 @@ impl IoPool {
 
 /// Makes a pool of threads for blocking work.
 ///
-/// Work reaches it through the kernel cmdlets, which name a body this
-/// module implements; a script block cannot be submitted, because a
-/// script block runs only on the thread that owns the pipeline.
+/// # Nothing in this module submits to it yet
+///
+/// The pool exists and reports its width, and no cmdlet here puts
+/// work on it: every declared kernel dispatches on the main arena,
+/// including the file ones that block. So a pool made here starts
+/// threads that will sit idle, and the reason the pool exists, which
+/// is keeping blocking work off the scheduler's own workers, is not
+/// reachable from PowerShell today.
+///
+/// It is said here rather than left to be discovered because the
+/// alternative is a script that creates a pool, sees the worker count
+/// it asked for, and concludes its file work is routed.
+///
+/// A script block could not be submitted in any case: it runs only on
+/// the thread that owns the pipeline.
 ///
 /// # Examples
 ///
 /// `$io = New-FlynnelIoPool -WorkerCount 4`
+///
+/// `(New-FlynnelIoPool -WorkerCount 4).Workers`
 #[cmdlet(
     verb = "New",
     noun = "FlynnelIoPool",
