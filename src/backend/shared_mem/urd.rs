@@ -571,13 +571,15 @@ unsafe fn wait_with_monitorx(state_addr: *const u8, deadline_tsc: u64) {
     //
     // SAFETY: caller-asserted MONITORX availability + valid pointer.
     unsafe {
+        // The zeros arrive as operands rather than through `xor`,
+        // because `xor` writes flags and this block promises not to.
+        // MONITORX itself leaves them alone, so the promise holds
+        // only while no instruction here breaks it.
         asm!(
-            "xor ecx, ecx",
-            "xor edx, edx",
             ".byte 0x0f, 0x01, 0xfa",
             in("rax") state_addr,
-            out("rcx") _,
-            out("rdx") _,
+            in("ecx") 0u32,
+            in("edx") 0u32,
             options(nostack, preserves_flags),
         );
         // EAX = 0 requests C0, matching the WAITPKG arm's C0.1 hint;
@@ -592,13 +594,11 @@ unsafe fn wait_with_monitorx(state_addr: *const u8, deadline_tsc: u64) {
         asm!(
             "push rbx",
             "mov ebx, {ask:e}",
-            "mov ecx, 2",
-            "xor eax, eax",
             ".byte 0x0f, 0x01, 0xfb",
             "pop rbx",
             ask = in(reg) ask,
-            out("rax") _,
-            out("rcx") _,
+            inout("eax") 0u32 => _,
+            inout("ecx") 2u32 => _,
         );
     }
 }

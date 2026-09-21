@@ -391,14 +391,16 @@ impl Parker {
             // field of `self`. Encoded as bytes because the mnemonic
             // needs a target feature this crate does not set, and the
             // encoding is fixed.
+            // The zeros arrive as operands rather than through `xor`,
+            // because `xor` writes flags and this block promises not
+            // to. MONITORX itself leaves them alone, so the promise
+            // holds only while no instruction here breaks it.
             unsafe {
                 core::arch::asm!(
-                    "xor ecx, ecx",
-                    "xor edx, edx",
                     ".byte 0x0f, 0x01, 0xfa",
                     in("rax") addr,
-                    out("rcx") _,
-                    out("rdx") _,
+                    in("ecx") 0u32,
+                    in("edx") 0u32,
                     options(nostack, preserves_flags),
                 );
             }
@@ -436,13 +438,11 @@ impl Parker {
                 core::arch::asm!(
                     "push rbx",
                     "mov ebx, {ask:e}",
-                    "mov ecx, 2",
-                    "xor eax, eax",
                     ".byte 0x0f, 0x01, 0xfb",
                     "pop rbx",
                     ask = in(reg) ask,
-                    out("rax") _,
-                    out("rcx") _,
+                    inout("eax") 0u32 => _,
+                    inout("ecx") 2u32 => _,
                 );
             }
 
@@ -604,14 +604,65 @@ mod tests {
 
     #[test]
     fn wait_strategy_pick_matches_cpuid() {
-        // pick() returns Waitpkg if and only if cpu_info::has_waitpkg
-        // reports true. Test asserts the two queries agree.
+        // The order is what is asserted, not any one host's answer:
+        // WAITPKG wins where present, MONITORX takes the hosts that
+        // have only it, and the kernel park is what is left.
         let want = if crate::cpu_info::has_waitpkg() {
             WaitStrategy::Waitpkg
+        } else if crate::cpu_info::has_monitorx() {
+            WaitStrategy::Monitorx
         } else {
             WaitStrategy::StdPark
         };
         assert_eq!(WaitStrategy::pick(), want);
+    }
+
+    #[test]
+    fn the_parker_never_picks_a_wait_its_host_cannot_execute() {
+        // The strategy names an instruction, so picking one the CPUID
+        // probe did not confirm is a `#UD` on the idle path rather
+        // than a wrong answer. Read from the strategy toward the
+        // probe, which is the direction that catches a `pick` whose
+        // arms have been reordered out from under the detections.
+        match WaitStrategy::pick() {
+            WaitStrategy::Waitpkg => assert!(crate::cpu_info::has_waitpkg()),
+            WaitStrategy::Monitorx => assert!(crate::cpu_info::has_monitorx()),
+            WaitStrategy::StdPark => {
+                assert!(!crate::cpu_info::has_waitpkg());
+                assert!(!crate::cpu_info::has_monitorx());
+            }
+        }
+    }
+
+    #[test]
+    fn the_hosts_own_strategy_wakes_on_unpark() {
+        // The other wake tests name a strategy, so on a host whose
+        // pick() differs from all of them the arm that actually runs
+        // in production goes unexercised. This one parks on whatever
+        // this host chose, which is the only test here that executes
+        // the MONITORX path on a MONITORX host.
+        let p = Arc::new(Parker::new(0));
+        let ready = Arc::new(AtomicU32::new(0));
+        let woke = Arc::new(AtomicU32::new(0));
+
+        let p_thread = Arc::clone(&p);
+        let ready_thread = Arc::clone(&ready);
+        let woke_thread = Arc::clone(&woke);
+        let owner = thread::spawn(move || {
+            let ok = p_thread.park_until(|| ready_thread.load(Ordering::Acquire) == 1);
+            woke_thread.store(1, Ordering::Release);
+            ok
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        ready.store(1, Ordering::Release);
+        p.unpark();
+
+        assert!(
+            owner.join().expect("owner thread joins"),
+            "park_until must report a wake rather than a shutdown"
+        );
+        assert_eq!(woke.load(Ordering::Acquire), 1);
     }
 
     #[test]
