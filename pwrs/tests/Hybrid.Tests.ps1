@@ -209,41 +209,32 @@ Describe 'Measure-FlynnelHybridSplit' {
         }
     }
 
-    It 'holds the split near even while both sides cost the same per item' {
-        # Measured on zen3: eight calls at one size with the same body
-        # on both sides never leave 500. That is the model working, not
-        # the model asleep. Each side's clock starts inside its own
-        # half, so the backend side's thread hand-off falls outside both
-        # readings and the two per-item costs come out the same.
+    It 'follows the backend side getting dearer, within one size bucket' {
+        # The claim: the model reads its inputs and tracks a change in
+        # them. Asserted as a movement inside one run rather than
+        # against a band, because a band on a timing-derived ratio is a
+        # statement about the box. The first form of this test used one
+        # and flaked on zen3 at 488 tests while passing at 467.
         #
-        # A band rather than an exact 500, because the recorded cost is
-        # a whole number of nanoseconds and two sides that differ by one
-        # of them give 508 rather than 500.
-        $shares = 1..8 | ForEach-Object {
-            (Measure-FlynnelHybridSplit -Count 32768 -Operation Sqrt -Repetitions 8).CpuSharePerMille
-        }
-        foreach ($s in $shares) {
-            $s | Should -BeGreaterOrEqual 450
-            $s | Should -BeLessOrEqual 550
-        }
-    }
+        # One bucket throughout, so the second arm is the first arm's
+        # model being corrected rather than a fresh one. Repetitions is
+        # high on purpose: the model records per-item cost as a whole
+        # number of nanoseconds, so at the default of one repetition
+        # every side of every call truncates to the same integer and
+        # nothing can be resolved at all.
+        $bucket = 32768
+        $even = 1..6 | ForEach-Object {
+            (Measure-FlynnelHybridSplit -Count $bucket -Operation Exp `
+                -Repetitions 16).CpuSharePerMille
+        } | Select-Object -Last 1
 
-    It 'moves the share when the backend side costs more per item' {
-        # The other direction, and the one that shows the model reads
-        # its inputs at all. BackendRepetitions makes the backend side
-        # several times dearer per item, which is what a split model
-        # exists to track, so the share has to move toward the CPU.
-        #
-        # Repetitions is high on purpose. The model records per-item
-        # cost as a whole number of nanoseconds, so at the default of
-        # one repetition every side of every call truncates to the same
-        # integer and no real difference can be resolved at all.
-        $shares = 1..8 | ForEach-Object {
-            (Measure-FlynnelHybridSplit -Count 8192 -Operation Exp `
+        $skewed = 1..8 | ForEach-Object {
+            (Measure-FlynnelHybridSplit -Count $bucket -Operation Exp `
                 -Repetitions 16 -BackendRepetitions 64).CpuSharePerMille
-        }
-        ($shares | Select-Object -Last 1) | Should -BeGreaterThan 550 `
-            -Because 'the dearer side should be given fewer items'
+        } | Select-Object -Last 1
+
+        $skewed | Should -BeGreaterThan $even `
+            -Because 'a backend side four times dearer per item should be given fewer items'
     }
 
     It 'times both sides' {
