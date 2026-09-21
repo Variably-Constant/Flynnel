@@ -23,7 +23,7 @@
 //! `Parker` accepts the spin-round count at construction so it
 //! works across tiers without conditional plumbing.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::{self, Thread};
 
 /// Selects how the [`Parker`] waits after the spin floor is exhausted.
@@ -73,20 +73,40 @@ pub enum WaitStrategy {
 /// CPUID bit does not answer and only the length of a real wait
 /// reveals. A Ryzen 7 2700 under load returns from MWAITX at once.
 ///
-/// Set false by the first parker to find that, never set back: a
-/// wrong false costs the kernel park that was there anyway, a wrong
-/// true costs a spin over the instruction pair on every park.
+/// Never set back once false: a wrong false costs the kernel park
+/// that was there anyway, a wrong true costs a spin over the
+/// instruction pair on every park.
 static MONITOR_HOLDS: AtomicBool = AtomicBool::new(true);
+
+/// Separate waits that have found the monitor not holding.
+///
+/// The verdict is permanent and process-wide, so it is not taken on
+/// one wait's evidence. A host whose monitor never holds supplies
+/// these in microseconds; a host whose monitor holds has to be
+/// unlucky this many times in separate waits.
+static MONITOR_DOUBTS: AtomicU32 = AtomicU32::new(0);
+
+/// Waits that must independently find the monitor not holding before
+/// the process stops trying.
+///
+/// One was too few. On a 7900X, whose monitor holds, a single
+/// unlucky wait condemned the process and every later group in that
+/// run measured the kernel park under a MONITORX label; two runs of
+/// one binary read 0.99 us and 5.08 us for the same cell depending
+/// only on whether that happened before or after the cell ran.
+const DOUBTS_BEFORE_GIVING_UP: u32 = 8;
 
 /// Whether re-arming a monitor is still believed to be worth it.
 fn monitor_holds() -> bool {
     MONITOR_HOLDS.load(Ordering::Relaxed)
 }
 
-/// Record that a monitor wait did not suspend the core on this host,
-/// so later parks go straight to the kernel.
+/// Record that one wait did not suspend the core, and stop trying
+/// once enough separate waits have said so.
 fn note_monitor_does_not_hold() {
-    MONITOR_HOLDS.store(false, Ordering::Relaxed);
+    if MONITOR_DOUBTS.fetch_add(1, Ordering::Relaxed) + 1 >= DOUBTS_BEFORE_GIVING_UP {
+        MONITOR_HOLDS.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Whether any wait has found this host's monitor not to hold.
