@@ -1423,6 +1423,11 @@ reason = "internal-to-another-surface"
 note = "exported as Flynnel.LinalgMethod"
 
 [[entry]]
+item = "crate::gpu_peer::wave::span"
+reason = "internal-to-another-surface"
+note = "the wave span's byte layout: ninety-seven offsets and codes held in lockstep with kernels/gpu_peer_wave.cu, which is the device half of the same contract. Reading a span by offset from a script would be a second implementation of a contract whose whole point is that there is one, the same reasoning gpu_peer::layout carries for the shared region. What a caller reaches is the wave's own operations and the figures the device wrote into these fields"
+
+[[entry]]
 item = "crate::gpu_peer::wave::plan"
 reason = "internal-to-another-surface"
 note = "the frontier cost model, bound as Get-FlynnelWavePlan. PlanInputs becomes the cmdlet's parameters and Plan becomes Flynnel.WavePlan, with Frontier exported as Flynnel.Frontier. It is a pure function over costs the caller supplies, so it answers on a host with no device"
