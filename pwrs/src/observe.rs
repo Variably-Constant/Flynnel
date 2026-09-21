@@ -160,7 +160,7 @@ static TRACE_SET_BY_CMDLET: AtomicU64 = AtomicU64::new(0);
 
 /// The trace row, shared by the cmdlet that reads it and the one that
 /// sets it, so the two cannot describe the state differently.
-fn trace_state_row() -> TraceState {
+pub(crate) fn trace_state_row() -> TraceState {
     // The dispatch counters have no public predicate. Whether they
     // are armed is read from the variable that arms them, which is
     // the same thing the crate latches.

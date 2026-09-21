@@ -1241,30 +1241,45 @@ pub struct Calibration {
 #[derive(Default)]
 pub struct GetFlynnelCalibration {}
 
+/// Everything the scheduler has calibrated for this host, as one row.
+///
+/// Built here rather than inside the cmdlet so the Flynnel drive's
+/// `calibration\summary` leaf answers the same object rather than a
+/// second rendering of it.
+pub(crate) fn calibration_row() -> Calibration {
+    let profile = par_iter::host_dispatch_profile();
+    let measured = par_iter::measured_collapse_threshold_ns();
+    let host_at = HOST_MEASURED_AT.load(Ordering::Relaxed);
+    let thresholds = read_thresholds(adaptive_profile::class_thresholds());
+    Calibration {
+        dispatch_cost_ns: profile.dispatch_cost_ns,
+        collapse_threshold_ns: profile.collapse_threshold_ns,
+        measured_collapse_threshold_ns: measured,
+        jec_wake_threshold_ns: profile.jec_wake_threshold_ns,
+        host_source: host_source(host_at, measured),
+        fine_grain_ns: thresholds.fine_grain_ns,
+        port_heavy_ns: thresholds.port_heavy_ns,
+        memory_latency_ns: thresholds.memory_latency_ns,
+        cv2_low_per_mille: thresholds.cv2_low_per_mille,
+        cv2_high_per_mille: thresholds.cv2_high_per_mille,
+        trivial_reduce_cycles: thresholds.trivial_reduce_cycles,
+        class_source: thresholds.source,
+        k_gating: CrateKGating::Auto.resolved().into(),
+        seed_hysteresis: par_iter::seed_hysteresis(),
+        active_profile: adaptive_profile::active_dispatch_profile().into(),
+        active_class: adaptive_profile::active_workload_class().into(),
+    }
+}
+
+/// The live class boundaries, as the row Get-FlynnelClassThreshold
+/// writes. Shared with the drive for the same reason.
+pub(crate) fn threshold_row() -> ClassThresholds {
+    read_thresholds(adaptive_profile::class_thresholds())
+}
+
 impl Cmdlet for GetFlynnelCalibration {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let profile = par_iter::host_dispatch_profile();
-        let measured = par_iter::measured_collapse_threshold_ns();
-        let host_at = HOST_MEASURED_AT.load(Ordering::Relaxed);
-        let thresholds = read_thresholds(adaptive_profile::class_thresholds());
-        ps.write(Calibration {
-            dispatch_cost_ns: profile.dispatch_cost_ns,
-            collapse_threshold_ns: profile.collapse_threshold_ns,
-            measured_collapse_threshold_ns: measured,
-            jec_wake_threshold_ns: profile.jec_wake_threshold_ns,
-            host_source: host_source(host_at, measured),
-            fine_grain_ns: thresholds.fine_grain_ns,
-            port_heavy_ns: thresholds.port_heavy_ns,
-            memory_latency_ns: thresholds.memory_latency_ns,
-            cv2_low_per_mille: thresholds.cv2_low_per_mille,
-            cv2_high_per_mille: thresholds.cv2_high_per_mille,
-            trivial_reduce_cycles: thresholds.trivial_reduce_cycles,
-            class_source: thresholds.source,
-            k_gating: CrateKGating::Auto.resolved().into(),
-            seed_hysteresis: par_iter::seed_hysteresis(),
-            active_profile: adaptive_profile::active_dispatch_profile().into(),
-            active_class: adaptive_profile::active_workload_class().into(),
-        })
+        ps.write(calibration_row())
     }
 }
 

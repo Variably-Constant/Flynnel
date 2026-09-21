@@ -43,14 +43,22 @@ use pwrs::prelude::*;
 /// Held as a path list rather than built per call so enumerating a
 /// container is one pass over this table, and so a path that is not
 /// here is not there.
-const CONTAINERS: [&str; 5] = ["host", "pool", "pool/workers", "sites", "backends"];
+const CONTAINERS: [&str; 7] = [
+    "host",
+    "pool",
+    "pool/workers",
+    "sites",
+    "backends",
+    "calibration",
+    "trace",
+];
 
 /// Every leaf whose path is fixed, by its normalized path.
 ///
 /// `pool/workers` has children too, but how many is a reading rather
 /// than a shape, so they are not here; [`FlynnelDrive::children_of`]
 /// asks the pool.
-const LEAVES: [&str; 7] = [
+const LEAVES: [&str; 10] = [
     "host/topology",
     "host/cpu",
     "host/latency",
@@ -58,6 +66,9 @@ const LEAVES: [&str; 7] = [
     "pool/summary",
     "pool/spin",
     "pool/split",
+    "calibration/summary",
+    "calibration/thresholds",
+    "trace/state",
 ];
 
 /// A provider path in internal form: forward slashes, no leading or
@@ -131,6 +142,9 @@ impl FlynnelDrive {
             "pool/summary" => Some(crate::pool::pool_snapshot().into_ps()?),
             "pool/spin" => Some(crate::pool::spin_snapshot().into_ps()?),
             "pool/split" => Some(crate::pool::split_snapshot().into_ps()?),
+            "calibration/summary" => Some(crate::calibration::calibration_row().into_ps()?),
+            "calibration/thresholds" => Some(crate::calibration::threshold_row().into_ps()?),
+            "trace/state" => Some(crate::observe::trace_state_row().into_ps()?),
             _ => None,
         })
     }

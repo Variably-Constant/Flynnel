@@ -253,6 +253,32 @@ Describe 'the sites level' {
     }
 }
 
+Describe 'the calibration and trace levels' {
+    It 'answers the same calibration as Get-FlynnelCalibration' {
+        $d = Test-SameRow -Left (Get-FlynnelCalibration) `
+            -Right (Get-Item Flynnel:\calibration\summary)
+        $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
+    }
+
+    It 'answers the same thresholds as Get-FlynnelClassThreshold' {
+        $d = Test-SameRow -Left (Get-FlynnelClassThreshold) `
+            -Right (Get-Item Flynnel:\calibration\thresholds)
+        $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
+    }
+
+    It 'answers the same trace state as Get-FlynnelTraceState' {
+        $d = Test-SameRow -Left (Get-FlynnelTraceState) `
+            -Right (Get-Item Flynnel:\trace\state)
+        $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
+    }
+
+    It 'enumerates both calibration leaves' {
+        $names = @(Get-ChildItem Flynnel:\calibration | ForEach-Object { $_.PSChildName })
+        $names | Should -Contain 'summary'
+        $names | Should -Contain 'thresholds'
+    }
+}
+
 Describe 'a reading this host cannot take' {
     It 'is a leaf that exists and holds nothing, not a missing path' {
         # The distinction a script cannot make for itself: "this host
