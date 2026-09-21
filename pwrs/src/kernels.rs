@@ -1407,6 +1407,58 @@ fn hash_files(plan: &flynnel::JobPlan, paths: &[String]) -> Vec<Result<(String, 
     collect_indexed(plan, paths.len(), 1, |i| hash_file_streaming(&paths[i]))
 }
 
+/// Hashes each file on the process-wide IO pool instead of the arena,
+/// returning `None` when no such pool exists.
+///
+/// `None` rather than a silent fall-through to the arena: the caller
+/// has asked for a route and is entitled to know it was not taken.
+/// The crate's own submit helpers run the task inline when the pool is
+/// absent, which is correct for them and would make this cmdlet report
+/// a route it did not use.
+///
+/// The paths are cloned because `IoPool::submit` takes a `'static`
+/// closure. That is one allocation per file, on top of the read, and
+/// it is the cost this route has to earn back.
+fn hash_files_on_io_pool(paths: &[String]) -> Option<Vec<Result<(String, u64), String>>> {
+    let pool = flynnel::sched::io_pool::global_io_pool()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (i, path) in paths.iter().enumerate() {
+        let tx = tx.clone();
+        let path = path.clone();
+        pool.submit(move || {
+            let row = hash_file_streaming(&path);
+            if tx.send((i, row)).is_err() {
+                eprintln!(
+                    "flynnel: the result channel for {path} closed before its hash was reported"
+                );
+            }
+        });
+    }
+    drop(tx);
+
+    let mut out: Vec<Option<Result<(String, u64), String>>> =
+        (0..paths.len()).map(|_| None).collect();
+    for (i, row) in rx {
+        out[i] = Some(row);
+    }
+    // Every slot is filled unless a task panicked, which the pool does
+    // not catch. Reported as a refusal for that path rather than
+    // silently standing in a value.
+    Some(
+        out.into_iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                slot.unwrap_or_else(|| {
+                    Err(format!(
+                        "the IO pool task for {} did not return a result",
+                        paths[i]
+                    ))
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Hashes files with BLAKE3 on Flynnel's workers, one task per file.
 ///
 /// BLAKE3 comes from the crate's own verify-chain hasher, so the root
@@ -1441,6 +1493,15 @@ pub struct MeasureFlynnelFileHash {
     /// The plan to run under.
     #[param]
     pub plan: Option<Plan>,
+    /// Read the files on the process-wide IO pool rather than on the
+    /// scheduler's own workers, so a blocking read does not hold a
+    /// worker that compute could be using.
+    ///
+    /// Warns and uses the workers when no such pool exists, which is
+    /// the default: one is created only when FLYNNEL_SCHED_SMT_AS_IO
+    /// is set.
+    #[param]
+    pub use_io_pool: bool,
 }
 
 impl Cmdlet for MeasureFlynnelFileHash {
@@ -1452,7 +1513,26 @@ impl Cmdlet for MeasureFlynnelFileHash {
         if n == 0 {
             return Ok(());
         }
-        let rows = hash_files(&plan, &paths);
+        // Asked for and available, asked for and absent, or not asked
+        // for. The middle one warns rather than falling through
+        // quietly, because a pool that does not exist and a pool that
+        // was never wanted produce identical output otherwise.
+        let rows = if self.use_io_pool {
+            match hash_files_on_io_pool(&paths) {
+                Some(rows) => rows,
+                None => {
+                    pwrs::warning!(
+                        ps,
+                        "this process has no IO pool, so the reads ran on the scheduler's \
+                         workers. Set FLYNNEL_SCHED_SMT_AS_IO before the first dispatch to \
+                         create one"
+                    )?;
+                    hash_files(&plan, &paths)
+                }
+            }
+        } else {
+            hash_files(&plan, &paths)
+        };
 
         let mut refused = 0usize;
         for (i, row) in rows.into_iter().enumerate() {
