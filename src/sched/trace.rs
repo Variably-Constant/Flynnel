@@ -87,6 +87,15 @@ pub enum TraceEvent {
     /// which is what tells a reader whether an early measurement was
     /// taken before or after the move.
     WaitSwitch = 15,
+    /// A pool worker committed to parking in the JEC sleep coordinator.
+    /// Payload = its worker index. Distinct from [`TraceEvent::ParkEnter`],
+    /// which is the latch parker a waiting caller uses.
+    PoolPark = 16,
+    /// A producer claimed a parked pool worker to wake it. Payload =
+    /// the claimed worker's index. Distinct from
+    /// [`TraceEvent::WorkerWake`], which the latch parker emits on its
+    /// own return.
+    PoolWake = 17,
 }
 
 /// One trace event row recorded into the per-thread buffer.

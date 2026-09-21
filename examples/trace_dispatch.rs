@@ -24,14 +24,22 @@
 //! 14 park enter (payload is the wait strategy, 0 kernel park, 1
 //! WAITPKG, 2 MONITORX, plus 16 when the park is half of a controller
 //! probe), 8 worker wake (payload is that wake's cost in
-//! nanoseconds), 15 wait switch (payload is the strategy now in use).
-//! 9 is defined for a steal hit and no hook emits it. The wall time
-//! of the traced call is printed on stdout.
+//! nanoseconds), 15 wait switch (payload is the strategy now in use),
+//! 16 pool park (a pool worker committing to park in the sleep
+//! coordinator; payload is its worker index), 17 pool wake (a
+//! producer claiming a parked pool worker; payload is that worker's
+//! index). 9 is defined for a steal hit and no hook emits it. The
+//! wall time of the traced call is printed on stdout.
 //!
-//! At the default gap of zero this shape emits no 14, 8 or 15 at all:
-//! over two hundred back-to-back dispatches the workers never go idle
-//! long enough to park. The parker runs between bursts of work rather
-//! than inside one, so a trace meant to catch it needs a workload with
+//! 14, 8 and 15 belong to the latch parker a waiting caller uses; 16
+//! and 17 belong to the pool's own sleep coordinator. A dispatch that
+//! wakes the pool shows in 16 and 17 and can leave 14, 8 and 15 at
+//! zero.
+//!
+//! At the default gap of zero this shape emits none of them: over two
+//! hundred back-to-back dispatches the workers never go idle long
+//! enough to park. The parker runs between bursts of work rather than
+//! inside one, so a trace meant to catch it needs a workload with
 //! gaps, and a run without them cannot witness the parker whatever it
 //! records. The fourth argument is that gap in milliseconds; the pool
 //! parks during it and the dispatch after has to wake parked workers.

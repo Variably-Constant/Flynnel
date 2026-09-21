@@ -800,6 +800,10 @@ impl Sleep {
             idle.parked = true;
             idle.sleepless = 0;
             PARK_EVENTS.fetch_add(1, Ordering::Relaxed);
+            crate::sched::trace::emit(
+                crate::sched::trace::TraceEvent::PoolPark,
+                idle.worker_index as u32,
+            );
             maybe_adapt();
 
             // Publish first, then re-read. A waker arriving from here
@@ -880,6 +884,7 @@ impl Sleep {
         }
         for i in 0..self.worker_states.len() {
             if self.wake_specific_thread(i) {
+                crate::sched::trace::emit(crate::sched::trace::TraceEvent::PoolWake, i as u32);
                 num -= 1;
                 if num == 0 {
                     return;
