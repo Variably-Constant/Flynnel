@@ -22,7 +22,11 @@
 
 use pwrs::prelude::*;
 
+use flynnel::gpu_peer::wave::Frontier as CrateFrontier;
+use flynnel::gpu_peer::wave::plan::{Imbalance, PlanInputs, plan as plan_wave};
 use flynnel::gpu_peer::watchdog::{self, DriverModel as CrateDriverModel};
+
+use crate::host::arg_err;
 
 /// How a device's driver presents it, which decides whether the
 /// watchdog covers it.
@@ -143,6 +147,192 @@ impl Cmdlet for GetFlynnelPeerWatchdog {
             driver_model_known: known,
             driver_model_problem: problem,
             basis: state.basis,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------
+// The wave planner
+// ---------------------------------------------------------------------
+
+/// How a wave keeps its frontier.
+#[psenum(name = "Flynnel.Frontier")]
+#[derive(Clone, Copy, Default)]
+pub enum FrontierKind {
+    /// One frontier across the team, fixed by a barrier every
+    /// generation. Load stays even and each generation waits for its
+    /// slowest block.
+    #[default]
+    Global,
+    /// One frontier per block, met and dealt out evenly every so many
+    /// generations.
+    Partition,
+}
+
+/// The frontier a wave should keep, and what the model prices it at.
+#[psclass(name = "Flynnel.WavePlan")]
+#[derive(Clone, Default)]
+pub struct WavePlan {
+    /// How the frontier is kept.
+    pub frontier: FrontierKind,
+    /// Generations between rebalances. Null on a global frontier,
+    /// which has none, and also on a partition the model says should
+    /// never rebalance, which is a different answer; RebalancesAtAll
+    /// separates them.
+    pub rebalance_every: Option<u32>,
+    /// Whether the chosen plan rebalances at all.
+    pub rebalances_at_all: bool,
+    /// What the model expects the chosen frontier to cost per
+    /// generation.
+    pub cost_per_generation_ns: f64,
+    /// What it expects a global frontier to cost per generation, which
+    /// is the barrier. Carried beside the chosen cost so the margin is
+    /// readable without a second call.
+    pub global_cost_ns: f64,
+    /// How much cheaper the chosen frontier is than a global one. Zero
+    /// when the plan is global.
+    pub saving_ns: f64,
+    /// Blocks in the team the plan was chosen for.
+    pub width: u32,
+    /// Whether an imbalance was supplied. False means the plan is
+    /// global because nothing has been observed yet, not because a
+    /// global frontier won a comparison.
+    pub imbalance_supplied: bool,
+}
+
+/// Chooses how a wave should keep its frontier, from what the device
+/// costs and what an earlier run observed.
+///
+/// Two costs trade against each other. A global frontier pays a barrier
+/// every generation and idles no block. A partition pays a rebalance
+/// once every so many generations and idles blocks in between as their
+/// frontiers diverge; one that never rebalances pays nothing and idles
+/// until the divergence reaches the team width.
+///
+/// With no imbalance supplied the answer is a global frontier, and
+/// ImbalanceSupplied false says that is because nothing has been
+/// observed rather than because a comparison chose it. A wave run that
+/// way records the imbalance the next plan needs.
+///
+/// This is the cost model alone. It launches nothing, needs no peer and
+/// no device, and answers the same on a host with no card: the costs
+/// are arguments. Measure them on the machine that will run the wave
+/// and pass them here.
+///
+/// # Examples
+///
+/// `Get-FlynnelWavePlan -Width 32 -BarrierNs 4000 -GenerationNs 90000`
+///
+/// `Get-FlynnelWavePlan -Width 32 -BarrierNs 4000 -GenerationNs 90000
+///     -ImbalancePerMille 1800 -ImbalanceOverGenerations 8`
+#[cmdlet(
+    verb = "Get",
+    noun = "FlynnelWavePlan",
+    alias = "Get-FlyWavePlan",
+    output = ["Flynnel.WavePlan"]
+)]
+#[derive(Default)]
+pub struct GetFlynnelWavePlan {
+    /// Blocks in the team.
+    #[param(mandatory, position = 0)]
+    pub width: u32,
+    /// What one cross-block barrier costs at this width.
+    #[param(mandatory, position = 1)]
+    pub barrier_ns: f64,
+    /// What one generation of the program takes.
+    #[param(mandatory, position = 2)]
+    pub generation_ns: f64,
+    /// A rebalance's fixed cost, apart from the ids it moves.
+    #[param]
+    pub rebalance_fixed_ns: Option<f64>,
+    /// What moving one pending id through staging costs at a
+    /// rebalance.
+    #[param]
+    pub copy_ns_per_id: Option<f64>,
+    /// Ids typically pending when a rebalance happens.
+    #[param]
+    pub pending_ids: Option<f64>,
+    /// The largest block's frontier over the mean on an earlier run, in
+    /// thousandths, where 1000 is balanced. Without it the plan is
+    /// global.
+    #[param]
+    pub imbalance_per_mille: Option<u32>,
+    /// Generations of independent growth that imbalance accumulated
+    /// over. One for a global frontier's per-generation share.
+    #[param]
+    pub imbalance_over_generations: Option<u32>,
+}
+
+impl Cmdlet for GetFlynnelWavePlan {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        if self.width == 0 {
+            return Err(arg_err("Width must be above zero").terminating());
+        }
+        for (name, v) in [
+            ("BarrierNs", self.barrier_ns),
+            ("GenerationNs", self.generation_ns),
+        ] {
+            if !v.is_finite() || v < 0.0 {
+                return Err(
+                    arg_err(format!("{name} must be a finite cost at or above zero"))
+                        .terminating(),
+                );
+            }
+        }
+        // An imbalance is a pair and half of one is not a reading. A
+        // per-mille with no generation count would silently become one
+        // generation, which prices a divergence as growing far faster
+        // than it was observed to.
+        let imbalance = match (self.imbalance_per_mille, self.imbalance_over_generations) {
+            (Some(per_mille), Some(over_generations)) => {
+                if over_generations == 0 {
+                    return Err(arg_err(
+                        "ImbalanceOverGenerations must be at least one; an imbalance over no \
+                         generations is not a reading",
+                    )
+                    .terminating());
+                }
+                Some(Imbalance {
+                    per_mille,
+                    over_generations,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(arg_err(
+                    "an imbalance needs both ImbalancePerMille and ImbalanceOverGenerations; \
+                     a ratio without the generations it grew over does not price a divergence",
+                )
+                .terminating());
+            }
+        };
+
+        let inputs = PlanInputs {
+            width: self.width,
+            barrier_ns: self.barrier_ns,
+            rebalance_fixed_ns: self.rebalance_fixed_ns.unwrap_or(0.0),
+            copy_ns_per_id: self.copy_ns_per_id.unwrap_or(0.0),
+            pending_ids: self.pending_ids.unwrap_or(0.0),
+            generation_ns: self.generation_ns,
+            imbalance,
+        };
+        let chosen = plan_wave(&inputs);
+        let (kind, every) = match chosen.frontier {
+            CrateFrontier::Global => (FrontierKind::Global, None),
+            CrateFrontier::Partition { rebalance_every } => (
+                FrontierKind::Partition,
+                rebalance_every.map(|n| n.get()),
+            ),
+        };
+        ps.write(WavePlan {
+            frontier: kind,
+            rebalance_every: every,
+            rebalances_at_all: every.is_some(),
+            cost_per_generation_ns: chosen.cost_per_generation_ns,
+            global_cost_ns: chosen.global_cost_ns,
+            saving_ns: (chosen.global_cost_ns - chosen.cost_per_generation_ns).max(0.0),
+            width: self.width,
+            imbalance_supplied: imbalance.is_some(),
         })
     }
 }

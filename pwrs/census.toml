@@ -1172,3 +1172,13 @@ note = "the bounded-quantum persistent kernel's lifecycle: launched on demand, p
 item = "crate::gpu_peer::timed_lock"
 reason = "internal-to-another-surface"
 note = "the Fischer timed lock: cross-device mutual exclusion from plain stores and a measured visibility bound, with the GPU contender in kernels/gpu_peer.cu. Its margin is calibrated at peer init and validated by a live contention self-test, which is a figure a caller reads rather than a lock a caller takes"
+
+[[entry]]
+item = "crate::gpu_peer::wave::plan"
+reason = "internal-to-another-surface"
+note = "the frontier cost model, bound as Get-FlynnelWavePlan. PlanInputs becomes the cmdlet's parameters and Plan becomes Flynnel.WavePlan, with Frontier exported as Flynnel.Frontier. It is a pure function over costs the caller supplies, so it answers on a host with no device"
+
+[[entry]]
+item = "crate::gpu_peer::watchdog"
+reason = "internal-to-another-surface"
+note = "bound as Get-FlynnelPeerWatchdog, which writes the state and the driver model as one row. DriverModel is exported as Flynnel.DriverModel with an Unknown member, because an unreadable model is a reading and the device is still treated as covered. decide is the rule the row states and detect_with_model is what reads the host for it"

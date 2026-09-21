@@ -147,6 +147,109 @@ Describe 'Get-FlynnelPeerWatchdog where there is no readable device' {
     }
 }
 
+Describe 'Get-FlynnelWavePlan' {
+    # The cost model alone, so every assertion here holds on a host with
+    # no card. The costs are arguments.
+
+    It 'shapes the plan row the way its cmdlet documents' {
+        @(Get-FlynnelTypeProperty -TypeName 'Flynnel.WavePlan').Count |
+            Should -BeGreaterThan 0
+        $names = [enum]::GetNames([Flynnel.Frontier])
+        $names | Should -Contain 'Global'
+        $names | Should -Contain 'Partition'
+    }
+
+    It 'keeps a global frontier when nothing has been observed' {
+        # Not a comparison won: there is no imbalance to price a
+        # partition against, and a wave run this way records the one the
+        # next plan needs. The column says which it was.
+        $p = Get-FlynnelWavePlan -Width 32 -BarrierNs 4000 -GenerationNs 90000
+        $p.Frontier | Should -Be 'Global'
+        $p.ImbalanceSupplied | Should -BeFalse
+        $p.CostPerGenerationNs | Should -Be 4000
+        $p.GlobalCostNs | Should -Be 4000
+        $p.SavingNs | Should -Be 0
+    }
+
+    It 'partitions a team whose barrier is dear against a cheap generation' {
+        # A barrier costing nearly as much as the generation it guards
+        # is the case a partition exists for.
+        $p = Get-FlynnelWavePlan -Width 32 -BarrierNs 50000 -GenerationNs 60000 `
+            -ImbalancePerMille 1100 -ImbalanceOverGenerations 8 `
+            -RebalanceFixedNs 20000 -CopyNsPerId 5 -PendingIds 1000
+        $p.Frontier | Should -Be 'Partition'
+        $p.CostPerGenerationNs | Should -BeLessThan $p.GlobalCostNs
+        $p.SavingNs | Should -BeGreaterThan 0
+    }
+
+    It 'keeps a global frontier when the barrier is cheap against the generation' {
+        # The other side of the same trade, so the suite is not only
+        # testing that the model can say Partition.
+        $p = Get-FlynnelWavePlan -Width 32 -BarrierNs 50 -GenerationNs 2000000 `
+            -ImbalancePerMille 4000 -ImbalanceOverGenerations 2 `
+            -RebalanceFixedNs 500000 -CopyNsPerId 50 -PendingIds 100000
+        $p.Frontier | Should -Be 'Global'
+        $p.ImbalanceSupplied | Should -BeTrue -Because 'this one was a comparison, not an absence'
+    }
+
+    It 'never rebalances a team of one block' {
+        # One block has nothing to rebalance with and nothing to idle,
+        # so both costs are zero and a barrier would be pure loss.
+        $p = Get-FlynnelWavePlan -Width 1 -BarrierNs 4000 -GenerationNs 90000 `
+            -ImbalancePerMille 2000 -ImbalanceOverGenerations 4
+        $p.Frontier | Should -Be 'Partition'
+        $p.RebalancesAtAll | Should -BeFalse
+        $p.CostPerGenerationNs | Should -Be 0
+    }
+
+    It 'tells a plan that never rebalances from one with no interval to report' {
+        # RebalanceEvery is null in both cases and they are different
+        # answers, which is why RebalancesAtAll is a column.
+        $global = Get-FlynnelWavePlan -Width 32 -BarrierNs 4000 -GenerationNs 90000
+        $global.RebalanceEvery | Should -BeNullOrEmpty
+        $global.RebalancesAtAll | Should -BeFalse
+        $global.Frontier | Should -Be 'Global'
+    }
+
+    It 'gives a rebalancing plan a positive interval' {
+        $p = Get-FlynnelWavePlan -Width 64 -BarrierNs 50000 -GenerationNs 60000 `
+            -ImbalancePerMille 1100 -ImbalanceOverGenerations 8 `
+            -RebalanceFixedNs 20000 -CopyNsPerId 5 -PendingIds 1000
+        if ($p.RebalancesAtAll) {
+            $p.RebalanceEvery | Should -BeGreaterThan 0
+        } else {
+            $p.RebalanceEvery | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'echoes the width it planned for' {
+        (Get-FlynnelWavePlan -Width 17 -BarrierNs 100 -GenerationNs 1000).Width | Should -Be 17
+    }
+
+    It 'refuses half an imbalance' {
+        # A ratio with no generation count would quietly become one
+        # generation, which prices a divergence as growing far faster
+        # than it was seen to.
+        { Get-FlynnelWavePlan -Width 32 -BarrierNs 100 -GenerationNs 1000 `
+            -ImbalancePerMille 1500 } | Should -Throw -ExpectedMessage '*both*'
+        { Get-FlynnelWavePlan -Width 32 -BarrierNs 100 -GenerationNs 1000 `
+            -ImbalanceOverGenerations 4 } | Should -Throw -ExpectedMessage '*both*'
+    }
+
+    It 'refuses an imbalance over no generations' {
+        { Get-FlynnelWavePlan -Width 32 -BarrierNs 100 -GenerationNs 1000 `
+            -ImbalancePerMille 1500 -ImbalanceOverGenerations 0 } |
+            Should -Throw -ExpectedMessage '*at least one*'
+    }
+
+    It 'refuses a width of zero and a cost that is not one' {
+        { Get-FlynnelWavePlan -Width 0 -BarrierNs 100 -GenerationNs 1000 } |
+            Should -Throw -ExpectedMessage '*above zero*'
+        { Get-FlynnelWavePlan -Width 8 -BarrierNs -1 -GenerationNs 1000 } |
+            Should -Throw -ExpectedMessage '*at or above zero*'
+    }
+}
+
 Describe 'Get-FlynnelPeerWatchdog where a device is readable' {
     It 'reports the model the device presents' {
         if (-not $script:HasCard) {
