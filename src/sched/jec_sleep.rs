@@ -379,25 +379,49 @@ fn rounds_until_sleeping() -> u32 {
 /// default, so a throughput workload never regresses and a bursty one
 /// reclaims the idle spin. Called only when a worker is about to park,
 /// off the hot path.
-fn maybe_adapt() {
-    if !ADAPTIVE.load(Ordering::Relaxed) {
-        return;
-    }
-    let park = PARK_EVENTS.load(Ordering::Relaxed);
-    let rescue = RESCUE_EVENTS.load(Ordering::Relaxed);
-    if park + rescue < 256 {
-        return;
-    }
-    ADAPT_DECISIONS.fetch_add(1, Ordering::Relaxed);
-    let cur = SPIN_WINDOW.load(Ordering::Relaxed);
-    let new = if park > rescue.saturating_mul(3) {
+/// Parks plus rescues a controller needs before it will move the
+/// window. Below it the sample is a moment of a workload rather than
+/// its shape.
+const EVIDENCE_FLOOR: u32 = 256;
+
+/// Whether a controller in this state has enough to decide on.
+///
+/// Split out from the wiring so it can be checked as arithmetic. The
+/// state it reads is process-global and every park writes to it, so a
+/// test driving those statics has to exclude every other test that
+/// dispatches; a test calling this does not.
+#[inline]
+fn should_adapt(adaptive: bool, park: u32, rescue: u32) -> bool {
+    adaptive && park.saturating_add(rescue) >= EVIDENCE_FLOOR
+}
+
+/// The window a controller moves to, given the one it holds and the
+/// evidence it has.
+///
+/// Parks dominating means the spin ran out before work arrived, so the
+/// window halves toward the floor. Rescues dominating means work
+/// landed inside the window and the spin saved a park and unpark pair,
+/// so it grows by a quarter, clamped to the tuned default.
+#[inline]
+fn adapted_window(cur: u32, park: u32, rescue: u32) -> u32 {
+    if park > rescue.saturating_mul(3) {
         (cur / 2).max(FLOOR_SPIN_WINDOW_ROUNDS)
     } else if rescue > park {
         (cur + cur / 4 + 1).min(DEFAULT_SPIN_WINDOW_ROUNDS)
     } else {
         cur
-    };
-    SPIN_WINDOW.store(new, Ordering::Relaxed);
+    }
+}
+
+fn maybe_adapt() {
+    let park = PARK_EVENTS.load(Ordering::Relaxed);
+    let rescue = RESCUE_EVENTS.load(Ordering::Relaxed);
+    if !should_adapt(ADAPTIVE.load(Ordering::Relaxed), park, rescue) {
+        return;
+    }
+    ADAPT_DECISIONS.fetch_add(1, Ordering::Relaxed);
+    let cur = SPIN_WINDOW.load(Ordering::Relaxed);
+    SPIN_WINDOW.store(adapted_window(cur, park, rescue), Ordering::Relaxed);
     PARK_EVENTS.store(0, Ordering::Relaxed);
     RESCUE_EVENTS.store(0, Ordering::Relaxed);
 }
@@ -893,124 +917,83 @@ impl Sleep {
 mod tests {
     use super::*;
 
-    /// Serializes the tests that drive the process-global controller.
-    ///
-    /// `SPIN_WINDOW`, `ADAPTIVE`, `PARK_EVENTS` and `RESCUE_EVENTS` are
-    /// process state and the harness runs tests on parallel threads, so
-    /// two of these interleaving read each other's stores.
-    ///
-    /// Measured over 4,500 runs of the lib suite on a Linux guest: the
-    /// controller tests account for 31 of 61 failing runs, the
-    /// commonest being a window asserted to have halved to 250 and
-    /// found still at 500, which is what `maybe_adapt` leaves when a
-    /// neighbour has stored `ADAPTIVE` false between the arm and the
-    /// adapt.
-    ///
-    /// A poisoned lock is taken anyway. Poison means another of these
-    /// tests panicked, which the harness already reports; refusing the
-    /// lock here would turn one failure into several and bury the
-    /// first.
-    static CONTROLLER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Put the controller in a known state and enable it, so a test
-    /// reads its response rather than whatever an earlier test left.
-    ///
-    /// Returns the guard rather than taking it internally and dropping
-    /// it, because the state has to stay this test's until the test is
-    /// done reading it. Holding it for the caller's scope is what makes
-    /// the arming mean anything, and returning it is what stops a
-    /// caller arming the controller without holding it.
-    #[must_use]
-    fn arm_controller(window: u32) -> std::sync::MutexGuard<'static, ()> {
-        let guard = CONTROLLER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        spin_init();
-        SPIN_WINDOW.store(window, Ordering::Relaxed);
-        ADAPTIVE.store(true, Ordering::Relaxed);
-        PARK_EVENTS.store(0, Ordering::Relaxed);
-        RESCUE_EVENTS.store(0, Ordering::Relaxed);
-        guard
-    }
+    // These drive `should_adapt` and `adapted_window` rather than the
+    // process-global statics those read in production. Every park
+    // writes PARK_EVENTS, so a test driving the statics has to exclude
+    // every other test that dispatches, and the only way to do that is
+    // a lock. Against the functions there is nothing to exclude: the
+    // arithmetic is the behavior, and two tests calling it at once
+    // cannot see each other.
 
     #[test]
     fn a_window_that_keeps_being_missed_shrinks_toward_the_floor() {
         // Parks dominating means the spin ran out before work arrived,
         // which on a contended host is a worker burning slices a
         // neighbour could have used.
-        let _controller = arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
-        PARK_EVENTS.store(300, Ordering::Relaxed);
-        RESCUE_EVENTS.store(4, Ordering::Relaxed);
-        maybe_adapt();
-        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS / 2);
+        let mut window = adapted_window(DEFAULT_SPIN_WINDOW_ROUNDS, 300, 4);
+        assert_eq!(window, DEFAULT_SPIN_WINDOW_ROUNDS / 2);
 
         for _ in 0..12 {
-            PARK_EVENTS.store(300, Ordering::Relaxed);
-            RESCUE_EVENTS.store(4, Ordering::Relaxed);
-            maybe_adapt();
+            window = adapted_window(window, 300, 4);
         }
-        assert_eq!(spin_window(), FLOOR_SPIN_WINDOW_ROUNDS);
+        assert_eq!(window, FLOOR_SPIN_WINDOW_ROUNDS);
     }
 
     #[test]
     fn a_window_that_keeps_paying_grows_back_but_never_past_the_tuned_default() {
         // Rescues dominating means work landed inside the window and the
         // spin saved a park and unpark pair.
-        let _controller = arm_controller(FLOOR_SPIN_WINDOW_ROUNDS);
+        let mut window = FLOOR_SPIN_WINDOW_ROUNDS;
         for _ in 0..64 {
-            PARK_EVENTS.store(4, Ordering::Relaxed);
-            RESCUE_EVENTS.store(300, Ordering::Relaxed);
-            maybe_adapt();
+            window = adapted_window(window, 4, 300);
         }
-        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
+        assert_eq!(window, DEFAULT_SPIN_WINDOW_ROUNDS);
     }
 
     #[test]
     fn one_burst_does_not_move_the_window() {
         // Below the evidence floor the controller has seen too little to
         // tell a workload's shape from a moment of it.
-        let _controller = arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
-        PARK_EVENTS.store(200, Ordering::Relaxed);
-        RESCUE_EVENTS.store(0, Ordering::Relaxed);
-        maybe_adapt();
-        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
+        assert!(!should_adapt(true, 200, 0), "200 parks is under the floor");
+        assert!(
+            should_adapt(true, 200, EVIDENCE_FLOOR - 200),
+            "the floor counts parks and rescues together"
+        );
     }
 
     #[test]
     fn a_held_window_tells_a_controller_that_ran_from_one_that_never_reached_the_gate() {
         // Rescues dominating grows the window and clamps it to the
-        // default it started from, so the window is unmoved and only the
-        // decision count says the controller ran. Compared as an
-        // inequality because the counter is process-wide and monotonic,
-        // so a concurrent test can raise it between the two readings.
-        let _controller = arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
-        let before = spin_adapt_decisions();
-        PARK_EVENTS.store(4, Ordering::Relaxed);
-        RESCUE_EVENTS.store(300, Ordering::Relaxed);
-        maybe_adapt();
-        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS, "clamped to where it began");
+        // default it started from, so the window comes back unmoved
+        // while the controller did decide. The two are told apart by
+        // asking whether it had the evidence to run, not by a counter:
+        // the counter is process-wide and monotonic, so any test that
+        // parks raises it between two readings.
         assert!(
-            spin_adapt_decisions() > before,
-            "a held window and a decided one differ only here"
+            should_adapt(true, 4, 300),
+            "this much evidence reaches the gate"
+        );
+        assert_eq!(
+            adapted_window(DEFAULT_SPIN_WINDOW_ROUNDS, 4, 300),
+            DEFAULT_SPIN_WINDOW_ROUNDS,
+            "clamped to where it began"
         );
     }
 
     #[test]
     fn the_controller_stays_still_while_it_is_off() {
         // Off is the shipped default, and the window it holds is the one
-        // tuned across three host classes.
-        // Armed through the same helper as the rest, then switched off,
-        // so this test holds the controller while it does that. Storing
-        // ADAPTIVE false without the guard is what made the other tests
-        // flaky: a neighbour between its arm and its adapt reads the
-        // controller as disabled and sees no adaptation at all.
-        let _controller = arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
-        ADAPTIVE.store(false, Ordering::Relaxed);
-        PARK_EVENTS.store(1_000, Ordering::Relaxed);
-        RESCUE_EVENTS.store(0, Ordering::Relaxed);
-        maybe_adapt();
-        assert_eq!(spin_window(), DEFAULT_SPIN_WINDOW_ROUNDS);
-        reset_spin_stats();
+        // tuned across three host classes. Asked of the gate rather
+        // than by storing ADAPTIVE false, which is a process-global
+        // write every other controller test would then read.
+        assert!(
+            !should_adapt(false, 1_000, 0),
+            "evidence past the floor still decides nothing while it is off"
+        );
+        assert!(
+            should_adapt(true, 1_000, 0),
+            "and the same evidence decides once it is on"
+        );
     }
 
     #[test]
