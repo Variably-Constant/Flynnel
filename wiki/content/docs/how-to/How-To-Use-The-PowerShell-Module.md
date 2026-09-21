@@ -123,6 +123,71 @@ $consumers = $all | Where-Object Role -eq Consumer
 
 Disposing a handle frees its ring. `Dispose` is the generated one and the garbage collector reaches it too, so a `try`/`finally` is the ordinary idiom and a forgotten handle is not a permanent leak.
 
+## Asking what this machine can do, before asking it to
+
+Four questions answer on any host, including one with no accelerator of any kind. Each is worth asking before the work rather than after it.
+
+```powershell
+# Which backends exist, which are reachable, and which this host's own
+# sweep found. Three separate columns, because they come apart.
+Get-FlynnelBackend | Select-Object Kind, Registered, Available, Detected
+
+# What bounds one piece of GPU work. On Windows this is the timeout
+# detection and recovery setting; Applies false means nothing bounds it.
+$w = Get-FlynnelPeerWatchdog
+if ($w.Applies) { "device work must finish inside $($w.DelaySeconds) s" }
+else            { "no watchdog: $($w.Basis)" }
+
+# Which cross-process deque a dispatch of this shape would use, and
+# whether a measurement or the fixed rule decided.
+Get-FlynnelCrossProcessRoute -ArgsInlineBytes 8 -NDrainThreads 4 -ExpectedBurstSize 32 |
+    Select-Object Variant, FromExplicitCell, HeuristicVariant, PayloadFits
+
+# How a wave should keep its frontier, from costs you measured.
+Get-FlynnelWavePlan -Width 32 -BarrierNs 4000 -GenerationNs 90000 |
+    Select-Object Frontier, RebalanceEvery, CostPerGenerationNs, GlobalCostNs
+```
+
+Every one of these is a decision or a reading, never a launch. The watchdog reading loads NVML once and caches it, because neither the hardware nor the driver configuration can change under a running process; the other three touch nothing outside this process.
+
+**A failed read is not an absent answer.** Where the watchdog's driver model or registry read fails, the documented delay is taken and `Basis` names which read failed. A watchdog that is present and treated as absent ends in a device reset; one treated as present only shortens slices.
+
+## Starting a GPU peer
+
+```powershell
+if (-not (Get-FlynnelBackend | Where-Object { $_.Kind -eq 'Cuda' -and $_.Available })) {
+    throw 'no CUDA driver on this host'
+}
+
+try {
+    $peer = New-FlynnelGpuPeer -Config (New-FlynnelGpuPeerConfig -Lanes 4 -VramBlocks 32)
+    if ($peer.TeamNarrowed) {
+        "asked for $($peer.BlocksPerLaneRequested) blocks a lane, ran $($peer.TeamSize)"
+    }
+    if ($peer.DisplacedForeignContext) {
+        'your own CUDA context was replaced by the device primary one'
+    }
+} finally {
+    Remove-FlynnelGpuPeer | Out-Null
+}
+```
+
+One peer per process: it owns the device context, the mapped region and the resident kernel, and a second start is refused rather than quietly contending. Teardown is a command and not a `Dispose`, because a handle the garbage collector releases would free a device context at a moment nothing chose.
+
+## Measuring where work should run
+
+The hybrid commands do not transform your data; `Invoke-FlynnelMap` does that, and on a host with no device it is faster at it, because it puts the whole pool on the work while a hybrid shape splits one call two ways. What the hybrid commands produce is the placement reading.
+
+```powershell
+# Which side this call site has learned to prefer at this size.
+1..20 | ForEach-Object { Measure-FlynnelHybridPlacement -Count 65536 -Operation Sqrt } |
+    Group-Object Placement | Select-Object Name, Count
+```
+
+The first call in a size bucket comes back `Race`: with nothing measured there is nothing to choose on, so both sides run and both are timed. Later calls in the same bucket run one side, and every thirty-second call races again so the model follows drift.
+
+On a host with no registered device the backend side is the CPU backend reached through a thread hand-off, so the model settles on `Cpu`. Every row carries `BackendIsCpu`, so a reading taken that way is never mistaken for a device measurement.
+
 ## Reading a number the module gives you
 
 Two conventions matter before quoting anything.
@@ -137,12 +202,12 @@ Two conventions matter before quoting anything.
 
 It never runs a PowerShell script block on a Flynnel worker.
 
-A script block runs only on the thread that owns the pipeline: the binding framework's pipeline token is `!Send`, and the managed side refuses a stream call reached from another thread. Work that runs on the pool is therefore work this module declares — the kernels over arrays, files and text, the accelerator ops, and the bodies the racing and hybrid commands take by name.
+A script block runs only on the thread that owns the pipeline: the binding framework's pipeline token is `!Send`, and the managed side refuses a stream call reached from another thread. Work that runs on the pool is therefore work this module declares: the kernels over arrays, files and text, the accelerator ops, and the bodies the racing and hybrid commands take by name.
 
-The adjacent rule is a contract rather than something the compiler enforces. `PsObject` is `Send + Sync` and its `get` and `pin` call the managed vtable on `&self`, so a `Send + Sync` closure *can* capture one and call it — and one such call attaches that worker to the runtime for the life of the process, making it a GC root suspended at safepoints. So: resolve every managed value before the parallel section and hand the closure plain Rust data.
+The adjacent rule is a contract rather than something the compiler enforces. `PsObject` is `Send + Sync` and its `get` and `pin` call the managed vtable on `&self`, so a `Send + Sync` closure *can* capture one and call it, and one such call attaches that worker to the runtime for the life of the process, making it a GC root suspended at safepoints. So: resolve every managed value before the parallel section and hand the closure plain Rust data.
 
 ## Where to look next
 
-- [PowerShell Module Reference](../reference/PowerShell-Module-Reference/) — every command by family, with its objects and enumerations.
-- [JobPlan Reference](../reference/JobPlan-Reference/) — what a plan carries and how it resolves.
-- [Environment Variables](../reference/Environment-Variables/) — the switches the scheduler reads at startup, including `FLYNNEL_SCHED_SMT_AS_IO` and `FLYNNEL_TRACE`.
+- [PowerShell Module Reference](../reference/PowerShell-Module-Reference/): every command by family, with its objects and enumerations.
+- [JobPlan Reference](../reference/JobPlan-Reference/): what a plan carries and how it resolves.
+- [Environment Variables](../reference/Environment-Variables/): the switches the scheduler reads at startup, including `FLYNNEL_SCHED_SMT_AS_IO` and `FLYNNEL_TRACE`.
