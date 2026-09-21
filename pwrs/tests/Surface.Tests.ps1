@@ -206,6 +206,52 @@ Describe 'help' {
         $bad.Count | Should -Be 0 -Because ("these parameters carry no description: " +
             ($bad -join ', '))
     }
+
+    It 'names only parameters that exist in every example' {
+        # The three checks above ask whether help is present. This one
+        # asks whether a piece of it is correct, which is the half a
+        # structural check cannot reach: an example naming a parameter
+        # the cmdlet does not take is wrong in the way a reader finds
+        # by running it.
+        #
+        # Read from the loaded module rather than from the Rust, so
+        # what is compared is what PowerShell actually exposes.
+        $common = [System.Management.Automation.PSCmdlet]::CommonParameters +
+            [System.Management.Automation.PSCmdlet]::OptionalCommonParameters
+        $bad = @()
+        foreach ($cmdlet in $script:Cmdlets) {
+            $declared = @((Get-Command $cmdlet.Name).Parameters.Keys)
+            $examples = @((Get-Help $cmdlet.Name -ErrorAction SilentlyContinue).Examples.Example)
+            foreach ($example in $examples) {
+                $code = "$($example.Code) $(($example.Remarks | ForEach-Object Text) -join ' ')"
+                # A parameter belongs to the command it follows, so the
+                # line is split at every separator and only the pieces
+                # invoking this cmdlet are read. Without that split,
+                # -Descending on a trailing Sort-Object is charged to
+                # the cmdlet at the head of the line, and a parameter
+                # of a nested call in parentheses to its caller.
+                foreach ($segment in ($code -split '[|;()]')) {
+                    $commands = [regex]::Matches($segment, '\b[A-Z][A-Za-z]*-[A-Za-z]+')
+                    if ($commands.Count -eq 0) { continue }
+                    if ($commands[0].Value -ne $cmdlet.Name) { continue }
+                    # Every Verb-Noun token goes first, or the noun half
+                    # of the command reads as a parameter of it. The
+                    # verb pattern allows camel case, because
+                    # ForEach-Object is a command and a lowercase-only
+                    # verb misses it and leaves -Object behind.
+                    $stripped = [regex]::Replace($segment, '\b[A-Z][A-Za-z]*-[A-Za-z]+', ' ')
+                    foreach ($used in [regex]::Matches($stripped, '-([A-Z][A-Za-z]+)\b')) {
+                        $name = $used.Groups[1].Value
+                        if ($common -contains $name) { continue }
+                        if ($declared -contains $name) { continue }
+                        $bad += "$($cmdlet.Name): -$name"
+                    }
+                }
+            }
+        }
+        $bad.Count | Should -Be 0 -Because ("these examples name a parameter the cmdlet " +
+            "does not take: " + ($bad -join ', '))
+    }
 }
 
 Describe 'every command is reached by a suite' {
