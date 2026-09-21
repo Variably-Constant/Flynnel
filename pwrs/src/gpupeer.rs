@@ -20,11 +20,14 @@
 //! a fact about the machine, not about a peer, so it is readable
 //! without one.
 
+use std::sync::Mutex;
+
 use pwrs::prelude::*;
 
 use flynnel::gpu_peer::wave::Frontier as CrateFrontier;
 use flynnel::gpu_peer::wave::plan::{Imbalance, PlanInputs, plan as plan_wave};
 use flynnel::gpu_peer::watchdog::{self, DriverModel as CrateDriverModel};
+use flynnel::gpu_peer::{GpuPeer, GpuPeerConfig, GpuPeerError};
 
 use crate::host::arg_err;
 
@@ -334,5 +337,519 @@ impl Cmdlet for GetFlynnelWavePlan {
             width: self.width,
             imbalance_supplied: imbalance.is_some(),
         })
+    }
+}
+
+// ---------------------------------------------------------------------
+// The peer's lifecycle
+// ---------------------------------------------------------------------
+
+/// The one peer this process holds.
+///
+/// One rather than a table, because a peer owns a device context, a
+/// mapped region and a resident kernel, and two of them on one device
+/// contend for all three. `Get-FlynnelGpuPeer` means the live one, and
+/// there is only ever a live one.
+static PEER: Mutex<Option<GpuPeer>> = Mutex::new(None);
+
+/// What the running peer was asked for, kept beside it so a clamped
+/// team width can be reported as a clamp rather than as the only
+/// number there is.
+static REQUESTED_BLOCKS: Mutex<u32> = Mutex::new(0);
+
+/// The peer slot.
+fn peer_slot() -> std::sync::MutexGuard<'static, Option<GpuPeer>> {
+    match PEER.lock() {
+        Ok(guard) => guard,
+        // Taken over rather than propagated, and that is a decision
+        // about this lock rather than an error going unread. The panic
+        // that poisoned it happened beside the peer, not inside it, so
+        // the peer is intact; refusing every later call would strand a
+        // device context with nothing able to release it.
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The requested team width, on the same terms as [`peer_slot`].
+fn requested_blocks() -> std::sync::MutexGuard<'static, u32> {
+    match REQUESTED_BLOCKS.lock() {
+        Ok(guard) => guard,
+        // A poisoned lock still holds the number some earlier call
+        // wrote, and that number is what this reports.
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// A peer error as an error record, with the category that matches what
+/// went wrong rather than one category for the family.
+fn peer_err(err: GpuPeerError) -> PsError {
+    let category = match &err {
+        GpuPeerError::NoDevice(_) | GpuPeerError::Unavailable(_) => ErrorCategory::DeviceError,
+        GpuPeerError::Driver(_) => ErrorCategory::NotSpecified,
+        GpuPeerError::Io(_) => ErrorCategory::WriteError,
+        GpuPeerError::PayloadTooLarge { .. } | GpuPeerError::ReapOutOfOrder { .. } => {
+            ErrorCategory::InvalidArgument
+        }
+        GpuPeerError::Timeout => ErrorCategory::OperationTimeout,
+    };
+    PsError::new(category, "FlynnelGpuPeer", err.to_string()).terminating()
+}
+
+/// What a peer is built from.
+#[psclass(name = "Flynnel.GpuPeerConfig")]
+#[derive(Clone)]
+pub struct PeerConfig {
+    /// Backing file for the shared region. Empty means a per-process
+    /// file in the temp directory, removed when the peer goes. A fixed
+    /// path is what makes the region attachable by another process.
+    pub region_path: String,
+    /// Lanes, each served by its own consumer.
+    pub lanes: u32,
+    /// Slot size in bytes, including the sixteen byte descriptor.
+    pub slot_bytes: u32,
+    /// Ring depth per lane.
+    pub slots_per_lane: u32,
+    /// How long one resident quantum runs before it exits. This is the
+    /// number the watchdog bounds, so Get-FlynnelPeerWatchdog is what
+    /// says whether a value is safe on this host.
+    pub quantum_ns: u64,
+    /// How long rank zero waits for the rest of its block team before
+    /// retiring the slot. Read only when BlocksPerLane is above one.
+    pub barrier_deadline_ns: u64,
+    /// Idle time after which a resident quantum parks.
+    pub idle_exit_ns: u64,
+    /// Which CUDA device.
+    pub device_ordinal: u32,
+    /// Bytes of device memory per resident block.
+    pub vram_block_bytes: u32,
+    /// Resident blocks. Zero disables the pool.
+    pub vram_blocks: u32,
+    /// Blocks serving each lane. One keeps a lane on a single
+    /// multiprocessor; above one a lane is worked by a team and a
+    /// single doorbell spreads across the device. The peer clamps this
+    /// to the device's multiprocessor count at init and reports the
+    /// size it actually ran.
+    pub blocks_per_lane: u32,
+    /// Blocks serving each lane individually, one entry per lane, for
+    /// a peer whose lanes run teams of different widths. Empty runs
+    /// every lane at BlocksPerLane.
+    pub lane_teams: Vec<u32>,
+}
+
+impl Default for PeerConfig {
+    fn default() -> Self {
+        // Taken from the crate's own default rather than restated, so
+        // the two cannot drift.
+        let d = GpuPeerConfig::default();
+        Self {
+            region_path: String::new(),
+            lanes: d.lanes,
+            slot_bytes: d.slot_bytes,
+            slots_per_lane: d.slots_per_lane,
+            quantum_ns: d.quantum_ns,
+            barrier_deadline_ns: d.barrier_deadline_ns,
+            idle_exit_ns: d.idle_exit_ns,
+            device_ordinal: d.device_ordinal as u32,
+            vram_block_bytes: d.vram_block_bytes,
+            vram_blocks: d.vram_blocks,
+            blocks_per_lane: d.blocks_per_lane,
+            lane_teams: d.lane_teams.clone(),
+        }
+    }
+}
+
+impl PeerConfig {
+    fn to_crate(&self) -> GpuPeerConfig {
+        GpuPeerConfig {
+            region_path: if self.region_path.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(&self.region_path))
+            },
+            lanes: self.lanes,
+            slot_bytes: self.slot_bytes,
+            slots_per_lane: self.slots_per_lane,
+            quantum_ns: self.quantum_ns,
+            barrier_deadline_ns: self.barrier_deadline_ns,
+            idle_exit_ns: self.idle_exit_ns,
+            device_ordinal: self.device_ordinal as usize,
+            vram_block_bytes: self.vram_block_bytes,
+            vram_blocks: self.vram_blocks,
+            blocks_per_lane: self.blocks_per_lane,
+            lane_teams: self.lane_teams.clone(),
+            // Deliberately not exposed. A user op is CUDA C source
+            // compiled by NVRTC at init, and handing a driver a source
+            // that came from a script is the boundary this module
+            // declines for bind_accel_kernel too. There is also
+            // exactly one flynnel_user_op hook per module, so a second
+            // source string would not be a second op.
+            user_ops_cuda: None,
+            user_ops_nvrtc_options: Vec::new(),
+        }
+    }
+}
+
+/// Builds the settings a peer is created from, starting at the crate's
+/// own defaults.
+///
+/// Every parameter is optional and an omitted one keeps the default, so
+/// a config differing in one field is one parameter rather than twelve.
+///
+/// There is no parameter for user-op source. A user op is CUDA C
+/// compiled by NVRTC when the peer starts, and this module does not
+/// hand a driver a source that came from a script; the same reasoning
+/// keeps Register cmdlets off the accelerator-op family.
+///
+/// # Examples
+///
+/// `New-FlynnelGpuPeerConfig`
+///
+/// `New-FlynnelGpuPeerConfig -Lanes 8 -VramBlocks 64 -VramBlockBytes 1048576`
+#[cmdlet(
+    verb = "New",
+    noun = "FlynnelGpuPeerConfig",
+    alias = "New-FlyGpuPeerConfig",
+    output = ["Flynnel.GpuPeerConfig"]
+)]
+#[derive(Default)]
+pub struct NewFlynnelGpuPeerConfig {
+    /// A fixed path for the region, so another process can attach it.
+    #[param]
+    pub region_path: Option<String>,
+    /// Lanes.
+    #[param]
+    pub lanes: Option<u32>,
+    /// Slot size in bytes.
+    #[param]
+    pub slot_bytes: Option<u32>,
+    /// Ring depth per lane.
+    #[param]
+    pub slots_per_lane: Option<u32>,
+    /// Resident quantum.
+    #[param]
+    pub quantum_ns: Option<u64>,
+    /// Team barrier deadline.
+    #[param]
+    pub barrier_deadline_ns: Option<u64>,
+    /// Idle time before a quantum parks.
+    #[param]
+    pub idle_exit_ns: Option<u64>,
+    /// CUDA device ordinal.
+    #[param]
+    pub device_ordinal: Option<u32>,
+    /// Bytes per resident block.
+    #[param]
+    pub vram_block_bytes: Option<u32>,
+    /// Resident blocks; zero disables the pool.
+    #[param]
+    pub vram_blocks: Option<u32>,
+    /// Blocks per lane.
+    #[param]
+    pub blocks_per_lane: Option<u32>,
+    /// Blocks per lane individually, one entry per lane.
+    #[param]
+    pub lane_teams: Option<Vec<u32>>,
+}
+
+impl Cmdlet for NewFlynnelGpuPeerConfig {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let mut c = PeerConfig::default();
+        if let Some(v) = self.region_path.take() {
+            c.region_path = v;
+        }
+        if let Some(v) = self.lanes {
+            c.lanes = v;
+        }
+        if let Some(v) = self.slot_bytes {
+            c.slot_bytes = v;
+        }
+        if let Some(v) = self.slots_per_lane {
+            c.slots_per_lane = v;
+        }
+        if let Some(v) = self.quantum_ns {
+            c.quantum_ns = v;
+        }
+        if let Some(v) = self.barrier_deadline_ns {
+            c.barrier_deadline_ns = v;
+        }
+        if let Some(v) = self.idle_exit_ns {
+            c.idle_exit_ns = v;
+        }
+        if let Some(v) = self.device_ordinal {
+            c.device_ordinal = v;
+        }
+        if let Some(v) = self.vram_block_bytes {
+            c.vram_block_bytes = v;
+        }
+        if let Some(v) = self.vram_blocks {
+            c.vram_blocks = v;
+        }
+        if let Some(v) = self.blocks_per_lane {
+            c.blocks_per_lane = v;
+        }
+        if let Some(v) = self.lane_teams.take() {
+            c.lane_teams = v;
+        }
+        if c.lanes == 0 {
+            return Err(arg_err("Lanes must be above zero").terminating());
+        }
+        // Refused here rather than at init, because init's refusal
+        // arrives after a device context has been made and torn down.
+        if !c.lane_teams.is_empty() && c.lane_teams.len() != c.lanes as usize {
+            return Err(arg_err(format!(
+                "LaneTeams has {} entries and Lanes is {}; a per-lane team width needs one \
+                 entry for every lane",
+                c.lane_teams.len(),
+                c.lanes
+            ))
+            .terminating());
+        }
+        ps.write(c)
+    }
+}
+
+/// The live peer, and what it measured about this host when it started.
+#[psclass(name = "Flynnel.GpuPeer")]
+#[derive(Clone, Default)]
+pub struct PeerRow {
+    /// Whether a peer is running in this process. False means every
+    /// other column is empty rather than describing one.
+    pub running: bool,
+    /// Lanes the region was built with.
+    pub lanes: u32,
+    /// Slot size in bytes.
+    pub slot_bytes: u32,
+    /// Ring depth per lane.
+    pub slots_per_lane: u32,
+    /// Blocks actually serving a lane, after the peer clamped the
+    /// requested width to the device's multiprocessor count. Below
+    /// BlocksPerLaneRequested means the clamp fired.
+    pub team_size: u32,
+    /// Blocks per lane the config asked for.
+    pub blocks_per_lane_requested: u32,
+    /// Whether the peer narrowed the team. A team wider than the
+    /// device loses ranks at its barrier, so the clamp is a correction
+    /// rather than a preference.
+    pub team_narrowed: bool,
+    /// Whether starting the peer replaced a CUDA context the caller
+    /// had built. The peer works on the device primary context, so a
+    /// consumer holding its own finds its launches on the primary one
+    /// after this.
+    pub displaced_foreign_context: bool,
+    /// Free blocks in the resident pool.
+    pub pool_free_blocks: u32,
+    /// Blocks in the resident pool. Zero means the pool is disabled,
+    /// which is a setting rather than an exhausted pool.
+    pub pool_total_blocks: u32,
+    /// Doorbell round trip, minimum observed at init.
+    pub rtt_min_ns: u64,
+    /// Doorbell round trip, median at init.
+    pub rtt_median_ns: u64,
+    /// Doorbell round trip, 99th percentile at init.
+    pub rtt_p99_ns: u64,
+    /// One-way visibility bound.
+    pub one_way_ns: u64,
+    /// Cross-device clock alignment error.
+    pub clock_err_ns: u64,
+    /// The timed-lock margin the self-test actually validated.
+    pub delta_ns: u64,
+    /// Kernel launch and synchronize baseline, median at init.
+    pub launch_ns: u64,
+    /// Whether the doorbell handshake completed and was measured.
+    pub doorbell_ok: bool,
+    /// Whether the timed-lock self-test passed with no violations.
+    pub timed_lock_ok: bool,
+    /// Whether cross-device compare-and-swap conserved claims, which
+    /// only a coherent link gives.
+    pub sys_atomics_ok: bool,
+    /// Contended rounds the CPU side saw in the granting self-test, of
+    /// 150. The evidence behind TimedLockOk: a pass with no contention
+    /// tested nothing.
+    pub lock_cpu_contended: u32,
+    /// Contended rounds the GPU side saw, of 150.
+    pub lock_gpu_contended: u32,
+}
+
+/// The row for a live peer, or the empty row when there is none.
+fn peer_row(slot: &Option<GpuPeer>, requested: u32) -> PeerRow {
+    let Some(peer) = slot else {
+        return PeerRow::default();
+    };
+    let g = peer.geometry();
+    let c = peer.calibration();
+    let (free, total) = peer.pool_stats();
+    let team = peer.team_size();
+    PeerRow {
+        running: true,
+        lanes: g.lanes,
+        slot_bytes: g.slot_bytes,
+        slots_per_lane: g.slots_per_lane,
+        team_size: team,
+        blocks_per_lane_requested: requested,
+        team_narrowed: requested > 0 && team < requested,
+        displaced_foreign_context: peer.displaced_foreign_context(),
+        pool_free_blocks: free as u32,
+        pool_total_blocks: total,
+        rtt_min_ns: c.rtt_min_ns,
+        rtt_median_ns: c.rtt_median_ns,
+        rtt_p99_ns: c.rtt_p99_ns,
+        one_way_ns: c.one_way_ns,
+        clock_err_ns: c.clock_err_ns,
+        delta_ns: c.delta_ns,
+        launch_ns: c.launch_ns,
+        doorbell_ok: c.doorbell_ok,
+        timed_lock_ok: c.timed_lock_ok,
+        sys_atomics_ok: c.sys_atomics_ok,
+        lock_cpu_contended: c.lock_cpu_contended,
+        lock_gpu_contended: c.lock_gpu_contended,
+    }
+}
+
+/// Reads the peer this process is running, or says there is none.
+///
+/// Running false is a row, never an absent one: a script asking whether
+/// a peer exists has to get an answer it can branch on.
+///
+/// Every timing column was measured when the peer started and is not
+/// re-measured by this call. They describe the host as it was at init:
+/// the doorbell round trip, the cross-device clock error, the
+/// timed-lock margin the self-test validated, and the launch baseline.
+///
+/// # Examples
+///
+/// `Get-FlynnelGpuPeer`
+///
+/// `if ((Get-FlynnelGpuPeer).Running) { Submit-FlynnelGpuOp ... }`
+#[cmdlet(
+    verb = "Get",
+    noun = "FlynnelGpuPeer",
+    alias = "Get-FlyGpuPeer",
+    output = ["Flynnel.GpuPeer"]
+)]
+#[derive(Default)]
+pub struct GetFlynnelGpuPeer {}
+
+impl Cmdlet for GetFlynnelGpuPeer {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let requested = *requested_blocks();
+        let slot = peer_slot();
+        ps.write(peer_row(&slot, requested))
+    }
+}
+
+/// Starts the GPU peer: maps the shared region, registers it with the
+/// driver, launches the resident poller and calibrates this host.
+///
+/// One peer per process. A peer owns a device context, a mapped region
+/// and a resident kernel, and a second one on the same device would
+/// contend for all three, so a call made while one is running is
+/// refused and says so. Remove-FlynnelGpuPeer tears the running one
+/// down first.
+///
+/// A host with no loadable CUDA driver is refused before anything is
+/// created. That order matters: the check is made against the driver's
+/// own loadability rather than by attempting the call and catching
+/// what comes back, because the failing shape this family has already
+/// had once was a CUDA entry point reached before the driver was known
+/// to be there.
+///
+/// Starting a peer makes the device primary context current on the
+/// calling thread. A consumer that built its own context finds its
+/// later launches on the primary one instead, and the row says so
+/// through DisplacedForeignContext rather than leaving it to be
+/// discovered at a launch far from the cause.
+///
+/// The team width is clamped to the device's multiprocessor count,
+/// because a team wider than the device loses ranks at its barrier.
+/// TeamSize is what ran and TeamNarrowed says whether the clamp fired.
+///
+/// # Examples
+///
+/// `New-FlynnelGpuPeer`
+///
+/// `New-FlynnelGpuPeer -Config (New-FlynnelGpuPeerConfig -Lanes 8)`
+#[cmdlet(
+    verb = "New",
+    noun = "FlynnelGpuPeer",
+    alias = "New-FlyGpuPeer",
+    output = ["Flynnel.GpuPeer"]
+)]
+#[derive(Default)]
+pub struct NewFlynnelGpuPeer {
+    /// The settings to start with. The defaults when unset.
+    #[param(position = 0)]
+    pub config: Option<PeerConfig>,
+}
+
+impl Cmdlet for NewFlynnelGpuPeer {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let mut slot = peer_slot();
+        if slot.is_some() {
+            return Err(PsError::new(
+                ErrorCategory::ResourceExists,
+                "FlynnelGpuPeer",
+                "a GPU peer is already running in this process; Remove-FlynnelGpuPeer tears \
+                 it down first. One peer owns the device context, the mapped region and the \
+                 resident kernel, and a second would contend for all three",
+            )
+            .terminating());
+        }
+        if !flynnel::backend::detect::cuda_available() {
+            return Err(PsError::new(
+                ErrorCategory::DeviceError,
+                "FlynnelGpuPeer",
+                "no loadable CUDA driver on this host, so there is no device for a peer to \
+                 join. Get-FlynnelBackend reports what this host has",
+            )
+            .terminating());
+        }
+        let config = match self.config.take() {
+            Some(c) => c,
+            None => PeerConfig::default(),
+        };
+        let requested = config.blocks_per_lane;
+        let peer = GpuPeer::init(config.to_crate()).map_err(peer_err)?;
+        *requested_blocks() = requested;
+        *slot = Some(peer);
+        ps.write(peer_row(&slot, requested))
+    }
+}
+
+/// Tears the running peer down: stops the poller, unregisters the
+/// region and releases the device memory, now rather than whenever the
+/// process ends.
+///
+/// This is the deterministic teardown, and it is a cmdlet rather than a
+/// Dispose on a handle because the peer is one per process. A handle
+/// released by the garbage collector would free a device context at a
+/// moment nothing chose.
+///
+/// Removing when nothing is running is not an error. It writes false
+/// and warns, so a cleanup block does not have to ask first.
+///
+/// # Examples
+///
+/// `Remove-FlynnelGpuPeer`
+#[cmdlet(
+    verb = "Remove",
+    noun = "FlynnelGpuPeer",
+    alias = "Remove-FlyGpuPeer",
+    output = ["System.Boolean"]
+)]
+#[derive(Default)]
+pub struct RemoveFlynnelGpuPeer {}
+
+impl Cmdlet for RemoveFlynnelGpuPeer {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let mut slot = peer_slot();
+        let had = slot.is_some();
+        // Dropped inside the lock, so a second Remove cannot find the
+        // slot empty while this teardown is still running.
+        *slot = None;
+        *requested_blocks() = 0;
+        if !had {
+            pwrs::warning!(ps, "no GPU peer was running, so nothing was torn down")?;
+        }
+        ps.write(had)
     }
 }

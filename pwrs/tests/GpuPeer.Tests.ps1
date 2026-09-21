@@ -250,6 +250,146 @@ Describe 'Get-FlynnelWavePlan' {
     }
 }
 
+Describe 'New-FlynnelGpuPeerConfig' {
+    # A plain settings object, so every assertion holds on any host.
+
+    It 'starts from the crate defaults' {
+        $c = New-FlynnelGpuPeerConfig
+        $c.Lanes | Should -BeGreaterThan 0
+        $c.SlotBytes | Should -BeGreaterThan 0
+        $c.SlotsPerLane | Should -BeGreaterThan 0
+        $c.QuantumNs | Should -BeGreaterThan 0
+    }
+
+    It 'changes only what it was given' {
+        $d = New-FlynnelGpuPeerConfig
+        $c = New-FlynnelGpuPeerConfig -Lanes 8
+        $c.Lanes | Should -Be 8
+        $c.SlotBytes | Should -Be $d.SlotBytes
+        $c.QuantumNs | Should -Be $d.QuantumNs
+    }
+
+    It 'leaves the region path empty unless one is given' {
+        # Empty is a per-process file removed when the peer goes. A
+        # fixed path is what makes the region attachable by another
+        # process, so the two are different intentions.
+        (New-FlynnelGpuPeerConfig).RegionPath | Should -BeNullOrEmpty
+        (New-FlynnelGpuPeerConfig -RegionPath 'C:\Temp\peer.bin').RegionPath |
+            Should -Be 'C:\Temp\peer.bin'
+    }
+
+    It 'refuses a per-lane team list that does not cover every lane' {
+        # Caught here rather than at init, because init's refusal
+        # arrives after a device context has been made and torn down.
+        { New-FlynnelGpuPeerConfig -Lanes 4 -LaneTeams @(1, 2) } |
+            Should -Throw -ExpectedMessage '*every lane*'
+    }
+
+    It 'accepts a per-lane team list that covers every lane' {
+        (New-FlynnelGpuPeerConfig -Lanes 3 -LaneTeams @(1, 2, 4)).LaneTeams.Count |
+            Should -Be 3
+    }
+
+    It 'refuses no lanes at all' {
+        { New-FlynnelGpuPeerConfig -Lanes 0 } | Should -Throw -ExpectedMessage '*above zero*'
+    }
+
+    It 'has no parameter for user-op source' {
+        # The boundary this module does not open: CUDA C from a script,
+        # compiled by NVRTC when the peer starts. A parameter appearing
+        # here later would be that door opening by accident.
+        $names = (Get-Command New-FlynnelGpuPeerConfig).Parameters.Keys
+        $names | Should -Not -Contain 'UserOpsCuda'
+        $names | Should -Not -Contain 'UserOpsNvrtcOptions'
+    }
+}
+
+Describe 'the peer lifecycle' {
+    It 'says no peer is running before one is started' {
+        # A row, not an absent one: a script asking whether a peer
+        # exists has to get something it can branch on.
+        $p = Get-FlynnelGpuPeer
+        $p | Should -Not -BeNullOrEmpty
+        $p.Running | Should -BeFalse
+    }
+
+    It 'refuses to start without a loadable CUDA driver, and says so' {
+        # The refusal path, and the one every deviceless host proves.
+        # It has to be a clear error rather than a panic, and it has to
+        # come from checking the driver's loadability rather than from
+        # calling into the driver and catching what comes back.
+        $cuda = Get-FlynnelBackend | Where-Object { $_.Kind -eq 'Cuda' -and $_.Available }
+        if ($cuda) {
+            Set-ItResult -Skipped -Because 'this host has a loadable CUDA driver'
+            return
+        }
+        { New-FlynnelGpuPeer } | Should -Throw -ExpectedMessage '*no loadable CUDA driver*'
+    }
+
+    It 'leaves nothing running after a refused start' {
+        $cuda = Get-FlynnelBackend | Where-Object { $_.Kind -eq 'Cuda' -and $_.Available }
+        if ($cuda) {
+            Set-ItResult -Skipped -Because 'this host has a loadable CUDA driver'
+            return
+        }
+        try { New-FlynnelGpuPeer } catch { }
+        (Get-FlynnelGpuPeer).Running | Should -BeFalse
+    }
+
+    It 'removing nothing is not an error' {
+        # So a cleanup block does not have to ask first.
+        $r = Remove-FlynnelGpuPeer -WarningAction SilentlyContinue
+        $r | Should -BeFalse
+    }
+
+    It 'warns when there was nothing to remove' {
+        Remove-FlynnelGpuPeer -WarningVariable warned | Out-Null
+        @($warned).Count | Should -BeGreaterThan 0
+    }
+
+    It 'starts, reports and tears down on a host with a device' {
+        $cuda = Get-FlynnelBackend | Where-Object { $_.Kind -eq 'Cuda' -and $_.Available }
+        if (-not $cuda) {
+            Set-ItResult -Skipped -Because 'no loadable CUDA driver on this host'
+            return
+        }
+        try {
+            $p = New-FlynnelGpuPeer -Config (New-FlynnelGpuPeerConfig -Lanes 2)
+            $p.Running | Should -BeTrue
+            $p.Lanes | Should -Be 2
+            $p.TeamSize | Should -BeGreaterThan 0
+            (Get-FlynnelGpuPeer).Running | Should -BeTrue
+
+            # A second peer would contend for the context, the region
+            # and the resident kernel, so it is refused rather than
+            # quietly made.
+            { New-FlynnelGpuPeer } | Should -Throw -ExpectedMessage '*already running*'
+        } finally {
+            Remove-FlynnelGpuPeer -WarningAction SilentlyContinue | Out-Null
+        }
+        (Get-FlynnelGpuPeer).Running | Should -BeFalse
+    }
+
+    It 'narrows a team wider than the device and says it did' {
+        $cuda = Get-FlynnelBackend | Where-Object { $_.Kind -eq 'Cuda' -and $_.Available }
+        if (-not $cuda) {
+            Set-ItResult -Skipped -Because 'no loadable CUDA driver on this host'
+            return
+        }
+        try {
+            # Far wider than any device, so the clamp has to fire and
+            # the row has to report it rather than only reporting the
+            # size that ran.
+            $p = New-FlynnelGpuPeer -Config (New-FlynnelGpuPeerConfig -Lanes 1 -BlocksPerLane 4096)
+            $p.BlocksPerLaneRequested | Should -Be 4096
+            $p.TeamSize | Should -BeLessThan 4096
+            $p.TeamNarrowed | Should -BeTrue
+        } finally {
+            Remove-FlynnelGpuPeer -WarningAction SilentlyContinue | Out-Null
+        }
+    }
+}
+
 Describe 'Get-FlynnelPeerWatchdog where a device is readable' {
     It 'reports the model the device presents' {
         if (-not $script:HasCard) {

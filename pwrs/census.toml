@@ -1174,6 +1174,16 @@ reason = "internal-to-another-surface"
 note = "the Fischer timed lock: cross-device mutual exclusion from plain stores and a measured visibility bound, with the GPU contender in kernels/gpu_peer.cu. Its margin is calibrated at peer init and validated by a live contention self-test, which is a figure a caller reads rather than a lock a caller takes"
 
 [[entry]]
+item = "crate::gpu_peer::GpuPeerConfig"
+reason = "internal-to-another-surface"
+note = "bound as Flynnel.GpuPeerConfig, built by New-FlynnelGpuPeerConfig with one optional parameter per field. Two fields are deliberately absent: user_ops_cuda is CUDA C compiled by NVRTC when the peer starts, and this module does not hand a driver a source that came from a script, the same boundary bind_accel_kernel is declined at. There is also one flynnel_user_op hook per module, so a second source string would not be a second op"
+
+[[entry]]
+item = "crate::gpu_peer::GpuPeerError"
+reason = "internal-to-another-surface"
+note = "each variant reaches a script as an error record's category and message under the id FlynnelGpuPeer: NoDevice and Unavailable as DeviceError, Io as WriteError, PayloadTooLarge and ReapOutOfOrder as InvalidArgument, Timeout as OperationTimeout"
+
+[[entry]]
 item = "crate::gpu_peer::wave::plan"
 reason = "internal-to-another-surface"
 note = "the frontier cost model, bound as Get-FlynnelWavePlan. PlanInputs becomes the cmdlet's parameters and Plan becomes Flynnel.WavePlan, with Frontier exported as Flynnel.Frontier. It is a pure function over costs the caller supplies, so it answers on a host with no device"

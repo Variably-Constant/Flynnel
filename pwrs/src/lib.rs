@@ -140,6 +140,10 @@ pwrs::export_module! {
         hybrid::MeasureFlynnelHybridPipeline,
         gpupeer::GetFlynnelPeerWatchdog,
         gpupeer::GetFlynnelWavePlan,
+        gpupeer::NewFlynnelGpuPeerConfig,
+        gpupeer::NewFlynnelGpuPeer,
+        gpupeer::GetFlynnelGpuPeer,
+        gpupeer::RemoveFlynnelGpuPeer,
     ],
     classes: [
         host::CpuInfo,
@@ -213,6 +217,8 @@ pwrs::export_module! {
         hybrid::HybridPipelineRun,
         gpupeer::PeerWatchdog,
         gpupeer::WavePlan,
+        gpupeer::PeerConfig,
+        gpupeer::PeerRow,
     ],
     enums: [
         host::Vendor,
