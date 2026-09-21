@@ -69,6 +69,9 @@ pub struct HazardDomain<T, const READERS: usize, const RETIRED: usize> {
 }
 
 impl<T, const READERS: usize, const RETIRED: usize> HazardDomain<T, READERS, RETIRED> {
+    /// An empty domain, with no reader slots handed out and nothing
+    /// retired. Const so a domain can be a `static` beside the table
+    /// it protects.
     pub const fn new() -> Self {
         Self {
             published: [const { AtomicPtr::new(core::ptr::null_mut()) }; READERS],
