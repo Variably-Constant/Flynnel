@@ -34,8 +34,14 @@ BeforeAll {
 
     # Every exported type, so the class and enum checks read the
     # assembly rather than a list.
+    #
+    # The generated shell carries a build-identity suffix, so the name
+    # is Flynnel.Shell.<hash>. Matching it exactly left Exported empty
+    # and every class and enum check in this file passed over nothing,
+    # which is the shape those checks exist to catch.
     $script:Shell = [AppDomain]::CurrentDomain.GetAssemblies() |
-        Where-Object { $_.GetName().Name -eq 'Flynnel.Shell' } |
+        Where-Object { $_.GetName().Name -eq 'Flynnel.Shell' -or
+                       $_.GetName().Name -like 'Flynnel.Shell.*' } |
         Select-Object -First 1
     $script:Exported = if ($script:Shell) { $script:Shell.GetExportedTypes() } else { @() }
 }

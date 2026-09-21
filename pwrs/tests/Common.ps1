@@ -55,11 +55,27 @@ function Test-FlynnelMultiNode {
 # primitive.
 function Get-FlynnelTypeProperty {
     param([Parameter(Mandatory)][string]$TypeName)
+    # The generated shell carries a build-identity suffix, so its
+    # assembly is Flynnel.Shell.<hash> rather than Flynnel.Shell. An
+    # exact match passed only while the build happened not to add one,
+    # and then failed every type check in every suite at once with a
+    # message naming nothing.
     $shell = [AppDomain]::CurrentDomain.GetAssemblies() |
-        Where-Object { $_.GetName().Name -eq 'Flynnel.Shell' } |
+        Where-Object { $_.GetName().Name -eq 'Flynnel.Shell' -or
+                       $_.GetName().Name -like 'Flynnel.Shell.*' } |
         Select-Object -First 1
-    if (-not $shell) { throw 'the Flynnel.Shell assembly is not loaded' }
+    if (-not $shell) {
+        # Name what is loaded. A bare "not loaded" sends a reader
+        # looking for a module that failed to import, when what
+        # actually happened is that the assembly is there under a name
+        # this did not expect.
+        $loaded = @([AppDomain]::CurrentDomain.GetAssemblies() |
+            ForEach-Object { $_.GetName().Name } |
+            Where-Object { $_ -like '*Flynnel*' })
+        $seen = if ($loaded) { $loaded -join ', ' } else { 'none' }
+        throw "no Flynnel.Shell assembly is loaded; Flynnel assemblies present: $seen"
+    }
     $type = $shell.GetExportedTypes() | Where-Object FullName -eq $TypeName
-    if (-not $type) { throw "no exported type named $TypeName" }
+    if (-not $type) { throw "no exported type named $TypeName in $($shell.GetName().Name)" }
     $type.GetProperties()
 }
