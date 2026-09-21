@@ -72,6 +72,7 @@ pub mod calibration_store;
 #[cfg(feature = "verify-chain")]
 pub mod verify_chain;
 pub mod split_observer;
+pub mod hazard;
 pub mod prefetch;
 /// The mutex-backed alternative to the Chase-Lev deque, kept for the
 /// measurement that rejected it and compiled only under test so that

@@ -16,8 +16,11 @@
 //! and use the resulting value as both the registry key and the
 //! wire id; [`hash_name`] provides an FNV-1a hash for that purpose.
 
-use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::sched::hazard::HazardDomain;
 
 /// One unit of work that can be sent across the ring: a
 /// closure-identifier plus its already-serialized argument blob.
@@ -61,11 +64,166 @@ impl std::error::Error for PassError {}
 
 /// Handler shape: takes raw arg bytes, returns either raw response
 /// bytes or a structured error.
-pub type PassHandler = Box<dyn Fn(&[u8]) -> PassResult + Send + Sync + 'static>;
+/// Shared rather than owned so that a handler handed back by
+/// [`register`] or [`unregister`] stays callable while a peer is
+/// still executing through the copy the table held.
+pub type PassHandler = Arc<dyn Fn(&[u8]) -> PassResult + Send + Sync + 'static>;
 
-fn registry() -> &'static RwLock<HashMap<u32, PassHandler>> {
-    static CACHE: OnceLock<RwLock<HashMap<u32, PassHandler>>> = OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+/// Slot count of the handler table.
+///
+/// Slots are RECYCLED, which is what makes a fixed size right here.
+/// Handler ids churn: `dispatch_calibration` registers under a
+/// nanosecond nonce and unregisters, a fresh id per measurement, so a
+/// table that only ever claimed slots would fill and start refusing
+/// registrations. What bounds the table is the number of handlers
+/// live at once, which is a handful.
+const SLOTS: usize = 256;
+const MASK: usize = SLOTS - 1;
+
+/// Threads that may execute a pass. One slot each, claimed on first
+/// execute and never returned.
+const READERS: usize = 256;
+
+/// Replaced handlers awaiting a sweep. Only one per live handler can
+/// be outstanding at a time, so this is far above what the churn
+/// needs.
+const RETIRED: usize = 256;
+
+/// A slot's identity and whether a handler is installed, in one word
+/// so that claiming, tombstoning and re-keying are each a single
+/// compare-exchange.
+///
+/// Zero means never used. Otherwise the low bits are `id + 1` and
+/// [`LIVE`] says whether a handler is installed. A removal keeps the
+/// key and clears `LIVE`, so the probe chain is never broken, and a
+/// slot in that state can be re-keyed for a different id, which is
+/// what stops the table filling.
+/// A handler is installed and reachable.
+const LIVE: u64 = 1 << 40;
+/// A registrar owns this slot and is about to install one. Distinct
+/// from a tombstone because a tombstone may be re-keyed and a slot
+/// someone is mid-registration on may not.
+const RESERVED: u64 = 1 << 41;
+/// The `id + 1` a slot is keyed to, with both flags removed.
+const KEY_MASK: u64 = !(LIVE | RESERVED);
+
+struct Slot {
+    state: AtomicU64,
+    handler: AtomicPtr<PassHandler>,
+}
+
+static TABLE: [Slot; SLOTS] = [const {
+    Slot {
+        state: AtomicU64::new(0),
+        handler: AtomicPtr::new(core::ptr::null_mut()),
+    }
+}; SLOTS];
+
+static DOMAIN: HazardDomain<PassHandler, READERS, RETIRED> = HazardDomain::new();
+
+fn key_of(id: u32) -> u64 {
+    id as u64 + 1
+}
+
+fn reader_slot() -> usize {
+    thread_local! {
+        static READER: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+    READER.with(|cell| {
+        let held = cell.get();
+        if held != usize::MAX {
+            return held;
+        }
+        let fresh = DOMAIN.claim_reader();
+        cell.set(fresh);
+        fresh
+    })
+}
+
+/// The slot currently holding `id` live, if any.
+fn find_live(id: u32) -> Option<&'static Slot> {
+    let key = key_of(id);
+    let mut idx = (id as usize) & MASK;
+    for _ in 0..SLOTS {
+        let state = TABLE[idx].state.load(Ordering::Acquire);
+        if state == 0 {
+            return None;
+        }
+        if state == key | LIVE {
+            return Some(&TABLE[idx]);
+        }
+        idx = (idx + 1) & MASK;
+    }
+    None
+}
+
+/// Install `fresh` under `id` and answer what it displaced.
+///
+/// A slot already keyed to `id` is reused whether or not it is live.
+/// Otherwise the first slot that is untouched, or tombstoned under
+/// some other id, is claimed by a compare-exchange on its state word,
+/// so exactly one registrar wins it.
+fn install(id: u32, fresh: *mut PassHandler) -> Option<PassHandler> {
+    let key = key_of(id);
+    let slot = claim(id, key);
+    // The slot is ours before any handler is written, so nothing can
+    // re-key it underneath this and no other registrar can be writing
+    // the same slot for a different id.
+    let previous = slot.handler.swap(fresh, Ordering::AcqRel);
+    slot.state.store(key | LIVE, Ordering::Release);
+    displace(previous)
+}
+
+/// The slot this id owns, claiming one if it does not own one yet.
+///
+/// A slot is takeable only when it has never been used or is a bare
+/// tombstone, and the take is a compare-exchange on the whole state
+/// word, so exactly one registrar wins it. A tombstone stays occupied
+/// through the change, so re-keying never cuts a probe chain: a
+/// lookup that walks past a re-keyed slot is looking for an id that
+/// is genuinely absent from it.
+fn claim(id: u32, key: u64) -> &'static Slot {
+    let mut idx = (id as usize) & MASK;
+    for _ in 0..(SLOTS * 2) {
+        let slot = &TABLE[idx];
+        let state = slot.state.load(Ordering::Acquire);
+        if state & KEY_MASK == key && state & (LIVE | RESERVED) != 0 {
+            // Already ours and not a bare tombstone, so it cannot be
+            // taken from under us. A concurrent registrar of the SAME
+            // id may be here too; the later handler wins, which is
+            // what re-registration means.
+            return slot;
+        }
+        if state == 0 || state & (LIVE | RESERVED) == 0 {
+            if slot
+                .state
+                .compare_exchange(state, key | RESERVED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return slot;
+            }
+            // Lost the race for this slot; read it again rather than
+            // moving on, because it may now be ours.
+            continue;
+        }
+        idx = (idx + 1) & MASK;
+    }
+    panic!("pass registry full at {SLOTS} live handlers; id {id} could not be registered");
+}
+
+/// Hand back a copy of what a slot held and retire the table's own.
+fn displace(previous: *mut PassHandler) -> Option<PassHandler> {
+    if previous.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null handler pointer in the table came from
+    // Box::into_raw and is not freed until a sweep proves no reader
+    // holds it, and this read happens before that retire.
+    let handed_back = unsafe { &*previous }.clone();
+    // SAFETY: the swap above removed it from the only source a reader
+    // can reach, and it is retired exactly once.
+    unsafe { DOMAIN.retire(previous) };
+    Some(handed_back)
 }
 
 /// Register `handler` under `id`. Returns the previous handler if
@@ -76,37 +234,82 @@ pub fn register<F>(id: u32, handler: F) -> Option<PassHandler>
 where
     F: Fn(&[u8]) -> PassResult + Send + Sync + 'static,
 {
-    let mut g = registry().write().expect("pass_registry write lock poisoned");
-    g.insert(id, Box::new(handler))
+    let shared: PassHandler = Arc::new(handler);
+    install(id, Box::into_raw(Box::new(shared)))
 }
 
 /// Unregister `id`; returns the previously-registered handler if any.
 pub fn unregister(id: u32) -> Option<PassHandler> {
-    let mut g = registry().write().expect("pass_registry write lock poisoned");
-    g.remove(&id)
+    let key = key_of(id);
+    let mut idx = (id as usize) & MASK;
+    for _ in 0..SLOTS {
+        let slot = &TABLE[idx];
+        let state = slot.state.load(Ordering::Acquire);
+        if state == 0 {
+            return None;
+        }
+        if state == key | LIVE
+            && slot
+                .state
+                .compare_exchange(key | LIVE, key, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let removed = slot.handler.swap(core::ptr::null_mut(), Ordering::AcqRel);
+            return displace(removed);
+        }
+        idx = (idx + 1) & MASK;
+    }
+    None
 }
 
 /// True when `id` has a handler registered in the current process.
 pub fn is_registered(id: u32) -> bool {
-    let g = registry().read().expect("pass_registry read lock poisoned");
-    g.contains_key(&id)
+    find_live(id).is_some()
 }
 
 /// Number of handlers registered in the current process.
+///
+/// A registration landing in a slot the walk has passed is not in the
+/// count, so this is the number live at some point during the walk
+/// rather than at an instant.
 pub fn registered_count() -> usize {
-    let g = registry().read().expect("pass_registry read lock poisoned");
-    g.len()
+    TABLE
+        .iter()
+        .filter(|slot| slot.state.load(Ordering::Acquire) & LIVE != 0)
+        .count()
 }
 
 /// Execute `pass` against the locally-registered handler. Returns
 /// [`PassError::UnknownClosureId`] when no handler is registered
 /// under `pass.closure_id`.
 pub fn execute(pass: &Pass) -> PassResult {
-    let g = registry().read().expect("pass_registry read lock poisoned");
-    match g.get(&pass.closure_id) {
-        Some(handler) => handler(&pass.args),
-        None => Err(PassError::UnknownClosureId(pass.closure_id)),
+    let id = pass.closure_id;
+    let key = key_of(id);
+    let reader = reader_slot();
+    let mut idx = (id as usize) & MASK;
+    for _ in 0..SLOTS {
+        let slot = &TABLE[idx];
+        let state = slot.state.load(Ordering::Acquire);
+        if state == 0 {
+            break;
+        }
+        if state == key | LIVE {
+            let guard = DOMAIN.protect(reader, &slot.handler);
+            // The slot could have been removed or re-keyed between the
+            // state read and the protect, so the state is confirmed
+            // again now that the handler cannot be freed. Without this
+            // a re-keyed slot would run another id's handler.
+            if slot.state.load(Ordering::Acquire) != key | LIVE {
+                break;
+            }
+            if let Some(handler) = guard.get() {
+                return (**handler)(&pass.args);
+            }
+            break;
+        }
+        idx = (idx + 1) & MASK;
     }
+    Err(PassError::UnknownClosureId(id))
 }
 
 /// Deterministic 32-bit hash of a stable string name. FNV-1a 32-bit
