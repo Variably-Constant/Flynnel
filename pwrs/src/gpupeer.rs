@@ -24,6 +24,9 @@ use std::sync::Mutex;
 
 use pwrs::prelude::*;
 
+use flynnel::gpu_peer::linalg::{
+    self, JacobiShape as CrateJacobiShape, LinalgMethod as CrateLinalgMethod,
+};
 use flynnel::gpu_peer::wave::Frontier as CrateFrontier;
 use flynnel::gpu_peer::wave::plan::{Imbalance, PlanInputs, plan as plan_wave};
 use flynnel::gpu_peer::watchdog::{self, DriverModel as CrateDriverModel};
@@ -855,5 +858,179 @@ impl Cmdlet for RemoveFlynnelGpuPeer {
             pwrs::warning!(ps, "no GPU peer was running, so nothing was torn down")?;
         }
         ps.write(had)
+    }
+}
+
+// ---------------------------------------------------------------------
+// Which linear-algebra kernel a size gets
+// ---------------------------------------------------------------------
+
+/// Which batched decomposition a call uses.
+#[psenum(name = "Flynnel.LinalgMethod")]
+#[derive(Clone, Copy, Default)]
+pub enum LinalgMethodKind {
+    /// The Jacobi kernels, with their shape chosen by size.
+    #[default]
+    Jacobi,
+    /// Householder reduction followed by bisection on the
+    /// tridiagonal.
+    Bisection,
+}
+
+impl From<CrateLinalgMethod> for LinalgMethodKind {
+    fn from(m: CrateLinalgMethod) -> Self {
+        match m {
+            CrateLinalgMethod::Jacobi => LinalgMethodKind::Jacobi,
+            CrateLinalgMethod::Bisection => LinalgMethodKind::Bisection,
+        }
+    }
+}
+
+/// How the Jacobi kernels lay a batch out on the device.
+#[psenum(name = "Flynnel.JacobiShape")]
+#[derive(Clone, Copy, Default)]
+pub enum JacobiShapeKind {
+    /// One block of 256 threads per matrix, the matrix in shared
+    /// memory, half its dimension in disjoint rotations per round.
+    #[default]
+    BlockPerMatrix,
+    /// One thread per matrix, the matrix in local memory, swept
+    /// cyclically. Only for small matrices, and only when there are
+    /// enough of them to fill the device.
+    ThreadPerMatrix,
+}
+
+impl From<CrateJacobiShape> for JacobiShapeKind {
+    fn from(s: CrateJacobiShape) -> Self {
+        match s {
+            CrateJacobiShape::BlockPerMatrix => JacobiShapeKind::BlockPerMatrix,
+            CrateJacobiShape::ThreadPerMatrix => JacobiShapeKind::ThreadPerMatrix,
+        }
+    }
+}
+
+/// Which decomposition a batched call of one size would use.
+#[psenum(name = "Flynnel.LinalgOp")]
+#[derive(Clone, Copy, Default)]
+pub enum LinalgOpKind {
+    /// Symmetric eigenvalues.
+    #[default]
+    Syev,
+    /// Singular values.
+    Gesvd,
+}
+
+/// The kernel a batched decomposition of one size would use, and the
+/// bounds that decided it.
+#[psclass(name = "Flynnel.LinalgChoice")]
+#[derive(Clone, Default)]
+pub struct LinalgChoice {
+    /// The operation asked about.
+    pub operation: LinalgOpKind,
+    /// The matrix dimension asked about.
+    pub n: u32,
+    /// The batch size asked about.
+    pub batch: u32,
+    /// Which method this size gets.
+    pub method: LinalgMethodKind,
+    /// Which Jacobi layout it would get. Reported whatever the
+    /// method, because a caller comparing the two wants to see the
+    /// shape bisection is being chosen over.
+    pub jacobi_shape: JacobiShapeKind,
+    /// The dimension at or above which bisection is chosen for this
+    /// operation.
+    pub bisect_min_n: u32,
+    /// The largest dimension these kernels handle at all. A call
+    /// above it is not a slower call, it is one the kernels do not
+    /// take.
+    pub max_n: u32,
+    /// The largest dimension the thread-per-matrix layout handles.
+    pub thread_shape_max_n: u32,
+    /// Matrices per unit of dimension needed before thread-per-matrix
+    /// has enough of them to fill the device.
+    pub thread_shape_batch_per_n: u32,
+    /// Whether the dimension is inside MaxN. False means the row
+    /// describes what would be chosen if it fit, and nothing here
+    /// would run.
+    pub within_max_n: bool,
+}
+
+/// Reads which batched kernel a decomposition of one size would use,
+/// and the measured bounds that decide it.
+///
+/// Two families implement each decomposition: the Jacobi kernels, and
+/// Householder reduction followed by bisection. Which one wins moves
+/// with the matrix dimension, and the crossover differs between
+/// symmetric eigenvalues and singular values, so a caller sizing a
+/// batch gets a different answer for each.
+///
+/// The crossovers are measured rather than assumed. Bisection is
+/// chosen for symmetric eigenvalues from dimension 32, where it was
+/// 1.4 to 1.8 times the block Jacobi kernel, rising to 4.0 times at
+/// 64; for singular values from 64, where it was 1.05 to 1.4 times,
+/// and it is behind Jacobi at 32. Both were measured on an RTX 3070
+/// and an RTX 5070.
+///
+/// The Jacobi layout is reported whatever the method, because a caller
+/// weighing the two wants to see the shape bisection is being chosen
+/// over. Thread-per-matrix needs both a small dimension and enough
+/// matrices to fill the device; block-per-matrix takes everything
+/// else.
+///
+/// This needs no device. The choice is a function of the sizes and of
+/// figures measured when the kernels were written.
+///
+/// # Examples
+///
+/// `Get-FlynnelLinalgMethod -N 48 -Batch 1024`
+///
+/// `Get-FlynnelLinalgMethod -Operation Gesvd -N 48 -Batch 1024`
+///
+/// `8, 16, 32, 64 | ForEach-Object { Get-FlynnelLinalgMethod -N $_ -Batch 4096 } |
+///     Select-Object N, Method, JacobiShape`
+#[cmdlet(
+    verb = "Get",
+    noun = "FlynnelLinalgMethod",
+    alias = "Get-FlyLinalgMethod",
+    output = ["Flynnel.LinalgChoice"]
+)]
+#[derive(Default)]
+pub struct GetFlynnelLinalgMethod {
+    /// The matrix dimension.
+    #[param(mandatory, position = 0)]
+    pub n: u32,
+    /// How many matrices the call carries. One when unset, which puts
+    /// every size on the block layout.
+    #[param(position = 1)]
+    pub batch: Option<u32>,
+    /// Symmetric eigenvalues or singular values. The two have
+    /// different measured crossovers, so this changes the answer.
+    #[param(position = 2)]
+    pub operation: LinalgOpKind,
+}
+
+impl Cmdlet for GetFlynnelLinalgMethod {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        if self.n == 0 {
+            return Err(arg_err("N must be above zero").terminating());
+        }
+        let n = self.n as usize;
+        let batch = self.batch.unwrap_or(1) as usize;
+        let (method, bisect_min_n) = match self.operation {
+            LinalgOpKind::Syev => (linalg::syev_method_for(n), linalg::SYEV_BISECT_MIN_N),
+            LinalgOpKind::Gesvd => (linalg::gesvd_method_for(n), linalg::GESVD_BISECT_MIN_N),
+        };
+        ps.write(LinalgChoice {
+            operation: self.operation,
+            n: self.n,
+            batch: batch as u32,
+            method: LinalgMethodKind::from(method),
+            jacobi_shape: JacobiShapeKind::from(linalg::jacobi_shape_for(n, batch)),
+            bisect_min_n: bisect_min_n as u32,
+            max_n: linalg::LINALG_MAX_N as u32,
+            thread_shape_max_n: linalg::LINALG_THR_MAX_N as u32,
+            thread_shape_batch_per_n: linalg::JACOBI_THREAD_SHAPE_BATCH_PER_N as u32,
+            within_max_n: n <= linalg::LINALG_MAX_N,
+        })
     }
 }

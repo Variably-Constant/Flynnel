@@ -304,6 +304,75 @@ Describe 'New-FlynnelGpuPeerConfig' {
     }
 }
 
+Describe 'Get-FlynnelLinalgMethod' {
+    # The choice is a function of the sizes and of figures measured
+    # when the kernels were written, so every assertion holds on a host
+    # with no card.
+
+    It 'names both methods and both Jacobi shapes' {
+        [enum]::GetNames([Flynnel.LinalgMethod]) | Should -Contain 'Jacobi'
+        [enum]::GetNames([Flynnel.LinalgMethod]) | Should -Contain 'Bisection'
+        [enum]::GetNames([Flynnel.JacobiShape]) | Should -Contain 'BlockPerMatrix'
+        [enum]::GetNames([Flynnel.JacobiShape]) | Should -Contain 'ThreadPerMatrix'
+    }
+
+    It 'crosses to bisection at the measured dimension for eigenvalues' {
+        # 32 is where bisection was measured at 1.4 to 1.8 times the
+        # block Jacobi kernel. A binding that reported the crossover
+        # one either side of that would send a caller to the slower
+        # kernel at exactly the size the measurement was taken.
+        (Get-FlynnelLinalgMethod -N 31 -Operation Syev).Method | Should -Be 'Jacobi'
+        (Get-FlynnelLinalgMethod -N 32 -Operation Syev).Method | Should -Be 'Bisection'
+        (Get-FlynnelLinalgMethod -N 32 -Operation Syev).BisectMinN | Should -Be 32
+    }
+
+    It 'crosses later for singular values than for eigenvalues' {
+        # The two crossovers genuinely differ, and a caller sizing a
+        # batch gets a different answer for each. At 32 bisection is
+        # behind Jacobi for singular values and ahead for eigenvalues.
+        (Get-FlynnelLinalgMethod -N 32 -Operation Gesvd).Method | Should -Be 'Jacobi'
+        (Get-FlynnelLinalgMethod -N 64 -Operation Gesvd).Method | Should -Be 'Bisection'
+        (Get-FlynnelLinalgMethod -N 32 -Operation Gesvd).BisectMinN |
+            Should -BeGreaterThan (Get-FlynnelLinalgMethod -N 32 -Operation Syev).BisectMinN
+    }
+
+    It 'needs both a small matrix and many of them for the thread layout' {
+        # Thread-per-matrix wants enough matrices to fill the device.
+        # Either condition alone leaves it on the block layout.
+        (Get-FlynnelLinalgMethod -N 8 -Batch 1).JacobiShape | Should -Be 'BlockPerMatrix'
+        (Get-FlynnelLinalgMethod -N 64 -Batch 1000000).JacobiShape |
+            Should -Be 'BlockPerMatrix'
+        (Get-FlynnelLinalgMethod -N 8 -Batch 100000).JacobiShape |
+            Should -Be 'ThreadPerMatrix'
+    }
+
+    It 'reports the Jacobi shape even where bisection is chosen' {
+        # A caller weighing the two wants to see the shape bisection is
+        # being chosen over, not an empty column.
+        $r = Get-FlynnelLinalgMethod -N 64 -Batch 8 -Operation Syev
+        $r.Method | Should -Be 'Bisection'
+        $r.JacobiShape | Should -Not -BeNullOrEmpty
+    }
+
+    It 'says when a dimension is past what these kernels take' {
+        # Not a slower call: one the kernels do not take at all.
+        (Get-FlynnelLinalgMethod -N 64).WithinMaxN | Should -BeTrue
+        $over = Get-FlynnelLinalgMethod -N 128
+        $over.WithinMaxN | Should -BeFalse
+        $over.MaxN | Should -BeLessThan 128
+    }
+
+    It 'echoes the sizes it was asked about' {
+        $r = Get-FlynnelLinalgMethod -N 48 -Batch 1024
+        $r.N | Should -Be 48
+        $r.Batch | Should -Be 1024
+    }
+
+    It 'refuses a dimension of zero' {
+        { Get-FlynnelLinalgMethod -N 0 } | Should -Throw -ExpectedMessage '*above zero*'
+    }
+}
+
 Describe 'the peer lifecycle' {
     It 'says no peer is running before one is started' {
         # A row, not an absent one: a script asking whether a peer
