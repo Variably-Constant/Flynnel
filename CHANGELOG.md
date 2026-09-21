@@ -233,9 +233,30 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   undershoot a deadline and never overshoot it, and the difference
   costs an iteration.
 
+  **And a monitor wait that decodes is not a monitor wait that
+  holds.** On a Ryzen 9 7900X the arm beats the kernel park in every
+  cell measured - 4.7 to 1.2 us idle and 5.1 to 0.7 us under load at a
+  50 us inter-arrival, over three runs - but the identical code on a
+  Ryzen 7 2700 is a severe regression under load: 444 to 755 us
+  against the 15 to 25 us of the park it replaced. There the monitor
+  does not survive to be waited on, `MWAITX` returns straight back,
+  and re-arming becomes a spin over a 1600-cycle instruction pair.
+  CPUID reports bit 29 on both parts and distinguishes them not at
+  all; only the length of a real wait does.
+
+  So the wait checks that it held. Four consecutive returns under an
+  eighth of the requested timeout end it in `thread::park` and record
+  the finding process-wide, so later parks skip the attempt. That caps
+  the waste at roughly ten thousand cycles, once. The flag is never
+  cleared: a wrong `false` costs the kernel park that was already
+  there, a wrong `true` costs the regression on every park, and the
+  two directions are not worth the same.
+
   `benches/parker_wait_strategy.rs` carries all three arms in one
   process, each at a 50 us and a 500 us inter-arrival and each both
-  idle and against busy threads occupying half the host.
+  idle and against busy threads occupying half the host. It reports
+  when the fallback fired, because a fallen-back row looks exactly
+  like the control row beside it.
 
 - **A PowerShell module, `pwrs/`, binding the scheduler surface
   directly to the Rust.** 107 cmdlets, 78 classes and 36 enumerations
