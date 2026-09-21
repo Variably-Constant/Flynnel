@@ -338,18 +338,28 @@ fn bench_idle_neighbours(c: &mut Criterion, label: &str, parkers: Option<WaitStr
             }
 
             let t0 = Instant::now();
-            let mut acc = 0u64;
+            // Four independent chains rather than one, so the loop is
+            // throughput-bound rather than latency-bound. A single
+            // dependency chain advances at one multiply per step
+            // whatever else the core is doing, which makes it almost
+            // blind to a co-runner: it is the wrong probe for a
+            // question about who gets the issue slots. Four chains
+            // want the whole core and notice when they do not have
+            // it.
+            let mut a = [0u64; 4];
             for i in 0..iters {
-                // Deterministic, CPU-bound, and nothing to do with
-                // the scheduler: this is the neighbour's own work.
-                let mut x = i | 1;
-                for _ in 0..512 {
-                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                    acc = acc.wrapping_add(x >> 33);
+                let mut x = [i | 1, i ^ 0x9e37, i | 0x5555, i ^ 0xdead];
+                for _ in 0..128 {
+                    for lane in 0..4 {
+                        x[lane] = x[lane]
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1);
+                        a[lane] = a[lane].wrapping_add(x[lane] >> 33);
+                    }
                 }
             }
             let elapsed = t0.elapsed();
-            black_box(acc);
+            black_box(a);
 
             stop.store(1, Ordering::Release);
             for p in &waiting {
