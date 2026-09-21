@@ -2405,7 +2405,7 @@ mod tests {
         // Both halves are inside the thread because either can be the
         // one that blocks: `new` waits for workers to come up and
         // `drop` signals shutdown and joins them.
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<u32>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<usize>();
         let built = std::thread::spawn(move || {
             let a = LocalArena::new(4);
             let count = a.worker_count();
