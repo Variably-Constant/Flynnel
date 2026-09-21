@@ -9,6 +9,53 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- The parker records what it did, under `FLYNNEL_TRACE=1`. `ParkEnter`
+  (kind 14) on every park, payload the strategy it chose - 0 kernel
+  park, 1 WAITPKG, 2 MONITORX - plus 16 when that park is one half of a
+  controller probe and is therefore being timed. `WorkerWake` (8) on a
+  sampled park, payload that wake's cost in nanoseconds. `WaitSwitch`
+  (15) when the controller moves, payload the strategy now in use. The
+  strategy is recorded per park rather than read from the controller
+  afterwards, because the controller reports where it ended up and a run
+  that switched partway through looks from its report exactly like one
+  that started there.
+
+  None of the three has yet been observed to fire. The one trace taken
+  produced 110,458 rows over 201 dispatches with no park event among
+  them: `examples/trace_dispatch` dispatched back to back and no worker
+  went idle long enough to park. Its fourth argument is now a gap in
+  milliseconds, applied between dispatches and once more before the
+  timed call, which is the condition under which these events have
+  anything to record. A run at gap zero still records none.
+
+- The park path reads the trace switch before it builds the payload.
+  Rust evaluates arguments before the call, so passing the payload to
+  `trace::emit` computed it on every park and discarded it inside when
+  tracing was off.
+
+  Measured by `examples/trace_predicate_cost` on a Zen 3 Linux guest,
+  five cells interleaved in one process, 500,000,000 calls a cell, seven
+  repeats, the control interleaved with the rest and its span across its
+  own repeats printed as the run's resolution floor. Nanoseconds over
+  that control, on the two runs of six that passed their own readability
+  test:
+
+  quiet, control 0.5958 ns at a 2.11 per cent spread, floor 0.0126 ns -
+  payload alone 0.5603, whole emit 1.2316.
+
+  loaded at 8 spinners on 16 cores, control 1.8348 ns at a 4.00 per cent
+  spread, floor 0.0734 ns - payload alone 0.4705, emit with the payload
+  passed as an argument 1.2533, emit with the switch read first 0.1299.
+  The difference between those last two is 1.1234 ns a park, against a
+  floor of 0.0734.
+
+  The other four runs declared themselves unreadable on control spreads
+  of 45.46, 76.70, 79.96 and 62.51 per cent and are not quoted. An
+  earlier batch was unreadable for a different reason, a control sampled
+  only at the run's two endpoints while every other cell was
+  interleaved, which put the one cell everything is subtracted from on
+  the extremes of the warm-up curve.
+
 - `FLYNNEL_LEVER_ALLOWED_WIDTH` defaults on. A plan's worker count is
   capped by the CPUs the process may use at that moment, re-read every
   250 ms, so a process whose affinity mask or cgroup quota narrows after
