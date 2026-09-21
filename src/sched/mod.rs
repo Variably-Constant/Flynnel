@@ -73,6 +73,10 @@ pub mod calibration_store;
 pub mod verify_chain;
 pub mod split_observer;
 pub mod prefetch;
+/// The mutex-backed alternative to the Chase-Lev deque, kept for the
+/// measurement that rejected it and compiled only under test so that
+/// mutex reaches no shipped binary. `arena_local` records the numbers.
+#[cfg(test)]
 pub mod private_deque;
 pub mod idempotent;
 pub mod cooperative;

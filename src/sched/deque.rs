@@ -4,10 +4,9 @@
 //! Thin layer over [`crate::sched::chase_lev_local`] (the in-
 //! house implementation of the Chase-Lev algorithm formally
 //! verified in Vafeiadis et al. arXiv:2309.03642). The live
-//! worker pool's owner-private deque lives in
-//! [`crate::sched::private_deque`]; this module exposes the
-//! [`steal_retry`] helper that walks `Steal::Retry` outcomes
-//! for arena leaders.
+//! worker pool takes its owner-private deque from that module
+//! directly; this module exposes the [`steal_retry`] helper that
+//! walks `Steal::Retry` outcomes for arena leaders.
 //!
 //! The deque only stores [`JobRef`]; the lifetime of the captured
 //! state (`StackJob` / `HeapJob` / `ArcJob`) is managed by the caller
@@ -21,9 +20,8 @@ use crate::sched::job::JobRef;
 use crate::sched::chase_lev_local::{Worker, new_chase_lev};
 
 /// Per-arena work-stealing deque used by the in-file tests to
-/// exercise [`steal_retry`] without depending on the full
-/// [`crate::sched::private_deque::PrivateDeque`]
-/// scaffold. Production callers use `PrivateDeque` directly.
+/// exercise [`steal_retry`] over a real Chase-Lev worker and
+/// stealer pair rather than a mock.
 #[cfg(test)]
 pub(crate) struct ArenaDeque {
     worker: Worker<JobRef>,

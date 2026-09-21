@@ -18,9 +18,10 @@
 //! [`std::sync::Mutex`] the owner uses for push/pop.
 //!
 //! The production worker loop (arena_local `find_work`) uses the
-//! adaptive Chase-Lev deque directly; this deque backs the
-//! receiver-initiated migration benches and stays available as an
-//! alternative backing.
+//! adaptive Chase-Lev deque directly. This module is compiled only
+//! under `cfg(test)`, so the mutex above reaches no shipped binary:
+//! what it holds is the measurement that rejected the design, and
+//! `arena_local` carries the numbers that rejected it.
 //!
 
 use crate::sched::job::JobRef;
