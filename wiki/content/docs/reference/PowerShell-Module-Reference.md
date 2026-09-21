@@ -312,6 +312,50 @@ Methods on a chain: `Add`, `AddMany`, `Root`.
 
 **`Get-FlynnelMatrixBackend` writes one row today, the scalar fallback.** The crate carries the CGRA substrate and no tile backend implements it yet, so a host with AMX or SME has nothing here to select. That is a row saying so rather than an empty listing, which would read as a family that failed to enumerate.
 
+## Racing - 2 commands
+
+Several attempts at one piece of work, and what taking the first of them buys.
+
+| command | alias | shape |
+|---|---|---|
+| `Measure-FlynnelRaceAny` | `Measure-FlyRaceAny` | keeps the first arm home, signals the rest to stop |
+| `Measure-FlynnelExploreSelect` | `Measure-FlyExploreSelect` | runs every arm to the end, picks the fastest |
+
+Objects: `Flynnel.RaceOutcome`, `Flynnel.RaceArm`.
+
+**They answer opposite questions and are worth running as a pair.** The race reports `TailRatio`, the slowest arm's time over the winner's, which is what hedging trimmed on this host; 1.0 is a race that saved nothing. The exploration cancels nothing, because a slow explorer that finds the best answer is the point of that shape, so what it reports is what exploring costs.
+
+**The call returns when every arm has returned.** Cancelling a loser stops it spending more; it does not hand the call back early. `SlowestArmNs` is what the call actually waited for.
+
+**`CancelledEarly` zero means different things in the two shapes.** On a race it means every loser finished before the winner's signal reached it, which is a fact about how even this host is. On an exploration it is the shape: nothing is cancelled. Raise `-Count` or `-Repetitions` to give a signal time to arrive.
+
+**Only two of the crate's nine racing entry points are bound.** The other seven need an arm that can decline a contract it failed, refute a peer, or disagree with one. Every body this module can offer is a declared deterministic kernel, so a cmdlet over `race_agree` would always answer unanimous - a property of the binding rather than of the work.
+
+## The Flynnel drive
+
+A running scheduler, browsed. `Import-Module` creates it; there is nothing to mount.
+
+```
+Flynnel:\
+  host\         topology, cpu, latency, cache
+  pool\         summary, spin, split, workers\<n>
+  sites\        one per call site the scheduler has materialised
+  backends\     one per backend kind, present on this host or not
+  calibration\  summary, thresholds
+  trace\        state
+  peer\         summary, while a GPU peer is running
+```
+
+**Read only, and by not implementing rather than by refusing.** There is no `New-Item`, `Remove-Item` or `Set-Content`: the binding framework's own defaults answer an error for every write. A drive that could change the scheduler would be a second way to do what the `Set-` commands already do, and two ways to write one setting is how they drift apart.
+
+**Every leaf is the object its command writes**, built by the same function - `Flynnel:\host\cpu` answers the same `Flynnel.CpuInfo` as `Get-FlynnelCpuInfo`. The suite compares them field by field, which is what keeps them together.
+
+**A leaf therefore has no `Name`.** A `Flynnel.CpuInfo` carries no such property and adding one would make the drive's object differ from the command's. `PSChildName` is the name, supplied by the engine from the path. Containers do carry `Name`, because their object is the provider's own.
+
+**A level that cannot be read says so.** `peer\` exists on a host with no GPU and enumerates nothing; `host\latency` is a leaf that exists and holds no rows where the ping-pong sweep could not run. A missing path and a missing reading look alike to a script, and only one of them is worth retrying.
+
+**`pool\workers` is built in one pass**, not one call into Rust per child. Its children are matched against the names the level lists, so `5` finds worker five and `05` finds nothing. The external slots a foreign thread pushes through are left out: they are real rows and they are not workers, and `Get-FlynnelWorker -IncludeExternalSlot` is where a caller who wants them asks.
+
 ## Conventions across every family
 
 **A counter that has measured nothing says so.** The pool's burst ratio starts at 0.5 with nothing pushed, and `HasPushed` is what tells that from a measured half. A ring's `DepthKnown` does the same job for a depth of zero.
