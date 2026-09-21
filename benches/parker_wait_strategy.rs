@@ -273,75 +273,125 @@ fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
     report_latch(&name, held_before);
 }
 
-/// Wake latency on a parker that follows the controller, with the
-/// controller's own state printed after.
+/// Wake latency on one parker woken repeatedly on one thread, which
+/// is the shape a pool worker has.
 ///
-/// Every other group here pins a strategy, so none of them executes
-/// the controller at all: they measure the arms it chooses between
-/// and say nothing about the choosing. This one leaves the parker
-/// unpinned, which is what a worker is.
+/// `pin` of `None` leaves the parker on the controller and is the
+/// adaptive arm; `Some` holds one strategy still, the way the groups
+/// above do. Both go through this same function because the arms
+/// only compare if they are measured the same way, and the adaptive
+/// arm cannot use the groups above: those build a parker per
+/// iteration, and the controller's cadence is per thread, so a
+/// thread that parks once never reaches a probe.
 ///
-/// Two things it answers. On a host with no second strategy it is
-/// the overhead arm: identical work to the pinned baseline group,
-/// differing only by the controller being consulted, so the gap
-/// between them is what the controller costs a host that can never
-/// use it. On a host with both it is the arm that has to end up at
-/// least as fast as the better of the two pinned groups, because
-/// otherwise the choosing is worse than either choice.
-fn bench_adaptive(c: &mut Criterion, gap_us: u64, loaded: bool) {
+/// Two things this answers. On a host with no second strategy the
+/// adaptive arm is the overhead arm, differing from the pinned
+/// baseline beside it only by the controller being consulted, so the
+/// gap between them is what the controller costs a host that can
+/// never use it. On a host with both it has to end up at least as
+/// fast as the better pinned arm, because otherwise the choosing is
+/// worse than either choice.
+///
+/// These are steady-state numbers and do not replace the groups
+/// above, which time a first park on a cold thread.
+fn bench_repeat(
+    c: &mut Criterion,
+    label: &str,
+    pin: Option<WaitStrategy>,
+    gap_us: u64,
+    loaded: bool,
+) {
     let _load = if loaded { Some(Load::spawn()) } else { None };
     let arm = if loaded { "load" } else { "idle" };
-    let name = format!("parker_adaptive_{arm}_gap_{gap_us}us");
+    let held_before = flynnel::sched::sleep::monitor_wait_held();
+    let name = format!("parker_repeat_{label}_{arm}_gap_{gap_us}us");
     let mut group = c.benchmark_group(&name);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
     group.bench_function("unpark_to_return", |b| {
         b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let ready = Arc::new(AtomicU32::new(0));
-                let returned = Arc::new(AtomicU32::new(0));
-                let returned_clone = Arc::clone(&returned);
-                let ready_clone = Arc::clone(&ready);
-                let (tx, rx) = std::sync::mpsc::channel::<Arc<Parker>>();
-                let owner = std::thread::spawn(move || {
-                    // Parker::new, not with_strategy: this is the
-                    // shape a worker has and the only one the
-                    // controller governs.
-                    let p = Arc::new(Parker::new(0));
-                    tx.send(Arc::clone(&p)).expect("send parker");
-                    let ok = p.park_until(|| ready.load(Ordering::Acquire) == 1);
-                    returned_clone.store(1, Ordering::Release);
-                    ok
+            // One parker on one thread, parked and woken `iters`
+            // times.
+            //
+            // The thread is long-lived because the controller's
+            // cadence is per thread: a thread that parks once takes
+            // one step toward a probe it needs sixty-four to reach,
+            // so a thread per iteration leaves every park unsampled
+            // and the controller at zero samples however long the
+            // bench runs. It would report the baseline in use and
+            // nothing measured, which reads like a verdict and is an
+            // instrument that never engaged.
+            let ready = Arc::new(AtomicU32::new(0));
+            let done = Arc::new(AtomicU32::new(0));
+            let stop = Arc::new(AtomicU32::new(0));
+            let (ready_c, done_c, stop_c) =
+                (Arc::clone(&ready), Arc::clone(&done), Arc::clone(&stop));
+            let (tx, rx) = std::sync::mpsc::channel::<Arc<Parker>>();
+            let owner = std::thread::spawn(move || {
+                let p = Arc::new(match pin {
+                    Some(s) => Parker::with_strategy(0, s),
+                    None => Parker::new(0),
                 });
-                let p_owner = rx.recv().expect("recv parker");
+                tx.send(Arc::clone(&p)).expect("send parker");
+                let mut seen = 0u32;
+                loop {
+                    p.park_until(|| {
+                        stop_c.load(Ordering::Acquire) == 1
+                            || ready_c.load(Ordering::Acquire) != seen
+                    });
+                    if stop_c.load(Ordering::Acquire) == 1 {
+                        return;
+                    }
+                    seen = ready_c.load(Ordering::Acquire);
+                    done_c.store(seen, Ordering::Release);
+                }
+            });
+            let p = rx.recv().expect("recv parker");
+
+            // A generation rather than a flag, so the owner tells
+            // this wake from the one it just served without the
+            // harness clearing anything underneath it. Consecutive
+            // wrapping values always differ, which is all it needs.
+            let mut total = Duration::ZERO;
+            let mut generation = 0u32;
+            for _ in 0..iters {
+                generation = generation.wrapping_add(1);
                 std::thread::sleep(Duration::from_micros(gap_us));
                 let t0 = Instant::now();
-                ready_clone.store(1, Ordering::Release);
-                p_owner.unpark();
-                while returned.load(Ordering::Acquire) == 0 {
+                ready.store(generation, Ordering::Release);
+                p.unpark();
+                while done.load(Ordering::Acquire) != generation {
                     std::hint::spin_loop();
                 }
                 total += t0.elapsed();
-                owner.join().expect("owner join");
             }
+
+            stop.store(1, Ordering::Release);
+            p.unpark();
+            owner.join().expect("owner join");
             black_box(total)
         });
     });
     group.finish();
 
-    let r = flynnel::sched::sleep::wait_controller().report();
-    eprintln!(
-        "parker_wait_strategy: after {name}, controller has baseline {} ns over {} samples, \
-         challenger {} ns over {} samples, in use {:?}, {} switch(es), probing every {} parks",
-        r.baseline_ns,
-        r.baseline_samples,
-        r.challenger_ns,
-        r.challenger_samples,
-        r.in_use,
-        r.switches,
-        r.probe_every
-    );
+    report_latch(&name, held_before);
+
+    // Only the unpinned arm runs the controller, so only it has
+    // anything to say about what the controller did.
+    if pin.is_none() {
+        let r = flynnel::sched::sleep::wait_controller().report();
+        eprintln!(
+            "parker_wait_strategy: after {name}, controller has baseline {} ns over {} samples, \
+             challenger {} ns over {} samples, in use {:?}, {} switch(es), probing every {} parks",
+            r.baseline_ns,
+            r.baseline_samples,
+            r.challenger_ns,
+            r.challenger_samples,
+            r.in_use,
+            r.switches,
+            r.probe_every
+        );
+    }
 }
 
 fn bench_all(c: &mut Criterion) {
@@ -410,14 +460,26 @@ fn bench_all(c: &mut Criterion) {
         }
     }
 
-    // The adaptive arm runs in both conditions and against the
-    // pinned groups above, which are its comparison: on a host with
-    // no challenger it should match the pinned baseline, and on one
-    // with a challenger it should end up no worse than the better
-    // pinned arm.
+    // The steady-state set: one parker woken repeatedly on one
+    // thread, pinned and unpinned, so the adaptive arm has arms
+    // beside it measured the same way. The groups above build a
+    // parker per iteration and time a cold first park, which is a
+    // different quantity and not this arm's comparison.
+    //
+    // The adaptive arm goes last in each cell so the pinned arms are
+    // not measured through whatever the controller has by then
+    // decided.
     for loaded in [false, true] {
-        bench_adaptive(c, 50, loaded);
-        bench_adaptive(c, 500, loaded);
+        for gap_us in [50, 500] {
+            bench_repeat(c, "stdpark", Some(WaitStrategy::StdPark), gap_us, loaded);
+            if waitpkg {
+                bench_repeat(c, "waitpkg", Some(WaitStrategy::Waitpkg), gap_us, loaded);
+            }
+            if monitorx {
+                bench_repeat(c, "monitorx", Some(WaitStrategy::Monitorx), gap_us, loaded);
+            }
+            bench_repeat(c, "adaptive", None, gap_us, loaded);
+        }
     }
 
     // Neighbours last, and only the two strategies a monitor wait can
