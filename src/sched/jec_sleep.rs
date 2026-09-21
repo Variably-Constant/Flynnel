@@ -24,9 +24,12 @@
 //! 4. `SLEEPING`: publishes that it is sleeping in its own atomic
 //!    word, re-reads the shutdown flag, then parks; counted as both
 //!    `inactive` AND `sleeping`. Awoken by `wake_specific_thread`,
-//!    which swaps that word and unparks the thread. The swap decides
-//!    who wakes it, so exactly one party unparks and exactly one
-//!    decrements the sleeping count.
+//!    which claims that word (`SLEEPING` to `WAKING`), gives the
+//!    sleeping count back, stores `AWAKE`, then unparks the thread.
+//!    The worker stays parked until it reads `AWAKE`, so the count
+//!    is back before it can take work and before a producer can
+//!    count it as a sleeper still to wake. Exactly one party wins
+//!    the claim, so exactly one decrements.
 //!
 //! Producers (`new_internal_jobs`):
 //!   - Increment JEC if it is sleepy (signals sleepy workers to
@@ -149,9 +152,9 @@ impl AtomicCounters {
         Ord::min(sleepers, 2)
     }
 
-    /// Sub one sleeping thread. Caller MUST know that at least
-    /// one sleeping thread exists (typically because they just
-    /// woke one by unparking it).
+    /// Sub one sleeping thread. The caller must know that at least
+    /// one sleeping thread exists: a waker that has claimed one, or a
+    /// sleeper giving back its own before it parks.
     #[inline]
     pub(crate) fn sub_sleeping_thread(&self) {
         let old = Counters {
@@ -492,10 +495,10 @@ pub fn spin_adaptive() -> bool {
 /// Cilk's `CILK_CACHE_LINE = 128` is the same rationale.
 #[repr(align(128))]
 struct WorkerSleepState {
-    /// [`SLEEPING`] from just before this worker parks until whoever
-    /// wakes it swaps it back, [`AWAKE`] otherwise. The swap is what
-    /// decides who wakes it: exactly one party observes the
-    /// transition, so exactly one decrements the sleeping count.
+    /// [`SLEEPING`] from just before this worker parks until a waker
+    /// claims it, [`WAKING`] while that waker gives the sleeping count
+    /// back, [`AWAKE`] otherwise. Only [`AWAKE`] releases the worker
+    /// from its park loop, so the count is back before it runs.
     state: AtomicU32,
     /// This worker's own thread handle, stored the first time it
     /// sleeps and reused after.
@@ -512,6 +515,11 @@ const AWAKE: u32 = 0;
 /// [`WorkerSleepState::state`] for a worker that is parked, or has
 /// committed to parking and is making its last checks.
 const SLEEPING: u32 = 1;
+/// [`WorkerSleepState::state`] for a parked worker a waker has
+/// claimed and not yet released: the sleeping count is being given
+/// back on the waker's thread, and the worker keeps parking until
+/// it reads [`AWAKE`].
+const WAKING: u32 = 2;
 
 /// Per-worker idle bookkeeping carried across calls to
 /// `no_work_found`. Initialized once when a worker enters its idle
@@ -584,21 +592,20 @@ pub(crate) struct Sleep {
     /// the rate the slot count dilutes a random pick to.
     claimed_slots: AtomicU64,
     /// Set once by [`Sleep::wake_all_for_shutdown`], before it wakes
-    /// anybody, and read by [`Sleep::sleep`] while that worker holds
-    /// its own `is_blocked` mutex.
+    /// anybody, and re-read by [`Sleep::sleep`] after that worker has
+    /// published `SLEEPING`.
     ///
     /// The flag is what makes shutdown durable. Waking is not: a wake
-    /// reaches only the workers that are blocked at the moment it
+    /// reaches only the workers that are parked at the moment it
     /// runs, and a worker still walking its tiers is not one of them,
     /// so without something left behind it parks afterwards and
     /// nothing ever wakes it again, which is `LocalArena::drop`
     /// joining a worker that will not return.
     ///
-    /// Reading it under the mutex is the load-bearing part rather than
-    /// the flag itself. That is what orders the read against the wake:
-    /// a worker holding the mutex makes shutdown block until it is
-    /// waiting, and a worker taking the mutex afterwards reads a flag
-    /// stored before the wake it missed.
+    /// The publish-then-read order is the load-bearing part rather
+    /// than the flag itself. With every operation of the pair SeqCst,
+    /// either the sweep's claim sees `SLEEPING` or the worker's read
+    /// sees the flag.
     shutdown: AtomicBool,
 }
 
@@ -659,7 +666,7 @@ impl Sleep {
         let blocked = self
             .worker_states
             .iter()
-            .map(|s| s.state.load(Ordering::Relaxed) == SLEEPING)
+            .map(|s| s.state.load(Ordering::Relaxed) != AWAKE)
             .collect();
         SleepDebug {
             sleeping: c.sleeping_threads(),
@@ -796,39 +803,41 @@ impl Sleep {
             maybe_adapt();
 
             // Publish first, then re-read. A waker arriving from here
-            // on sees SLEEPING and unparks; one that arrived earlier
+            // on sees SLEEPING and claims it; one that arrived earlier
             // stored the flag this reads next. Both orders are covered
-            // and neither needs a lock, which is the whole point:
-            // SeqCst on the store here and on the swap in
-            // wake_specific_thread is what the mutex was standing in
-            // for.
+            // and neither needs a lock: SeqCst on the store here and
+            // on the claim in wake_specific_thread puts all four
+            // operations in one total order.
             //
             // Jobs do not need this treatment. A producer bumps the
             // packed counter, and try_add_sleeping_thread above is a
             // CAS that fails when it moves, so the counter word is
             // already the ordering for work arriving. Shutdown has no
-            // counter, which is why it was the one that leaked.
+            // counter.
             state.handle.get_or_init(thread::current);
             state.state.store(SLEEPING, Ordering::SeqCst);
-            if self.shutdown.load(Ordering::SeqCst) {
-                // The swap only stops a later waker unparking a thread
-                // that has gone; whichever side it finds, the sleeping
-                // count is this thread's to give back.
-                state.state.swap(AWAKE, Ordering::SeqCst);
+            if self.shutdown.load(Ordering::SeqCst)
+                && state
+                    .state
+                    .compare_exchange(SLEEPING, AWAKE, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                // Shutdown landed and no waker has claimed this worker,
+                // so the sleeping count is this thread's to give back.
+                // A claimed worker falls through to the loop below and
+                // is released by its waker.
                 self.counters.sub_sleeping_thread();
                 idle.wake_fully();
                 return;
             }
 
             // park returns on a permit, on an unpark, and spuriously,
-            // so the state is what says whether to go back.
-            while state.state.load(Ordering::Acquire) == SLEEPING {
+            // and a claimed worker is still owed its release, so only
+            // AWAKE ends the loop. The waker gave the sleeping count
+            // back before it stored AWAKE; nothing is owed here.
+            while state.state.load(Ordering::Acquire) != AWAKE {
                 thread::park();
             }
-            // Given back here, on this thread, before anything below
-            // can take work and decrement inactive. The waker does not
-            // touch it.
-            self.counters.sub_sleeping_thread();
         }
         idle.wake_fully();
     }
@@ -880,28 +889,33 @@ impl Sleep {
     }
 
     /// Wake one specific worker. Returns true if the worker was
-    /// actually asleep (and is now waking up); false if it was
-    /// already awake.
+    /// asleep and this call claimed it; false if it was awake or
+    /// already claimed.
     fn wake_specific_thread(&self, idx: usize) -> bool {
         let state = &self.worker_states[idx];
         // SeqCst against the sleeper's publish-then-recheck. Either
-        // this swap sees SLEEPING, or the sleeper's re-read sees what
+        // this claim sees SLEEPING, or the sleeper's re-read sees what
         // this caller stored before calling; one of the two always
-        // holds, which is what the mutex used to buy.
-        if state.state.swap(AWAKE, Ordering::SeqCst) == SLEEPING {
-            // Only the party that wins the swap unparks. The sleeper
-            // gives the sleeping count back itself when it leaves the
-            // park loop, on its own thread and before it can take
-            // work. A decrement made here would land after the unpark,
-            // and an unparked worker that found work first would take
-            // inactive below sleeping.
-            if let Some(handle) = state.handle.get() {
-                handle.unpark();
-            }
-            true
-        } else {
-            false
+        // holds. A failed SeqCst compare-exchange is a SeqCst load, so
+        // it sits in the same total order as the store it races.
+        if state
+            .state
+            .compare_exchange(SLEEPING, WAKING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
         }
+        // The worker keeps parking while it reads WAKING, so this
+        // decrement lands before it can take work and decrement
+        // inactive. A producer reading the counters between the claim
+        // and the store below is the only one that sees a sleeper that
+        // is already spoken for.
+        self.counters.sub_sleeping_thread();
+        state.state.store(AWAKE, Ordering::SeqCst);
+        if let Some(handle) = state.handle.get() {
+            handle.unpark();
+        }
+        true
     }
 
     /// Wake every worker (for shutdown). Called once when the
