@@ -461,6 +461,10 @@ name = "gpu_linalg"
 harness = false
 required-features = ["gpu-peer"]
 
+[[bench]]
+name = "verify_chain_fold"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
