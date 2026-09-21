@@ -971,7 +971,49 @@ pub fn host_dispatch_profile() -> HostDispatchProfile {
             jec_wake_threshold_ns: HOST_JEC_WAKE_THRESHOLD_NS.load(Ordering::Relaxed),
         };
     }
+    // Nobody has published yet, and only one caller may go and
+    // measure. Calibrating dispatches into the pool and waits, and a
+    // worker helping inside that wait can pick up an outside job that
+    // arrives here, reads the same zero, and starts a second
+    // calibration on its own stack, whose waits pick up more. Nothing
+    // stores until the innermost one finishes, so the nesting is
+    // bounded only by how many dispatchers arrive during the window,
+    // and a worker's stack is not.
+    //
+    // The mutex this replaced made a second arrival block until the
+    // first finished. This makes it return zeros instead, which route
+    // conservatively: nothing collapses inline, every leaf sizes from
+    // one item, and every dispatch takes the wake path. That holds for
+    // the tens of milliseconds one calibration takes and never again in
+    // the process, so it costs nothing a measurement can see.
+    if CALIBRATING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return HostDispatchProfile {
+            dispatch_cost_ns: 0,
+            collapse_threshold_ns: 0,
+            jec_wake_threshold_ns: 0,
+        };
+    }
+    let _in_flight = CalibrationInFlight;
     calibrate_host_dispatch()
+}
+
+/// Set for as long as a calibration started from
+/// [`host_dispatch_profile`] is measuring, so a second arrival in
+/// that window does not start another.
+static CALIBRATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Clears [`CALIBRATING`] when the measuring caller leaves, by any
+/// path. A calibration that panics must not leave the flag set, or
+/// every later caller would read zeros for the life of the process.
+struct CalibrationInFlight;
+
+impl Drop for CalibrationInFlight {
+    fn drop(&mut self) {
+        CALIBRATING.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Total work, in nanoseconds from the caller's explicit per-item
