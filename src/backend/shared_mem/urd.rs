@@ -301,6 +301,36 @@ impl UrdDeque {
         self.wait_strategy
     }
 
+    /// Override the wait strategy for benches and tests that need to
+    /// A/B against the auto-picked one.
+    ///
+    /// The thief's choice is the one worth measuring rather than
+    /// assuming: a `PAUSE`-spin is already the fastest wake there is,
+    /// because it never stopped looking, so replacing it with a
+    /// monitor wait trades some of that latency for a core it stops
+    /// occupying. Which way that comes out is a property of the host
+    /// and cannot be read off the instruction set.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a strategy this host cannot execute, since the
+    /// alternative is a `#UD` inside the steal path with nothing to
+    /// say which caller asked for it.
+    pub fn set_wait_strategy(&mut self, strategy: WaitStrategy) {
+        match strategy {
+            WaitStrategy::Waitpkg => assert!(
+                has_waitpkg(),
+                "this host has no WAITPKG, so UMONITOR would be an illegal instruction"
+            ),
+            WaitStrategy::Monitorx => assert!(
+                has_monitorx(),
+                "this host has no MONITORX, so MONITORX would be an illegal instruction"
+            ),
+            WaitStrategy::PauseSpin => {}
+        }
+        self.wait_strategy = strategy;
+    }
+
     /// Owner pid at create time, or 0 after `close_owner()`.
     pub fn owner_pid(&self) -> u64 {
         self.header().owner_pid.load(Ordering::Acquire)

@@ -208,6 +208,35 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- **`MONITORX`/`MWAITX`, so AMD parts before Zen 5 stop falling back
+  to the kernel.** `cpu_info::has_monitorx` reads CPUID `Fn8000_0001`
+  ECX bit 29, and both waiters gained a third arm: the worker parker
+  picks WAITPKG, then MONITORX, then `std::thread::park`, and the URD
+  thief picks WAITPKG, then MONITORX, then its `PAUSE`-spin.
+
+  The gap this closes is the whole AMD line from 2015 to Zen 5.
+  `has_waitpkg` was the only probe, and it is false on Zen 1 through
+  4, so every such host took the fallback although AMD's user-mode
+  monitor-wait has been present throughout. For the parker that
+  fallback is a syscall, not a spin.
+
+  **Each arm re-checks and waits again rather than trusting one
+  instruction, because `MWAITX`'s unit is not a constant.** It counts
+  a relative number of `EBX` units where `UMWAIT` takes an absolute
+  TSC deadline, and one unit measures 0.4999 RDTSC cycles on a Ryzen 9
+  7900X against 0.9987 on a Ryzen 7 2700 - a factor of two between two
+  AMD parts, with nothing in CPUID reporting which applies. Both
+  figures are least-squares fits over a sweep from 10,000 to 2,000,000
+  units, worst residual 1.8% and 0.4%; the pair's fixed cost is 2369
+  and 1606 cycles. Neither number is read anywhere in the crate. The
+  code passes the remaining count through unscaled, which can only
+  undershoot a deadline and never overshoot it, and the difference
+  costs an iteration.
+
+  `benches/parker_wait_strategy.rs` carries all three arms in one
+  process, each at a 50 us and a 500 us inter-arrival and each both
+  idle and against busy threads occupying half the host.
+
 - **A PowerShell module, `pwrs/`, binding the scheduler surface
   directly to the Rust.** 107 cmdlets, 78 classes and 36 enumerations
   over PWRS, plus a read-only `Flynnel:` drive. It is a binary module:
@@ -324,6 +353,31 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   the same assertion, which is how the Windows result read at first.
 
 ### Fixed
+
+- **A monitor wait reported its own deadline as a wake.**
+  `Parker::park_until` dispatched to the wait once and returned `true`
+  whatever came back, but `UMWAIT` returns on its TSC deadline as well
+  as on a store to the watched line. An idle worker was therefore
+  handed back to its caller every deadline with nothing to do, and the
+  caller re-entered through the whole spin floor; with the 10 ms cap
+  that is a worker waking a hundred times a second to find the same
+  empty deque. It also broke the shutdown contract outright, returning
+  `true` before any shutdown arrived. Both monitor arms now re-read
+  state on the deadline and wait again, which is what the deadline was
+  for: catching a store that went missing, not announcing one that
+  never happened.
+
+  Present since the WAITPKG arm was written and never executed, because
+  no host this project measures on has WAITPKG. The MONITORX arm below
+  is what ran it for the first time.
+
+- **The MONITORX inline-asm blocks promised flags they clobbered.**
+  Both cleared `ECX` and `EDX` with `xor` inside a block marked
+  `options(preserves_flags)`. `xor` writes flags, so the promise was
+  false and the caller's next conditional read whatever the block left
+  behind; on a Zen 4 host this surfaced as `park_until` returning
+  `true` straight through a shutdown. The zeros are operands now, so
+  nothing in either block writes flags ahead of the wait instruction.
 
 - **`VerifyChain` rooted over the order chunks finished, not the order
   they were submitted.** A hash chain is ordered: `update(a)` then

@@ -429,6 +429,10 @@ name = "parker_wait_strategy"
 harness = false
 
 [[bench]]
+name = "urd_thief_wait"
+harness = false
+
+[[bench]]
 name = "simc_cooperative"
 harness = false
 
