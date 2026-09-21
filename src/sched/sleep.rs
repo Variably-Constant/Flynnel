@@ -131,7 +131,14 @@ impl WaitStrategy {
 /// On non-WAITPKG hosts the wake_counter increment is still issued
 /// (it costs one atomic add) but the wait path falls through to
 /// `std::thread::park()` as before.
+/// One cache line per parker, because a monitor wait watches the line
+/// `wake_counter` sits in and wakes on any store to it. Without this
+/// two parkers share a line and each one's unpark fires the other's
+/// monitor, and an `Arc`'s refcounts sit immediately before the data
+/// so every clone and drop fires it too. Both read as the monitor
+/// failing to hold.
 #[derive(Debug)]
+#[repr(align(64))]
 pub struct Parker {
     /// Cached `Thread` handle for cross-thread unpark.
     thread: Thread,
@@ -324,11 +331,10 @@ impl Parker {
         let addr = (&raw const self.wake_counter).cast::<u8>();
 
         // UMONITOR rax: arm hardware monitor on the cache line
-        // containing the wake_counter. Any store to that line
-        // (including unrelated writes that share the line) wakes
-        // UMWAIT. Cache-line padding inside Parker keeps adjacent
-        // fields off the same line so unrelated writes do not
-        // produce spurious wakes.
+        // containing the wake_counter. Any store to that line wakes
+        // UMWAIT, including one to another field of this Parker;
+        // `repr(align(64))` on the struct is what keeps a different
+        // parker's stores out of it.
         //
         // SAFETY: caller (Parker::new -> WaitStrategy::pick) only
         // installs the Waitpkg strategy when has_waitpkg() returned
@@ -682,6 +688,16 @@ mod tests {
             WaitStrategy::StdPark
         };
         assert_eq!(WaitStrategy::pick(), want);
+    }
+
+    #[test]
+    fn no_two_parkers_can_share_a_cache_line() {
+        // A monitor wait watches the line wake_counter sits in, so a
+        // neighbour sharing it turns that neighbour's every unpark
+        // into a wake here. Pinned by alignment rather than by size,
+        // because adding a field must not be able to undo it.
+        assert_eq!(std::mem::align_of::<Parker>(), 64);
+        assert_eq!(std::mem::size_of::<Parker>() % 64, 0);
     }
 
     #[test]
