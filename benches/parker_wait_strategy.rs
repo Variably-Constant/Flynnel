@@ -482,6 +482,26 @@ fn bench_repeat(
     // anything to say about what the controller did.
     if pin.is_none() {
         let r = flynnel::sched::sleep::wait_controller().report();
+
+        // A host that could have raced something, and did not, is a
+        // broken instrument rather than a verdict, and it does not
+        // look like one: the line below reads "in use StdPark" with
+        // two zeroes, which is exactly what a controller that looked
+        // and declined would print. Every arm of this bench once
+        // reported that on every host, because it built a parker per
+        // iteration and the sampling cadence is per thread, so no
+        // thread lived long enough to reach a probe. Said out loud
+        // here so the next reader does not have to notice it.
+        let could_race = flynnel::cpu_info::has_monitorx()
+            && !flynnel::cpu_info::has_waitpkg()
+            && flynnel::sched::sleep::monitor_wait_held();
+        if could_race && r.challenger_samples == 0 {
+            eprintln!(
+                "parker_wait_strategy: INSTRUMENT DID NOT ENGAGE in {name} - this host has a \
+                 monitor wait to race and the controller took zero samples of it, so the row \
+                 above says nothing about the controller and the line below is not a verdict"
+            );
+        }
         eprintln!(
             "parker_wait_strategy: after {name}, controller has baseline {} ns over {} samples, \
              challenger {} ns over {} samples, in use {:?}, {} switch(es), probing every {} \
