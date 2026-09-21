@@ -22,8 +22,17 @@
 //! - **Same scheduling shape**: two threads pinned to distinct cores;
 //!   one parks, one unparks; we measure the unpark-to-return delta.
 //! - **The primitive's named feature IS exercised**: WAITPKG path
-//!   issues UMONITOR + UMWAIT against `wake_counter`; StdPark path
+//!   issues UMONITOR + UMWAIT against `wake_counter`; MONITORX path
+//!   issues MONITORX + MWAITX against the same line; StdPark path
 //!   issues `thread::park()` + permits.
+//! - **Idle and loaded, every arm in both**: the load arm occupies
+//!   half the host with busy threads for the length of a group. A
+//!   wake is what a kernel park pays to get back onto a core, so an
+//!   idle host is the condition under which that cost is smallest
+//!   and the arms are hardest to tell apart. Neither arm alone
+//!   settles anything: the loaded rows are the case being argued
+//!   for, and the idle rows are where "never slower" has to hold
+//!   anyway.
 //!
 //! ## Hardware availability
 //!
@@ -56,8 +65,72 @@ use flynnel::sched::sleep::{Parker, WaitStrategy};
 /// unparks, owner returns. We measure unpark -> return delta from
 /// the producer side (rdtsc bracketing on the unpark + the owner's
 /// observable return via a Release/Acquire flag).
-fn bench_strategy(c: &mut Criterion, label: &str, strategy: WaitStrategy, gap_us: u64) {
-    let mut group = c.benchmark_group(format!("parker_wait_{label}_gap_{gap_us}us"));
+/// Busy threads occupying half the host, joined when this is dropped.
+///
+/// A wake measured on an idle host is the case a scheduler is least
+/// often in: there is a free core waiting to take the woken thread.
+/// Under load a kernel park has to queue behind other runnable work
+/// to get back on a core, and an in-core monitor wait does not, so
+/// the arms are only distinguishable here. An idle-only reading would
+/// report the smaller half of whatever difference exists.
+struct Load {
+    stop: Arc<AtomicU32>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Load {
+    fn spawn() -> Self {
+        let n = std::thread::available_parallelism()
+            .map(|p| p.get() / 2)
+            .unwrap_or(1)
+            .max(1);
+        let stop = Arc::new(AtomicU32::new(0));
+        let threads = (0..n)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut x = 0u64;
+                    while stop.load(Ordering::Relaxed) == 0 {
+                        // A dependent chain, so the thread occupies a
+                        // core rather than being elided.
+                        x = black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+                    }
+                })
+            })
+            .collect();
+        Self { stop, threads }
+    }
+}
+
+impl Drop for Load {
+    fn drop(&mut self) {
+        self.stop.store(1, Ordering::Relaxed);
+        for t in self.threads.drain(..) {
+            // A load thread that panicked took its share of the load
+            // with it, so the arm it was loading measured something
+            // lighter than the one beside it. Said out loud rather
+            // than dropped, because the run would otherwise look
+            // like a clean A/B.
+            if t.join().is_err() {
+                eprintln!("parker_wait_strategy: a load thread panicked, so this run's load arm carried less load than it reports");
+            }
+        }
+    }
+}
+
+fn bench_strategy(
+    c: &mut Criterion,
+    label: &str,
+    strategy: WaitStrategy,
+    gap_us: u64,
+    loaded: bool,
+) {
+    // Held for the whole group so every sample in it sees the same
+    // occupancy, and dropped with the group so the next arm does not
+    // inherit it.
+    let _load = if loaded { Some(Load::spawn()) } else { None };
+    let arm = if loaded { "load" } else { "idle" };
+    let mut group = c.benchmark_group(format!("parker_wait_{label}_{arm}_gap_{gap_us}us"));
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
     group.bench_function("unpark_to_return", |b| {
@@ -101,43 +174,52 @@ fn bench_strategy(c: &mut Criterion, label: &str, strategy: WaitStrategy, gap_us
 }
 
 fn bench_all(c: &mut Criterion) {
-    // Always bench the StdPark baseline. Two gap values exercise
-    // the syscall cost across a short (50us) and longer (500us)
-    // inter-arrival.
-    bench_strategy(c, "stdpark", WaitStrategy::StdPark, 50);
-    bench_strategy(c, "stdpark", WaitStrategy::StdPark, 500);
+    let waitpkg = flynnel::cpu_info::has_waitpkg();
+    let monitorx = flynnel::cpu_info::has_monitorx();
 
-    if flynnel::cpu_info::has_waitpkg() {
-        bench_strategy(c, "waitpkg", WaitStrategy::Waitpkg, 50);
-        bench_strategy(c, "waitpkg", WaitStrategy::Waitpkg, 500);
-    } else {
+    if !waitpkg {
         eprintln!(
-            "parker_wait_strategy: WAITPKG branch skipped - host has \
-             no WAITPKG (cpuid leaf 7 ECX bit 5 = 0). StdPark numbers \
-             measure the existing Parker baseline."
+            "parker_wait_strategy: WAITPKG arm skipped - host has no \
+             WAITPKG (cpuid leaf 7 ECX bit 5 = 0)."
         );
     }
-
-    // Benched independently of WAITPKG rather than as its else-arm.
-    // A host carrying both would otherwise report only the arm it
-    // picks, and the comparison worth having on such a host is the
-    // three side by side.
-    if flynnel::cpu_info::has_monitorx() {
-        bench_strategy(c, "monitorx", WaitStrategy::Monitorx, 50);
-        bench_strategy(c, "monitorx", WaitStrategy::Monitorx, 500);
-    } else {
+    if !monitorx {
         eprintln!(
-            "parker_wait_strategy: MONITORX branch skipped - host has \
-             no MONITORX (cpuid Fn8000_0001 ECX bit 29 = 0)."
+            "parker_wait_strategy: MONITORX arm skipped - host has no \
+             MONITORX (cpuid Fn8000_0001 ECX bit 29 = 0)."
         );
     }
-
-    if !flynnel::cpu_info::has_waitpkg() && !flynnel::cpu_info::has_monitorx() {
+    if !waitpkg && !monitorx {
         eprintln!(
             "parker_wait_strategy: this host has neither monitor-wait, \
              so the StdPark rows are the only path its Parker can take \
              and there is no A/B in this run."
         );
+    }
+
+    // Idle before load, and every arm present in both. The idle rows
+    // alone cannot carry a claim, because the case being argued for
+    // is a busy host; the load rows alone cannot either, because
+    // "never slower" has to hold when the host is quiet too.
+    for loaded in [false, true] {
+        // StdPark is the control and runs whatever the host is: it is
+        // what the Parker does today on every part that reaches this
+        // code, so a run without it compares two treatments.
+        for gap_us in [50, 500] {
+            bench_strategy(c, "stdpark", WaitStrategy::StdPark, gap_us, loaded);
+
+            // Each monitor wait is gated on its own bit rather than
+            // one being the other's else-arm. A host carrying both
+            // would otherwise report only the arm `pick` chooses,
+            // and on such a host the comparison worth having is the
+            // three side by side.
+            if waitpkg {
+                bench_strategy(c, "waitpkg", WaitStrategy::Waitpkg, gap_us, loaded);
+            }
+            if monitorx {
+                bench_strategy(c, "monitorx", WaitStrategy::Monitorx, gap_us, loaded);
+            }
+        }
     }
 }
 
