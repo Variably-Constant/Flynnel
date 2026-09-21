@@ -724,19 +724,28 @@ mod tests {
         // in production goes unexercised. This one parks on whatever
         // this host chose, which is the only test here that executes
         // the MONITORX path on a MONITORX host.
-        let p = Arc::new(Parker::new(0));
+        // Constructed on the thread that parks, and handed back over
+        // a channel. A Parker captures `thread::current()` at
+        // construction and unparks that handle, so one built here and
+        // parked over there sends the permit to this thread and the
+        // parked one never wakes. The StdPark arm is where that
+        // shows: a monitor wait returns on the cache-line store and
+        // never reads the handle at all.
         let ready = Arc::new(AtomicU32::new(0));
         let woke = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = std::sync::mpsc::channel::<Arc<Parker>>();
 
-        let p_thread = Arc::clone(&p);
         let ready_thread = Arc::clone(&ready);
         let woke_thread = Arc::clone(&woke);
         let owner = thread::spawn(move || {
-            let ok = p_thread.park_until(|| ready_thread.load(Ordering::Acquire) == 1);
+            let p = Arc::new(Parker::new(0));
+            tx.send(Arc::clone(&p)).expect("send parker");
+            let ok = p.park_until(|| ready_thread.load(Ordering::Acquire) == 1);
             woke_thread.store(1, Ordering::Release);
             ok
         });
 
+        let p = rx.recv().expect("recv parker");
         thread::sleep(Duration::from_millis(20));
         ready.store(1, Ordering::Release);
         p.unpark();
