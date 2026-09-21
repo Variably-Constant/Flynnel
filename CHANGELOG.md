@@ -219,38 +219,57 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   construction separates those, because CPUID reports the instruction
   and not what it costs, and the cost moves with the load.
 
-  So `WaitController` times the parks the pool performs anyway. One
-  park in sixty-four, per thread, is timed; the unparker stamps its
-  TSC only when the waiter armed it, out of the cache line it is
-  already writing `wake_counter` into, so an unsampled wake pays one
-  relaxed load and no clock read, and a host with no second strategy
-  never touches the controller at all. Each arm needs 32 samples
-  before its mean counts and the cheaper must win by a fifth.
+  So `WaitController` times the parks the pool performs anyway. A
+  probe is two consecutive timed parks, one per arm; the unparker
+  stamps its TSC only when the waiter armed it, out of the cache line
+  it is already writing `wake_counter` into, so a wake between probes
+  pays one relaxed load and no clock read, and a host with no second
+  strategy never touches the controller at all. Each arm needs 32
+  samples before its mean counts and the cheaper must win by a fifth.
 
-  **Sampled parks alternate strictly between the arms**, so every
-  baseline reading has a challenger reading beside it in time. That
-  pairing is the control, and it is not decoration: a quiet draw and
-  a loaded draw of one quantity differ on these hosts by 350 to 4000
-  times, far more than the two waits differ from each other, so means
+  **The two halves of a probe are back to back**, so every baseline
+  reading has a challenger reading beside it in time. That pairing is
+  the control, and it is not decoration: a quiet draw and a loaded
+  draw of one quantity differ on these hosts by 350 to 4000 times,
+  far more than the two waits differ from each other, so means
   gathered over different stretches would compare the machine's mood.
-  Alternation never stops, so no verdict outlives its evidence and
-  the choice moves back when a host gets busy.
+
+  **How often a probe runs is itself adaptive**, because a probe
+  spends one park on the arm not in use, and on a host that settled
+  against the monitor wait that park costs twenty times what the
+  chosen one costs. At a fixed one park in sixty-four that is about a
+  sixth of every park for the life of the process, on exactly the
+  host that already decided against it. The interval doubles to 4096
+  parks while the answer keeps returning the same and collapses to 64
+  when the two means come within the margin of each other, which
+  happens before the order flips rather than after. Probing never
+  stops, so no verdict outlives its evidence and the choice moves
+  back when a host gets busy.
 
   A process starts on WAITPKG or the kernel park, exactly as before,
   and leaves that only on measurement. `Parker::with_strategy` pins an
   arm and is never sampled, so the benches that hold one still cannot
   move the default they inform.
 
-  **The URD thief has the arm and does not default to it.** Its spin
-  is already the fastest wake there is, because it never stopped
-  looking, and measured against it the monitor wait is slower in
-  three cells of four (1.54 to 2.00 us idle at a 50 us inter-arrival,
-  1.66 to 1.92 us under load; best median of three runs on a 7900X).
-  What the monitor would buy the thief is the core it stops
-  occupying, and `benches/urd_thief_wait.rs` cannot see that: it
-  times the thief's own wake, not the throughput of whatever else
-  could have used the core. `UrdDeque::set_wait_strategy` selects it,
-  which is how those numbers were taken.
+  **The URD thief waits in two stages.** Its spin is the fastest wake
+  there is, because it never stopped looking, and it is also the most
+  expensive way to be idle, because it holds a logical CPU throughout.
+  Those are not alternatives to choose between, which is what the
+  earlier comparison treated them as: the thief now spins for
+  `SPIN_BEFORE_WAIT` polls and only then reaches whatever monitor wait
+  the host has, so a publish already in flight is caught at spin
+  latency and never reaches the second stage at all.
+
+  Measured with no floor, so the monitor wait was doing the spin's job
+  as well as its own, it was slower in three cells of four (1.54
+  against 2.00 us idle at a 50 us inter-arrival, 1.66 against 1.92 us
+  under load; best median of three runs on a 7900X). What the second
+  stage buys is the core a long wait gives back, which those rows
+  cannot see because they time the thief and not its neighbours. The
+  co-runner group in `benches/urd_thief_wait.rs` times the neighbours
+  and has not yet run on any host, so the choice rests on the
+  instruction being present rather than on it being cheaper here.
+  Nothing outside that bench calls `UrdDeque::wait_and_drain`.
 
   The gap this closes is the whole AMD line from 2015 to Zen 5.
   `has_waitpkg` was the only probe, and it is false on Zen 1 through
