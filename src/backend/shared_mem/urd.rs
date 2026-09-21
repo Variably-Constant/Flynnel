@@ -824,7 +824,12 @@ mod tests {
         // which is the configuration measured slower in three cells
         // of four. Pinned so it cannot be tuned to zero without the
         // reason being revisited.
-        assert!(SPIN_BEFORE_WAIT >= 64);
+        //
+        // In a const block, so the pin holds at compile time rather
+        // than needing this test to be reached. A value that breaks
+        // it stops the build instead of failing a run somebody has
+        // to make.
+        const { assert!(SPIN_BEFORE_WAIT >= 64) };
     }
 
     #[test]
