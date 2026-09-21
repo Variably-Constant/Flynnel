@@ -148,6 +148,8 @@ pwrs::export_module! {
         crossproc::GetFlynnelCrossProcessVariant,
         crossproc::GetFlynnelCrossProcessRoute,
         crossproc::GetFlynnelPassRegistry,
+        racing::MeasureFlynnelRaceAny,
+        racing::MeasureFlynnelExploreSelect,
     ],
     classes: [
         host::CpuInfo,
@@ -227,6 +229,8 @@ pwrs::export_module! {
         crossproc::DequeVariantInfo,
         crossproc::CrossProcessRoute,
         crossproc::PassRegistryRow,
+        racing::RaceArm,
+        racing::RaceOutcome,
     ],
     enums: [
         host::Vendor,
@@ -281,6 +285,7 @@ mod observe;
 mod plan;
 mod pool;
 mod provider;
+mod racing;
 mod rings;
 mod types;
 mod verify;

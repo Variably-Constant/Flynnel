@@ -1134,10 +1134,19 @@ note = "the profile itself is exported as Flynnel.DispatchProfile and set on a p
 # an arm needing one of them is absent rather than bound to a body
 # that cannot fail.
 #
-# race_any and explore_select have no entry on purpose. They take the
-# attempt index, so candidate PLANS over one declared kernel fits them
-# exactly and they are bindable; leaving them uncovered is what keeps
-# that work visible instead of letting a reason absorb it.
+# race_any and explore_select are the two that fit a declared body,
+# because both take the attempt index and neither asks an arm to
+# decline or disagree. Both are bound.
+
+[[entry]]
+item = "crate::sched::race::race_any"
+reason = "internal-to-another-surface"
+note = "bound as Measure-FlynnelRaceAny, which fires several attempts at one declared operation and keeps the first to finish. TailRatio is what the hedge saved on this host: the slowest arm's time over the winner's"
+
+[[entry]]
+item = "crate::sched::race::explore_select"
+reason = "internal-to-another-surface"
+note = "bound as Measure-FlynnelExploreSelect, the complement that runs every arm to completion and picks the fastest. Its comparator is wall time with the earlier index kept on a tie, so the winner is deterministic given deterministic arms"
 
 [[entry]]
 item = "crate::sched::race::race_variants"
