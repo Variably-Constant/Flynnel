@@ -262,7 +262,7 @@ fn measure(calls: u64, shared_mutex: &Mutex<Vec<Item>>, shared_stack: &Staging) 
 /// The shipped path: stage into a real `KhpdDeque` and let it
 /// auto-publish, which is the sequence `dispatch_marshal` runs.
 ///
-/// This is here because the four cells above are REPLICAS of the three
+/// This is here because the four cells above are replicas of the three
 /// shapes, written in this file. They answer which shape is fastest.
 /// They cannot answer whether the shape shows through the real path's
 /// other costs, and `LINE_ITEMS` is 3, so the real path publishes every
