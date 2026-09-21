@@ -466,11 +466,16 @@ fn bench_all(c: &mut Criterion) {
     // parker per iteration and time a cold first park, which is a
     // different quantity and not this arm's comparison.
     //
-    // The adaptive arm goes last in each cell so the pinned arms are
-    // not measured through whatever the controller has by then
-    // decided.
+    // The adaptive arm leads each cell. A pinned parker ignores the
+    // controller, so nothing the controller decides can reach the
+    // arms beside it; the coupling runs the other way. The fallback
+    // flag is process-wide and never cleared, so a monitor arm that
+    // gives up on the monitor leaves every later group with no
+    // challenger to race, and the adaptive arm would then report no
+    // samples for a reason that has nothing to do with it.
     for loaded in [false, true] {
         for gap_us in [50, 500] {
+            bench_repeat(c, "adaptive", None, gap_us, loaded);
             bench_repeat(c, "stdpark", Some(WaitStrategy::StdPark), gap_us, loaded);
             if waitpkg {
                 bench_repeat(c, "waitpkg", Some(WaitStrategy::Waitpkg), gap_us, loaded);
@@ -478,7 +483,6 @@ fn bench_all(c: &mut Criterion) {
             if monitorx {
                 bench_repeat(c, "monitorx", Some(WaitStrategy::Monitorx), gap_us, loaded);
             }
-            bench_repeat(c, "adaptive", None, gap_us, loaded);
         }
     }
 
