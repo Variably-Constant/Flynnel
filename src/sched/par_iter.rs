@@ -5342,18 +5342,34 @@ mod tests {
             "expected a positive total leaf time in nanoseconds, got {}", stats.sum_ns);
         // The leaves of one dispatch run inside it, on at most every
         // worker at once, so their summed time cannot exceed the
-        // dispatch's own wall time times the worker count. Counter
-        // ticks would exceed that by the tick rate, which is what this
-        // catches: the leaf times and the wall clock must share a unit.
+        // dispatch's own wall time times the worker count.
+        //
+        // Two different faults break that and the counts tell them
+        // apart, which is why they are all in the message. Leaf times
+        // recorded in counter ticks rather than nanoseconds inflate
+        // the total while leaving the number of leaves right, so the
+        // mean per leaf comes out too high by the tick rate. Counters
+        // carrying leaves from another dispatch inflate the total and
+        // the number of leaves together, because the writer that
+        // escaped brought its own leaves with it.
+        //
+        // The second is the one seen in practice: the leaf counters
+        // are process-global, this test holds the leaf-stats lock, and
+        // a run that still exceeds the ceiling means some writer
+        // reached them without taking it.
         let workers = global_local_arena().total_workers().max(1) as u64;
         let ceiling = dispatch_ns.saturating_mul(workers).saturating_mul(2).max(1);
         assert!(
             stats.sum_ns <= ceiling,
-            "{} ns of leaf time against a {} ns dispatch on {} workers reads as counter ticks \
-             rather than nanoseconds",
+            "{} ns of leaf time over {} leaves ({} ns each) against a {} ns dispatch on {} \
+             workers, ceiling {}. A plausible leaf count means the unit is wrong; a count far \
+             above this dispatch's own leaves means the counters carry somebody else's",
             stats.sum_ns,
+            stats.count,
+            stats.sum_ns / stats.count.max(1),
             dispatch_ns,
-            workers
+            workers,
+            ceiling
         );
         // Cleanup so this test's data doesn't pollute neighbours.
         reset_leaf_stats();
