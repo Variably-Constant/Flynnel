@@ -254,32 +254,55 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   CPUID reports bit 29 on both parts and distinguishes them not at
   all; only the length of a real wait does.
 
-  So the wait checks that it held. Eight consecutive returns that did
-  not wait at all - under 16384 RDTSC cycles, against the 1600 to 2400
-  the instruction pair costs - end it in `thread::park` and record the
-  finding process-wide, so later parks skip the attempt.
+  So the wait checks that it held. Four arms inside a million RDTSC
+  cycles is a monitor that is not holding: four honoured budgets take
+  tens of milliseconds, four unheld ones take about four times the
+  instruction pair, which measures 2369 cycles on a 7900X and 1606 on
+  a 2700. The wait then ends in `thread::park`.
 
-  **That threshold is absolute on purpose.** Expressed as a fraction
-  of the requested timeout it cannot work, and the first version was:
-  a park asks for a 10 ms budget, so a store waking it after 50 us
-  returns at a fifty-thousandth of the request and a monitor that
-  never armed returns at a ten-thousandth. Both are under any
-  reasonable fraction. What separates them is the instruction's own
-  duration, about 2400 cycles against several hundred thousand. The
-  fractional form tripped on a host whose monitor holds, and the
-  sticky flag then spent the rest of that process in the kernel park,
-  which showed up as MONITORX rows sitting exactly level with the
-  StdPark rows beside them.
+  **The verdict is not taken on one wait.** It is permanent and
+  process-wide, so eight separate waits have to agree before the
+  process stops trying. A host whose monitor never holds supplies
+  those in microseconds; one whose monitor holds needs eight
+  independent coincidences. Requiring only one was tried and is why
+  this is written down: a single unlucky wait on a 7900X condemned
+  the process, and every group after it in that run measured the
+  kernel park under a MONITORX label, so two runs of one binary read
+  0.99 us and 5.08 us for the same cell depending only on when it
+  fired.
 
-  The flag is never cleared: a wrong `false` costs the kernel park
-  that was already there, a wrong `true` costs the regression on
-  every park, and the two directions are not worth the same.
+  Once taken, the verdict is never cleared: a wrong `false` costs the
+  kernel park that was already there, a wrong `true` costs the
+  regression on every park, and the two directions are not worth the
+  same.
+
+  **Each `Parker` owns a cache line.** A monitor wait watches the line
+  its `wake_counter` sits in and wakes on any store to it. The struct
+  was 32 bytes with no alignment, so two parkers shared a line and
+  each one's unpark fired the other's monitor, and an `Arc`'s
+  refcounts sit immediately before its data so every clone and drop
+  fired it too. In a pool the monitor therefore never held. Found by
+  a consumer's workload rather than by this crate's bench, which
+  constructs one parker and so has no neighbour to be disturbed by.
 
   `benches/parker_wait_strategy.rs` carries all three arms in one
   process, each at a 50 us and a 500 us inter-arrival and each both
-  idle and against busy threads occupying half the host. It reports
-  when the fallback fired, because a fallen-back row looks exactly
-  like the control row beside it.
+  idle and against busy threads occupying half the host, plus a group
+  that allocates a parker per logical CPU the way an arena does and
+  times one of them while a thread unparks the rest.
+
+  It names the group the fallback fired in, not merely that it fired.
+  A fallen-back row is numerically identical to the control row
+  beside it, and because the verdict is process-wide one group can
+  turn every later group into the kernel park, so a run-level notice
+  leaves every row after it unreadable and every row before it
+  indistinguishable from those.
+
+  Both benches print the tree they were built from. Two hosts here
+  carry a directory called `Flynnel-verify` and they are different
+  checkouts, so a run could otherwise be against source several
+  commits behind the one being reasoned about with nothing in the
+  output saying so.
 
 - **A PowerShell module, `pwrs/`, binding the scheduler surface
   directly to the Rust.** 109 cmdlets, 79 classes and 36 enumerations
