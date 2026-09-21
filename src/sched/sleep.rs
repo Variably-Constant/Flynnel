@@ -205,12 +205,22 @@ impl WaitStrategy {
 ///
 /// # Shape
 ///
-/// The same explore-then-exploit the hybrid dispatcher uses for CPU
-/// against device, and the same evidence gate the spin controller
-/// uses before it moves its window. While a strategy is unmeasured
-/// the controller alternates to gather samples; once both have
-/// enough it takes the lower mean; every so often it re-alternates so
-/// a host that got busy is noticed.
+/// The evidence gate the spin controller uses before it moves its
+/// window, over a paired comparison rather than a running one.
+///
+/// Sampled parks alternate strictly between the two arms, so every
+/// baseline reading has a challenger reading beside it in time. That
+/// pairing is the control: on this project's hosts a quiet draw and a
+/// loaded draw of one quantity differ by hundreds to thousands of
+/// times, which is far more than the two arms differ from each other,
+/// so two means gathered over different stretches would compare the
+/// machine's mood and not the waits.
+///
+/// Alternation never stops, so there is no separate re-probe and no
+/// verdict that outlives its evidence. Both means keep moving with an
+/// exponential weight once they are established, and a host that gets
+/// busy is noticed because both arms feel it and the cheaper one may
+/// change.
 ///
 /// # Cost on the path that does not use it
 ///
@@ -262,14 +272,6 @@ thread_local! {
 /// same reason: a wake latency has a long tail and a handful of
 /// samples is mostly tail.
 const SAMPLES_BEFORE_VERDICT: u32 = 32;
-
-/// Parks between re-probes of the strategy not currently in use.
-///
-/// Without this the first verdict is permanent, which is the defect
-/// that made the earlier one-shot guard useless: a host that was idle
-/// when the pool started and is loaded now needs the answer revisited.
-/// The hybrid dispatcher re-races every 32nd call for the same reason.
-const REPROBE_EVERY: u64 = 8192;
 
 /// How much cheaper the challenger must be before the process moves.
 ///
@@ -340,24 +342,22 @@ impl WaitController {
             return None;
         }
 
-        let base_n = self.samples[SLOT_BASELINE as usize].load(Ordering::Relaxed);
-        let chal_n = self.samples[SLOT_CHALLENGER as usize].load(Ordering::Relaxed);
         let taken = self.parks.fetch_add(1, Ordering::Relaxed);
-        let reprobe = taken % REPROBE_EVERY == 0;
 
-        // The side with less evidence, so a cold controller fills both
-        // means rather than confirming the one it started on.
-        let slot = if reprobe {
-            if self.current.load(Ordering::Relaxed) == SLOT_BASELINE {
-                SLOT_CHALLENGER
-            } else {
-                SLOT_BASELINE
-            }
-        } else if chal_n < base_n {
-            SLOT_CHALLENGER
-        } else {
-            SLOT_BASELINE
-        };
+        // Strict alternation, so consecutive samples are one of each
+        // and the pair sees the same machine.
+        //
+        // This is the controller's control arm and it is not
+        // optional. A quiet draw and a loaded draw of the same
+        // quantity differ here by hundreds to thousands of times, far
+        // more than the arms differ from each other, so two means
+        // gathered over different stretches compare the load and not
+        // the waits. Choosing whichever arm had fewer samples, which
+        // is what this did first, alternates on average and says
+        // nothing about when: one arm could fill its evidence while
+        // the box was idle and the other while it was busy, and the
+        // verdict would be confident and meaningless.
+        let slot = (taken % 2) as u32;
 
         Some((
             if slot == SLOT_CHALLENGER {
