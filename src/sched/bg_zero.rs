@@ -20,8 +20,8 @@
 //! cache), and NUMA placement beyond the IoPool worker's inherited
 //! affinity is [`crate::sched::numa_alloc`]'s job.
 
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::sched::io_pool::global_io_pool;
 
@@ -32,8 +32,23 @@ pub struct Handle {
 }
 
 struct HandleInner {
-    buffer: Mutex<Option<Vec<u8>>>,
+    /// Null until the worker publishes, and null again once a reader
+    /// has swapped the buffer out. One producer stores it, one
+    /// consumer takes it, and `ready` carries the edge between them.
+    buffer: AtomicPtr<Vec<u8>>,
     ready: AtomicBool,
+}
+
+impl Drop for HandleInner {
+    fn drop(&mut self) {
+        let p = *self.buffer.get_mut();
+        if !p.is_null() {
+            // SAFETY: the pointer came from Box::into_raw in the
+            // worker, and this is the last owner of the inner, so
+            // nothing else can reach it.
+            drop(unsafe { Box::from_raw(p) });
+        }
+    }
 }
 
 impl Handle {
@@ -54,7 +69,13 @@ impl Handle {
         while !self.inner.ready.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
-        self.inner.buffer.lock().ok()?.take()
+        let taken = self.inner.buffer.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if taken.is_null() {
+            return None;
+        }
+        // SAFETY: the pointer came from Box::into_raw in the worker,
+        // and the swap leaves null behind, so only this call owns it.
+        Some(*unsafe { Box::from_raw(taken) })
     }
 }
 
@@ -71,16 +92,18 @@ impl Handle {
 /// stride).
 pub fn prepare(n_bytes: usize) -> Handle {
     let inner = Arc::new(HandleInner {
-        buffer: Mutex::new(None),
+        buffer: AtomicPtr::new(core::ptr::null_mut()),
         ready: AtomicBool::new(false),
     });
 
     let inner_for_worker = Arc::clone(&inner);
     let work = move || {
         let buf = allocate_and_first_touch(n_bytes);
-        if let Ok(mut slot) = inner_for_worker.buffer.lock() {
-            *slot = Some(buf);
-        }
+        // The buffer is published before the flag a reader waits on,
+        // so a reader that sees ready sees the pointer too.
+        inner_for_worker
+            .buffer
+            .store(Box::into_raw(Box::new(buf)), Ordering::Release);
         inner_for_worker.ready.store(true, Ordering::Release);
     };
 
@@ -183,10 +206,11 @@ mod tests {
         // itself is consumed by wait).
         let handle = prepare(1024);
         let inner = Arc::clone(&handle.inner);
-        let _ = handle.wait();
-        // Now access via the cloned Arc: buffer slot is empty.
-        let second = inner.buffer.lock().unwrap();
-        assert!(second.is_none(), "buffer must be taken by the first wait");
+        let first = handle.wait();
+        assert!(first.is_some(), "the first wait must get the buffer");
+        // Now access via the cloned Arc: the slot the wait swapped.
+        let second = inner.buffer.load(Ordering::Acquire);
+        assert!(second.is_null(), "buffer must be taken by the first wait");
     }
 
     #[test]
