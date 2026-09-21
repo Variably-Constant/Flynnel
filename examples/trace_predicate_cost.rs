@@ -132,6 +132,22 @@ impl Strategy {
     }
 }
 
+/// A strategy from an opaque index, so every variant is constructed
+/// somewhere.
+///
+/// The timed cells park on one variant, which on its own leaves the
+/// other two never built and the enum reported as partly dead. Calling
+/// this once from the warm-up keeps all three live without putting a
+/// second match inside a cell.
+#[inline]
+fn strategy_from(i: u32) -> Strategy {
+    match i {
+        0 => Strategy::StdPark,
+        1 => Strategy::Waitpkg,
+        _ => Strategy::Monitorx,
+    }
+}
+
 /// The park path's payload expression with nothing called.
 ///
 /// Both inputs go through `black_box` because on the park path both
@@ -200,6 +216,9 @@ fn main() {
     black_box(latch_enabled());
     black_box(settable_enabled());
     black_box(park_emit());
+    for i in 0..3 {
+        black_box(strategy_from(black_box(i)).code());
+    }
 
     let control_first = cell(control_enabled);
 
@@ -243,6 +262,28 @@ fn main() {
         emit_ns - control_ns
     );
     println!("guard alone, emit minus payload {:.4} ns/call", emit_ns - payload_ns);
+
+    // The settable cell and the guard inside emit are the same `Once`
+    // and relaxed load, reached two ways: one through a static this
+    // crate can see through, the other behind an inlined call from the
+    // library. Reading them apart is the check that a cheap answer is
+    // the guard being cheap rather than the compiler having lifted it
+    // out of the loop. Where they diverge, the emit figure is the one
+    // standing on the shipped path.
+    let settable_over = settable_ns - control_ns;
+    let guard_over = emit_ns - payload_ns;
+    println!("coherence: settable over control {settable_over:.4}, guard inside emit {guard_over:.4}");
+    let ratio = if settable_over > 0.0 && guard_over > 0.0 {
+        (guard_over / settable_over).max(settable_over / guard_over)
+    } else {
+        f64::INFINITY
+    };
+    if ratio > 2.0 {
+        println!(
+            "DIVERGENT: one guard reads {ratio:.1}x apart through the two paths, so at most \
+             one of them is its cost"
+        );
+    }
 
     // A park consults this once, so one cell is one park's whole
     // share. Read against 204 ns, the challenger wake cost measured
