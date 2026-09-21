@@ -33,6 +33,9 @@ use std::thread::{self, Thread};
 ///   -> [`WaitStrategy::Waitpkg`]: UMONITOR + UMWAIT halt the logical
 ///   CPU sub-100ns until the watched cache line transitions or the
 ///   TSC deadline fires. No kernel syscall.
+/// - AMD silicon without WAITPKG (Excavator onward, so every Zen
+///   before Zen 5) -> [`WaitStrategy::Monitorx`]: MONITORX + MWAITX,
+///   the same wake-on-store shape from user mode.
 /// - All other silicon -> [`WaitStrategy::StdPark`]: the original
 ///   `std::thread::park()` path (kernel condvar; ~1us syscall on Linux
 ///   futex / Windows WaitForSingleObject).
@@ -49,15 +52,36 @@ pub enum WaitStrategy {
     /// Available if and only if [`crate::cpu_info::has_waitpkg`]
     /// is true.
     Waitpkg,
+    /// `MONITORX` + `MWAITX`. AMD's user-mode monitor-wait, the same
+    /// wake-on-store behavior as the WAITPKG pair. Available if and
+    /// only if [`crate::cpu_info::has_monitorx`] is true.
+    ///
+    /// MWAITX takes a relative count of cycles in EBX where UMWAIT
+    /// takes an absolute TSC deadline in EDX:EAX. The two are not the
+    /// same quantity, and how far one EBX unit reaches is a property
+    /// of the part rather than a constant: on a Ryzen 9 7900X one unit
+    /// measures half an RDTSC cycle. Nothing in CPUID reports that
+    /// ratio, and a busy host also returns from MWAITX early by an
+    /// amount that varies between runs.
+    /// [`Parker::wait_via_monitorx`] therefore re-arms toward its own
+    /// deadline rather than trusting one instruction to reach it,
+    /// which is what makes the arm indifferent to both.
+    Monitorx,
 }
 
 impl WaitStrategy {
-    /// Pick the best wait strategy for this host. Returns
-    /// [`WaitStrategy::Waitpkg`] when WAITPKG is available, otherwise
+    /// Pick the best wait strategy for this host: WAITPKG where the
+    /// silicon has it, else MONITORX, else
     /// [`WaitStrategy::StdPark`].
+    ///
+    /// WAITPKG is preferred where both are present because UMWAIT
+    /// takes the deadline this parker wants directly, so that arm
+    /// reaches its bound in one instruction.
     pub fn pick() -> Self {
         if crate::cpu_info::has_waitpkg() {
             Self::Waitpkg
+        } else if crate::cpu_info::has_monitorx() {
+            Self::Monitorx
         } else {
             Self::StdPark
         }
@@ -177,6 +201,9 @@ impl Parker {
             }
             WaitStrategy::Waitpkg => {
                 self.wait_via_waitpkg(initial_wake);
+            }
+            WaitStrategy::Monitorx => {
+                self.wait_via_monitorx(initial_wake);
             }
         }
 
@@ -306,6 +333,133 @@ impl Parker {
     /// Fall through to `thread::park()` as a defensive default.
     #[cfg(not(target_arch = "x86_64"))]
     fn wait_via_waitpkg(&self, _initial_wake: u64) {
+        thread::park();
+    }
+
+    /// MONITORX wait path: the same protocol
+    /// [`Self::wait_via_waitpkg`] runs, over AMD's user-mode pair, and
+    /// bounded to the same 10 ms.
+    ///
+    /// The difference from the WAITPKG arm is the loop, and the loop
+    /// is the whole design. MWAITX counts EBX units rather than
+    /// reaching a TSC deadline, and how far a unit reaches is not
+    /// knowable from CPUID: on a Ryzen 9 7900X one measures half an
+    /// RDTSC cycle, so a budget passed straight through would buy half
+    /// the wait it asked for. A busy host compounds that by returning
+    /// early anyway, by an amount that differs run to run. Either way
+    /// a single instruction hands a still-idle worker back to its
+    /// caller, which re-runs the whole spin floor before parking
+    /// again. Re-arming here keeps that traffic off the caller, and
+    /// turns both unknowns into iteration count rather than into a
+    /// wait that is wrong by a factor nobody measured.
+    ///
+    /// Returning does not mean `wake_counter` changed, exactly as on
+    /// the WAITPKG path: the budget can run out and the monitor can
+    /// fire on an unrelated store to the watched line. `park_until`
+    /// re-checks `is_ready` and `shutdown` on return.
+    #[cfg(target_arch = "x86_64")]
+    fn wait_via_monitorx(&self, initial_wake: u64) {
+        // Matches the WAITPKG arm's cap and its reasoning: a missed
+        // wake must not block forever, and the estimate may be off by
+        // a factor without mattering, because a short budget costs a
+        // re-park and a long one is cut short by the shutdown and
+        // wake checks below.
+        const WAIT_DEADLINE_NS: u64 = 10_000_000;
+        const TSC_HZ_ESTIMATE: u64 = 2_500_000_000;
+        // A monitor that keeps firing on traffic to a neighbouring
+        // address would otherwise spin here for the whole budget. The
+        // count bounds that case on its own, without assuming any
+        // iteration actually waits.
+        const MAX_ARMS: u32 = 256;
+
+        let budget = WAIT_DEADLINE_NS.saturating_mul(TSC_HZ_ESTIMATE / 1_000_000_000);
+        // SAFETY: `_rdtsc` is a no-side-effect read of the TSC
+        // counter; available on every x86_64 CPU produced this
+        // century.
+        let start = unsafe { core::arch::x86_64::_rdtsc() };
+
+        let addr = (&raw const self.wake_counter).cast::<u8>();
+
+        for _ in 0..MAX_ARMS {
+            // MONITORX rax: arm the monitor on the line holding
+            // wake_counter. ECX carries extensions and EDX hints, both
+            // zero, which is the only defined combination.
+            //
+            // SAFETY: Parker::new -> WaitStrategy::pick only installs
+            // this strategy when has_monitorx() returned true, so the
+            // opcode is not a `#UD`. `addr` points at a live AtomicU64
+            // field of `self`. Encoded as bytes because the mnemonic
+            // needs a target feature this crate does not set, and the
+            // encoding is fixed.
+            unsafe {
+                core::arch::asm!(
+                    "xor ecx, ecx",
+                    "xor edx, edx",
+                    ".byte 0x0f, 0x01, 0xfa",
+                    in("rax") addr,
+                    out("rcx") _,
+                    out("rdx") _,
+                    options(nostack, preserves_flags),
+                );
+            }
+
+            // An unpark between the caller's snapshot and the arming
+            // above would not wake MWAITX, because the monitor was not
+            // yet armed. Checked after every arm, not just the first,
+            // since each iteration re-opens the window.
+            if self.wake_counter.load(Ordering::Acquire) != initial_wake {
+                return;
+            }
+
+            let spent = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start);
+            let Some(left) = budget.checked_sub(spent) else {
+                return;
+            };
+            // EBX is 32 bits. A remaining budget past that asks for
+            // the longest wait the register can express and the next
+            // iteration asks for the rest.
+            let ask = u32::try_from(left).unwrap_or(u32::MAX);
+
+            // MWAITX: EAX = 0 requests C0, the light state matching
+            // the WAITPKG arm's C0.1 hint; ECX bit 1 enables the EBX
+            // timer; EBX carries the count.
+            //
+            // rbx is reserved by LLVM and cannot be an operand, so it
+            // is saved and restored inside the block. That is why this
+            // block does not claim `nostack`: it pushes, and a red
+            // zone below rsp would be live under that promise.
+            //
+            // SAFETY: same MONITORX-available reasoning as above.
+            // MWAITX reports timer-versus-wake exit in CF, so flags
+            // are not preserved.
+            unsafe {
+                core::arch::asm!(
+                    "push rbx",
+                    "mov ebx, {ask:e}",
+                    "mov ecx, 2",
+                    "xor eax, eax",
+                    ".byte 0x0f, 0x01, 0xfb",
+                    "pop rbx",
+                    ask = in(reg) ask,
+                    out("rax") _,
+                    out("rcx") _,
+                );
+            }
+
+            if self.wake_counter.load(Ordering::Acquire) != initial_wake {
+                return;
+            }
+            if self.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+        }
+    }
+
+    /// Non-x86_64 stub, for the same reason as the WAITPKG one: the
+    /// CPUID probe cannot report MONITORX off x86_64, so this strategy
+    /// is never installed there.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn wait_via_monitorx(&self, _initial_wake: u64) {
         thread::park();
     }
 

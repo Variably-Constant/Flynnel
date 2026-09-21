@@ -18,9 +18,11 @@
 //!   thief uses `UMONITOR` + `UMWAIT` to halt until the cache line
 //!   transitions OR a TSC deadline fires. Power-efficient; the
 //!   thief doesn't burn pipeline slots polling.
-//! - **WAITPKG not available** (most pre-2020 silicon including
-//!   AMD Zen+/2/3/4): thief uses [`std::hint::spin_loop`] (PAUSE
-//!   on x86) in a tight Acquire-load loop on the state byte.
+//! - **MONITORX available** (AMD Excavator onward, so every Zen
+//!   before Zen 5): thief uses `MONITORX` + `MWAITX`, which halts
+//!   on the same terms from user mode.
+//! - **Neither available**: thief uses [`std::hint::spin_loop`]
+//!   (PAUSE on x86) in a tight Acquire-load loop on the state byte.
 //!
 //! Both branches end the wait when `state` carries the ready bit
 //! for the expected epoch.
@@ -57,7 +59,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use memmap2::{MmapMut, MmapOptions};
 
 use super::khpd::LineItem;
-use crate::cpu_info::has_waitpkg;
+use crate::cpu_info::{has_monitorx, has_waitpkg};
 
 /// Magic byte sequence marking a valid URD file. ASCII "FURD".
 pub const URD_MAGIC: u64 = 0x4655_5244_0000_0001;
@@ -77,13 +79,21 @@ pub enum WaitStrategy {
     /// `UMONITOR` + `UMWAIT`. Available on Intel Tremont/Tiger Lake+
     /// and AMD Zen 5+; detected via CPUID leaf 7 ECX bit 5.
     Waitpkg,
+    /// `MONITORX` + `MWAITX`. Available on AMD from Excavator
+    /// onward, so on every Zen; detected via CPUID Fn8000_0001
+    /// ECX bit 29.
+    Monitorx,
 }
 
 impl WaitStrategy {
-    /// Returns the best wait strategy for this host.
+    /// Returns the best wait strategy for this host: WAITPKG where
+    /// the silicon has it, else MONITORX, else the PAUSE-spin that
+    /// every target can run.
     pub fn pick() -> Self {
         if has_waitpkg() {
             Self::Waitpkg
+        } else if has_monitorx() {
+            Self::Monitorx
         } else {
             Self::PauseSpin
         }
@@ -443,6 +453,14 @@ impl UrdDeque {
                     // re-validates the state byte.
                     unsafe { wait_with_waitpkg(state_addr, deadline_tsc) };
                 }
+                WaitStrategy::Monitorx => {
+                    // SAFETY: MONITORX was confirmed available by
+                    // CPUID at construction time. Same pointer and
+                    // same double-check as the WAITPKG arm; MWAITX
+                    // suspends on the same terms, and returning early
+                    // costs one more turn of this loop.
+                    unsafe { wait_with_monitorx(state_addr, deadline_tsc) };
+                }
             }
         }
         self.drain_mailbox(mailbox_idx)
@@ -507,6 +525,92 @@ unsafe fn wait_with_waitpkg(_state_addr: *const u8, _deadline_tsc: u64) {
     std::hint::spin_loop();
 }
 
+/// `MONITORX` + `MWAITX` wait primitive, AMD's user-mode pair.
+/// Halts the calling logical core until the monitored line
+/// transitions, an interrupt arrives, or the timer runs out.
+///
+/// Takes the same absolute `deadline_tsc` the WAITPKG primitive
+/// takes and converts it, because MWAITX counts a relative number
+/// of EBX units rather than reaching a TSC value. The conversion
+/// passes the remaining cycle count through unscaled, which is
+/// deliberate: an EBX unit is never longer than a TSC cycle (on a
+/// Ryzen 9 7900X it is half of one), so the wait can only end at or
+/// before the deadline, never after it. Undershooting costs another
+/// turn of the caller's loop; overshooting would hold a thief past
+/// a deadline it was given. That asymmetry is why this does not try
+/// to measure the ratio and correct for it.
+///
+/// # Safety
+///
+/// Caller must have confirmed MONITORX via
+/// [`crate::cpu_info::has_monitorx`] - executing `MONITORX` /
+/// `MWAITX` without it raises an illegal-instruction trap (`#UD`).
+///
+/// `state_addr` must be a valid pointer into accessible memory;
+/// `MONITORX` reads no payload, only the address.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn wait_with_monitorx(state_addr: *const u8, deadline_tsc: u64) {
+    use std::arch::asm;
+
+    // SAFETY: `_rdtsc` is a no-side-effect read of the TSC counter.
+    let now = unsafe { std::arch::x86_64::_rdtsc() };
+    // A deadline already past asks for the shortest wait the timer
+    // can express rather than the longest, which is what a zero
+    // would otherwise be read as.
+    let remaining = deadline_tsc.saturating_sub(now).max(1);
+    let ask = u32::try_from(remaining).unwrap_or(u32::MAX);
+
+    // Split for the same reason the WAITPKG pair is split: MONITORX
+    // needs the address in RAX and MWAITX needs EAX for its hints,
+    // and one asm! call cannot bind both. The monitor stays armed
+    // across the two blocks.
+    //
+    // Encoded as bytes because the mnemonics need a target feature
+    // this crate does not set; the encodings are fixed.
+    //
+    // SAFETY: caller-asserted MONITORX availability + valid pointer.
+    unsafe {
+        asm!(
+            "xor ecx, ecx",
+            "xor edx, edx",
+            ".byte 0x0f, 0x01, 0xfa",
+            in("rax") state_addr,
+            out("rcx") _,
+            out("rdx") _,
+            options(nostack, preserves_flags),
+        );
+        // EAX = 0 requests C0, matching the WAITPKG arm's C0.1 hint;
+        // ECX bit 1 enables the EBX timer; EBX carries the count.
+        //
+        // rbx is reserved by LLVM and cannot be an operand, so it is
+        // saved and restored inside the block. That is why this one
+        // does not claim `nostack`: it pushes, and a red zone below
+        // rsp would be live under that promise. MWAITX reports
+        // timer-versus-wake exit in CF, so flags are not preserved
+        // either.
+        asm!(
+            "push rbx",
+            "mov ebx, {ask:e}",
+            "mov ecx, 2",
+            "xor eax, eax",
+            ".byte 0x0f, 0x01, 0xfb",
+            "pop rbx",
+            ask = in(reg) ask,
+            out("rax") _,
+            out("rcx") _,
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn wait_with_monitorx(_state_addr: *const u8, _deadline_tsc: u64) {
+    // Non-x86_64: MONITORX cannot be available, for the same reason
+    // the WAITPKG stub above is never called.
+    std::hint::spin_loop();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +627,15 @@ mod tests {
             .unwrap_or(0);
         p.push(format!("flynnel_urd_{pid}_{nonce}_{name}.bin"));
         p
+    }
+
+    /// Delete a test's backing file, reporting a failure rather than
+    /// discarding it. A leaked mapping shows up here first, and a
+    /// silent drop would leave the next run to find the file instead.
+    fn remove_temp(path: &std::path::Path) {
+        if let Err(e) = std::fs::remove_file(path) {
+            eprintln!("urd test: could not remove {}: {e}", path.display());
+        }
     }
 
     fn item(id: u32) -> LineItem {
@@ -544,12 +657,39 @@ mod tests {
         let path = temp_path("strategy");
         let u = UrdDeque::create(&path, 2).expect("create");
         let s = u.wait_strategy();
+        // The order is the assertion, not any one host's answer:
+        // WAITPKG wins where present, MONITORX takes hosts that have
+        // only it, and the spin is what is left. A host with neither
+        // and a host with both both pass, and each does so for the
+        // one reason that applies to it.
         if has_waitpkg() {
             assert_eq!(s, WaitStrategy::Waitpkg);
+        } else if has_monitorx() {
+            assert_eq!(s, WaitStrategy::Monitorx);
         } else {
             assert_eq!(s, WaitStrategy::PauseSpin);
         }
-        std::fs::remove_file(&path).ok();
+        remove_temp(&path);
+    }
+
+    #[test]
+    fn the_thief_never_picks_a_wait_its_host_cannot_execute() {
+        // The strategy names an instruction, so picking one the CPUID
+        // probe did not confirm is a `#UD` on the steal path rather
+        // than a wrong answer. Read from the strategy toward the
+        // probe, which is the direction that catches a `pick` whose
+        // arms have been reordered out from under the detections.
+        let path = temp_path("strategy_executable");
+        let u = UrdDeque::create(&path, 2).expect("create");
+        match u.wait_strategy() {
+            WaitStrategy::Waitpkg => assert!(has_waitpkg()),
+            WaitStrategy::Monitorx => assert!(has_monitorx()),
+            WaitStrategy::PauseSpin => {
+                assert!(!has_waitpkg());
+                assert!(!has_monitorx());
+            }
+        }
+        remove_temp(&path);
     }
 
     #[test]

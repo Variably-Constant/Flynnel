@@ -1,5 +1,6 @@
-//! A/B microbench: Parker wake latency with std::thread::park vs
-//! WAITPKG (UMONITOR + UMWAIT) wake paths.
+//! A/B microbench: Parker wake latency across the three wake paths,
+//! std::thread::park, WAITPKG (UMONITOR + UMWAIT) and MONITORX
+//! (MONITORX + MWAITX).
 //!
 //! Two threads:
 //! - **Owner**: parks via `park_until` past the spin floor.
@@ -26,11 +27,17 @@
 //!
 //! ## Hardware availability
 //!
-//! WAITPKG is detected at runtime via `crate::cpu_info::has_waitpkg`.
-//! On Zen+ R7 2700 (the development host) WAITPKG is NOT available;
-//! the WAITPKG bench is skipped with an explanatory eprintln. On
-//! Genoa / Tiger Lake+ / Zen 5+ the WAITPKG variant runs and is
-//! the comparison the bench is designed to expose.
+//! Each path is detected at runtime, WAITPKG via
+//! `crate::cpu_info::has_waitpkg` and MONITORX via
+//! `crate::cpu_info::has_monitorx`, and a path the host does not
+//! carry is skipped with an explanatory eprintln rather than run.
+//!
+//! Which rows a host produces is itself the reading. WAITPKG needs
+//! Tiger Lake and later or Zen 5 and later, so on Zen 1 to 4 only the
+//! MONITORX rows appear beside the baseline, and that pair is the
+//! comparison this bench exists for on those parts. A guest whose
+//! hypervisor masks both leaves produces the StdPark rows alone,
+//! which is not a result about the silicon.
 
 #![allow(clippy::missing_docs_in_private_items)]
 
@@ -108,6 +115,28 @@ fn bench_all(c: &mut Criterion) {
             "parker_wait_strategy: WAITPKG branch skipped - host has \
              no WAITPKG (cpuid leaf 7 ECX bit 5 = 0). StdPark numbers \
              measure the existing Parker baseline."
+        );
+    }
+
+    // Benched independently of WAITPKG rather than as its else-arm.
+    // A host carrying both would otherwise report only the arm it
+    // picks, and the comparison worth having on such a host is the
+    // three side by side.
+    if flynnel::cpu_info::has_monitorx() {
+        bench_strategy(c, "monitorx", WaitStrategy::Monitorx, 50);
+        bench_strategy(c, "monitorx", WaitStrategy::Monitorx, 500);
+    } else {
+        eprintln!(
+            "parker_wait_strategy: MONITORX branch skipped - host has \
+             no MONITORX (cpuid Fn8000_0001 ECX bit 29 = 0)."
+        );
+    }
+
+    if !flynnel::cpu_info::has_waitpkg() && !flynnel::cpu_info::has_monitorx() {
+        eprintln!(
+            "parker_wait_strategy: this host has neither monitor-wait, \
+             so the StdPark rows are the only path its Parker can take \
+             and there is no A/B in this run."
         );
     }
 }

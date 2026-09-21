@@ -253,7 +253,10 @@ fn monitorx_available() -> &'static bool {
 ///   Alder Lake, Raptor Lake, Emerald Rapids, and later
 /// - AMD: Zen 5 (2024+) - Ryzen 9000 series, EPYC Turin
 /// - Older Intel (pre-Tiger-Lake desktop) and AMD Zen 4 and earlier:
-///   returns `false`; callers fall back to PAUSE-spin
+///   returns `false`, and what a caller does then depends on the
+///   caller: both the worker parker and the URD thief try
+///   [`has_monitorx`] next, and fall back to a kernel park and a
+///   PAUSE-spin respectively only when that is false too
 ///
 /// Cached on first call via [`waitpkg_available`].
 #[cfg(target_arch = "x86_64")]
