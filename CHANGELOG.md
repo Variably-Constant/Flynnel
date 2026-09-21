@@ -210,9 +210,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 - **`MONITORX`/`MWAITX`, so AMD parts before Zen 5 stop falling back
   to the kernel.** `cpu_info::has_monitorx` reads CPUID `Fn8000_0001`
-  ECX bit 29, and both waiters gained a third arm: the worker parker
-  picks WAITPKG, then MONITORX, then `std::thread::park`, and the URD
-  thief picks WAITPKG, then MONITORX, then its `PAUSE`-spin.
+  ECX bit 29, and the worker parker gained a third arm: it picks
+  WAITPKG, then MONITORX, then `std::thread::park`.
+
+  **The URD thief has the arm and does not default to it.** Its spin
+  is already the fastest wake there is, because it never stopped
+  looking, and measured against it the monitor wait is slower in
+  three cells of four (1.54 to 2.00 us idle at a 50 us inter-arrival,
+  1.66 to 1.92 us under load; best median of three runs on a 7900X).
+  What the monitor would buy the thief is the core it stops
+  occupying, and `benches/urd_thief_wait.rs` cannot see that: it
+  times the thief's own wake, not the throughput of whatever else
+  could have used the core. `UrdDeque::set_wait_strategy` selects it,
+  which is how those numbers were taken.
 
   The gap this closes is the whole AMD line from 2015 to Zen 5.
   `has_waitpkg` was the only probe, and it is false on Zen 1 through

@@ -18,11 +18,13 @@
 //!   thief uses `UMONITOR` + `UMWAIT` to halt until the cache line
 //!   transitions OR a TSC deadline fires. Power-efficient; the
 //!   thief doesn't burn pipeline slots polling.
-//! - **MONITORX available** (AMD Excavator onward, so every Zen
-//!   before Zen 5): thief uses `MONITORX` + `MWAITX`, which halts
-//!   on the same terms from user mode.
-//! - **Neither available**: thief uses [`std::hint::spin_loop`]
+//! - **WAITPKG not available**: thief uses [`std::hint::spin_loop`]
 //!   (PAUSE on x86) in a tight Acquire-load loop on the state byte.
+//!
+//! `MONITORX` + `MWAITX` is implemented as a third strategy and is
+//! not picked automatically: measured against the spin it is slower
+//! in three cells of four. See [`WaitStrategy::pick`] for the table
+//! and for what the measurement does not cover.
 //!
 //! Both branches end the wait when `state` carries the ready bit
 //! for the expected epoch.
@@ -86,14 +88,39 @@ pub enum WaitStrategy {
 }
 
 impl WaitStrategy {
-    /// Returns the best wait strategy for this host: WAITPKG where
-    /// the silicon has it, else MONITORX, else the PAUSE-spin that
-    /// every target can run.
+    /// Returns the wait strategy for this host: WAITPKG where the
+    /// silicon has it, otherwise the PAUSE-spin.
+    ///
+    /// # MONITORX is implemented and is deliberately not picked here
+    ///
+    /// The thief's spin is already the fastest wake there is, because
+    /// it never stopped looking, and the measurement says a monitor
+    /// wait does not beat it. On a Ryzen 9 7900X, best median of
+    /// three runs of `benches/urd_thief_wait.rs`, publish to drained:
+    ///
+    /// ```text
+    ///                PAUSE-spin   MONITORX
+    ///   idle   50us     1.54 us    2.00 us
+    ///   idle  500us     1.69 us    1.60 us
+    ///   load   50us     1.66 us    1.92 us
+    ///   load  500us     1.63 us    1.85 us
+    /// ```
+    ///
+    /// Slower in three cells of four, so it does not pass a rule that
+    /// nothing may get slower anywhere, and it is not the default.
+    ///
+    /// What a monitor wait would buy the thief is the core it stops
+    /// occupying, and that bench cannot see it: it times the thief's
+    /// own wake, not the throughput of whatever else could have used
+    /// the core meanwhile. Establishing the benefit needs a harness
+    /// that measures the co-runner, and until one exists the trade is
+    /// unmeasured in the direction that would justify it.
+    ///
+    /// [`UrdDeque::set_wait_strategy`] still selects it, which is how
+    /// the numbers above were taken.
     pub fn pick() -> Self {
         if has_waitpkg() {
             Self::Waitpkg
-        } else if has_monitorx() {
-            Self::Monitorx
         } else {
             Self::PauseSpin
         }
@@ -687,19 +714,35 @@ mod tests {
         let path = temp_path("strategy");
         let u = UrdDeque::create(&path, 2).expect("create");
         let s = u.wait_strategy();
-        // The order is the assertion, not any one host's answer:
-        // WAITPKG wins where present, MONITORX takes hosts that have
-        // only it, and the spin is what is left. A host with neither
-        // and a host with both both pass, and each does so for the
-        // one reason that applies to it.
+        // WAITPKG where the host has it, the spin otherwise. MONITORX
+        // is never picked, and that is asserted below rather than
+        // left implicit, because it is a measurement result and not
+        // an oversight.
         if has_waitpkg() {
             assert_eq!(s, WaitStrategy::Waitpkg);
-        } else if has_monitorx() {
-            assert_eq!(s, WaitStrategy::Monitorx);
         } else {
             assert_eq!(s, WaitStrategy::PauseSpin);
         }
         remove_temp(&path);
+    }
+
+    #[test]
+    fn monitorx_is_available_to_ask_for_and_is_never_chosen_on_its_own() {
+        // It loses to the spin on latency, so defaulting to it would
+        // be a regression; it stays reachable because the bench that
+        // found that out selects it, and because the trade it makes
+        // has not been measured in the direction that would justify
+        // it. A later measurement changes `pick`, and this test is
+        // what will notice.
+        assert_ne!(WaitStrategy::pick(), WaitStrategy::Monitorx);
+
+        if has_monitorx() {
+            let path = temp_path("strategy_monitorx");
+            let mut u = UrdDeque::create(&path, 2).expect("create");
+            u.set_wait_strategy(WaitStrategy::Monitorx);
+            assert_eq!(u.wait_strategy(), WaitStrategy::Monitorx);
+            remove_temp(&path);
+        }
     }
 
     #[test]
