@@ -18,6 +18,15 @@
 //! against itself. The suite asserts the equality field by field,
 //! which is the check that keeps them together.
 //!
+//! One consequence a caller meets immediately: a leaf has no `Name`.
+//! A `Flynnel.CpuInfo` carries no such property, and adding one here
+//! would make the drive's object differ from the cmdlet's, which is
+//! the single thing this design must not do. `PSChildName` is the
+//! name, supplied by the engine from the item's path, and it is what
+//! `Get-ChildItem | ForEach-Object { $_.PSChildName }` reads.
+//! Containers do carry `Name`, because their object is this
+//! provider's own and has nothing to stay equal to.
+//!
 //! # A level that cannot be read says so
 //!
 //! A container that exists and is empty is a different answer from a

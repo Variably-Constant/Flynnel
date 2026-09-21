@@ -63,11 +63,26 @@ Describe 'the tree' {
     }
 
     It 'enumerates every leaf under host' {
-        $names = @(Get-ChildItem Flynnel:\host | ForEach-Object { $_.Name })
+        # PSChildName, not Name. A leaf's object is the row its cmdlet
+        # writes, and a Flynnel.CpuInfo has no Name property of its
+        # own; adding one would make it a different object from what
+        # the cmdlet writes, which is the one thing this drive must
+        # not do. The provider-supplied name is where a name lives.
+        $names = @(Get-ChildItem Flynnel:\host | ForEach-Object { $_.PSChildName })
         $names | Should -Contain 'topology'
         $names | Should -Contain 'cpu'
         $names | Should -Contain 'latency'
         $names | Should -Contain 'cache'
+    }
+
+    It 'gives a leaf no Name of its own, because it is the cmdlet''s row' {
+        # Pinned deliberately. A later change that added Name to a leaf
+        # would make the drive's object differ from the cmdlet's, and
+        # nothing else here would notice.
+        $leaf = Get-Item Flynnel:\host\cpu
+        $leaf.PSObject.Properties.Name | Should -Not -Contain 'Name'
+        $leaf.PSChildName | Should -Be 'cpu'
+        $leaf.PSIsContainer | Should -BeFalse
     }
 
     It 'says a path that is not there is not there' {
@@ -123,7 +138,7 @@ Describe 'the pool level' {
     }
 
     It 'has the three fixed leaves and the workers container' {
-        $names = @(Get-ChildItem Flynnel:\pool | ForEach-Object { $_.Name })
+        $names = @(Get-ChildItem Flynnel:\pool | ForEach-Object { $_.PSChildName })
         $names | Should -Contain 'summary'
         $names | Should -Contain 'spin'
         $names | Should -Contain 'split'
