@@ -69,19 +69,13 @@ pub enum WaitStrategy {
     Monitorx,
 }
 
-/// Whether a monitor wait on this host actually suspends the core.
+/// Whether a monitor wait on this host suspends the core, which the
+/// CPUID bit does not answer and only the length of a real wait
+/// reveals. A Ryzen 7 2700 under load returns from MWAITX at once.
 ///
-/// A CPUID bit says the instruction pair exists and decodes. It does
-/// not say the monitor survives long enough to be waited on, and on
-/// at least one part it does not: on a Ryzen 7 2700 under load,
-/// MWAITX returns straight back, so re-arming becomes a spin over a
-/// two-thousand-cycle instruction pair. Nothing reports that, and
-/// only the length of an actual wait reveals it.
-///
-/// Set false by the first parker to see it, and never set back. A
-/// wrong false costs the kernel park that was there before; a wrong
-/// true costs that regression on every park, so the two directions
-/// are not worth the same.
+/// Set false by the first parker to find that, never set back: a
+/// wrong false costs the kernel park that was there anyway, a wrong
+/// true costs a spin over the instruction pair on every park.
 static MONITOR_HOLDS: AtomicBool = AtomicBool::new(true);
 
 /// Whether re-arming a monitor is still believed to be worth it.
@@ -235,15 +229,10 @@ impl Parker {
             WaitStrategy::StdPark => {
                 thread::park();
             }
-            // Both monitor waits return on their own deadline as well
-            // as on a wake, and a deadline is not news. Reporting one
-            // as a wake would hand the caller a worker that nothing
-            // has given work to, and the caller would re-enter here
-            // through the whole spin floor. So the deadline is used
-            // for what it is, a chance to re-read state that a missed
-            // store would otherwise hide, and the wait is re-entered
-            // until there is something to report. That is what the
-            // StdPark arm gets from `thread::park` for free.
+            // A monitor wait returns on its deadline as well as on a
+            // wake, so the deadline re-reads state and the wait is
+            // re-entered. Only a wake, a shutdown or a ready
+            // predicate returns to the caller.
             WaitStrategy::Waitpkg | WaitStrategy::Monitorx => loop {
                 match self.wait_strategy {
                     WaitStrategy::Monitorx => self.wait_via_monitorx(initial_wake),
@@ -394,23 +383,17 @@ impl Parker {
     /// [`Self::wait_via_waitpkg`] runs, over AMD's user-mode pair, and
     /// bounded to the same 10 ms.
     ///
-    /// The difference from the WAITPKG arm is the loop, and the loop
-    /// is the whole design. MWAITX counts EBX units rather than
-    /// reaching a TSC deadline, and how far a unit reaches is not
-    /// knowable from CPUID: on a Ryzen 9 7900X one measures half an
-    /// RDTSC cycle, so a budget passed straight through would buy half
-    /// the wait it asked for. A busy host compounds that by returning
-    /// early anyway, by an amount that differs run to run. Either way
-    /// a single instruction hands a still-idle worker back to its
-    /// caller, which re-runs the whole spin floor before parking
-    /// again. Re-arming here keeps that traffic off the caller, and
-    /// turns both unknowns into iteration count rather than into a
-    /// wait that is wrong by a factor nobody measured.
+    /// Re-arms toward the deadline instead of asking one instruction
+    /// to reach it. MWAITX counts EBX units, and how far a unit
+    /// reaches is not in CPUID: half an RDTSC cycle on a Ryzen 9
+    /// 7900X, a whole one on a Ryzen 7 2700. A busy host also returns
+    /// early by a varying amount. Both cost iterations here and
+    /// neither is read.
     ///
-    /// Returning does not mean `wake_counter` changed, exactly as on
-    /// the WAITPKG path: the budget can run out and the monitor can
-    /// fire on an unrelated store to the watched line. `park_until`
-    /// re-checks `is_ready` and `shutdown` on return.
+    /// Returning does not mean `wake_counter` changed: the budget can
+    /// run out and the monitor can fire on an unrelated store to the
+    /// watched line. `park_until` re-checks `is_ready` and
+    /// `shutdown`.
     #[cfg(target_arch = "x86_64")]
     fn wait_via_monitorx(&self, initial_wake: u64) {
         // Matches the WAITPKG arm's cap and its reasoning: a missed
@@ -425,27 +408,12 @@ impl Parker {
         // count bounds that case on its own, without assuming any
         // iteration actually waits.
         const MAX_ARMS: u32 = 256;
-        // How many arms may be spent, and how quickly, before this
-        // concludes the monitor is not holding and parks instead.
-        //
-        // The test is the pair together: many arms in very little
-        // time. A monitor that holds cannot produce that, because one
-        // arm covers the whole budget and reaching a fourth means
-        // three full budgets have elapsed. A monitor that does not
-        // hold reaches the fourth in a few thousand cycles, since
-        // each turn costs only what the instruction pair costs, about
-        // 2369 cycles on a 7900X and 1606 on a 2700.
-        //
-        // Measured on a Ryzen 7 2700 under load, where the monitor
-        // does not hold and the full 256 arms ran: the parker took
-        // 444 to 755 us against 15 to 25 us for the kernel park it
-        // replaced, a regression of 20 to 40 times on the scheduler's
-        // own idle path.
+        // This many arms inside `ARMS_TOO_FAST_CYCLES` means the
+        // monitor is not holding, and the wait parks instead. Four
+        // honoured budgets take tens of milliseconds; four unheld
+        // ones take about four times the instruction pair, measured
+        // at 2369 cycles on a 7900X and 1606 on a 2700.
         const ARMS_BEFORE_JUDGING: u32 = 4;
-        // Below this, that many arms is impossibly fast for a wait
-        // that held. Roughly a quarter of a millisecond, against the
-        // tens of milliseconds four honoured budgets would take and
-        // the few thousand cycles four unheld ones do.
         const ARMS_TOO_FAST_CYCLES: u64 = 1_000_000;
 
         let budget = WAIT_DEADLINE_NS.saturating_mul(TSC_HZ_ESTIMATE / 1_000_000_000);
@@ -456,11 +424,9 @@ impl Parker {
 
         let addr = (&raw const self.wake_counter).cast::<u8>();
 
-        // A host whose monitor does not hold has already been found
-        // out, by this parker or another. The finding is a property
-        // of the part rather than of one wait, so it is read once
-        // here and never re-tested: the cost of being wrong the other
-        // way is the regression above, on every park.
+        // Whether the monitor holds is a property of the part, so a
+        // finding by any parker in this process applies to all of
+        // them and is never re-tested.
         if !monitor_holds() {
             thread::park();
             return;
@@ -541,14 +507,10 @@ impl Parker {
                 return;
             }
 
-            // Whether this loop is getting anywhere. Judged on the
-            // arms and the clock together rather than on how long any
-            // one return lasted: under load some returns are
-            // lengthened by an interrupt, so a rule counting only
-            // consecutive short ones keeps resetting and never fires
-            // while the loop is still spinning. Measured on the 2700,
-            // where that version reached the fallback only after
-            // spending 291 us in one group.
+            // Arms and clock together, not the length of any single
+            // return: an interrupt lengthens some returns, so a rule
+            // over consecutive short ones never fires on a host whose
+            // monitor is not holding.
             if arms >= ARMS_BEFORE_JUDGING
                 && unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start)
                     < ARMS_TOO_FAST_CYCLES
