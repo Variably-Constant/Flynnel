@@ -208,7 +208,7 @@ impl WaitStrategy {
 /// The evidence gate the spin controller uses before it moves its
 /// window, over a paired comparison rather than a running one.
 ///
-/// Sampled parks alternate strictly between the two arms, so every
+/// A probe is two consecutive timed parks, one per arm, so every
 /// baseline reading has a challenger reading beside it in time. That
 /// pairing is the control: on this project's hosts a quiet draw and a
 /// loaded draw of one quantity differ by hundreds to thousands of
@@ -216,11 +216,19 @@ impl WaitStrategy {
 /// so two means gathered over different stretches would compare the
 /// machine's mood and not the waits.
 ///
-/// Alternation never stops, so there is no separate re-probe and no
-/// verdict that outlives its evidence. Both means keep moving with an
-/// exponential weight once they are established, and a host that gets
-/// busy is noticed because both arms feel it and the cheaper one may
-/// change.
+/// Probing never stops, so there is no verdict that outlives its
+/// evidence. Both means keep moving with an exponential weight once
+/// they are established, and a host that gets busy is noticed because
+/// both arms feel it and the cheaper one may change.
+///
+/// What does change is how often. Each probe spends one park on the
+/// arm not in use, which on a host that settled against the monitor
+/// wait is a park costing twenty times what the chosen one costs, so
+/// a fixed rate is a standing tax for the life of the process. The
+/// interval doubles toward [`PROBE_EVERY_MAX`] while the answer keeps
+/// coming back the same and collapses to [`PROBE_EVERY_MIN`] the
+/// moment the two means fall within the margin of each other, which
+/// happens before the order flips rather than after.
 ///
 /// # Cost on the path that does not use it
 ///
@@ -229,8 +237,9 @@ impl WaitStrategy {
 /// line it is already writing, so an unsampled wake pays nothing it
 /// was not already paying. A park is the slow path by construction:
 /// the cheapest outcome measured here is about half a microsecond and
-/// the timing costs two clock reads, so a sampled park pays a few per
-/// cent and one park in [`SAMPLE_EVERY`] is sampled.
+/// the timing costs two clock reads, so a timed park pays a few per
+/// cent and one park in [`PROBE_EVERY_MIN`] is timed at the closest
+/// the controller ever looks.
 pub struct WaitController {
     /// Mean observed wake cost in nanoseconds, indexed by
     /// [`Self::slot`]. Zero means unmeasured.
@@ -245,24 +254,62 @@ pub struct WaitController {
     current: AtomicU32,
     /// Times a verdict changed which strategy is in use.
     switches: AtomicU64,
+    /// Parks a thread takes between probes, between
+    /// [`PROBE_EVERY_MIN`] and [`PROBE_EVERY_MAX`].
+    probe_every: AtomicU32,
 }
 
-/// One park in this many, per thread, is timed.
+/// Parks between probes while a verdict is forming or contested.
 ///
 /// Low enough that a verdict arrives inside a second of ordinary
 /// scheduling and high enough that the two clock reads it costs are
-/// spread thin. A park is already microseconds, so the sampled ones
-/// pay single-digit per cent and the rest pay nothing.
-const SAMPLE_EVERY: u32 = 64;
+/// spread thin.
+const PROBE_EVERY_MIN: u32 = 64;
+
+/// Parks between probes once the same answer has come back several
+/// times running.
+///
+/// A probe spends one park on the arm not in use, and on a host where
+/// that arm is far worse the difference lands on the pool's park
+/// latency. The measured spread here reaches twenty times, so at the
+/// close rate that is a sixth of every park, forever, on a host that
+/// settled against the monitor wait in the first place. Widening to
+/// this leaves a fortieth of that, which is under the run-to-run
+/// spread of the thing being protected, while still bringing eight
+/// probes inside a few tens of thousands of parks so a host that
+/// changes character is noticed.
+const PROBE_EVERY_MAX: u32 = 4096;
+
+/// A thread's place in the probe cycle.
+#[derive(Clone, Copy)]
+struct ProbeCursor {
+    /// Parks since this thread last started a pair.
+    since: u32,
+    /// Interval it is counting to, refreshed when a pair starts.
+    every: u32,
+    /// Slot the second half of the current pair owes, or [`NO_PAIR`].
+    owed: u32,
+}
+
+/// No pair is open, so the next park is counted rather than timed.
+const NO_PAIR: u32 = u32::MAX;
 
 thread_local! {
-    /// Parks this thread has taken since it last sampled one.
+    /// Where this thread is in the probe cycle.
     ///
     /// Thread-local so the cadence costs no shared line. A worker
-    /// that parks rarely samples rarely, which is correct: the
+    /// that parks rarely probes rarely, which is correct: the
     /// controller wants samples in proportion to how much a thread
-    /// actually parks.
-    static PARKS_SINCE_SAMPLE: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    /// actually parks. The interval is copied in when a pair starts
+    /// rather than read per park, so an unsampled park reads nothing
+    /// another worker writes.
+    static PROBE: core::cell::Cell<ProbeCursor> = const {
+        core::cell::Cell::new(ProbeCursor {
+            since: 0,
+            every: PROBE_EVERY_MIN,
+            owed: NO_PAIR,
+        })
+    };
 }
 
 /// Samples each strategy needs before its mean is allowed to decide
@@ -288,6 +335,7 @@ static WAIT_CONTROLLER: WaitController = WaitController {
     parks: AtomicU64::new(0),
     current: AtomicU32::new(SLOT_BASELINE),
     switches: AtomicU64::new(0),
+    probe_every: AtomicU32::new(PROBE_EVERY_MIN),
 };
 
 /// Slot of [`WaitStrategy::baseline`], whatever that resolves to.
@@ -314,50 +362,53 @@ impl WaitController {
     /// Whether this park should be timed, and which slot it will
     /// report against. Called once per park, before the wait.
     ///
-    /// Also drives exploration: while either side is short of
-    /// evidence, or a re-probe is due, the sampled park is steered to
-    /// the side that needs it rather than to whichever is in use.
+    /// This is also what drives exploration: the park it asks for is
+    /// the arm being measured, not the arm the verdict prefers, so a
+    /// probe is the only thing that ever runs the losing wait.
     ///
-    /// # What an unsampled park pays
+    /// # What a park between probes pays
     ///
     /// Nothing shared. The challenger check comes first, so a host
     /// with no second strategy leaves without touching the controller
-    /// at all, and the park counter is thread-local, so the
-    /// sixty-three parks between samples never write a line another
-    /// worker reads. An earlier version counted in a process-wide
-    /// atomic before asking whether there was anything to count, which
-    /// put a contended read-modify-write on every park on every host.
+    /// at all, and the cursor is thread-local, so the parks between
+    /// probes neither read nor write a line another worker touches.
+    /// The interval is copied into the cursor when a pair opens, so
+    /// even the one relaxed load that sets it is paid per probe
+    /// rather than per park.
     fn sample_plan(&self) -> Option<(WaitStrategy, u32)> {
         let challenger = challenger()?;
-        if !PARKS_SINCE_SAMPLE.with(|c| {
-            let n = c.get() + 1;
-            if n >= SAMPLE_EVERY {
-                c.set(0);
-                true
-            } else {
-                c.set(n);
-                false
+
+        // A probe is two consecutive timed parks, one per arm, and
+        // the pair is the controller's control. It is not optional.
+        // A quiet draw and a loaded draw of the same quantity differ
+        // here by hundreds to thousands of times, far more than the
+        // arms differ from each other, so two means gathered over
+        // different stretches compare the load and not the waits.
+        // Taking the two halves back to back keeps them inside the
+        // same conditions however far apart the probes themselves
+        // are, which is what lets the interval widen.
+        let slot = PROBE.with(|p| {
+            let mut c = p.get();
+            if c.owed != NO_PAIR {
+                let owed = c.owed;
+                c.owed = NO_PAIR;
+                c.since = 0;
+                p.set(c);
+                return Some(owed);
             }
-        }) {
-            return None;
-        }
-
-        let taken = self.parks.fetch_add(1, Ordering::Relaxed);
-
-        // Strict alternation, so consecutive samples are one of each
-        // and the pair sees the same machine.
-        //
-        // This is the controller's control arm and it is not
-        // optional. A quiet draw and a loaded draw of the same
-        // quantity differ here by hundreds to thousands of times, far
-        // more than the arms differ from each other, so two means
-        // gathered over different stretches compare the load and not
-        // the waits. Choosing whichever arm had fewer samples, which
-        // is what this did first, alternates on average and says
-        // nothing about when: one arm could fill its evidence while
-        // the box was idle and the other while it was busy, and the
-        // verdict would be confident and meaningless.
-        let slot = (taken % 2) as u32;
+            c.since += 1;
+            if c.since < c.every {
+                p.set(c);
+                return None;
+            }
+            // Which arm leads alternates across probes, so neither is
+            // always the one measured first out of a cold cache.
+            let first = (self.parks.fetch_add(1, Ordering::Relaxed) % 2) as u32;
+            c.owed = 1 - first;
+            c.every = self.probe_every.load(Ordering::Relaxed);
+            p.set(c);
+            Some(first)
+        })?;
 
         Some((
             if slot == SLOT_CHALLENGER {
@@ -411,10 +462,25 @@ impl WaitController {
         } else if base * 100 < chal * (100 - MARGIN_PER_CENT) {
             SLOT_BASELINE
         } else {
+            // Inside the margin the two are close enough that the
+            // order could change on the next shift in load, and the
+            // probe is cheap for the same reason: the arm not in use
+            // costs about what the one in use costs. Look often.
+            self.probe_every.store(PROBE_EVERY_MIN, Ordering::Relaxed);
             return;
         };
         if self.current.swap(want, Ordering::Relaxed) != want {
             self.switches.fetch_add(1, Ordering::Relaxed);
+            self.probe_every.store(PROBE_EVERY_MIN, Ordering::Relaxed);
+        } else {
+            // The same answer again. Widen the gap between probes, so
+            // a settled host stops paying to rediscover what it
+            // already knows.
+            let e = self.probe_every.load(Ordering::Relaxed);
+            if e < PROBE_EVERY_MAX {
+                self.probe_every
+                    .store((e * 2).min(PROBE_EVERY_MAX), Ordering::Relaxed);
+            }
         }
     }
 
@@ -432,6 +498,7 @@ impl WaitController {
             challenger_samples: self.samples[SLOT_CHALLENGER as usize].load(Ordering::Relaxed),
             in_use: self.choose(),
             switches: self.switches.load(Ordering::Relaxed),
+            probe_every: self.probe_every.load(Ordering::Relaxed),
         }
     }
 }
@@ -451,6 +518,10 @@ pub struct WaitControllerReport {
     pub in_use: WaitStrategy,
     /// Times the verdict changed which strategy is in use.
     pub switches: u64,
+    /// Parks a thread currently takes between probes. Sits at
+    /// [`PROBE_EVERY_MIN`] while the answer is unsettled and reaches
+    /// [`PROBE_EVERY_MAX`] once it stops changing.
+    pub probe_every: u32,
 }
 
 /// A cycle counter reading, or 0 where the target has none.
@@ -1170,6 +1241,7 @@ mod tests {
             parks: AtomicU64::new(0),
             current: AtomicU32::new(SLOT_BASELINE),
             switches: AtomicU64::new(0),
+            probe_every: AtomicU32::new(PROBE_EVERY_MIN),
         }
     }
 
@@ -1258,6 +1330,31 @@ mod tests {
             c.record(SLOT_CHALLENGER, chal[i % chal.len()]);
         }
         assert_eq!(c.current.load(Ordering::Relaxed), SLOT_CHALLENGER);
+    }
+
+    #[test]
+    fn a_settled_verdict_probes_less_often_and_a_closing_gap_probes_more() {
+        // A probe spends one park on the arm not in use. Where that
+        // arm is twenty times worse, probing at the close rate is a
+        // sixth of every park for the life of the process, which is
+        // the cost this widening exists to remove.
+        let c = fresh_controller();
+        for _ in 0..SAMPLES_BEFORE_VERDICT * 2 {
+            c.record(SLOT_BASELINE, 6_000);
+            c.record(SLOT_CHALLENGER, 1_000);
+        }
+        assert_eq!(c.current.load(Ordering::Relaxed), SLOT_CHALLENGER);
+        assert_eq!(c.probe_every.load(Ordering::Relaxed), PROBE_EVERY_MAX);
+
+        // The arms converge. The gap falls inside the margin before
+        // the order flips, and that is the point to look often again
+        // rather than after the verdict is already stale.
+        for _ in 0..SAMPLES_BEFORE_VERDICT {
+            c.record(SLOT_CHALLENGER, 5_800);
+            c.record(SLOT_BASELINE, 6_000);
+        }
+        assert_eq!(c.current.load(Ordering::Relaxed), SLOT_CHALLENGER);
+        assert_eq!(c.probe_every.load(Ordering::Relaxed), PROBE_EVERY_MIN);
     }
 
     #[test]
