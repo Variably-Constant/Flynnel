@@ -205,6 +205,9 @@ name = "trace_predicate_cost"
 name = "call_site_registry_cost"
 
 [[example]]
+name = "staging_buffer_cost"
+
+[[example]]
 name = "adaptive_dispatcher_demo"
 
 [[example]]
