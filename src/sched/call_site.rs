@@ -3,9 +3,9 @@
 //!
 //! Every dispatch entry is `#[track_caller]` and maps
 //! `std::panic::Location::caller()` to a `&'static CallSiteState`
-//! via [`site_for_location`]: read-mostly `RwLock<HashMap>` fronted
-//! by a per-thread one-slot cache, states `Box::leak`ed for process
-//! lifetime. A `static` in a generic fn cannot provide this
+//! via [`site_for_location`]: an insert-once open-addressed table of
+//! leaked nodes fronted by a per-thread one-slot cache, states
+//! `Box::leak`ed for process lifetime. A `static` in a generic fn cannot provide this
 //! identity (statics never monomorphize; every caller would share
 //! one pool). `#[track_caller]` chains through wrapper entries, so
 //! delegating helpers resolve to the outermost user call site.
@@ -30,7 +30,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::sched::adaptive_profile::{
     WorkloadClass, class_tag_decode, class_tag_encode, classify_observed,
@@ -1508,11 +1508,112 @@ impl core::fmt::Debug for SiteRef {
 /// counters. One pointer per site, stored once when the location is
 /// first seen; the dispatch path reads through a thread-local one-slot
 /// cache and does not touch this map at all.
-type SiteEntry = (&'static std::panic::Location<'static>, &'static CallSiteState);
+struct SiteNode {
+    key: u64,
+    location: &'static std::panic::Location<'static>,
+    state: &'static CallSiteState,
+}
 
-static SITE_REGISTRY: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::HashMap<u64, SiteEntry>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+/// Slot count of the site table. Call sites are source locations in
+/// the binary, so the population is fixed at compile time and small;
+/// 2048 slots is 16 KiB of zeroed bss and leaves the table under an
+/// eighth full for a crate with a couple of hundred dispatch sites.
+/// Linear probing wants the headroom: a table near capacity walks a
+/// long run of occupied slots on every miss.
+const SITE_SLOTS: usize = 2048;
+const SITE_MASK: usize = SITE_SLOTS - 1;
+
+/// Open-addressed, insert-once, never-removed table of leaked nodes.
+///
+/// A slot is empty exactly when its pointer is null, and a node is
+/// fully built before the pointer that publishes it, so a non-null
+/// slot is always a complete entry and a reader needs one atomic load
+/// per probe and no lock. Nothing is ever removed or rehashed, so a
+/// pointer a reader holds stays valid for the life of the process.
+static SITE_TABLE: [AtomicPtr<SiteNode>; SITE_SLOTS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; SITE_SLOTS];
+
+/// The number of sites the table failed to hold. Non-zero means
+/// [`SITE_SLOTS`] was reached and later sites are running on
+/// unshared one-off state, which reads as every call being a first
+/// call. Silence here would make that look like ordinary behavior.
+static SITE_TABLE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// The node for `key`, or `None` with the probe stopping at the first
+/// empty slot, which is where an insert for this key would go.
+fn site_lookup(key: u64) -> Option<&'static SiteNode> {
+    let mut idx = (key as usize) & SITE_MASK;
+    for _ in 0..SITE_SLOTS {
+        let p = SITE_TABLE[idx].load(Ordering::Acquire);
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null slot holds a leaked SiteNode that is
+        // never freed, moved or rehashed.
+        let node = unsafe { &*p };
+        if node.key == key {
+            return Some(node);
+        }
+        idx = (idx + 1) & SITE_MASK;
+    }
+    None
+}
+
+/// The state for `key`, inserting one that records `loc` if the key
+/// is not yet present. Racing inserters of the same key all return
+/// the one node that won its slot.
+fn site_insert(key: u64, loc: &'static std::panic::Location<'static>) -> &'static CallSiteState {
+    // Built at most once and only on reaching an empty slot, so a
+    // caller that finds the key already present allocates nothing. A
+    // racer that loses its CAS and then finds its key further along
+    // abandons the node it prepared; that is bounded by the number of
+    // threads meeting one new location at the same moment.
+    let mut prepared: Option<&'static SiteNode> = None;
+    let mut idx = (key as usize) & SITE_MASK;
+    for _ in 0..SITE_SLOTS {
+        let p = SITE_TABLE[idx].load(Ordering::Acquire);
+        if p.is_null() {
+            let node = *prepared.get_or_insert_with(|| {
+                &*Box::leak(Box::new(SiteNode {
+                    key,
+                    location: loc,
+                    state: Box::leak(Box::new(CallSiteState::new())),
+                }))
+            });
+            let fresh = node as *const SiteNode as *mut SiteNode;
+            match SITE_TABLE[idx].compare_exchange(
+                core::ptr::null_mut(),
+                fresh,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return node.state,
+                Err(taken) => {
+                    // SAFETY: as in site_lookup.
+                    let other = unsafe { &*taken };
+                    if other.key == key {
+                        return other.state;
+                    }
+                }
+            }
+        } else {
+            // SAFETY: as in site_lookup.
+            let node = unsafe { &*p };
+            if node.key == key {
+                return node.state;
+            }
+        }
+        idx = (idx + 1) & SITE_MASK;
+    }
+    SITE_TABLE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+    Box::leak(Box::new(CallSiteState::new()))
+}
+
+/// How many sites the table could not hold. Zero on every table that
+/// has not reached [`SITE_SLOTS`] distinct call sites.
+pub fn site_table_overflow() -> u64 {
+    SITE_TABLE_OVERFLOW.load(Ordering::Relaxed)
+}
 
 fn location_key(loc: &'static std::panic::Location<'static>) -> u64 {
     use core::hash::{Hash, Hasher};
@@ -1540,9 +1641,10 @@ pub fn caller_site() -> SiteRef {
 ///
 /// Fast path: a per-thread one-slot cache keyed on the `Location`
 /// address (two thread-local loads). Miss path: value-hash of
-/// (file, line, column) into the read-mostly registry; the write
-/// lock is taken only the first time a location is seen
-/// process-wide.
+/// (file, line, column) probed in the site table, one atomic load per
+/// probe. A location seen for the first time process-wide is
+/// published into an empty slot by a single compare-exchange; every
+/// other caller only reads.
 pub fn site_for_location(loc: &'static std::panic::Location<'static>) -> SiteRef {
     thread_local! {
         static LAST: core::cell::Cell<(usize, usize)> = const { core::cell::Cell::new((0, 0)) };
@@ -1556,23 +1658,9 @@ pub fn site_for_location(loc: &'static std::panic::Location<'static>) -> SiteRef
         return SiteRef::new(unsafe { &*(cached.1 as *const CallSiteState) });
     }
     let key = location_key(loc);
-    let existing = SITE_REGISTRY
-        .read()
-        .ok()
-        .and_then(|map| map.get(&key).map(|&(_, site)| site));
-    let site: &'static CallSiteState = match existing {
-        Some(site) => site,
-        None => match SITE_REGISTRY.write() {
-            Ok(mut map) => {
-                map.entry(key)
-                    .or_insert_with(|| (loc, Box::leak(Box::new(CallSiteState::new()))))
-                    .1
-            }
-            // Lock poisoned (a panic while inserting): fall back to
-            // a leaked one-off state so dispatch keeps working; the
-            // site just will not be shared with future calls.
-            Err(_) => Box::leak(Box::new(CallSiteState::new())),
-        },
+    let site: &'static CallSiteState = match site_lookup(key) {
+        Some(node) => node.state,
+        None => site_insert(key, loc),
     };
     LAST.with(|c| c.set((loc_addr, site as *const CallSiteState as usize)));
     SiteRef::new(site)
@@ -1581,24 +1669,26 @@ pub fn site_for_location(loc: &'static std::panic::Location<'static>) -> SiteRef
 /// Number of distinct call sites the registry has materialised.
 #[cfg(test)]
 pub(crate) fn registry_len() -> usize {
-    SITE_REGISTRY.read().map(|m| m.len()).unwrap_or(0)
+    site_nodes().count()
 }
 
-/// Reads the registry, recovering it when a panic has poisoned the
-/// lock.
+/// Every node the table holds, in slot order.
 ///
-/// The map survives such a panic intact. The only write is one
-/// `or_insert_with`, which either completes or inserts nothing, and
-/// [`site_for_location`] answers a poisoned write lock by leaking a
-/// one-off state rather than writing a partial entry. So the sites
-/// already registered are still valid and still readable, and
-/// refusing to read them would report damage the registry does not
-/// have.
-fn registry() -> std::sync::RwLockReadGuard<'static, std::collections::HashMap<u64, SiteEntry>> {
-    match SITE_REGISTRY.read() {
-        Ok(map) => map,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+/// Slot order is the hash's and carries no meaning. A scan can see an
+/// insert that lands in an earlier slot after it has passed that slot,
+/// so a walk answers the sites present at some point during it rather
+/// than an instant's snapshot. Nothing is ever removed, so a site the
+/// scan does report was really there.
+fn site_nodes() -> impl Iterator<Item = &'static SiteNode> {
+    SITE_TABLE.iter().filter_map(|slot| {
+        let p = slot.load(Ordering::Acquire);
+        if p.is_null() {
+            None
+        } else {
+            // SAFETY: as in site_lookup.
+            Some(unsafe { &*p })
+        }
+    })
 }
 
 /// One call site the registry has materialised, and where it is.
@@ -1618,18 +1708,12 @@ pub struct RegisteredSite {
 
 /// Every call site the registry holds, each with where it is.
 ///
-/// The whole set in one allocation rather than a walk the caller
-/// drives: the lock this takes is the one a dispatch meeting a new
-/// location must take to write, and a caller holding it open across
-/// its own work would block those dispatches for that long.
-///
-/// Order is the map's and carries no meaning; sort on the location.
+/// Order is the table's and carries no meaning; sort on the location.
 pub fn registered_sites() -> Vec<RegisteredSite> {
-    registry()
-        .values()
-        .map(|&(location, state)| RegisteredSite {
-            location,
-            site: SiteRef::new(state),
+    site_nodes()
+        .map(|node| RegisteredSite {
+            location: node.location,
+            site: SiteRef::new(node.state),
         })
         .collect()
 }
@@ -1639,16 +1723,17 @@ pub fn registered_sites() -> Vec<RegisteredSite> {
 /// For measuring two arms in one process: see [`CallSiteState::reset`]
 /// for why the alternative, a process each, measures something else.
 ///
-/// Holds the read lock for the whole sweep, which blocks a dispatch
-/// that meets a location for the first time but not one reaching a
-/// site already registered. The sweep is a few tens of atomic stores
-/// per site.
+/// The sweep blocks nothing and is a few tens of atomic stores per
+/// site. It is not an instant: a site registered while the walk is
+/// past its slot keeps the counters it had, so reset before starting
+/// the arm rather than alongside it.
 pub fn reset_all_sites() -> usize {
-    let map = registry();
-    for (_, state) in map.values() {
-        state.reset();
+    let mut swept = 0;
+    for node in site_nodes() {
+        node.state.reset();
+        swept += 1;
     }
-    map.len()
+    swept
 }
 
 #[cfg(test)]

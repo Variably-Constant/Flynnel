@@ -297,43 +297,29 @@ where
         return Vec::new();
     }
     let cancel = Arc::new(AtomicBool::new(false));
-    // One ticket per finisher. The first `k` tickets own the `k` result
-    // slots, so the ticket order IS the completion order and each slot
-    // has exactly one writer.
+    // One ticket per finisher, so the ticket order IS the completion
+    // order. It rides back with the result rather than through shared
+    // storage, which is what keeps the payload bound at `Send`: a
+    // shared slot array would have to be `Sync` as well, and a quorum
+    // replica's answer is not required to be.
     let claimed = Arc::new(AtomicUsize::new(0));
-    let slots: Arc<Vec<OnceLock<(usize, P)>>> = Arc::new((0..k).map(|_| OnceLock::new()).collect());
     let cancel_inner = Arc::clone(&cancel);
     let claimed_inner = Arc::clone(&claimed);
-    let slots_inner = Arc::clone(&slots);
-    collect_indexed(plan, n, 1, move |i| {
+    let mut finished: Vec<(usize, usize, P)> = collect_indexed(plan, n, 1, move |i| {
         let token = CancelToken { flag: Arc::clone(&cancel_inner) };
         let r = attempt(i, &token);
         let ticket = claimed_inner.fetch_add(1, Ordering::AcqRel);
-        if ticket < k {
-            if slots_inner[ticket].set((i, r)).is_err() {
-                panic!("quorum slot {ticket} was written twice");
-            }
-            if ticket == k - 1 {
-                cancel_inner.store(true, Ordering::Release);
-            }
+        if ticket + 1 == k {
+            cancel_inner.store(true, Ordering::Release);
         }
+        (ticket, i, r)
     });
     drop(cancel);
-    let filled = match Arc::try_unwrap(slots) {
-        Ok(v) => v,
-        Err(shared) => panic!(
-            "quorum slots still shared by {} references after join",
-            Arc::strong_count(&shared)
-        ),
-    };
-    let mut winners = Vec::with_capacity(k);
-    for (ticket, slot) in filled.into_iter().enumerate() {
-        match slot.into_inner() {
-            Some(entry) => winners.push(entry),
-            None => panic!("quorum slot {ticket} was never written"),
-        }
-    }
-    winners
+    // Tickets are a permutation of 0..n, so this orders the whole field
+    // by completion and the first k are the quorum.
+    finished.sort_by_key(|&(ticket, _, _)| ticket);
+    finished.truncate(k);
+    finished.into_iter().map(|(_, i, r)| (i, r)).collect()
 }
 
 /// How a [`race_refute`] duel ended.
