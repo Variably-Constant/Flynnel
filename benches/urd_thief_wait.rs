@@ -20,14 +20,19 @@
 //!
 //! What it buys is the core. A spinning thief occupies a logical CPU
 //! and issues into the pipeline the whole time it waits, which on an
-//! SMT sibling is taken directly out of the thread beside it. So the
-//! two arms are not ordered by the idle rows, and the load rows are
-//! the ones that decide it: they are where a spinning thief's cost is
-//! paid by somebody.
+//! SMT sibling is taken directly out of the thread beside it.
 //!
-//! Reported rather than concluded. If the monitor wait is slower on
-//! both arms on a host, that is the reading, and the thief's default
-//! should follow the reading rather than this comment.
+//! So there are two questions and two groups. `urd_thief_*` times the
+//! thief's own wake, where the spin is expected to win. `urd_corunner_*`
+//! times a fixed workload on every other thread while one thief waits,
+//! which is where a freed core shows up and where the wake latency
+//! does not appear at all. Neither group settles it alone: the first
+//! is the cost and the second is the benefit, and a default that reads
+//! only one of them is choosing with half the evidence.
+//!
+//! Reported rather than concluded. If the monitor wait loses on both,
+//! that is the reading, and the thief's default follows the reading
+//! rather than this comment.
 //!
 //! ## Bench-audit
 //!
@@ -182,6 +187,79 @@ fn bench_strategy(
     group.finish();
 }
 
+/// What a waiting thief costs the rest of the machine.
+///
+/// The wake bench above times the thief. It cannot see the thing a
+/// monitor wait is actually bought for, which is the core the thief
+/// stops occupying, because nothing in it is trying to use that core.
+/// So this one measures the co-runners instead: a fixed workload
+/// spread over as many threads as the host has, timed while one thief
+/// sits in `wait_and_drain` on a mailbox nobody has published to.
+///
+/// Lower is better here and the thief's own latency does not appear.
+/// A `PAUSE`-spin issues into the pipeline the whole time it waits and
+/// on an SMT sibling that is taken out of the thread beside it; a
+/// halted core is not. If the two arms come back equal, the core a
+/// monitor wait gives back is worth nothing on this host, which is a
+/// result and not a failure of the bench.
+fn bench_corunner(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
+    const WORK_PER_THREAD: u64 = 4_000_000;
+
+    let mut group = c.benchmark_group(format!("urd_corunner_{label}"));
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("corunner_wall", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let path = temp_path(label);
+                let mut owner = UrdDeque::create(&path, 1).expect("create urd");
+                owner.set_wait_strategy(strategy);
+                let urd = Arc::new(owner);
+
+                // The thief waits on a mailbox nothing has published
+                // to, so it is still waiting for the whole measured
+                // span and is released afterwards.
+                let thief_urd = Arc::clone(&urd);
+                let thief = std::thread::spawn(move || thief_urd.wait_and_drain(0, u64::MAX));
+                std::thread::sleep(Duration::from_millis(2));
+
+                let n = std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(2);
+                let t0 = Instant::now();
+                let runners: Vec<_> = (0..n)
+                    .map(|_| {
+                        std::thread::spawn(move || {
+                            let mut x = 0u64;
+                            for _ in 0..WORK_PER_THREAD {
+                                x = black_box(
+                                    x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1),
+                                );
+                            }
+                            x
+                        })
+                    })
+                    .collect();
+                for r in runners {
+                    black_box(r.join().expect("co-runner joins"));
+                }
+                total += t0.elapsed();
+
+                // Release the thief, outside the measured span.
+                urd.publish_to(0, &[item(1)]).expect("publish");
+                thief.join().expect("thief joins");
+
+                if let Err(e) = std::fs::remove_file(&path) {
+                    eprintln!("urd_thief_wait: could not remove {}: {e}", path.display());
+                }
+            }
+            black_box(total)
+        });
+    });
+    group.finish();
+}
+
 fn bench_all(c: &mut Criterion) {
     let waitpkg = flynnel::cpu_info::has_waitpkg();
     let monitorx = flynnel::cpu_info::has_monitorx();
@@ -219,6 +297,15 @@ fn bench_all(c: &mut Criterion) {
                 bench_strategy(c, "monitorx", WaitStrategy::Monitorx, gap_us, loaded);
             }
         }
+    }
+
+    // The other half of the question, and the half that decides it.
+    bench_corunner(c, "pausespin", WaitStrategy::PauseSpin);
+    if waitpkg {
+        bench_corunner(c, "waitpkg", WaitStrategy::Waitpkg);
+    }
+    if monitorx {
+        bench_corunner(c, "monitorx", WaitStrategy::Monitorx);
     }
 }
 
