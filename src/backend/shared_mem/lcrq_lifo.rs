@@ -540,16 +540,16 @@ impl LohDeque {
         Ok(n)
     }
 
-    /// Owner-side pop from the local LIFO. Items not yet flushed to
-    /// the ring may be retrieved locally without round-tripping
-    /// through the ring. Used by the dual-deque worker that owns the
-    /// originator side of the deque.
+    /// Owner-side pop from the calling thread's LIFO. Items not yet
+    /// flushed to the ring may be retrieved locally without
+    /// round-tripping through the ring. Used by the dual-deque worker
+    /// that owns the originator side of the deque.
+    ///
+    /// A thread pops only what it pushed. Reaching another thread's
+    /// unflushed items goes through the ring, which is what the ring
+    /// is for.
     pub fn pop_local(&self) -> Option<LohLifoEntry> {
-        let mut lifo = self
-            .local_lifo
-            .lock()
-            .expect("LOH local LIFO mutex poisoned");
-        lifo.pop()
+        self.local_lifo.with_mine(|lifo| lifo.pop())
     }
 
     /// Thief-side steal. Race-free CAS-on-head with sequence-number
