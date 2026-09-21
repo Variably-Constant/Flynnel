@@ -59,12 +59,35 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
 
+use flynnel::backend::shared_mem::khpd::{KhpdDeque, LINE_ITEMS, LineItem};
+
 /// Pushes before a drain, matching the `LINE_ITEMS` flush these
 /// buffers do.
 const BATCH: usize = 8;
 
-/// Pushes per timed cell.
+/// Pushes per timed cell in the quiet row.
 const CALLS: u64 = 20_000_000;
+
+/// Pushes per timed cell in the loaded row.
+///
+/// Ten times smaller than the quiet count, because the contended mutex
+/// cell runs at roughly 800 ns per push where the quiet one runs at 5.
+/// At the quiet count the loaded row alone took minutes per repeat and
+/// held a leased box for an hour over a difference that is three
+/// orders of magnitude wide and resolved in seconds.
+const LOADED_CALLS: u64 = 2_000_000;
+
+/// Pushes through the real `KhpdDeque` in the shipped-path cell.
+///
+/// Small because this cell publishes. `LINE_ITEMS` is 3, so a publish
+/// fires every third stage, and a publisher with nothing draining the
+/// ring spins once the ring wraps. Keeping the count well under
+/// `REAL_CAPACITY * LINE_ITEMS` means the ring never wraps and no
+/// consumer is needed.
+const REAL_CALLS: u64 = 100_000;
+
+/// Publication lines in the deque the shipped-path cell stages into.
+const REAL_CAPACITY: usize = 65_536;
 
 /// Timed cells per shape. The median is taken, so an odd count has a
 /// middle.
@@ -201,7 +224,7 @@ fn push_stack(buffer: &Staging, i: u64) {
     }
 }
 
-fn measure(shared_mutex: &Mutex<Vec<Item>>, shared_stack: &Staging) -> [Vec<f64>; 4] {
+fn measure(calls: u64, shared_mutex: &Mutex<Vec<Item>>, shared_stack: &Staging) -> [Vec<f64>; 4] {
     thread_local! {
         static LOCAL: RefCell<Vec<Item>> = const { RefCell::new(Vec::new()) };
     }
@@ -212,12 +235,12 @@ fn measure(shared_mutex: &Mutex<Vec<Item>>, shared_stack: &Staging) -> [Vec<f64>
     let mut thread_cell = Vec::with_capacity(REPEATS);
 
     for _ in 0..REPEATS {
-        control.push(cell(CALLS, |i| {
+        control.push(cell(calls, |i| {
             black_box(item_at(i).offset);
         }));
-        mutex_cell.push(cell(CALLS, |i| push_mutex(shared_mutex, i)));
-        stack_cell.push(cell(CALLS, |i| push_stack(shared_stack, i)));
-        thread_cell.push(cell(CALLS, |i| {
+        mutex_cell.push(cell(calls, |i| push_mutex(shared_mutex, i)));
+        stack_cell.push(cell(calls, |i| push_stack(shared_stack, i)));
+        thread_cell.push(cell(calls, |i| {
             LOCAL.with(|buffer| {
                 let mut held = buffer.borrow_mut();
                 held.push(item_at(i));
@@ -228,6 +251,42 @@ fn measure(shared_mutex: &Mutex<Vec<Item>>, shared_stack: &Staging) -> [Vec<f64>
         }));
     }
     [control, mutex_cell, stack_cell, thread_cell]
+}
+
+/// The shipped path: stage into a real `KhpdDeque` and let it
+/// auto-publish, which is the sequence `dispatch_marshal` runs.
+///
+/// This is here because the four cells above are REPLICAS of the three
+/// shapes, written in this file. They answer which shape is fastest.
+/// They cannot answer whether the shape shows through the real path's
+/// other costs, and `LINE_ITEMS` is 3, so the real path publishes every
+/// third stage and the publish may well dominate the push the shapes
+/// differ on. A harness pointed away from the code that changed prints
+/// the same clean rows whether or not the change did anything.
+///
+/// Quiet only. A loaded arm would need a consumer draining the ring,
+/// because a publisher spins on `STATE_EMPTY` once the ring wraps and
+/// helper threads run until told to stop.
+fn measure_shipped(deque: &KhpdDeque) -> (Vec<f64>, Vec<f64>) {
+    let mut control = Vec::with_capacity(REPEATS);
+    let mut khpd_cell = Vec::with_capacity(REPEATS);
+    for _ in 0..REPEATS {
+        control.push(cell(REAL_CALLS, |i| {
+            black_box(
+                LineItem::new(i as u32, (i & 0xFFFF) as u32, &i.to_le_bytes())
+                    .expect("eight bytes fits the inline payload"),
+            );
+        }));
+        khpd_cell.push(cell(REAL_CALLS, |i| {
+            let item = LineItem::new(i as u32, (i & 0xFFFF) as u32, &i.to_le_bytes())
+                .expect("eight bytes fits the inline payload");
+            let staged = deque.stage(item).expect("staging never fails");
+            if staged >= LINE_ITEMS {
+                deque.publish().expect("the ring is sized not to wrap");
+            }
+        }));
+    }
+    (control, khpd_cell)
 }
 
 fn report(label: &str, cells: [Vec<f64>; 4]) {
@@ -278,8 +337,41 @@ fn main() {
     let shared_mutex: Arc<Mutex<Vec<Item>>> = Arc::new(Mutex::new(Vec::with_capacity(BATCH)));
     let shared_stack: Arc<Staging> = Arc::new(Staging::new());
 
-    println!("staging_buffer_cost threads={threads} batch={BATCH} calls={CALLS} repeats={REPEATS}");
-    report("quiet", measure(&shared_mutex, &shared_stack));
+    println!(
+        "staging_buffer_cost threads={threads} batch={BATCH} calls={CALLS} \
+         loaded_calls={LOADED_CALLS} real_calls={REAL_CALLS} repeats={REPEATS}"
+    );
+    report("quiet", measure(CALLS, &shared_mutex, &shared_stack));
+
+    // The shipped path, against the replicas above. Its own control,
+    // because it runs a different number of calls and builds a real
+    // LineItem per call rather than an Item.
+    let deque_path = std::env::temp_dir().join(format!(
+        "flynnel_staging_cost_{}.khpd",
+        std::process::id()
+    ));
+    let deque = KhpdDeque::create(&deque_path, REAL_CAPACITY)
+        .expect("a temp-dir deque of the sized capacity");
+    let (real_control, khpd_cell) = measure_shipped(&deque);
+    let real_floor = median(real_control.clone());
+    let real_spread = spread_pct(&real_control);
+    println!(
+        "shipped floor={real_floor:.4} ns control_spread={real_spread:.2}% \
+         resolution_floor={:.4} ns",
+        real_floor * real_spread / 100.0
+    );
+    let khpd_median = median(khpd_cell.clone());
+    println!(
+        "shipped khpd_stage={:.4} ns over_floor={:.4} ns spread={:.2}% \
+         (includes the publish that fires every {LINE_ITEMS} stages)",
+        khpd_median,
+        khpd_median - real_floor,
+        spread_pct(&khpd_cell)
+    );
+    drop(deque);
+    if let Err(e) = std::fs::remove_file(&deque_path) {
+        println!("shipped note: the deque file at {deque_path:?} outlived the run: {e}");
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(threads));
@@ -302,7 +394,7 @@ fn main() {
     if threads > 1 {
         barrier.wait();
     }
-    report("loaded", measure(&shared_mutex, &shared_stack));
+    report("loaded", measure(LOADED_CALLS, &shared_mutex, &shared_stack));
     stop.store(true, Ordering::Relaxed);
     for h in helpers {
         h.join().expect("a helper thread panicked");
