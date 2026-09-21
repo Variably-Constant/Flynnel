@@ -49,7 +49,7 @@ use flynnel::backend::{Backend as CrateBackend, BackendCapabilities};
 /// this, and the id rides beside it on the row. A fieldless enum is
 /// what a shell can compare and complete against.
 #[psenum(name = "Flynnel.BackendKind")]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BackendKind {
     /// The host's own cores. Always registered and always available.
     #[default]
@@ -80,7 +80,7 @@ impl BackendKind {
     /// Custom is absent on purpose: its variant carries a caller's own
     /// u32 and there is no set of them to walk, so a Custom backend
     /// appears in a listing only when it has been registered.
-    const ENUMERABLE: [BackendKind; 8] = [
+    pub(crate) const ENUMERABLE: [BackendKind; 8] = [
         BackendKind::Cpu,
         BackendKind::Cuda,
         BackendKind::Rocm,
@@ -92,7 +92,7 @@ impl BackendKind {
     ];
 
     /// The crate's backend for this kind at a device id.
-    fn to_crate(self, device_id: u32) -> CrateBackend {
+    pub(crate) fn to_crate(self, device_id: u32) -> CrateBackend {
         match self {
             BackendKind::Cpu => CrateBackend::Cpu,
             BackendKind::Cuda => CrateBackend::Cuda { device_id },
