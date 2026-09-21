@@ -71,7 +71,7 @@ pub type PassHandler = Arc<dyn Fn(&[u8]) -> PassResult + Send + Sync + 'static>;
 
 /// Slot count of the handler table.
 ///
-/// Slots are RECYCLED, which is what makes a fixed size right here.
+/// Slots are recycled, which is what makes a fixed size right here.
 /// Handler ids churn: `dispatch_calibration` registers under a
 /// nanosecond nonce and unregisters, a fresh id per measurement, so a
 /// table that only ever claimed slots would fill and start refusing
@@ -192,7 +192,7 @@ fn claim(id: u32, key: u64) -> &'static Slot {
         let state = slot.state.load(Ordering::Acquire);
         if state & KEY_MASK == key && state & (LIVE | RESERVED) != 0 {
             // Already ours and not a bare tombstone, so it cannot be
-            // taken from under us. A concurrent registrar of the SAME
+            // taken from under us. A concurrent registrar of this same
             // id may be here too; the later handler wins, which is
             // what re-registration means.
             return slot;
