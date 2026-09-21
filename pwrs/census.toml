@@ -1112,7 +1112,7 @@ note = "Get-FlynnelTopology writes the whole topology in one crossing, Get-Flynn
 [[entry]]
 item = "crate::cpu_info"
 reason = "internal-to-another-surface"
-note = "Get-FlynnelCpuInfo writes the vendor, the features and the counts in one row, with Vendor exported as Flynnel.Vendor. has_waitpkg is the feature column behind the spin window's ability to use a monitor-wait, and small_host_dispatch_factor is the correction Get-FlynnelHostDispatch reports applying"
+note = "Get-FlynnelCpuInfo writes the vendor, the features and the counts in one row, with Vendor exported as Flynnel.Vendor. has_waitpkg and has_monitorx are the two feature columns behind a worker's ability to wait without a syscall, separate because having MONITORX and not WAITPKG is the ordinary AMD case before Zen 5, and small_host_dispatch_factor is the correction Get-FlynnelHostDispatch reports applying"
 
 [[entry]]
 item = "crate::foundation"
@@ -1305,7 +1305,7 @@ note = "batched publication lines, three items to a line. Same reasoning"
 [[entry]]
 item = "crate::backend::shared_mem::urd"
 reason = "unsafe-or-structural"
-note = "a mailbox per thief, with a hardware wait where WAITPKG is present. Same reasoning; Get-FlynnelCpuInfo reports whether this host has that instruction"
+note = "a mailbox per thief, waiting on WAITPKG where the host has it and on a PAUSE-spin otherwise. Same reasoning; Get-FlynnelCpuInfo reports HasWaitpkg and HasMonitorx so a script can see which waits this host can execute. The MONITORX arm is implemented and deliberately not picked: measured against the spin it is slower in three cells of four, and set_wait_strategy is how that was measured"
 
 [[entry]]
 item = "crate::backend::shared_mem::lcrq_lifo"
