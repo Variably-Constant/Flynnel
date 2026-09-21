@@ -208,9 +208,6 @@ name = "call_site_registry_cost"
 name = "staging_buffer_cost"
 
 [[example]]
-name = "help_depth"
-
-[[example]]
 name = "adaptive_dispatcher_demo"
 
 [[example]]

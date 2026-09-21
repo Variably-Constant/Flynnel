@@ -18,11 +18,15 @@
 //!
 //! Measured on zen3 at 16 threads, quiet, over a control floor, in
 //! nanoseconds per push: a thread-local vector 2.55, the mutex 5.03, a
-//! compare-exchange stack 13.96. The lock-free staging buffer is the
-//! slowest of the three, because pushing a node allocates where the
-//! vector does not. Giving each thread its own buffer is both the
-//! fastest arm and the one that needs no exclusion at all, which is
-//! why this module exists rather than a lock-free queue.
+//! compare-exchange stack 13.96. The linked stack is the slowest of
+//! the three because pushing a node allocates where the vector does
+//! not; its compare-exchange is the same primitive as the mutex's
+//! uncontended fast path, so the loss is the allocation and not the
+//! lock-freedom, and a lock-free queue over pre-allocated slots would
+//! not pay it. What no shared structure can avoid is the shared cache
+//! line itself. Giving each thread its own buffer removes that line
+//! rather than synchronising on it faster, which is why it is both the
+//! fastest arm and the one that needs no exclusion at all.
 //!
 //! # The slot index
 //!
