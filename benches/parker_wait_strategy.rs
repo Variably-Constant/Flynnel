@@ -333,9 +333,14 @@ fn bench_adaptive(c: &mut Criterion, gap_us: u64, loaded: bool) {
     let r = flynnel::sched::sleep::wait_controller().report();
     eprintln!(
         "parker_wait_strategy: after {name}, controller has baseline {} ns over {} samples, \
-         challenger {} ns over {} samples, in use {:?}, {} switch(es)",
-        r.baseline_ns, r.baseline_samples, r.challenger_ns, r.challenger_samples, r.in_use,
-        r.switches
+         challenger {} ns over {} samples, in use {:?}, {} switch(es), probing every {} parks",
+        r.baseline_ns,
+        r.baseline_samples,
+        r.challenger_ns,
+        r.challenger_samples,
+        r.in_use,
+        r.switches,
+        r.probe_every
     );
 }
 
