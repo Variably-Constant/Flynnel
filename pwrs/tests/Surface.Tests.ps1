@@ -252,6 +252,52 @@ Describe 'help' {
         $bad.Count | Should -Be 0 -Because ("these examples name a parameter the cmdlet " +
             "does not take: " + ($bad -join ', '))
     }
+
+    It 'names only types that the module exports' {
+        # A help page naming a type that does not exist sends the
+        # reader to Get-Member on nothing. It is the easiest claim in
+        # a doc to get wrong, because a plausible name is written from
+        # memory and nothing rejects it: Flynnel.PassRegistryInfo was
+        # written here for a class called Flynnel.PassRegistry and was
+        # caught only by going and reading the attributes.
+        #
+        # The dot-then-capital is what separates a type from a file:
+        # Flynnel.psd1 does not match, Flynnel.PassRegistry does.
+        $known = @($script:Exported | ForEach-Object FullName)
+        # The generated assembly carries a build-identity suffix, so
+        # its own name is not in the exported-type list.
+        $known += 'Flynnel.Shell'
+        $bad = @()
+        foreach ($cmdlet in $script:Cmdlets) {
+            $help = Get-Help $cmdlet.Name -ErrorAction SilentlyContinue
+            $text = ($help | Out-String)
+            foreach ($hit in [regex]::Matches($text, '\bFlynnel(?:\.[A-Z][A-Za-z0-9]*)+')) {
+                if ($known -contains $hit.Value) { continue }
+                $bad += "$($cmdlet.Name): $($hit.Value)"
+            }
+        }
+        $bad.Count | Should -Be 0 -Because ("this help names a type the module does not " +
+            "export: " + (($bad | Sort-Object -Unique) -join ', '))
+    }
+
+    It 'names only cmdlets that the module exports' {
+        # Same defect one layer out: help that points at a sibling
+        # command by a name the module no longer has. A rename moves
+        # the command and leaves every reference to it reading
+        # correctly, because prose is not compiled.
+        $known = @($script:Cmdlets | ForEach-Object Name)
+        $bad = @()
+        foreach ($cmdlet in $script:Cmdlets) {
+            $help = Get-Help $cmdlet.Name -ErrorAction SilentlyContinue
+            $text = ($help | Out-String)
+            foreach ($hit in [regex]::Matches($text, '\b[A-Z][A-Za-z]*-Flynnel[A-Za-z]*\b')) {
+                if ($known -contains $hit.Value) { continue }
+                $bad += "$($cmdlet.Name): $($hit.Value)"
+            }
+        }
+        $bad.Count | Should -Be 0 -Because ("this help names a cmdlet the module does not " +
+            "export: " + (($bad | Sort-Object -Unique) -join ', '))
+    }
 }
 
 Describe 'every command is reached by a suite' {
