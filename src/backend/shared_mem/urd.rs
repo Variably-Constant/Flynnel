@@ -131,10 +131,31 @@ impl WaitStrategy {
     ///
     /// Slower in three cells of four, which is what a monitor wait
     /// costs when it has to catch wakes the spin would have caught.
-    /// With the floor in front of it those never reach it. What it
-    /// buys in exchange, the core a long wait gives back, is the
-    /// co-runner group in `benches/urd_thief_wait.rs` and not the
-    /// rows above, which time the thief rather than its neighbours.
+    /// With the floor in front of it those never reach it.
+    ///
+    /// # What it gives back is narrower than a core
+    ///
+    /// A `PAUSE`-spin issues into the pipeline the whole time it
+    /// waits, so it takes both the physical core's execution
+    /// resources and a logical CPU the operating system could have
+    /// given to something else. `MWAITX` halts the logical processor,
+    /// which hands the physical core's issue width to its SMT
+    /// sibling. It does not deschedule the thread: the kernel still
+    /// counts it as occupying that logical CPU, so a runnable thread
+    /// elsewhere on the machine does not get one from it.
+    ///
+    /// Those are different gifts. The first is real for a sibling
+    /// sharing the core; the second is what a pool with more
+    /// runnable work than CPUs actually wants, and the monitor wait
+    /// does not supply it. Which one a host needs depends on the
+    /// workload rather than on the instruction.
+    ///
+    /// The co-runner group in `benches/urd_thief_wait.rs` is what
+    /// measures this, not the rows above, which time the thief
+    /// rather than its neighbours. It oversubscribes deliberately,
+    /// one neighbour per logical CPU, because that is the
+    /// arrangement in which the difference has somewhere to show.
+    /// It has not run on any host.
     pub fn pick() -> Self {
         if has_waitpkg() {
             Self::Waitpkg
