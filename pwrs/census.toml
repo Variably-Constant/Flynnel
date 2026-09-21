@@ -1323,6 +1323,105 @@ item = "crate::backend::shared_mem::pass_registry"
 reason = "internal-to-another-surface"
 note = "bound as Get-FlynnelPassRegistry, which answers the count and whether a named or numbered pass is registered here. register takes the handler as a Rust closure, so there is no Register cmdlet and the Get says so; execute runs one on behalf of a peer and is reached by the drain loop rather than by a caller"
 
+# ---------------------------------------------------------------------
+# The linear-algebra kernels' own text and bounds
+# ---------------------------------------------------------------------
+# The kernels themselves have no entry: binding them is the last
+# unbuilt slice of this family, and leaving them uncovered is what
+# keeps that visible. What is covered here is the part a caller
+# reaches without a device - the sizes the kernels take, and the
+# measured crossovers that decide which of them runs.
+
+[[entry]]
+item = "crate::gpu_peer::linalg::LINALG_PTX"
+reason = "unsafe-or-structural"
+note = "the compiled kernel text, embedded so a host needs only the driver and no toolkit. A script handing bytes to a driver to compile is the boundary this module declines for bind_accel_kernel; what it can ask instead is which kernel a size gets, through Get-FlynnelLinalgMethod"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::LINALG_CU"
+reason = "unsafe-or-structural"
+note = "the CUDA C the PTX was generated from, kept for a host whose toolchain is newer than its driver. Same boundary as the PTX"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::LINALG_BISECT_PTX"
+reason = "unsafe-or-structural"
+note = "the bisection kernels' text. Same boundary"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::LINALG_BISECT_CU"
+reason = "unsafe-or-structural"
+note = "their source. Same boundary"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::LINALG_LU_PTX"
+reason = "unsafe-or-structural"
+note = "the LU kernels' text. Same boundary"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::LINALG_LU_CU"
+reason = "unsafe-or-structural"
+note = "their source. Same boundary"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::LINALG_MAX_N"
+reason = "internal-to-another-surface"
+note = "the largest dimension these kernels take, reported as MaxN on Flynnel.LinalgChoice beside WithinMaxN, because a dimension past it is not a slower call but one the kernels do not take"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::LINALG_THR_MAX_N"
+reason = "internal-to-another-surface"
+note = "the largest dimension the thread-per-matrix layout takes, reported as ThreadShapeMaxN on the same row"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::JACOBI_THREAD_SHAPE_BATCH_PER_N"
+reason = "internal-to-another-surface"
+note = "matrices per unit of dimension needed before thread-per-matrix has enough of them to fill the device, reported as ThreadShapeBatchPerN"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::SYEV_BISECT_MIN_N"
+reason = "internal-to-another-surface"
+note = "the measured crossover for symmetric eigenvalues, reported as BisectMinN when Get-FlynnelLinalgMethod is asked about Syev. Bisection was 1.4 to 1.8 times the block Jacobi kernel at 32 and 4.0 times at 64, on an RTX 3070 and an RTX 5070"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::GESVD_BISECT_MIN_N"
+reason = "internal-to-another-surface"
+note = "the same crossover for singular values, where bisection was 1.05 to 1.4 times Jacobi at 64 and behind it at 32. The two differ, which is why the cmdlet takes the operation"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::LINALG_BLOCK"
+reason = "internal-to-another-surface"
+note = "the thread count a block-per-matrix kernel launches with. A launch shape rather than a caller's choice"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::EINSUM_MAX_RANK"
+reason = "internal-to-another-surface"
+note = "the most indices an einsum expression may carry. It bounds a cmdlet that is not built yet, and arrives as a column on that cmdlet's row when it is"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::jacobi_shape_for"
+reason = "internal-to-another-surface"
+note = "bound as the JacobiShape column of Get-FlynnelLinalgMethod"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::syev_method_for"
+reason = "internal-to-another-surface"
+note = "bound as the Method column of Get-FlynnelLinalgMethod for Syev"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::gesvd_method_for"
+reason = "internal-to-another-surface"
+note = "bound as the Method column of Get-FlynnelLinalgMethod for Gesvd"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::JacobiShape"
+reason = "internal-to-another-surface"
+note = "exported as Flynnel.JacobiShape"
+
+[[entry]]
+item = "crate::gpu_peer::linalg::LinalgMethod"
+reason = "internal-to-another-surface"
+note = "exported as Flynnel.LinalgMethod"
+
 [[entry]]
 item = "crate::gpu_peer::wave::plan"
 reason = "internal-to-another-surface"
