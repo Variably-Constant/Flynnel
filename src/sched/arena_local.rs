@@ -2391,10 +2391,41 @@ mod tests {
 
     #[test]
     fn new_arena_spawns_workers() {
-        let a = LocalArena::new(4);
-        assert_eq!(a.worker_count(), 4);
-        // Drop releases workers.
-        drop(a);
+        // Built and dropped on a worker thread so this one can bound
+        // the wait. Measured: this test hung a whole pass once in 5000
+        // runs of the suite on a Linux guest, and a hang here stops the
+        // harness reporting anything at all - the original instance sat
+        // for over four hours with 16 sched threads and the harness
+        // main thread in futex_wait_queue, and what identified it was
+        // the harness printing "has been running for over 60 seconds"
+        // rather than any failure.
+        //
+        // Both halves are inside the thread because either can be the
+        // one that blocks: `new` waits for workers to come up and
+        // `drop` signals shutdown and joins them.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<u32>();
+        let built = std::thread::spawn(move || {
+            let a = LocalArena::new(4);
+            let count = a.worker_count();
+            drop(a);
+            if done_tx.send(count).is_err() {
+                eprintln!("the arena finished after the test stopped waiting for it");
+            }
+            count
+        });
+        let count = match done_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(count) => count,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "LocalArena::new(4) and its drop did not complete within 30 seconds; \
+                 a worker is parked with nothing left to wake it"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                built.join().expect("the arena thread panicked without reporting");
+                unreachable!("a join over a dropped sender re-raises the panic that dropped it")
+            }
+        };
+        built.join().expect("the arena thread reported before this join");
+        assert_eq!(count, 4);
     }
 
     #[test]
