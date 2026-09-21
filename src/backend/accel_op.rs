@@ -127,7 +127,10 @@ fn update_bindings(op: &'static AccelOp, edit: impl Fn(&mut Bindings)) {
         let fresh = Box::into_raw(Box::new(next));
         match op
             .kernels
-            .compare_exchange(current, fresh, Ordering::AcqRel, Ordering::Acquire)
+            // SeqCst because this unlink is one of the four operations
+            // in the hazard domain's Dekker pair; see
+            // HazardDomain::retire for what an AcqRel here would permit.
+            .compare_exchange(current, fresh, Ordering::SeqCst, Ordering::Acquire)
         {
             Ok(replaced) => {
                 // SAFETY: the compare-exchange removed it from the only

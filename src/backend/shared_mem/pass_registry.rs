@@ -169,7 +169,10 @@ fn install(id: u32, fresh: *mut PassHandler) -> Option<PassHandler> {
     // The slot is ours before any handler is written, so nothing can
     // re-key it underneath this and no other registrar can be writing
     // the same slot for a different id.
-    let previous = slot.handler.swap(fresh, Ordering::AcqRel);
+    // SeqCst because this unlink is one of the four operations in the
+    // hazard domain's Dekker pair; see HazardDomain::retire for what an
+    // AcqRel here would permit.
+    let previous = slot.handler.swap(fresh, Ordering::SeqCst);
     slot.state.store(key | LIVE, Ordering::Release);
     displace(previous)
 }
@@ -254,7 +257,8 @@ pub fn unregister(id: u32) -> Option<PassHandler> {
                 .compare_exchange(key | LIVE, key, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
-            let removed = slot.handler.swap(core::ptr::null_mut(), Ordering::AcqRel);
+            // SeqCst for the reason given on the swap in `install`.
+            let removed = slot.handler.swap(core::ptr::null_mut(), Ordering::SeqCst);
             return displace(removed);
         }
         idx = (idx + 1) & MASK;

@@ -28,12 +28,20 @@
 //! delays a free rather than permitting a use after free, and the
 //! sweep that skips it is being conservative, not correct by luck.
 //!
-//! Publication is `SeqCst` on both sides. The reader's store must be
-//! visible to a sweeping writer before the reader's own re-read
-//! happens, and `Release`/`Acquire` on two different addresses does
-//! not give that: this is the store-buffer shape where both threads
-//! read after writing, and only a total order rules out both of them
-//! missing the other.
+//! Every one of the four operations is `SeqCst`, and the count is the
+//! point. The reader publishes then re-reads the source; the writer
+//! unlinks the source then reads what is published. This is the
+//! store-buffer shape, where both threads read after writing, and only
+//! a total order rules out both of them missing the other. Three out
+//! of four does not do it: whichever operation is left out can be
+//! reordered past the other side's, and the pair that was supposed to
+//! catch each other both come back empty.
+//!
+//! The reader's two are in this module, and so is the writer's read of
+//! the published slots. The writer's unlink is not. It belongs to
+//! whoever owns the source, so the contract on
+//! [`HazardDomain::retire`] states it, and a caller that unlinks with
+//! `AcqRel` breaks the protocol without touching this file.
 //!
 //! # What this is not
 //!
@@ -123,12 +131,35 @@ impl<T, const READERS: usize, const RETIRED: usize> HazardDomain<T, READERS, RET
     ///
     /// The caller must have removed `ptr` from every source a reader
     /// can reach before calling this. Retiring something still
-    /// reachable is what the protocol above rules out, and it is the
-    /// one way to break it.
+    /// reachable is what the protocol above rules out.
+    ///
+    /// The unlink has to be `SeqCst`, and that requirement lives at the
+    /// call site rather than in this module, which is the reason it is
+    /// spelled out here. The protocol is a Dekker pair and all four of
+    /// its operations have to sit in the one total order:
+    ///
+    ///   reader   store(published, p, SeqCst) then load(source, SeqCst)
+    ///   writer   unlink(source, SeqCst)      then load(published, SeqCst)
+    ///
+    /// Three of those are in this module. The fourth is the caller's
+    /// swap or compare-exchange, and an `AcqRel` there is not in the
+    /// total order, which makes this legal:
+    ///
+    ///   writer   unlinks, not yet visible
+    ///   writer   sweeps, reads the slot as empty
+    ///   reader   publishes p
+    ///   reader   re-reads the source, sees p still linked, so its
+    ///            check passes
+    ///   writer   frees p, and the reader follows it
+    ///
+    /// A use after free, reached without either side doing anything
+    /// wrong locally. x86 hides it because a locked read-modify-write
+    /// drains the store buffer; aarch64 does not.
     ///
     /// # Safety
     ///
-    /// `ptr` came from `Box::into_raw` and is retired exactly once.
+    /// `ptr` came from `Box::into_raw`, was unlinked with `SeqCst`,
+    /// and is retired exactly once.
     pub unsafe fn retire(&self, ptr: *mut T) {
         if ptr.is_null() {
             return;
@@ -246,7 +277,7 @@ mod tests {
         assert_eq!(guard.get().copied(), Some(7));
         drop(guard);
         // SAFETY: nothing else reaches this pointer in this test.
-        unsafe { domain.retire(source.swap(core::ptr::null_mut(), Ordering::AcqRel)) };
+        unsafe { domain.retire(source.swap(core::ptr::null_mut(), Ordering::SeqCst)) };
     }
 
     #[test]
@@ -264,7 +295,7 @@ mod tests {
         let reader = domain.claim_reader();
         let source = AtomicPtr::new(Box::into_raw(Box::new(11u64)));
         let guard = domain.protect(reader, &source);
-        let removed = source.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let removed = source.swap(core::ptr::null_mut(), Ordering::SeqCst);
         // SAFETY: removed from the source above, retired once.
         unsafe { domain.retire(removed) };
         // The sweep inside retire must have skipped it, so the guard
@@ -310,7 +341,9 @@ mod tests {
 
         for round in 1..=200u64 {
             let fresh = Box::into_raw(Box::new(round));
-            let previous = source.swap(fresh, Ordering::AcqRel);
+            // SeqCst, because a test that unlinks more weakly than the
+            // contract asks for is not exercising the contract.
+            let previous = source.swap(fresh, Ordering::SeqCst);
             // SAFETY: swapped out of the source above, retired once.
             unsafe { domain.retire(previous) };
         }
@@ -319,7 +352,7 @@ mod tests {
             r.join().expect("reader thread panicked");
         }
 
-        let last = source.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let last = source.swap(core::ptr::null_mut(), Ordering::SeqCst);
         // SAFETY: swapped out above, retired once.
         unsafe { domain.retire(last) };
         domain.sweep();
