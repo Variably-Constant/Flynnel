@@ -276,9 +276,15 @@ fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
 fn bench_all(c: &mut Criterion) {
     // Which tree built this. Two hosts here carry a directory called
     // Flynnel-verify and they are different checkouts, so a run can
-    // be against source several commits behind the one being reasoned
-    // about with nothing in the output to say so. Baked in at compile
-    // time, so it describes the binary rather than wherever it ran.
+    // be against source from the wrong host with nothing in the
+    // output to say so. Baked in at compile time, so it describes the
+    // binary rather than wherever it ran.
+    //
+    // It names the tree and not the commit, and the difference bites:
+    // a binary keeps running the source it linked while the tree
+    // moves underneath, so this line stays identical across a sync
+    // and cannot date the build. Getting the commit needs a build
+    // script, which would then run for every consumer of the crate.
     eprintln!(
         "parker_wait_strategy: built from {} v{}",
         env!("CARGO_MANIFEST_DIR"),
