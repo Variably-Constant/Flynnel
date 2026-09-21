@@ -80,6 +80,8 @@ Objects: `Flynnel.Pool`, `Flynnel.WorkerStat`, `Flynnel.SpinState`, `Flynnel.Spl
 
 `Get-FlynnelIoPool` writes a warning and nothing when the process has no global IO pool, rather than an empty pool: an empty pool and an absent one are different states and a null answer cannot say which.
 
+**No command in this module submits to an IO pool.** Every declared kernel dispatches on the main arena, the file ones that block included, so a pool made with `New-FlynnelIoPool` starts threads that sit idle. It is said here because the alternative is a script that creates a pool, sees the worker count it asked for, and concludes its file work is routed. The one thing that does use a pool is `Start-FlynnelSplitObserver`, and that is the process-wide pool rather than one this command makes.
+
 ## Kernels - 17 commands
 
 The work that actually runs on the pool. Each takes an optional `-Plan`, and `-Verbose` reports the plan that ran the work, the workers it resolved to and the leaves it asked for.
