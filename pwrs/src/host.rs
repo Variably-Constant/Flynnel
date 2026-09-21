@@ -75,6 +75,14 @@ pub struct CpuInfo {
     /// Whether UMONITOR and UMWAIT are present, which is what lets a
     /// worker wait without spinning.
     pub has_waitpkg: bool,
+    /// Whether MONITORX and MWAITX are present: AMD's user-mode
+    /// monitor-wait, which every Zen carries and which the parker
+    /// takes when WAITPKG is absent.
+    ///
+    /// A host with this and not WAITPKG is the usual AMD case before
+    /// Zen 5, and it is why the two are separate columns rather than
+    /// one "can wait without spinning" flag.
+    pub has_monitorx: bool,
     /// The factor every dispatch floor is scaled by here. Four on a
     /// host with fewer than four physical cores, where stealing has
     /// nothing to amortize against; one otherwise.
@@ -116,6 +124,7 @@ pub(crate) fn cpu_info_row() -> CpuInfo {
         model: info.model,
         stepping: info.stepping,
         has_waitpkg: flynnel::cpu_info::has_waitpkg(),
+        has_monitorx: flynnel::cpu_info::has_monitorx(),
         small_host_dispatch_factor: flynnel::cpu_info::small_host_dispatch_factor(),
     }
 }

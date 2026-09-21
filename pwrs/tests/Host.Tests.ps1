@@ -53,8 +53,20 @@ Describe 'Get-FlynnelCpuInfo' {
         }
     }
 
+    It 'reports both monitor-wait features as booleans' {
+        # Neither can be asserted to a value: this suite runs on hosts
+        # that have one, the other or neither, and pinning an answer
+        # would pin the machine. What is asserted is that the column
+        # exists and is a boolean, which is what a script branches on,
+        # and that the two are independent columns rather than one
+        # flag wearing two names.
+        $script:cpu.HasWaitpkg | Should -BeOfType [bool]
+        $script:cpu.HasMonitorx | Should -BeOfType [bool]
+    }
+
     It 'answers the same twice, because it is probed once and cached' {
         (Get-FlynnelCpuInfo).LogicalThreads | Should -Be $script:cpu.LogicalThreads
+        (Get-FlynnelCpuInfo).HasMonitorx | Should -Be $script:cpu.HasMonitorx
     }
 
     It 'answers to its Fly alias' {
