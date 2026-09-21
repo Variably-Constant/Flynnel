@@ -130,7 +130,14 @@ fn bench_strategy(
     // inherit it.
     let _load = if loaded { Some(Load::spawn()) } else { None };
     let arm = if loaded { "load" } else { "idle" };
-    let mut group = c.benchmark_group(format!("parker_wait_{label}_{arm}_gap_{gap_us}us"));
+    let name = format!("parker_wait_{label}_{arm}_gap_{gap_us}us");
+    // The fallback flag is process-wide and never cleared, so one
+    // group can turn every later group into the kernel park. Reported
+    // at the boundary it crossed, because a run that only says the
+    // monitor stopped holding leaves every row after it unreadable
+    // and every row before it indistinguishable from those.
+    let held_before = flynnel::sched::sleep::monitor_wait_held();
+    let mut group = c.benchmark_group(&name);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
     group.bench_function("unpark_to_return", |b| {
@@ -171,6 +178,12 @@ fn bench_strategy(
         });
     });
     group.finish();
+    if held_before && !flynnel::sched::sleep::monitor_wait_held() {
+        eprintln!(
+            "parker_wait_strategy: the monitor stopped holding during {name}. Rows from here \
+             on are the kernel park, whatever their label says."
+        );
+    }
 }
 
 /// Wake latency with other parkers alive and being unparked.
@@ -186,7 +199,9 @@ fn bench_strategy(
 /// Nothing it does should reach that one, and any effect on the
 /// timing is the layout rather than the protocol.
 fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
-    let mut group = c.benchmark_group(format!("parker_neighbours_{label}"));
+    let name = format!("parker_neighbours_{label}");
+    let held_before = flynnel::sched::sleep::monitor_wait_held();
+    let mut group = c.benchmark_group(&name);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
     group.bench_function("unpark_to_return", |b| {
@@ -243,6 +258,12 @@ fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
         });
     });
     group.finish();
+    if held_before && !flynnel::sched::sleep::monitor_wait_held() {
+        eprintln!(
+            "parker_wait_strategy: the monitor stopped holding during {name}. Rows from here \
+             on are the kernel park, whatever their label says."
+        );
+    }
 }
 
 fn bench_all(c: &mut Criterion) {
