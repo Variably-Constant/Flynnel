@@ -19,8 +19,9 @@
 //! and a caller comparator picks by result quality, which is the
 //! contract for episode racing / population search.
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::foundation::Variant;
@@ -296,26 +297,43 @@ where
         return Vec::new();
     }
     let cancel = Arc::new(AtomicBool::new(false));
-    let done: Arc<Mutex<Vec<(usize, P)>>> = Arc::new(Mutex::new(Vec::with_capacity(k)));
+    // One ticket per finisher. The first `k` tickets own the `k` result
+    // slots, so the ticket order IS the completion order and each slot
+    // has exactly one writer.
+    let claimed = Arc::new(AtomicUsize::new(0));
+    let slots: Arc<Vec<OnceLock<(usize, P)>>> = Arc::new((0..k).map(|_| OnceLock::new()).collect());
     let cancel_inner = Arc::clone(&cancel);
-    let done_inner = Arc::clone(&done);
+    let claimed_inner = Arc::clone(&claimed);
+    let slots_inner = Arc::clone(&slots);
     collect_indexed(plan, n, 1, move |i| {
         let token = CancelToken { flag: Arc::clone(&cancel_inner) };
         let r = attempt(i, &token);
-        let mut g = done_inner.lock().expect("quorum mutex poisoned");
-        if g.len() < k {
-            g.push((i, r));
-            if g.len() == k {
+        let ticket = claimed_inner.fetch_add(1, Ordering::AcqRel);
+        if ticket < k {
+            if slots_inner[ticket].set((i, r)).is_err() {
+                panic!("quorum slot {ticket} was written twice");
+            }
+            if ticket == k - 1 {
                 cancel_inner.store(true, Ordering::Release);
             }
         }
     });
     drop(cancel);
-    Arc::try_unwrap(done)
-        .ok()
-        .expect("done Arc still has outstanding clones")
-        .into_inner()
-        .expect("quorum mutex poisoned")
+    let filled = match Arc::try_unwrap(slots) {
+        Ok(v) => v,
+        Err(shared) => panic!(
+            "quorum slots still shared by {} references after join",
+            Arc::strong_count(&shared)
+        ),
+    };
+    let mut winners = Vec::with_capacity(k);
+    for (ticket, slot) in filled.into_iter().enumerate() {
+        match slot.into_inner() {
+            Some(entry) => winners.push(entry),
+            None => panic!("quorum slot {ticket} was never written"),
+        }
+    }
+    winners
 }
 
 /// How a [`race_refute`] duel ended.
@@ -460,9 +478,11 @@ where
 
 /// Handle an anytime explorer uses to check the clock and publish its
 /// best result so far. Passed to each [`race_deadline`] explorer.
+/// Each explorer gets its own handle, so `best` is touched by one
+/// thread only and the winner is reduced across handles after the join.
 pub struct Anytime<R> {
     expired: Arc<AtomicBool>,
-    best: Arc<Mutex<Option<(f64, R)>>>,
+    best: Cell<Option<(f64, R)>>,
 }
 
 impl<R> Anytime<R> {
@@ -474,14 +494,14 @@ impl<R> Anytime<R> {
     }
 
     /// Publish a candidate result with its score. A higher score
-    /// replaces the current best; ties keep the incumbent. Cheap to
-    /// call often, so publish every time the result improves.
+    /// replaces the current best; ties keep the incumbent. Costs no
+    /// cross-thread traffic, so publish every time the result improves.
     pub fn submit(&self, score: f64, value: R) {
-        let mut g = self.best.lock().expect("anytime mutex poisoned");
-        let improved = g.as_ref().is_none_or(|(s, _)| score > *s);
-        if improved {
-            *g = Some((score, value));
-        }
+        let kept = match self.best.take() {
+            Some((s, v)) if s >= score => Some((s, v)),
+            _ => Some((score, value)),
+        };
+        self.best.set(kept);
     }
 }
 
@@ -517,30 +537,36 @@ where
         return None;
     }
     let expired = Arc::new(AtomicBool::new(false));
-    let best: Arc<Mutex<Option<(f64, R)>>> = Arc::new(Mutex::new(None));
-    let ctx = Anytime { expired: Arc::clone(&expired), best: Arc::clone(&best) };
     let timer_flag = Arc::clone(&expired);
+    let explorer_flag = Arc::clone(&expired);
 
     // One arm is the clock; the other fans the explorers out. When the
     // clock arm flips the flag, the explorers observe it and return.
-    join(
+    let (_timer, published) = join(
         plan,
         move || {
             std::thread::sleep(budget);
             timer_flag.store(true, Ordering::Release);
         },
         move || {
-            // `ctx` moves in here and drops when this arm finishes,
-            // releasing its Arc clone of `best`; after join returns,
-            // `best` is the sole strong ref, so try_unwrap succeeds.
-            collect_indexed(plan, n, 1, |i| explore(i, &ctx));
+            collect_indexed(plan, n, 1, |i| {
+                let ctx = Anytime {
+                    expired: Arc::clone(&explorer_flag),
+                    best: Cell::new(None),
+                };
+                explore(i, &ctx);
+                ctx.best.into_inner()
+            })
         },
     );
-    Arc::try_unwrap(best)
-        .ok()
-        .expect("best Arc still has outstanding clones")
-        .into_inner()
-        .expect("anytime mutex poisoned")
+    let mut best: Option<(f64, R)> = None;
+    for candidate in published.into_iter().flatten() {
+        let improved = best.as_ref().is_none_or(|(s, _)| candidate.0 > *s);
+        if improved {
+            best = Some(candidate);
+        }
+    }
+    best
 }
 
 /// Tournament racing: run all candidates for a small budget, keep the
