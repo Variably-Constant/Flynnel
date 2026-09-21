@@ -21,9 +21,12 @@
 //!    they post new work. Still counted as `awake_but_idle`.
 //!    After `rounds_until_sleeping()` more yields the worker
 //!    transitions to:
-//! 4. `SLEEPING`: locks its Mutex, waits on Condvar; counted as
-//!    both `inactive` AND `sleeping`. Awoken by
-//!    `wake_specific_thread` (which clears the mutex and notifies).
+//! 4. `SLEEPING`: publishes that it is sleeping in its own atomic
+//!    word, re-reads the shutdown flag, then parks; counted as both
+//!    `inactive` AND `sleeping`. Awoken by `wake_specific_thread`,
+//!    which swaps that word and unparks the thread. The swap decides
+//!    who wakes it, so exactly one party unparks and exactly one
+//!    decrements the sleeping count.
 //!
 //! Producers (`new_internal_jobs`):
 //!   - Increment JEC if it is sleepy (signals sleepy workers to
@@ -33,7 +36,7 @@
 //!     capped at num_sleepers.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::thread;
 
 // ===========================================================================
@@ -148,7 +151,7 @@ impl AtomicCounters {
 
     /// Sub one sleeping thread. Caller MUST know that at least
     /// one sleeping thread exists (typically because they just
-    /// woke one via the condvar).
+    /// woke one by unparking it).
     #[inline]
     pub(crate) fn sub_sleeping_thread(&self) {
         let old = Counters {
@@ -234,7 +237,7 @@ impl std::fmt::Debug for Counters {
 const ROUNDS_UNTIL_SLEEPY: u32 = 32;
 
 /// Default spin-window rounds added on top of `ROUNDS_UNTIL_SLEEPY`
-/// before a sleepy worker locks the condvar. 500 rounds is
+/// before a sleepy worker parks. 500 rounds is
 /// approximately a 500us spin window, sized to span both typical
 /// inter-dispatch gaps (10-50us) AND the longer between-dispatch
 /// pauses that smaller pools see on dispatches that complete in
@@ -359,7 +362,7 @@ fn spin_init() {
     });
 }
 
-/// Yield rounds before a sleepy worker locks the condvar. Reads the
+/// Yield rounds before a sleepy worker parks. Reads the
 /// runtime-adjustable [`SPIN_WINDOW`] so the adaptive controller (or
 /// [`set_spin_window`]) can shorten it for a bursty-idle workload.
 #[inline]
@@ -461,13 +464,30 @@ pub fn spin_adaptive() -> bool {
 ///
 /// `#[repr(align(128))]` so two adjacent workers in the Vec never
 /// share a 128-byte prefetched cache-line pair. Without this, worker
-/// 0's `is_blocked` mutex acquire invalidates worker 1's cached
-/// state. Cilk's `CILK_CACHE_LINE = 128` is the same rationale.
+/// 0's write to its own state invalidates worker 1's cached copy.
+/// Cilk's `CILK_CACHE_LINE = 128` is the same rationale.
 #[repr(align(128))]
 struct WorkerSleepState {
-    is_blocked: Mutex<bool>,
-    condvar: Condvar,
+    /// [`SLEEPING`] from just before this worker parks until whoever
+    /// wakes it swaps it back, [`AWAKE`] otherwise. The swap is what
+    /// decides who wakes it: exactly one party observes the
+    /// transition, so exactly one decrements the sleeping count.
+    state: AtomicU32,
+    /// This worker's own thread handle, stored the first time it
+    /// sleeps and reused after.
+    ///
+    /// `thread::park` and `unpark` carry a permit, so an unpark that
+    /// lands before the park is remembered and the next park returns
+    /// at once, so a wake that arrives between the publish below and
+    /// the park is kept rather than dropped.
+    handle: OnceLock<thread::Thread>,
 }
+
+/// [`WorkerSleepState::state`] for a worker that is running.
+const AWAKE: u32 = 0;
+/// [`WorkerSleepState::state`] for a worker that is parked, or has
+/// committed to parking and is making its last checks.
+const SLEEPING: u32 = 1;
 
 /// Per-worker idle bookkeeping carried across calls to
 /// `no_work_found`. Initialized once when a worker enters its idle
@@ -480,7 +500,7 @@ pub(crate) struct IdleState {
     /// JEC snapshot taken when the worker entered sleepy state;
     /// used to detect a producer JEC bump that should rescue us.
     pub jobs_counter: JobsEventCounter,
-    /// Set once this worker has actually parked on the condvar in this
+    /// Set once this worker has actually parked in this
     /// idle episode, so a later find is not miscounted as a spin
     /// rescue (the spin did not save this worker - it parked).
     pub parked: bool,
@@ -522,8 +542,10 @@ pub(crate) struct SleepDebug {
     pub(crate) inactive: usize,
     /// Raw JEC value; even = sleepy, odd = active.
     pub(crate) jec: usize,
-    /// Per-worker condvar block flag; `None` if its mutex was held.
-    pub(crate) blocked: Vec<Option<bool>>,
+    /// Whether each worker is parked. Plain `bool` rather than an
+    /// `Option`: the absent case meant its mutex was held at the
+    /// moment of the read, and there is no mutex to hold now.
+    pub(crate) blocked: Vec<bool>,
 }
 
 /// Process-global sleep coordinator. One instance per arena;
@@ -544,10 +566,9 @@ pub(crate) struct Sleep {
     /// The flag is what makes shutdown durable. Waking is not: a wake
     /// reaches only the workers that are blocked at the moment it
     /// runs, and a worker still walking its tiers is not one of them,
-    /// so without something left behind it commits to the condvar
-    /// afterwards and nothing ever wakes it again. Measured at one
-    /// hang in 5000 runs of the lib suite, which is
-    /// `LocalArena::drop` joining a worker that will not return.
+    /// so without something left behind it parks afterwards and
+    /// nothing ever wakes it again, which is `LocalArena::drop`
+    /// joining a worker that will not return.
     ///
     /// Reading it under the mutex is the load-bearing part rather than
     /// the flag itself. That is what orders the read against the wake:
@@ -563,8 +584,8 @@ impl Sleep {
         let mut states = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             states.push(WorkerSleepState {
-                is_blocked: Mutex::new(false),
-                condvar: Condvar::new(),
+                state: AtomicU32::new(AWAKE),
+                handle: OnceLock::new(),
             });
         }
         Self {
@@ -607,14 +628,14 @@ impl Sleep {
     }
 
     /// Diagnostic view of the counter word and each worker's
-    /// condvar block flag. A flag is `None` when its mutex is held
+    /// parked flag, read straight out of each worker's atomic word
     /// at the instant of the read (worker mid-transition).
     pub(crate) fn debug_state(&self) -> SleepDebug {
         let c = self.counters.load(Ordering::SeqCst);
         let blocked = self
             .worker_states
             .iter()
-            .map(|s| s.is_blocked.try_lock().ok().map(|g| *g))
+            .map(|s| s.state.load(Ordering::Relaxed) == SLEEPING)
             .collect();
         SleepDebug {
             sleeping: c.sleeping_threads(),
@@ -701,7 +722,7 @@ impl Sleep {
             .jobs_counter()
     }
 
-    /// Worker-side: actually go to sleep on the condvar after the
+    /// Worker-side: actually park after the
     /// sleepy phase. Returns immediately if the JEC has changed
     /// (i.e. a producer posted work in the meantime).
     fn sleep(
@@ -710,13 +731,11 @@ impl Sleep {
         has_injected_jobs: impl FnOnce() -> bool,
     ) {
         let state = &self.worker_states[idle.worker_index];
-        let mut is_blocked = state.is_blocked.lock().unwrap();
-        debug_assert!(!*is_blocked);
+        debug_assert_eq!(state.state.load(Ordering::Relaxed), AWAKE);
 
-        // Read under the mutex, so it cannot be missed. The wake this
-        // pairs with reaches only workers already blocked, and this
-        // worker was still walking its tiers when that ran, so the
-        // flag is the only thing that says shutdown happened.
+        // Cheap exit before touching the counters. Not the load-bearing
+        // check: that one is below, after this worker has published
+        // that it is sleeping.
         if self.shutdown.load(Ordering::Acquire) {
             idle.wake_partly();
             return;
@@ -745,15 +764,40 @@ impl Sleep {
             self.counters.sub_sleeping_thread();
             idle.sleepless = idle.sleepless.saturating_add(1);
         } else {
-            // Committing to the condvar: the spin did not rescue this
+            // Committing to a park: the spin did not rescue this
             // worker. Feed the controller before blocking.
             idle.parked = true;
             idle.sleepless = 0;
             PARK_EVENTS.fetch_add(1, Ordering::Relaxed);
             maybe_adapt();
-            *is_blocked = true;
-            while *is_blocked {
-                is_blocked = state.condvar.wait(is_blocked).unwrap();
+
+            // Publish first, then re-read. A waker arriving from here
+            // on sees SLEEPING and unparks; one that arrived earlier
+            // stored the flag this reads next. Both orders are covered
+            // and neither needs a lock, which is the whole point:
+            // SeqCst on the store here and on the swap in
+            // wake_specific_thread is what the mutex was standing in
+            // for.
+            //
+            // Jobs do not need this treatment. A producer bumps the
+            // packed counter, and try_add_sleeping_thread above is a
+            // CAS that fails when it moves, so the counter word is
+            // already the ordering for work arriving. Shutdown has no
+            // counter, which is why it was the one that leaked.
+            state.handle.get_or_init(thread::current);
+            state.state.store(SLEEPING, Ordering::SeqCst);
+            if self.shutdown.load(Ordering::SeqCst) {
+                if state.state.swap(AWAKE, Ordering::SeqCst) == SLEEPING {
+                    self.counters.sub_sleeping_thread();
+                }
+                idle.wake_fully();
+                return;
+            }
+
+            // park returns on a permit, on an unpark, and spuriously,
+            // so the state is what says whether to go back.
+            while state.state.load(Ordering::Acquire) == SLEEPING {
+                thread::park();
             }
         }
         idle.wake_fully();
@@ -767,7 +811,7 @@ impl Sleep {
     pub(crate) fn new_internal_jobs(&self, num_jobs: u32, queue_was_empty: bool) {
         // Flip JEC from sleepy (even) to active (odd) if any
         // worker is currently in the sleepy phase, so they bail
-        // out before locking the condvar.
+        // out before parking.
         let counters = self
             .counters
             .increment_jobs_event_counter_if(JobsEventCounter::is_sleepy);
@@ -810,10 +854,16 @@ impl Sleep {
     /// already awake.
     fn wake_specific_thread(&self, idx: usize) -> bool {
         let state = &self.worker_states[idx];
-        let mut is_blocked = state.is_blocked.lock().unwrap();
-        if *is_blocked {
-            *is_blocked = false;
-            state.condvar.notify_one();
+        // SeqCst against the sleeper's publish-then-recheck. Either
+        // this swap sees SLEEPING, or the sleeper's re-read sees what
+        // this caller stored before calling; one of the two always
+        // holds, which is what the mutex used to buy.
+        if state.state.swap(AWAKE, Ordering::SeqCst) == SLEEPING {
+            // Only the party that wins the swap unparks and decrements,
+            // so a sleeper racing its own waker cannot double-count.
+            if let Some(handle) = state.handle.get() {
+                handle.unpark();
+            }
             self.counters.sub_sleeping_thread();
             true
         } else {
@@ -826,8 +876,8 @@ impl Sleep {
     pub(crate) fn wake_all_for_shutdown(&self) {
         // Stored before the sweep, never after. A worker that takes
         // its mutex after its own slot has been swept has to find the
-        // flag already set, or it commits to the condvar behind the
-        // wake and stays there.
+        // flag already set, or it parks behind the wake and stays
+        // there.
         self.shutdown.store(true, Ordering::Release);
         for i in 0..self.worker_states.len() {
             self.wake_specific_thread(i);

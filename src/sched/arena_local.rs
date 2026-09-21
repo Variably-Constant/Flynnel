@@ -1553,9 +1553,11 @@ impl LocalArena {
         for i in 0..n {
             let st = &self.stats[i];
             let state = match sleep.blocked.get(i) {
-                Some(Some(true)) => "blocked",
-                Some(Some(false)) => "awake",
-                _ => "mutex-held",
+                Some(true) => "blocked",
+                Some(false) => "awake",
+                // Shorter than the worker count, which is a defect in
+                // this dump rather than a state a worker can be in.
+                None => "unreported",
             };
             s.push_str(&format!(
                 "  w{i:02} deques[{}] {state} pops={} steals={} stolen_from={} refused={}\n",
