@@ -144,6 +144,9 @@ pwrs::export_module! {
         gpupeer::NewFlynnelGpuPeer,
         gpupeer::GetFlynnelGpuPeer,
         gpupeer::RemoveFlynnelGpuPeer,
+        crossproc::GetFlynnelCrossProcessVariant,
+        crossproc::GetFlynnelCrossProcessRoute,
+        crossproc::GetFlynnelPassRegistry,
     ],
     classes: [
         host::CpuInfo,
@@ -219,6 +222,9 @@ pwrs::export_module! {
         gpupeer::WavePlan,
         gpupeer::PeerConfig,
         gpupeer::PeerRow,
+        crossproc::DequeVariantInfo,
+        crossproc::CrossProcessRoute,
+        crossproc::PassRegistryRow,
     ],
     enums: [
         host::Vendor,
@@ -253,11 +259,13 @@ pwrs::export_module! {
         hybrid::PlacementKind,
         gpupeer::DriverModelKind,
         gpupeer::FrontierKind,
+        crossproc::DequeVariantKind,
     ],
 }
 
 mod backends;
 mod calibration;
+mod crossproc;
 mod gpupeer;
 mod host;
 mod hybrid;

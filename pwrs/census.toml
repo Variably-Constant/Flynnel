@@ -1183,6 +1183,59 @@ item = "crate::gpu_peer::GpuPeerError"
 reason = "internal-to-another-surface"
 note = "each variant reaches a script as an error record's category and message under the id FlynnelGpuPeer: NoDevice and Unavailable as DeviceError, Io as WriteError, PayloadTooLarge and ReapOutOfOrder as InvalidArgument, Timeout as OperationTimeout"
 
+# ---------------------------------------------------------------------
+# The cross-process worker
+# ---------------------------------------------------------------------
+# Five mapped-file deque implementations, the latch they signal on and
+# the wire that encodes an argument. A script reaches this family
+# through the routing decision and the pass registry; the deques
+# themselves are the transport that decision picks among.
+
+[[entry]]
+item = "crate::backend::shared_mem::chase_lev_mmf"
+reason = "unsafe-or-structural"
+note = "the mapped-file Chase-Lev deque: a shared file two processes address by offset, with an owner release store and a thief compare-and-swap. Handing a script the mapping means handing it bytes another process is writing. Get-FlynnelCrossProcessVariant reports what it can carry"
+
+[[entry]]
+item = "crate::backend::shared_mem::khl_mmf"
+reason = "unsafe-or-structural"
+note = "the cache-line publication deque over the same mapping, using movdir64b where the host has it. Same reasoning as chase_lev_mmf"
+
+[[entry]]
+item = "crate::backend::shared_mem::khpd"
+reason = "unsafe-or-structural"
+note = "batched publication lines, three items to a line. Same reasoning"
+
+[[entry]]
+item = "crate::backend::shared_mem::urd"
+reason = "unsafe-or-structural"
+note = "a mailbox per thief, with a hardware wait where WAITPKG is present. Same reasoning; Get-FlynnelCpuInfo reports whether this host has that instruction"
+
+[[entry]]
+item = "crate::backend::shared_mem::lcrq_lifo"
+reason = "unsafe-or-structural"
+note = "the LCRQ-on-LIFO hybrid. Same reasoning"
+
+[[entry]]
+item = "crate::backend::shared_mem::latch_mmf"
+reason = "unsafe-or-structural"
+note = "64-byte latch cells in the shared file, where a peer publishes its result bytes inline and release-stores the flag. There is no response ring to read; the latch is the response"
+
+[[entry]]
+item = "crate::backend::shared_mem::wire"
+reason = "internal-to-another-surface"
+note = "encodes and decodes one KernelArg for the shared slot. The contract it implements is what makes an id-and-arguments dispatch possible, and both ends of it are inside the dispatcher"
+
+[[entry]]
+item = "crate::backend::shared_mem::variant_dispatch"
+reason = "internal-to-another-surface"
+note = "the routing decision, bound as Get-FlynnelCrossProcessRoute and Get-FlynnelCrossProcessVariant. DequeVariant is exported as Flynnel.DequeVariant; WorkloadShape becomes the route cmdlet's parameters and DispatcherRoutingTable's layering becomes the FromExplicitCell and HeuristicVariant columns. CrossProcessDispatcher itself submits work to a peer, which waits on a peer existing"
+
+[[entry]]
+item = "crate::backend::shared_mem::pass_registry"
+reason = "internal-to-another-surface"
+note = "bound as Get-FlynnelPassRegistry, which answers the count and whether a named or numbered pass is registered here. register takes the handler as a Rust closure, so there is no Register cmdlet and the Get says so; execute runs one on behalf of a peer and is reached by the drain loop rather than by a caller"
+
 [[entry]]
 item = "crate::gpu_peer::wave::plan"
 reason = "internal-to-another-surface"
