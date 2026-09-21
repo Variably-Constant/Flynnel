@@ -227,7 +227,9 @@ pub struct WaitController {
     mean_ns: [AtomicU64; 2],
     /// Samples folded into each mean.
     samples: [AtomicU32; 2],
-    /// Parks begun, for the sample and re-probe cadences.
+    /// Samples taken, which paces the re-probe. Counted here rather
+    /// than counting parks, because this is touched only on a park
+    /// that is already being timed.
     parks: AtomicU64,
     /// The strategy [`Self::choose`] currently returns, as a slot.
     current: AtomicU32,
@@ -235,13 +237,23 @@ pub struct WaitController {
     switches: AtomicU64,
 }
 
-/// One park in this many is timed.
+/// One park in this many, per thread, is timed.
 ///
 /// Low enough that a verdict arrives inside a second of ordinary
 /// scheduling and high enough that the two clock reads it costs are
 /// spread thin. A park is already microseconds, so the sampled ones
 /// pay single-digit per cent and the rest pay nothing.
-const SAMPLE_EVERY: u64 = 64;
+const SAMPLE_EVERY: u32 = 64;
+
+thread_local! {
+    /// Parks this thread has taken since it last sampled one.
+    ///
+    /// Thread-local so the cadence costs no shared line. A worker
+    /// that parks rarely samples rarely, which is correct: the
+    /// controller wants samples in proportion to how much a thread
+    /// actually parks.
+    static PARKS_SINCE_SAMPLE: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
 
 /// Samples each strategy needs before its mean is allowed to decide
 /// anything.
@@ -303,16 +315,35 @@ impl WaitController {
     /// Also drives exploration: while either side is short of
     /// evidence, or a re-probe is due, the sampled park is steered to
     /// the side that needs it rather than to whichever is in use.
+    ///
+    /// # What an unsampled park pays
+    ///
+    /// Nothing shared. The challenger check comes first, so a host
+    /// with no second strategy leaves without touching the controller
+    /// at all, and the park counter is thread-local, so the
+    /// sixty-three parks between samples never write a line another
+    /// worker reads. An earlier version counted in a process-wide
+    /// atomic before asking whether there was anything to count, which
+    /// put a contended read-modify-write on every park on every host.
     fn sample_plan(&self) -> Option<(WaitStrategy, u32)> {
-        let n = self.parks.fetch_add(1, Ordering::Relaxed);
-        if n % SAMPLE_EVERY != 0 {
+        let challenger = challenger()?;
+        if !PARKS_SINCE_SAMPLE.with(|c| {
+            let n = c.get() + 1;
+            if n >= SAMPLE_EVERY {
+                c.set(0);
+                true
+            } else {
+                c.set(n);
+                false
+            }
+        }) {
             return None;
         }
-        let challenger = challenger()?;
 
         let base_n = self.samples[SLOT_BASELINE as usize].load(Ordering::Relaxed);
         let chal_n = self.samples[SLOT_CHALLENGER as usize].load(Ordering::Relaxed);
-        let reprobe = n % REPROBE_EVERY == 0;
+        let taken = self.parks.fetch_add(1, Ordering::Relaxed);
+        let reprobe = taken % REPROBE_EVERY == 0;
 
         // The side with less evidence, so a cold controller fills both
         // means rather than confirming the one it started on.
