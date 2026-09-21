@@ -173,6 +173,78 @@ fn bench_strategy(
     group.finish();
 }
 
+/// Wake latency with other parkers alive and being unparked.
+///
+/// A monitor wait watches the cache line its `wake_counter` sits in,
+/// so what a neighbouring parker does to its own counter matters if
+/// the two share a line. One parker has no neighbour, which is what
+/// every other group here measures, and a pool has twenty-odd: this
+/// group is the difference between those two, and it is the shape a
+/// live arena actually has.
+///
+/// The noise thread unparks every parker except the one being timed.
+/// Nothing it does should reach that one, and any effect on the
+/// timing is the layout rather than the protocol.
+fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
+    let mut group = c.benchmark_group(format!("parker_neighbours_{label}"));
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("unpark_to_return", |b| {
+        b.iter_custom(|iters| {
+            let n = std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(4);
+            // Allocated together, the way an arena allocates its
+            // worker parkers, so they land near each other.
+            let neighbours: Vec<Arc<Parker>> = (0..n)
+                .map(|_| Arc::new(Parker::with_strategy(0, strategy)))
+                .collect();
+
+            let stop = Arc::new(AtomicU32::new(0));
+            let noise_stop = Arc::clone(&stop);
+            let noise_set: Vec<Arc<Parker>> = neighbours.clone();
+            let noise = std::thread::spawn(move || {
+                while noise_stop.load(Ordering::Relaxed) == 0 {
+                    for p in &noise_set {
+                        p.unpark();
+                    }
+                }
+            });
+
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let ready = Arc::new(AtomicU32::new(0));
+                let returned = Arc::new(AtomicU32::new(0));
+                let returned_clone = Arc::clone(&returned);
+                let ready_clone = Arc::clone(&ready);
+                let (tx, rx) = std::sync::mpsc::channel::<Arc<Parker>>();
+                let owner = std::thread::spawn(move || {
+                    let p = Arc::new(Parker::with_strategy(0, strategy));
+                    tx.send(Arc::clone(&p)).expect("send parker");
+                    let ok = p.park_until(|| ready.load(Ordering::Acquire) == 1);
+                    returned_clone.store(1, Ordering::Release);
+                    ok
+                });
+                let p_owner = rx.recv().expect("recv parker");
+                std::thread::sleep(Duration::from_micros(50));
+                let t0 = Instant::now();
+                ready_clone.store(1, Ordering::Release);
+                p_owner.unpark();
+                while returned.load(Ordering::Acquire) == 0 {
+                    std::hint::spin_loop();
+                }
+                total += t0.elapsed();
+                owner.join().expect("owner join");
+            }
+
+            stop.store(1, Ordering::Relaxed);
+            noise.join().expect("noise join");
+            black_box(total)
+        });
+    });
+    group.finish();
+}
+
 fn bench_all(c: &mut Criterion) {
     let waitpkg = flynnel::cpu_info::has_waitpkg();
     let monitorx = flynnel::cpu_info::has_monitorx();
@@ -220,6 +292,17 @@ fn bench_all(c: &mut Criterion) {
                 bench_strategy(c, "monitorx", WaitStrategy::Monitorx, gap_us, loaded);
             }
         }
+    }
+
+    // Neighbours last, and only the two strategies a monitor wait can
+    // take: StdPark has no monitor, so a neighbouring store cannot
+    // reach it and the row would only restate the idle one.
+    if waitpkg {
+        bench_neighbours(c, "waitpkg", WaitStrategy::Waitpkg);
+    }
+    if monitorx {
+        bench_neighbours(c, "stdpark", WaitStrategy::StdPark);
+        bench_neighbours(c, "monitorx", WaitStrategy::Monitorx);
     }
 
     // Printed after the arms, because it is only knowable once a wait
