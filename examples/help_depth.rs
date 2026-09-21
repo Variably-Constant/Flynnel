@@ -70,7 +70,7 @@ fn main() {
 
     println!("help_depth items={ITEMS} rounds={ROUNDS}");
     for width in widths {
-        let plan = JobPlan::new(ITEMS.trailing_zeros(), ITEMS);
+        let plan = JobPlan::new(ITEMS.trailing_zeros() as u8, ITEMS as u32);
         let before = help_depth_max();
         for _ in 0..ROUNDS {
             black_box(fork(&plan, 0, ITEMS));
