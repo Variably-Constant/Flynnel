@@ -1311,14 +1311,33 @@ mod tests {
 
     #[test]
     fn park_until_returns_false_on_shutdown() {
-        let p = Arc::new(Parker::new(8));
-        let p_signal = Arc::clone(&p);
-        let signal = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            p_signal.shutdown();
+        // The park runs on a worker and this thread does the waiting,
+        // so the wait can be bounded. A park on the test's own thread
+        // cannot be bounded from anywhere, because the thread that
+        // would time it out is the one that is stuck, and the failure
+        // this test looks for is precisely a shutdown that does not
+        // wake the park. The parker is built inside that worker
+        // because `Parker::new` captures `thread::current()` as the
+        // unpark target.
+        let (tx, rx) = std::sync::mpsc::channel::<Arc<Parker>>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+        let owner = thread::spawn(move || {
+            let p = Arc::new(Parker::new(8));
+            tx.send(Arc::clone(&p)).expect("send parker");
+            let ok = p.park_until(|| false);
+            if done_tx.send(ok).is_err() {
+                eprintln!("park_until returned after the test stopped waiting for it");
+            }
+            ok
         });
-        let ok = p.park_until(|| false);
-        signal.join().unwrap();
+        let p = rx.recv().expect("owner must send its parker");
+        thread::sleep(Duration::from_millis(50));
+        p.shutdown();
+        let ok = done_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "shutdown did not wake the parked thread within ten seconds, which is the \
+             lost wakeup this test exists to catch",
+        );
+        owner.join().expect("the owner thread reported before this join");
         assert!(!ok, "park_until must return false after shutdown");
     }
 
@@ -1331,12 +1350,21 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel::<Arc<Parker>>();
 
+        // Bounded through a channel rather than a join, for the reason
+        // given on shutdown_unparks_so_blocked_thread_exits: an unpark
+        // that never arrives is the failure this test looks for, and a
+        // join against it blocks until the suite is stopped by hand.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(bool, Duration)>();
         let owner = thread::spawn(move || {
             let p = Arc::new(Parker::new(8));
             tx.send(Arc::clone(&p)).unwrap();
             let t0 = Instant::now();
             let ok = p.park_until(|| ready.load(Ordering::Acquire) == 1);
-            (ok, t0.elapsed())
+            let result = (ok, t0.elapsed());
+            if done_tx.send(result).is_err() {
+                eprintln!("park_until returned after the test stopped waiting for it");
+            }
+            result
         });
 
         let p_owner = rx.recv().expect("owner must send its parker");
@@ -1344,7 +1372,11 @@ mod tests {
         ready_clone.store(1, Ordering::Release);
         p_owner.unpark();
 
-        let (ok, elapsed) = owner.join().unwrap();
+        let (ok, elapsed) = done_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "the unpark did not wake the parked thread within ten seconds, which is the \
+             lost wakeup this test exists to catch",
+        );
+        owner.join().expect("the owner thread reported before this join");
         assert!(ok, "park_until must return true after ready becomes true");
         // Should wake within ~100 ms.
         assert!(elapsed < Duration::from_millis(500),
@@ -1701,11 +1733,19 @@ mod tests {
 
         let ready_thread = Arc::clone(&ready);
         let woke_thread = Arc::clone(&woke);
+        // Bounded through a channel rather than a join. A permit sent
+        // to the wrong thread is exactly what this test looks for, and
+        // it leaves the owner parked forever, against which a join
+        // waits for as long as the suite is allowed to run.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
         let owner = thread::spawn(move || {
             let p = Arc::new(Parker::new(0));
             tx.send(Arc::clone(&p)).expect("send parker");
             let ok = p.park_until(|| ready_thread.load(Ordering::Acquire) == 1);
             woke_thread.store(1, Ordering::Release);
+            if done_tx.send(ok).is_err() {
+                eprintln!("park_until returned after the test stopped waiting for it");
+            }
             ok
         });
 
@@ -1714,10 +1754,12 @@ mod tests {
         ready.store(1, Ordering::Release);
         p.unpark();
 
-        assert!(
-            owner.join().expect("owner thread joins"),
-            "park_until must report a wake rather than a shutdown"
+        let ok = done_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "the unpark did not reach the parked thread within ten seconds, which is the \
+             misdirected permit this test exists to catch",
         );
+        owner.join().expect("the owner thread reported before this join");
+        assert!(ok, "park_until must report a wake rather than a shutdown");
         assert_eq!(woke.load(Ordering::Acquire), 1);
     }
 
@@ -1773,18 +1815,31 @@ mod tests {
         let ready = Arc::new(AtomicU32::new(0));
         let ready_clone = Arc::clone(&ready);
         let (tx, rx) = std::sync::mpsc::channel::<Arc<Parker>>();
+        // Bounded through a channel rather than a join. A monitor wait
+        // that misses its wake leaves the owner parked, and this arm
+        // has no kernel permit behind it to fall back on, so a join
+        // here waits for as long as the suite is allowed to run.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(bool, Duration)>();
         let owner = thread::spawn(move || {
             let p = Arc::new(Parker::with_strategy(8, WaitStrategy::Waitpkg));
             tx.send(Arc::clone(&p)).unwrap();
             let t0 = Instant::now();
             let ok = p.park_until(|| ready.load(Ordering::Acquire) == 1);
-            (ok, t0.elapsed())
+            let result = (ok, t0.elapsed());
+            if done_tx.send(result).is_err() {
+                eprintln!("park_until returned after the test stopped waiting for it");
+            }
+            result
         });
         let p_owner = rx.recv().expect("owner must send its parker");
         thread::sleep(Duration::from_millis(20));
         ready_clone.store(1, Ordering::Release);
         p_owner.unpark();
-        let (ok, elapsed) = owner.join().unwrap();
+        let (ok, elapsed) = done_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "the WAITPKG wait did not observe the unpark within ten seconds, which is the \
+             missed wake this test exists to catch",
+        );
+        owner.join().expect("the owner thread reported before this join");
         assert!(ok, "Waitpkg park_until must return true on unpark");
         // Cap should be well under 100ms; the 10ms UMWAIT deadline
         // bounds the worst case to ~10ms even if UMWAIT misses the
@@ -1801,15 +1856,38 @@ mod tests {
         // built in main and parked-on by a spawned thread would
         // unpark main, not the spawned thread, and deadlock.
         let (tx, rx) = std::sync::mpsc::channel::<Arc<Parker>>();
+        // The result comes back over a channel rather than from the
+        // join, so the wait for it can be bounded. A join cannot: the
+        // one failure this test exists to catch is a shutdown that does
+        // not wake the parked thread, and against that a join blocks
+        // for as long as the suite is allowed to run. Observed on a
+        // guest, where the whole suite sat in futex_wait_queue for over
+        // four hours and reported nothing, so the defect presented as a
+        // hung build rather than as a failure naming itself.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
         let owner = thread::spawn(move || {
             let p = Arc::new(Parker::new(8));
             tx.send(Arc::clone(&p)).unwrap();
-            p.park_until(|| false)
+            let woke = p.park_until(|| false);
+            if done_tx.send(woke).is_err() {
+                // The receiver is gone, which means the wait below
+                // timed out and the test is already failing. The park
+                // did return, late, and that is a different fact from
+                // never returning at all.
+                eprintln!("park_until returned after the test stopped waiting for it");
+            }
+            woke
         });
         let p_owner = rx.recv().expect("owner must send its parker");
         thread::sleep(Duration::from_millis(50));
         p_owner.shutdown();
-        let ok = owner.join().unwrap();
+        let ok = done_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "shutdown did not wake the parked thread within ten seconds, which is the \
+             lost wakeup this test exists to catch",
+        );
+        // Reached only once the thread has published its result, so it
+        // is about to return and this cannot be the call that blocks.
+        owner.join().expect("the owner thread reported before this join");
         assert!(!ok, "shutdown must surface as park_until -> false");
     }
 }
