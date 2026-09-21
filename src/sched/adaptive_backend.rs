@@ -173,37 +173,33 @@ mod tests {
         }
     }
 
+    // Every check that reads ACTIVE_BACKEND_TAG lives in this one body.
+    // The tag is process-global and the harness runs tests in parallel,
+    // so a second test storing Cpu between a store and its read fails
+    // the reader; one body cannot race itself. backend::accel_op's
+    // steering test also writes the tag, around one call, and restores
+    // Cpu.
     #[test]
-    fn default_active_is_cpu() {
+    fn the_global_tag_defaults_migrates_resolves_and_falls_back() {
         let _g = TestGuard::new();
         assert_eq!(active_backend_id(), Backend::Cpu);
-    }
 
-    #[test]
-    fn migrate_changes_active() {
-        let _g = TestGuard::new();
         migrate_backend(Backend::Cuda { device_id: 0 });
         assert_eq!(active_backend_id(), Backend::Cuda { device_id: 0 });
         migrate_backend(Backend::Tpu { device_id: 3 });
         assert_eq!(active_backend_id(), Backend::Tpu { device_id: 3 });
         migrate_backend(Backend::Cpu);
         assert_eq!(active_backend_id(), Backend::Cpu);
-    }
 
-    #[test]
-    fn resolve_falls_back_to_cpu_when_target_unregistered() {
-        let _g = TestGuard::new();
-        // Custom backend with a random id that won't be registered.
+        // A Custom id nothing registers resolves to the CPU backend and
+        // reports the fallback.
         migrate_backend(Backend::Custom(0x00ABCDEF));
         let (resolved, fell_back) = resolve_active_backend();
         assert!(fell_back, "should fall back to CPU when Custom unregistered");
         assert_eq!(resolved.id(), Backend::Cpu);
-    }
 
-    #[test]
-    fn resolve_returns_active_when_registered() {
-        let _g = TestGuard::new();
-        // CPU is always registered.
+        // The CPU backend is always registered, so it resolves to itself.
+        migrate_backend(Backend::Cpu);
         let (resolved, fell_back) = resolve_active_backend();
         assert!(!fell_back);
         assert_eq!(resolved.id(), Backend::Cpu);
