@@ -561,13 +561,21 @@ fn cycles_to_ns(cycles: u64) -> u64 {
 /// The monitor wait this host could race against the baseline, or
 /// `None` where it has none or has been found not to hold.
 fn challenger() -> Option<WaitStrategy> {
+    // Capability before standing, and the order is the cost. Both
+    // reads are cheap, but the CPUID answers are cached in a
+    // `OnceLock` written once at startup, while `monitor_holds` is a
+    // static this module writes when it gives up on the monitor and
+    // shares a line with the counters that record the giving up.
+    // This runs on every unpinned park, so a host that can never
+    // reach the challenger leaves here having touched nothing that
+    // any thread writes.
+    if !crate::cpu_info::has_monitorx() || crate::cpu_info::has_waitpkg() {
+        return None;
+    }
     if !monitor_holds() {
         return None;
     }
-    if crate::cpu_info::has_monitorx() && !crate::cpu_info::has_waitpkg() {
-        return Some(WaitStrategy::Monitorx);
-    }
-    None
+    Some(WaitStrategy::Monitorx)
 }
 
 /// Per-worker park primitive. One `Parker` per worker thread; the
