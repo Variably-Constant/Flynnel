@@ -377,10 +377,16 @@ impl WaitController {
         // Cumulative mean while the sample count is small, then an
         // exponential one, so early samples are not swamped and a
         // later shift in load still moves the figure.
+        //
+        // The delta is signed. A sample under the mean has to pull it
+        // down, and the cumulative phase is the one that establishes
+        // the verdict, so a mean that can only rise ranks the arms by
+        // the worst draw each happened to take.
         let next = if prev == 0 {
             wake_ns
         } else if n <= SAMPLES_BEFORE_VERDICT {
-            prev + (wake_ns.saturating_sub(prev)) / u64::from(n)
+            let prev_i = prev as i64;
+            (prev_i + (wake_ns as i64 - prev_i) / i64::from(n)).max(0) as u64
         } else {
             (prev * 7 + wake_ns) / 8
         };
@@ -1216,6 +1222,42 @@ mod tests {
         }
         assert_eq!(c.current.load(Ordering::Relaxed), SLOT_BASELINE);
         assert_eq!(c.switches.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_mean_follows_its_samples_down_as_well_as_up() {
+        // Every other gate here feeds an arm one number, which a mean
+        // that only rose would also satisfy, because a constant never
+        // asks it to fall. An arm whose first timed park is slow and
+        // whose next thirty-one are fast has to read as mostly fast.
+        let c = fresh_controller();
+        c.record(SLOT_CHALLENGER, 300_000);
+        assert_eq!(
+            c.mean_ns[SLOT_CHALLENGER as usize].load(Ordering::Relaxed),
+            300_000
+        );
+        for _ in 0..SAMPLES_BEFORE_VERDICT - 1 {
+            c.record(SLOT_CHALLENGER, 1_000);
+        }
+        // One 300us draw among thirty-one of 1us averages near 10us.
+        let m = c.mean_ns[SLOT_CHALLENGER as usize].load(Ordering::Relaxed);
+        assert!(m < 20_000, "mean stayed high at {m}");
+        assert!(m > 1_000, "mean dropped the slow draw at {m}");
+    }
+
+    #[test]
+    fn a_win_survives_the_spread_a_real_wake_has() {
+        // A wake latency arrives with a tail on both arms. The verdict
+        // has to come from where the two sit against each other over
+        // their samples, not from whichever drew the worst park.
+        let c = fresh_controller();
+        let base = [5_000u64, 6_500, 5_200, 40_000, 5_800, 6_100];
+        let chal = [1_100u64, 1_400, 1_200, 30_000, 1_300, 1_250];
+        for i in 0..SAMPLES_BEFORE_VERDICT as usize {
+            c.record(SLOT_BASELINE, base[i % base.len()]);
+            c.record(SLOT_CHALLENGER, chal[i % chal.len()]);
+        }
+        assert_eq!(c.current.load(Ordering::Relaxed), SLOT_CHALLENGER);
     }
 
     #[test]
