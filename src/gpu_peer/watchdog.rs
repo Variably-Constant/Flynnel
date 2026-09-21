@@ -115,28 +115,45 @@ pub fn decide(
 /// driver-model read loads NVML, initializes it and shuts it down, which
 /// costs tens of milliseconds whatever the span being sized.
 pub fn detect(ordinal: usize) -> WatchdogState {
-    static CACHE: std::sync::Mutex<Vec<(usize, WatchdogState)>> =
-        std::sync::Mutex::new(Vec::new());
+    detect_with_model(ordinal).1
+}
+
+/// The driver model and the watchdog state for `ordinal`, from one
+/// reading.
+///
+/// [`detect`] answers the state alone, which is what sizing a quantum
+/// needs. A caller reporting both takes them together: the model read
+/// loads NVML, initializes it and shuts it down, so asking twice pays
+/// that twice for one fact that cannot change while the process runs.
+///
+/// The model is a `Result` because an unreadable model is a different
+/// answer from a known one, and [`decide`] treats it as covered rather
+/// than as absent. A reader shown only the state cannot tell those
+/// apart.
+pub fn detect_with_model(ordinal: usize) -> (Result<DriverModel, String>, WatchdogState) {
+    type Reading = (Result<DriverModel, String>, WatchdogState);
+    static CACHE: std::sync::Mutex<Vec<(usize, Reading)>> = std::sync::Mutex::new(Vec::new());
 
     // A poisoned cache still holds readings, and every entry in it is a
     // value some earlier call already returned.
     let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((_, state)) = cache.iter().find(|(known, _)| *known == ordinal) {
-        return state.clone();
+    if let Some((_, reading)) = cache.iter().find(|(known, _)| *known == ordinal) {
+        return reading.clone();
     }
-    let state = read_watchdog(ordinal);
-    cache.push((ordinal, state.clone()));
-    state
+    let reading = read_watchdog(ordinal);
+    cache.push((ordinal, reading.clone()));
+    reading
 }
 
 /// One reading of the driver model and the TDR settings for `ordinal`.
-fn read_watchdog(ordinal: usize) -> WatchdogState {
+fn read_watchdog(ordinal: usize) -> (Result<DriverModel, String>, WatchdogState) {
     let model = pci_bus_id(ordinal).and_then(|bus_id| nvml_driver_model(&bus_id));
     #[cfg(windows)]
     let tdr = Some(tdr_settings());
     #[cfg(not(windows))]
     let tdr: Option<Result<TdrSettings, String>> = None;
-    decide(&model, tdr.as_ref())
+    let state = decide(&model, tdr.as_ref());
+    (model, state)
 }
 
 /// The PCI bus id the CUDA driver reports for `ordinal`, which is how the
@@ -375,5 +392,33 @@ mod tests {
         let state = decide(&Err("no NVML".to_string()), Some(&Ok((3, 2))));
         assert_eq!(state.delay_ns, Some(2_000_000_000));
         assert!(state.basis.contains("driver model unreadable (no NVML)"), "{}", state.basis);
+    }
+
+    #[test]
+    fn the_model_returned_beside_a_state_is_the_one_that_state_was_decided_from() {
+        // Runs on a host with a card and on one without: the pair has
+        // to agree either way, and the deviceless case is the one where
+        // a mismatch would be invisible because both halves are an
+        // error.
+        let (model, state) = detect_with_model(0);
+        let expected = match &model {
+            Ok(DriverModel::Tcc) => "driver model Tcc".to_string(),
+            Ok(covered) => format!("driver model {covered:?}"),
+            Err(err) => format!("driver model unreadable ({err})"),
+        };
+        assert!(
+            state.basis.starts_with(&expected),
+            "the state says {:?} and the model beside it is {:?}",
+            state.basis,
+            model
+        );
+    }
+
+    #[test]
+    fn detect_answers_the_state_half_of_the_pair() {
+        // The two entry points read the same cache, so a caller that
+        // uses both never pays the NVML load twice and never sees two
+        // different answers for one device.
+        assert_eq!(detect(0), detect_with_model(0).1);
     }
 }

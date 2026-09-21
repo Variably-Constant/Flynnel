@@ -1144,3 +1144,31 @@ note = "constructing one binds a JAX runtime this process must already host, and
 item = "crate::backend::wasm"
 reason = "unsafe-or-structural"
 note = "the same shape as the JAX backend: constructing one registers a runtime rather than reading it. Get-FlynnelBackend writes the Wasm row"
+
+# ---------------------------------------------------------------------
+# The GPU peer's own plumbing
+# ---------------------------------------------------------------------
+# The substrate under the peer: the region it maps, the kernel that
+# polls it, the byte offsets both sides agree on and the lock that
+# needs no atomics. What a script reaches is the peer and its
+# operations, not the contract they are carried over.
+
+[[entry]]
+item = "crate::gpu_peer::layout"
+reason = "internal-to-another-surface"
+note = "byte offsets into the shared region, held in lockstep with the matching defines in kernels/gpu_peer.cu and pinned one by one by the unit tests at the bottom of the file. Reading the region by offset from a script would be a second implementation of a contract whose whole point is that there is one"
+
+[[entry]]
+item = "crate::gpu_peer::region"
+reason = "unsafe-or-structural"
+note = "a memory-mapped file registered with the CUDA driver so the same physical pages are addressable by this process, by another process mapping the file, and by a kernel. Handing a script the mapping means handing it pages a GPU is writing to. Its geometry and occupancy reach a caller as a row on the peer"
+
+[[entry]]
+item = "crate::gpu_peer::poller"
+reason = "internal-to-another-surface"
+note = "the bounded-quantum persistent kernel's lifecycle: launched on demand, parked when idle, relaunched without a stream query. A caller does not start or stop it, and the quantum it stays under is what Get-FlynnelPeerWatchdog reports the bound for"
+
+[[entry]]
+item = "crate::gpu_peer::timed_lock"
+reason = "internal-to-another-surface"
+note = "the Fischer timed lock: cross-device mutual exclusion from plain stores and a measured visibility bound, with the GPU contender in kernels/gpu_peer.cu. Its margin is calibrated at peer init and validated by a live contention self-test, which is a figure a caller reads rather than a lock a caller takes"

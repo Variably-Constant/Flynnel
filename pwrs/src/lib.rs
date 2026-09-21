@@ -138,6 +138,7 @@ pwrs::export_module! {
         hybrid::MeasureFlynnelHybridPlacement,
         hybrid::MeasureFlynnelHybridSplit,
         hybrid::MeasureFlynnelHybridPipeline,
+        gpupeer::GetFlynnelPeerWatchdog,
     ],
     classes: [
         host::CpuInfo,
@@ -209,6 +210,7 @@ pwrs::export_module! {
         hybrid::HybridPlacement,
         hybrid::HybridSplit,
         hybrid::HybridPipelineRun,
+        gpupeer::PeerWatchdog,
     ],
     enums: [
         host::Vendor,
@@ -241,11 +243,13 @@ pwrs::export_module! {
         levers::ServePolicy,
         verify::VerifyHasherKind,
         hybrid::PlacementKind,
+        gpupeer::DriverModelKind,
     ],
 }
 
 mod backends;
 mod calibration;
+mod gpupeer;
 mod host;
 mod hybrid;
 mod kernels;
