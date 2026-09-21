@@ -462,6 +462,11 @@ pub struct HybridSplit {
 /// per-item throughputs this call site has measured, runs both sides
 /// concurrently, and reports the division.
 ///
+/// A size the model has no data for does not start even: it reads the
+/// site's overall ratio, which is whatever the last calls at other
+/// sizes established. An even first share means the site as a whole is
+/// even, not that this size is unmeasured.
+///
 /// The share is the ratio of the two measured per-item costs, so it
 /// stays even while both sides cost the same per item. On a host with
 /// no device that is the ordinary case, because the backend side is

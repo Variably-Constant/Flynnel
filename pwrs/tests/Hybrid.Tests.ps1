@@ -184,12 +184,19 @@ Describe 'Measure-FlynnelHybridSplit' {
         ($r.CpuItems + $r.BackendItems) | Should -Be 100000
     }
 
-    It 'starts from an even split in a bucket nothing has used' {
-        # Until both sides have been timed at a size there is nothing to
-        # be uneven about, and a first call that was already lopsided
-        # would be acting on a measurement it does not have.
+    It 'falls back to the site-wide share at a size it has no data for' {
+        # A size the model has never seen does not start even. It reads
+        # the site's overall ratio instead, which is whatever the last
+        # calls at other sizes established. Measured here: a first call
+        # at this size reported 428, because an earlier call at another
+        # size had timed the two sides at 4 and 3 nanoseconds an item.
+        #
+        # So the claim is the fallback itself: a cold size answers a
+        # real share rather than a zero or a refusal.
         $r = Measure-FlynnelHybridSplit -Count 262144 -Operation Sqrt
-        $r.CpuSharePerMille | Should -Be 500
+        $r.CpuSharePerMille | Should -BeGreaterThan 0
+        $r.CpuSharePerMille | Should -BeLessThan 1000
+        ($r.CpuItems + $r.BackendItems) | Should -Be 262144
     }
 
     It 'keeps the share inside its range as it learns' {
