@@ -1148,10 +1148,15 @@ note = "the same shape as the JAX backend: constructing one registers a runtime 
 # ---------------------------------------------------------------------
 # The GPU peer's own plumbing
 # ---------------------------------------------------------------------
-# The substrate under the peer: the region it maps, the kernel that
-# polls it, the byte offsets both sides agree on and the lock that
-# needs no atomics. What a script reaches is the peer and its
-# operations, not the contract they are carried over.
+# The substrate under the peer: the region it maps, the byte offsets
+# both sides agree on and the lock that needs no atomics. What a
+# script reaches is the peer and its operations, not the contract they
+# are carried over.
+#
+# gpu_peer::poller has no entry because it is a private module and the
+# census counts only what is reachable from the crate root. The
+# bounded-quantum kernel it runs is what Get-FlynnelPeerWatchdog
+# reports the bound for.
 
 [[entry]]
 item = "crate::gpu_peer::layout"
@@ -1162,11 +1167,6 @@ note = "byte offsets into the shared region, held in lockstep with the matching 
 item = "crate::gpu_peer::region"
 reason = "unsafe-or-structural"
 note = "a memory-mapped file registered with the CUDA driver so the same physical pages are addressable by this process, by another process mapping the file, and by a kernel. Handing a script the mapping means handing it pages a GPU is writing to. Its geometry and occupancy reach a caller as a row on the peer"
-
-[[entry]]
-item = "crate::gpu_peer::poller"
-reason = "internal-to-another-surface"
-note = "the bounded-quantum persistent kernel's lifecycle: launched on demand, parked when idle, relaunched without a stream query. A caller does not start or stop it, and the quantum it stays under is what Get-FlynnelPeerWatchdog reports the bound for"
 
 [[entry]]
 item = "crate::gpu_peer::timed_lock"

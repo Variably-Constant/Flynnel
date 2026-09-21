@@ -46,8 +46,15 @@
 //! The learned state hangs off the caller's source location, and from
 //! the crate's point of view that location is this file. Every script
 //! in a session shares one site per cmdlet, bucketed by `log2(count)`.
-//! `Get-FlynnelCallSite` reads it and `Reset-FlynnelCallSite` clears
-//! it; a script that wants an unlearned measurement resets first.
+//! `Reset-FlynnelCallSite` clears it, and a script that wants an
+//! unlearned measurement resets first.
+//!
+//! `Get-FlynnelCallSite` reads the site-wide half of it: the two arm
+//! ewmas and the overall split share. The per-bucket state that
+//! actually decides a placement at one size is not on that row, and
+//! the only reading of it is the report each of these cmdlets
+//! returns. A caller following one bucket watches the reports rather
+//! than the site.
 
 use pwrs::prelude::*;
 
