@@ -578,18 +578,28 @@ impl IoPool {
 
 /// Makes a pool of threads for blocking work.
 ///
-/// # Nothing in this module submits to it yet
+/// # Nothing submits to the pool this returns
 ///
-/// The pool exists and reports its width, and no cmdlet here puts
-/// work on it: every declared kernel dispatches on the main arena,
-/// including the file ones that block. So a pool made here starts
-/// threads that will sit idle, and the reason the pool exists, which
-/// is keeping blocking work off the scheduler's own workers, is not
-/// reachable from PowerShell today.
+/// One cmdlet does route to a pool: `Measure-FlynnelFileHash
+/// -UseIoPool` reads its files off one instead of off the arena. It
+/// uses the process-wide pool from `global_io_pool()`, which is not
+/// the object this cmdlet returns, so a pool made here starts threads
+/// that sit idle however the kernels are called.
 ///
-/// It is said here rather than left to be discovered because the
+/// The switch cannot be pointed at that object either. The Rust pool
+/// it holds is a skipped field, which is what stops a value copy
+/// carrying the handle, and a class with one cannot be taken as a
+/// typed cmdlet parameter.
+///
+/// The process-wide pool is built from the environment before the
+/// first dispatch: `global_io_pool()` is a `OnceLock`, so a session
+/// that has already dispatched cannot gain one afterwards.
+///
+/// What this cmdlet is good for, then, is starting a pool and reading
+/// the width it actually got. It is said plainly because the
 /// alternative is a script that creates a pool, sees the worker count
-/// it asked for, and concludes its file work is routed.
+/// it asked for, passes `-UseIoPool`, and concludes the two are
+/// connected.
 ///
 /// A script block could not be submitted in any case: it runs only on
 /// the thread that owns the pipeline.
