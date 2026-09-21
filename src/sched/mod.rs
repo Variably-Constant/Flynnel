@@ -108,7 +108,10 @@ pub use jec_sleep::{
     spin_window, total_idle_yields, total_sleepless_backoffs,
 };
 pub use job::NUMA_HINT_ANY;
-pub use arena::{dispatch_trace_snapshot, dispatch_trace_wait_snapshot, join, join_context, join_default};
+pub use arena::{
+    dispatch_trace_snapshot, dispatch_trace_wait_snapshot, help_depth_max, join, join_context,
+    join_default,
+};
 pub use io_pool::{IoPool, IoTask, global_io_pool, submit_io_or_inline};
 pub use bg_calibration::spawn_calibration;
 #[cfg(feature = "verify-chain")]
