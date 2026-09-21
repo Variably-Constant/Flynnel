@@ -224,15 +224,29 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   stamps its TSC only when the waiter armed it, out of the cache line
   it is already writing `wake_counter` into, so a wake between probes
   pays one relaxed load and no clock read, and a host with no second
-  strategy never touches the controller at all. Each arm needs 32
-  samples before its mean counts and the cheaper must win by a fifth.
+  strategy never touches the controller at all.
 
   **The two halves of a probe are back to back**, so every baseline
   reading has a challenger reading beside it in time. That pairing is
   the control, and it is not decoration: a quiet draw and a loaded
   draw of one quantity differ on these hosts by 350 to 4000 times,
-  far more than the two waits differ from each other, so means
+  far more than the two waits differ from each other, so readings
   gathered over different stretches would compare the machine's mood.
+
+  **The pair is also what decides.** Each one credits a point to
+  whichever arm was cheaper in it, saturating at 64, and the process
+  moves at a net 24; a pair whose readings sit within a fifth of each
+  other separates nothing and scores neither way. Comparing the two
+  means instead answers to their largest draws, and a wake latency
+  has a long tail. Measured on a 7900X, the controller read its
+  challenger at 17939 ns over 100 samples while a pinned arm measured
+  that same wait at 888 ns in the same group under the same load,
+  because a handful of draws near 340 us carried the average; it
+  declined a wait nearly seven times cheaper on that. Within a pair
+  the slower reading is the slower wait under the conditions that
+  applied to both, and how large the loss was never enters. The means
+  are kept and reported, because a tail that costs 340 us is worth
+  seeing, and they no longer move the process.
 
   **How often a probe runs is itself adaptive**, because a probe
   spends one park on the arm not in use, and on a host that settled
@@ -240,11 +254,12 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   chosen one costs. At a fixed one park in sixty-four that is about a
   sixth of every park for the life of the process, on exactly the
   host that already decided against it. The interval doubles to 4096
-  parks while the answer keeps returning the same and collapses to 64
-  when the two means come within the margin of each other, which
-  happens before the order flips rather than after. Probing never
-  stops, so no verdict outlives its evidence and the choice moves
-  back when a host gets busy.
+  parks once the score saturates, meaning one arm has won every
+  recent pair, and collapses to 64 as soon as the score falls back
+  inside the switching threshold, which is the order coming apart
+  and happens before it flips. Probing never stops, so no verdict
+  outlives its evidence and the choice moves back when a host gets
+  busy.
 
   A process starts on WAITPKG or the kernel park, exactly as before,
   and leaves that only on measurement. `Parker::with_strategy` pins an
