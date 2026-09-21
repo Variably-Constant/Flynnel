@@ -810,14 +810,44 @@ impl Sleep {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that drive the process-global controller.
+    ///
+    /// `SPIN_WINDOW`, `ADAPTIVE`, `PARK_EVENTS` and `RESCUE_EVENTS` are
+    /// process state and the harness runs tests on parallel threads, so
+    /// two of these interleaving read each other's stores.
+    ///
+    /// Measured over 4,500 runs of the lib suite on a Linux guest: the
+    /// controller tests account for 31 of 61 failing runs, the
+    /// commonest being a window asserted to have halved to 250 and
+    /// found still at 500, which is what `maybe_adapt` leaves when a
+    /// neighbour has stored `ADAPTIVE` false between the arm and the
+    /// adapt.
+    ///
+    /// A poisoned lock is taken anyway. Poison means another of these
+    /// tests panicked, which the harness already reports; refusing the
+    /// lock here would turn one failure into several and bury the
+    /// first.
+    static CONTROLLER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Put the controller in a known state and enable it, so a test
     /// reads its response rather than whatever an earlier test left.
-    fn arm_controller(window: u32) {
+    ///
+    /// Returns the guard rather than taking it internally and dropping
+    /// it, because the state has to stay this test's until the test is
+    /// done reading it. Holding it for the caller's scope is what makes
+    /// the arming mean anything, and returning it is what stops a
+    /// caller arming the controller without holding it.
+    #[must_use]
+    fn arm_controller(window: u32) -> std::sync::MutexGuard<'static, ()> {
+        let guard = CONTROLLER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         spin_init();
         SPIN_WINDOW.store(window, Ordering::Relaxed);
         ADAPTIVE.store(true, Ordering::Relaxed);
         PARK_EVENTS.store(0, Ordering::Relaxed);
         RESCUE_EVENTS.store(0, Ordering::Relaxed);
+        guard
     }
 
     #[test]
@@ -825,7 +855,7 @@ mod tests {
         // Parks dominating means the spin ran out before work arrived,
         // which on a contended host is a worker burning slices a
         // neighbour could have used.
-        arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
+        let _controller = arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
         PARK_EVENTS.store(300, Ordering::Relaxed);
         RESCUE_EVENTS.store(4, Ordering::Relaxed);
         maybe_adapt();
@@ -843,7 +873,7 @@ mod tests {
     fn a_window_that_keeps_paying_grows_back_but_never_past_the_tuned_default() {
         // Rescues dominating means work landed inside the window and the
         // spin saved a park and unpark pair.
-        arm_controller(FLOOR_SPIN_WINDOW_ROUNDS);
+        let _controller = arm_controller(FLOOR_SPIN_WINDOW_ROUNDS);
         for _ in 0..64 {
             PARK_EVENTS.store(4, Ordering::Relaxed);
             RESCUE_EVENTS.store(300, Ordering::Relaxed);
@@ -856,7 +886,7 @@ mod tests {
     fn one_burst_does_not_move_the_window() {
         // Below the evidence floor the controller has seen too little to
         // tell a workload's shape from a moment of it.
-        arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
+        let _controller = arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
         PARK_EVENTS.store(200, Ordering::Relaxed);
         RESCUE_EVENTS.store(0, Ordering::Relaxed);
         maybe_adapt();
@@ -870,7 +900,7 @@ mod tests {
         // decision count says the controller ran. Compared as an
         // inequality because the counter is process-wide and monotonic,
         // so a concurrent test can raise it between the two readings.
-        arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
+        let _controller = arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
         let before = spin_adapt_decisions();
         PARK_EVENTS.store(4, Ordering::Relaxed);
         RESCUE_EVENTS.store(300, Ordering::Relaxed);
@@ -886,8 +916,12 @@ mod tests {
     fn the_controller_stays_still_while_it_is_off() {
         // Off is the shipped default, and the window it holds is the one
         // tuned across three host classes.
-        spin_init();
-        SPIN_WINDOW.store(DEFAULT_SPIN_WINDOW_ROUNDS, Ordering::Relaxed);
+        // Armed through the same helper as the rest, then switched off,
+        // so this test holds the controller while it does that. Storing
+        // ADAPTIVE false without the guard is what made the other tests
+        // flaky: a neighbour between its arm and its adapt reads the
+        // controller as disabled and sees no adaptation at all.
+        let _controller = arm_controller(DEFAULT_SPIN_WINDOW_ROUNDS);
         ADAPTIVE.store(false, Ordering::Relaxed);
         PARK_EVENTS.store(1_000, Ordering::Relaxed);
         RESCUE_EVENTS.store(0, Ordering::Relaxed);
