@@ -278,13 +278,26 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   Measured with no floor, so the monitor wait was doing the spin's job
   as well as its own, it was slower in three cells of four (1.54
   against 2.00 us idle at a 50 us inter-arrival, 1.66 against 1.92 us
-  under load; best median of three runs on a 7900X). What the second
-  stage buys is the core a long wait gives back, which those rows
-  cannot see because they time the thief and not its neighbours. The
-  co-runner group in `benches/urd_thief_wait.rs` times the neighbours
-  and has not yet run on any host, so the choice rests on the
-  instruction being present rather than on it being cheaper here.
-  Nothing outside that bench calls `UrdDeque::wait_and_drain`.
+  under load; best median of three runs on a 7900X).
+
+  What the second stage buys is narrower than a core, and the
+  difference decides whether it is worth having. A `PAUSE`-spin takes
+  both the physical core's execution resources and a logical CPU the
+  operating system could have given elsewhere. `MWAITX` halts the
+  logical processor, handing the core's issue width to its SMT
+  sibling, but it does not deschedule the thread: the kernel still
+  counts that logical CPU as occupied. A pool with more runnable work
+  than CPUs wants the second of those, and the instruction does not
+  supply it.
+
+  Neither is visible in the rows above, which time the thief rather
+  than its neighbours. The co-runner group in
+  `benches/urd_thief_wait.rs` times the neighbours and oversubscribes
+  deliberately, one per logical CPU, which is the arrangement where
+  the difference has somewhere to show. It has not run on any host,
+  so the choice rests on the instruction being present rather than on
+  it being cheaper here. Nothing outside that bench calls
+  `UrdDeque::wait_and_drain`.
 
   The gap this closes is the whole AMD line from 2015 to Zen 5.
   `has_waitpkg` was the only probe, and it is false on Zen 1 through
