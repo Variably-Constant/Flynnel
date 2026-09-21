@@ -189,6 +189,61 @@ fn detect_smt_factor() -> u8 {
     1
 }
 
+/// True when this host supports `MONITORX` / `MWAITX`, AMD's
+/// user-mode monitor-wait. Detected via CPUID `Fn8000_0001`, ECX bit
+/// 29.
+///
+/// AMD shipped this with Excavator in 2015, nine years before
+/// WAITPKG reached Zen 5, and it is the reason a pre-Zen-5 AMD host
+/// need not park through the kernel. Like `UMONITOR` / `UMWAIT` and
+/// unlike the ring-0 `MONITOR` / `MWAIT`, it is usable from user
+/// mode.
+///
+/// # This is a feature bit, never a family range
+///
+/// Every Zen part has the instruction in silicon and that says
+/// nothing about whether a given machine will run it. Measured on
+/// the Zen 3 Linux guest this project tests on: family `0x19`, model
+/// `0x50`, and both `MONITORX` and `MONITOR` read false, because the
+/// hypervisor masks them. A family-and-model table would have
+/// concluded the opposite and emitted an instruction that host
+/// cannot execute, on the scheduler's park path.
+///
+/// # The timeout is not the same quantity WAITPKG uses
+///
+/// `MWAITX` takes a RELATIVE timeout in TSC cycles in `EBX`, enabled
+/// by `ECX` bit 1. `UMWAIT` takes an ABSOLUTE TSC deadline in
+/// `EDX:EAX`. Passing one where the other belongs returns at once or
+/// overshoots, and neither faults, so a park built on the wrong one
+/// looks like it works and simply is not fast.
+///
+/// Cached on first call via [`monitorx_available`].
+#[cfg(target_arch = "x86_64")]
+pub fn has_monitorx() -> bool {
+    *monitorx_available()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn has_monitorx() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+fn monitorx_available() -> &'static bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        use std::arch::x86_64::__cpuid;
+        // The extended leaves are a separate space with their own
+        // maximum, and a host that does not implement them at all
+        // answers this read with whatever the basic leaves return.
+        let max_ext = __cpuid(0x8000_0000).eax;
+        if max_ext < 0x8000_0001 {
+            return false;
+        }
+        (__cpuid(0x8000_0001).ecx >> 29) & 1 == 1
+    })
+}
+
 /// True when this host supports the WAITPKG instruction set
 /// extension (`UMONITOR` / `UMWAIT` / `TPAUSE`). Detected via
 /// CPUID leaf 7 sub-leaf 0, ECX bit 5.
@@ -239,6 +294,49 @@ mod tests {
         let a = cpu_info() as *const _;
         let b = cpu_info() as *const _;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn the_monitor_wait_detections_are_cached_and_agree_with_themselves() {
+        // Neither bit can be asserted to a value: this runs on hosts
+        // that have one, the other or neither, and a test pinning an
+        // answer would be pinning the machine. What can be asserted
+        // is that each answers the same thing twice, which is what a
+        // OnceLock is for and what a caller branching on it needs.
+        assert_eq!(has_monitorx(), has_monitorx());
+        assert_eq!(has_waitpkg(), has_waitpkg());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn monitorx_is_never_claimed_without_the_extended_leaf_that_carries_it() {
+        // The one relationship that holds on every x86-64 host: the
+        // bit lives in Fn8000_0001, so claiming it while the extended
+        // leaves stop short of that would mean the detection read a
+        // leaf the host does not implement and believed the result.
+        use std::arch::x86_64::__cpuid;
+        let max_ext = __cpuid(0x8000_0000).eax;
+        if max_ext < 0x8000_0001 {
+            assert!(
+                !has_monitorx(),
+                "claimed MONITORX while the extended leaves stop at {max_ext:#x}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn monitorx_matches_a_second_independent_read_of_the_bit() {
+        // Reads the bit again here rather than trusting the cached
+        // answer, so a detection that looked at the wrong leaf or
+        // shifted by the wrong amount fails rather than agreeing with
+        // itself. Measured on the Zen 3 guest this catches nothing
+        // because both are false; on a host that has the bit it is
+        // the only check that the right bit was read.
+        use std::arch::x86_64::__cpuid;
+        let expected = __cpuid(0x8000_0000).eax >= 0x8000_0001
+            && (__cpuid(0x8000_0001).ecx >> 29) & 1 == 1;
+        assert_eq!(has_monitorx(), expected);
     }
 
     #[test]
