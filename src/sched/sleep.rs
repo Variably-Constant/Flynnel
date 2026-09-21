@@ -816,10 +816,13 @@ mod tests {
         match WaitStrategy::pick() {
             WaitStrategy::Waitpkg => assert!(crate::cpu_info::has_waitpkg()),
             WaitStrategy::Monitorx => assert!(crate::cpu_info::has_monitorx()),
-            WaitStrategy::StdPark => {
-                assert!(!crate::cpu_info::has_waitpkg());
-                assert!(!crate::cpu_info::has_monitorx());
-            }
+            // The kernel park carries no precondition, and asserting
+            // one would assert something else: this host has MONITORX
+            // and is picked onto the park anyway, because MONITORX
+            // loses badly under load on at least one part. That is a
+            // choice, pinned in the test below, not a detection
+            // failure.
+            WaitStrategy::StdPark => assert!(!crate::cpu_info::has_waitpkg()),
         }
     }
 
