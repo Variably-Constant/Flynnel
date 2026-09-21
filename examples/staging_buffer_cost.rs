@@ -31,11 +31,18 @@
 //!            could reach if nothing were shared at all, so the other
 //!            two can be read against something rather than only
 //!            against each other.
+//!   khpd     the shipped path, `KhpdDeque::stage` into a real deque
+//!            with the publish it fires every `LINE_ITEMS` stages,
+//!            against its own control. The four above are replicas
+//!            written here and can only say which shape is fastest;
+//!            this one says whether that shows through the path that
+//!            changed.
 //!
 //! The item is a `u64` pair rather than a real `LineItem`, because
 //! what is being timed is the buffer and not the item: a heavier item
 //! would add the same constant to all four cells and shrink every
-//! difference toward the floor.
+//! difference toward the floor. The khpd cell builds a real `LineItem`
+//! and its control builds the same one.
 //!
 //! # Quiet and loaded
 //!
@@ -44,7 +51,9 @@
 //! predicts, since the buffer is documented owner-side. The loaded row
 //! is what happens if that contract is ever broken by a caller
 //! reaching a backend through an `Arc<dyn DispatchBackend>`, which the
-//! `&self` signature permits.
+//! `&self` signature permits. For the khpd cell the loaded siblings
+//! split into publishers and consumers of the same ring, and the cell
+//! reports how many of its publishes found the ring full.
 //!
 //! Each cell is read as its median over `REPEATS`, and the control is
 //! subtracted. The control is interleaved with the other three rather
@@ -59,7 +68,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
 
-use flynnel::backend::shared_mem::khpd::{KhpdDeque, LINE_ITEMS, LineItem};
+use flynnel::backend::shared_mem::khpd::{KhpdDeque, LINE_ITEMS, LineItem, PushError, Steal};
 
 /// Pushes before a drain, matching the `LINE_ITEMS` flush these
 /// buffers do.
@@ -94,6 +103,12 @@ const REAL_CALLS: u64 = 100_000;
 /// just one. A fixed 65536 covered one repeat and the seventh filled
 /// the ring, which surfaced as `PushError::Full`.
 const REAL_CAPACITY: usize = REPEATS * (REAL_CALLS as usize).div_ceil(LINE_ITEMS) + REPEATS;
+
+/// Publication lines in the deque the loaded shipped-path cell stages
+/// into. Consumers drain it, so it only has to absorb bursts; a
+/// publisher that finds it full waits, and every such wait in the timed
+/// cell is counted and printed.
+const REAL_LOADED_CAPACITY: usize = 4096;
 
 /// Timed cells per shape. The median is taken, so an odd count has a
 /// middle.
@@ -259,6 +274,27 @@ fn measure(calls: u64, shared_mutex: &Mutex<Vec<Item>>, shared_stack: &Staging) 
     [control, mutex_cell, stack_cell, thread_cell]
 }
 
+/// Publish the calling thread's staged items, waiting out a full ring
+/// one yield at a time. Answers how many times the ring was full.
+fn publish_or_wait(deque: &KhpdDeque) -> u64 {
+    let mut full = 0u64;
+    loop {
+        match deque.publish() {
+            Ok(_) => return full,
+            Err(PushError::Full) => {
+                full += 1;
+                std::thread::yield_now();
+            }
+            Err(other) => panic!("publish failed: {other:?}"),
+        }
+    }
+}
+
+fn line_item(i: u64) -> LineItem {
+    LineItem::new(i as u32, (i & 0xFFFF) as u32, &i.to_le_bytes())
+        .expect("eight bytes fits the inline payload")
+}
+
 /// The shipped path: stage into a real `KhpdDeque` and let it
 /// auto-publish, which is the sequence `dispatch_marshal` runs.
 ///
@@ -270,29 +306,43 @@ fn measure(calls: u64, shared_mutex: &Mutex<Vec<Item>>, shared_stack: &Staging) 
 /// differ on. A harness pointed away from the code that changed prints
 /// the same clean rows whether or not the change did anything.
 ///
-/// Quiet only. A loaded arm would need a consumer draining the ring,
-/// because a publisher spins on `STATE_EMPTY` once the ring wraps and
-/// helper threads run until told to stop.
-fn measure_shipped(deque: &KhpdDeque) -> (Vec<f64>, Vec<f64>) {
+/// The third figure is how many publishes in the timed cells found the
+/// ring full and waited. Quiet, the ring is sized so it is zero; loaded,
+/// a nonzero count says part of the cell's time went to the consumers
+/// rather than to the buffer.
+fn measure_shipped(deque: &KhpdDeque) -> (Vec<f64>, Vec<f64>, u64) {
     let mut control = Vec::with_capacity(REPEATS);
     let mut khpd_cell = Vec::with_capacity(REPEATS);
+    let mut full_waits = 0u64;
     for _ in 0..REPEATS {
         control.push(cell(REAL_CALLS, |i| {
-            black_box(
-                LineItem::new(i as u32, (i & 0xFFFF) as u32, &i.to_le_bytes())
-                    .expect("eight bytes fits the inline payload"),
-            );
+            black_box(line_item(i));
         }));
         khpd_cell.push(cell(REAL_CALLS, |i| {
-            let item = LineItem::new(i as u32, (i & 0xFFFF) as u32, &i.to_le_bytes())
-                .expect("eight bytes fits the inline payload");
-            let staged = deque.stage(item).expect("staging never fails");
+            let staged = deque.stage(line_item(i)).expect("staging never fails");
             if staged >= LINE_ITEMS {
-                deque.publish().expect("the ring is sized not to wrap");
+                full_waits += publish_or_wait(deque);
             }
         }));
     }
-    (control, khpd_cell)
+    (control, khpd_cell, full_waits)
+}
+
+fn report_shipped(label: &str, control: Vec<f64>, khpd_cell: Vec<f64>, full_waits: u64) {
+    let floor = median(control.clone());
+    let control_spread = spread_pct(&control);
+    println!(
+        "{label} floor={floor:.4} ns control_spread={control_spread:.2}% resolution_floor={:.4} ns",
+        floor * control_spread / 100.0
+    );
+    let khpd_median = median(khpd_cell.clone());
+    println!(
+        "{label} khpd_stage={:.4} ns over_floor={:.4} ns spread={:.2}% full_waits={full_waits} \
+         (includes the publish that fires every {LINE_ITEMS} stages)",
+        khpd_median,
+        khpd_median - floor,
+        spread_pct(&khpd_cell)
+    );
 }
 
 fn report(label: &str, cells: [Vec<f64>; 4]) {
@@ -358,22 +408,8 @@ fn main() {
     ));
     let deque = KhpdDeque::create(&deque_path, REAL_CAPACITY)
         .expect("a temp-dir deque of the sized capacity");
-    let (real_control, khpd_cell) = measure_shipped(&deque);
-    let real_floor = median(real_control.clone());
-    let real_spread = spread_pct(&real_control);
-    println!(
-        "shipped floor={real_floor:.4} ns control_spread={real_spread:.2}% \
-         resolution_floor={:.4} ns",
-        real_floor * real_spread / 100.0
-    );
-    let khpd_median = median(khpd_cell.clone());
-    println!(
-        "shipped khpd_stage={:.4} ns over_floor={:.4} ns spread={:.2}% \
-         (includes the publish that fires every {LINE_ITEMS} stages)",
-        khpd_median,
-        khpd_median - real_floor,
-        spread_pct(&khpd_cell)
-    );
+    let (real_control, khpd_cell, full_waits) = measure_shipped(&deque);
+    report_shipped("shipped", real_control, khpd_cell, full_waits);
     drop(deque);
     if let Err(e) = std::fs::remove_file(&deque_path) {
         println!("shipped note: the deque file at {deque_path:?} outlived the run: {e}");
@@ -404,5 +440,72 @@ fn main() {
     stop.store(true, Ordering::Relaxed);
     for h in helpers {
         h.join().expect("a helper thread panicked");
+    }
+
+    // The shipped path under load: siblings staging and publishing into
+    // the same deque while others drain it, so the ring stays a ring.
+    // Half the siblings consume, so the timed publisher rarely finds
+    // it full; the times it does are counted and printed, because a
+    // cell dominated by waiting for ring space measures the consumers
+    // rather than the buffer.
+    let loaded_path = std::env::temp_dir().join(format!(
+        "flynnel_staging_cost_loaded_{}.khpd",
+        std::process::id()
+    ));
+    let deque = Arc::new(
+        KhpdDeque::create(&loaded_path, REAL_LOADED_CAPACITY)
+            .expect("a temp-dir deque of the loaded capacity"),
+    );
+    let siblings = threads.saturating_sub(1);
+    let consumers = siblings / 2;
+    let publishers = siblings - consumers;
+    let stop = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(siblings + 1));
+    let mut helpers = Vec::with_capacity(siblings);
+    for _ in 0..consumers {
+        let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
+        let deque = Arc::clone(&deque);
+        helpers.push(std::thread::spawn(move || {
+            barrier.wait();
+            while !stop.load(Ordering::Relaxed) {
+                match deque.steal_line() {
+                    Steal::Success(line) => {
+                        for k in 0..line.n_items {
+                            black_box(line.items[k].closure_id);
+                        }
+                    }
+                    Steal::Empty | Steal::Retry => std::thread::yield_now(),
+                }
+            }
+        }));
+    }
+    for _ in 0..publishers {
+        let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
+        let deque = Arc::clone(&deque);
+        helpers.push(std::thread::spawn(move || {
+            barrier.wait();
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let staged = deque.stage(line_item(i)).expect("staging never fails");
+                if staged >= LINE_ITEMS {
+                    publish_or_wait(&deque);
+                }
+                i += 1;
+            }
+        }));
+    }
+    barrier.wait();
+    println!("shipped_loaded siblings={siblings} publishers={publishers} consumers={consumers}");
+    let (real_control, khpd_cell, full_waits) = measure_shipped(&deque);
+    report_shipped("shipped_loaded", real_control, khpd_cell, full_waits);
+    stop.store(true, Ordering::Relaxed);
+    for h in helpers {
+        h.join().expect("a helper thread panicked");
+    }
+    drop(deque);
+    if let Err(e) = std::fs::remove_file(&loaded_path) {
+        println!("shipped_loaded note: the deque file at {loaded_path:?} outlived the run: {e}");
     }
 }
