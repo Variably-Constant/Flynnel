@@ -131,21 +131,27 @@ impl SharedMemoryUrdBackend {
         let latch_offset = self.latches.alloc();
         let item = LineItem::new(closure_id, latch_offset, args)
             .map_err(|e| BackendError::Launch(format!("URD build item: {e:?}")))?;
-        // Taken out of the caller's own buffer and published outside
-        // it, so the publish does not sit inside the staging borrow.
-        let batch = self.pending.with_mine(|buffer| {
+        // Published straight out of the caller's own buffer. The
+        // buffer belongs to this thread, so holding it across the
+        // publish blocks nobody, and clearing it afterwards keeps its
+        // capacity where handing the vector away would make the next
+        // batch allocate.
+        //
+        // Cleared whether or not the publish succeeded, which is what
+        // the drain-then-publish this replaces did: a caller retrying
+        // a failed dispatch must not find the items still staged and
+        // send them a second time.
+        self.pending.with_mine(|buffer| {
             buffer.push(item);
-            if buffer.len() >= MAILBOX_ITEMS {
-                buffer.drain(..).collect::<Vec<_>>()
-            } else {
-                Vec::new()
+            if buffer.len() < MAILBOX_ITEMS {
+                return Ok(());
             }
-        });
-        if !batch.is_empty() {
-            self.deque
-                .publish_round_robin(&batch)
-                .map_err(|e| BackendError::Launch(format!("URD publish: {e:?}")))?;
-        }
+            let outcome = self.deque.publish_round_robin(buffer);
+            buffer.clear();
+            outcome
+                .map(|_| ())
+                .map_err(|e| BackendError::Launch(format!("URD publish: {e:?}")))
+        })?;
         self.dispatched.fetch_add(1, Ordering::Relaxed);
         Ok(DispatchHandle { latch_offset })
     }
@@ -190,18 +196,26 @@ impl SharedMemoryUrdBackend {
     /// items. Each staging thread accumulates and flushes its own, so
     /// this leaves every other thread's buffer where it is.
     pub fn flush(&self) -> Result<usize, BackendError> {
-        let batch = self
-            .pending
-            .with_mine(|buffer| buffer.drain(..).collect::<Vec<_>>());
-        if batch.is_empty() {
-            return Ok(0);
-        }
-        for chunk in batch.chunks(MAILBOX_ITEMS) {
-            self.deque
-                .publish_round_robin(chunk)
-                .map_err(|e| BackendError::Launch(format!("URD publish: {e:?}")))?;
-        }
-        Ok(batch.len())
+        self.pending.with_mine(|buffer| {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            let staged = buffer.len();
+            // Published in place and cleared afterwards, for the
+            // reasons given on the auto-flush in dispatch_marshal: the
+            // buffer is this thread's, so nothing waits on it, and
+            // clearing keeps the capacity the next batch would
+            // otherwise have to allocate.
+            let mut outcome = Ok(());
+            for chunk in buffer.chunks(MAILBOX_ITEMS) {
+                if let Err(e) = self.deque.publish_round_robin(chunk) {
+                    outcome = Err(BackendError::Launch(format!("URD publish: {e:?}")));
+                    break;
+                }
+            }
+            buffer.clear();
+            outcome.map(|()| staged)
+        })
     }
 
     /// Peer-side: drain one mailbox (`mailbox_idx`) and execute
