@@ -905,9 +905,11 @@ impl Parker {
         };
 
         // What this park actually did, for a run that has to be read
-        // rather than reasoned about. `trace::emit` returns on one
-        // relaxed load when tracing is off, which is why this sits on
-        // the path at all.
+        // rather than reasoned about. With tracing off `trace::emit`
+        // returns on a `Once` guard and one relaxed load, timed by
+        // `examples/trace_predicate_cost`, and the payload is a
+        // three-arm match on a constant. That pair is what a park pays
+        // to be legible.
         crate::sched::trace::emit(
             crate::sched::trace::TraceEvent::ParkEnter,
             strategy.trace_code() | if sampling.is_some() { 16 } else { 0 },

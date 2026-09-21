@@ -17,14 +17,21 @@
 //!
 //! # Shape
 //!
-//! Three cells, all in one process and interleaved so a clock or a
-//! frequency change moves all three together:
+//! Five cells, all in one process and interleaved so a clock or a
+//! frequency change moves all of them together:
 //!
 //!   control  a `black_box` read of a plain `bool`. The floor: what
 //!            the loop and the barrier cost with no predicate at all.
 //!   latch    `OnceLock<bool>::get_or_init`, which is what shipped.
 //!   settable `Once::call_once` plus an `AtomicBool` relaxed load,
 //!            which is what replaces it.
+//!   payload  the park path's trace payload with nothing called: a
+//!            three-arm match on the wait strategy, or-ed with the
+//!            bit marking a park as half of a probe pair.
+//!   emit     that same payload handed to the crate's `trace::emit`
+//!            with tracing off. Minus the payload cell it is the
+//!            guard alone; minus the control it is the whole of what
+//!            a park pays to carry a `ParkEnter` row.
 //!
 //! Each cell is read as its median over `REPEATS`, and the control is
 //! subtracted so the answer is the predicate's own cost rather than
@@ -33,12 +40,26 @@
 //!
 //! Both predicates are written out here rather than called through the
 //! crate, so one binary times both shapes and no second build is
-//! needed to compare them.
+//! needed to compare them. The payload match is written out for that
+//! reason and because `trace_code` is private to the crate. `emit` is
+//! the crate's own, because it is the function whose cost is in
+//! question.
+//!
+//! # Why this rather than an A/B of the park path
+//!
+//! `benches/parker_wait_strategy.rs` put its overhead arm at -16.5 and
+//! +23.9 per cent against the settled arm. A quantity one predicate
+//! wide does not survive a spread that size, so an A/B of the park
+//! path would report no change whatever the truth was. Timing the
+//! expression directly keeps the park's own cost out of the
+//! arithmetic entirely.
 
 use std::hint::black_box;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+use flynnel::sched::trace::{self, TraceEvent};
 
 /// Calls per timed cell.
 ///
@@ -88,6 +109,57 @@ fn control_enabled() -> bool {
     black_box(false)
 }
 
+/// The wait strategies in the encoding a trace row carries.
+///
+/// Written out rather than taken from `flynnel::sched::sleep`, whose
+/// `trace_code` is private to the crate. What is being timed is the
+/// shape: a three-arm match on a `Copy` enum yielding a constant.
+#[derive(Copy, Clone)]
+enum Strategy {
+    StdPark,
+    Waitpkg,
+    Monitorx,
+}
+
+impl Strategy {
+    #[inline]
+    fn code(self) -> u32 {
+        match self {
+            Self::StdPark => 0,
+            Self::Waitpkg => 1,
+            Self::Monitorx => 2,
+        }
+    }
+}
+
+/// The park path's payload expression with nothing called.
+///
+/// Both inputs go through `black_box` because on the park path both
+/// are runtime values: the strategy comes from the controller and the
+/// bit from whether this park was chosen for a probe. Leaving them
+/// constant would fold the match and time an expression the parker
+/// does not have. Returns a `bool` so the harness cell that times the
+/// predicates times this one unchanged.
+#[inline]
+fn payload_only() -> bool {
+    let strategy = black_box(Strategy::Monitorx);
+    let sampled = black_box(true);
+    black_box(strategy.code() | if sampled { 16 } else { 0 });
+    false
+}
+
+/// The whole emit as it sits on the park path, tracing off.
+#[inline]
+fn park_emit() -> bool {
+    let strategy = black_box(Strategy::Monitorx);
+    let sampled = black_box(true);
+    trace::emit(
+        TraceEvent::ParkEnter,
+        strategy.code() | if sampled { 16 } else { 0 },
+    );
+    false
+}
+
 /// Nanoseconds per call for one cell.
 fn cell(f: fn() -> bool) -> f64 {
     let t0 = Instant::now();
@@ -110,15 +182,31 @@ fn median(mut xs: Vec<f64>) -> f64 {
 }
 
 fn main() {
+    // The emit cell is only meaningful with tracing off, which is the
+    // path it exists to measure. With tracing on it would push CALLS
+    // records into a thread-local vector per cell and take the box
+    // down long before it reported anything.
+    if trace::is_enabled() {
+        eprintln!(
+            "REFUSING: FLYNNEL_TRACE is on, so the emit cell would record \
+             {CALLS} rows a cell. This run measures the off path; unset it."
+        );
+        std::process::exit(2);
+    }
+
     // Warm both predicates past their one-time initialisation, so no
-    // cell pays for it and every cell times the steady state.
+    // cell pays for it and every cell times the steady state. The emit
+    // path has the same seeding inside it.
     black_box(latch_enabled());
     black_box(settable_enabled());
+    black_box(park_emit());
 
     let control_first = cell(control_enabled);
 
     let mut latch = Vec::with_capacity(REPEATS);
     let mut settable = Vec::with_capacity(REPEATS);
+    let mut payload = Vec::with_capacity(REPEATS);
+    let mut emit = Vec::with_capacity(REPEATS);
     // Interleaved rather than run in blocks: a frequency change or a
     // neighbour arriving partway through would otherwise land on one
     // shape and not the other, and the difference between them is the
@@ -126,12 +214,16 @@ fn main() {
     for _ in 0..REPEATS {
         latch.push(cell(latch_enabled));
         settable.push(cell(settable_enabled));
+        payload.push(cell(payload_only));
+        emit.push(cell(park_emit));
     }
 
     let control_last = cell(control_enabled);
 
     let latch_ns = median(latch);
     let settable_ns = median(settable);
+    let payload_ns = median(payload);
+    let emit_ns = median(emit);
     let control_ns = (control_first + control_last) / 2.0;
     let drift = (control_last - control_first) / control_first * 100.0;
 
@@ -141,6 +233,27 @@ fn main() {
     println!(
         "settable {settable_ns:.4} ns/call, {:.4} over control",
         settable_ns - control_ns
+    );
+    println!(
+        "payload  {payload_ns:.4} ns/call, {:.4} over control",
+        payload_ns - control_ns
+    );
+    println!(
+        "emit     {emit_ns:.4} ns/call, {:.4} over control",
+        emit_ns - control_ns
+    );
+    println!("guard alone, emit minus payload {:.4} ns/call", emit_ns - payload_ns);
+
+    // A park consults this once, so one cell is one park's whole
+    // share. Read against 204 ns, the challenger wake cost measured
+    // over 119 samples on pc2 - the smallest measured wake figure
+    // there is, which makes the percentage an upper bound rather than
+    // a typical one.
+    const WAKE_NS: f64 = 204.0;
+    println!(
+        "a park carries {:.4} ns of this, {:.4}% of a 204 ns wake",
+        emit_ns - control_ns,
+        (emit_ns - control_ns) / WAKE_NS * 100.0
     );
     println!("settable minus latch {:.4} ns/call", settable_ns - latch_ns);
     println!(

@@ -20,10 +20,18 @@
 //! events are 1 enter, 2 exit, 3 leaf start, 4 leaf end, 5 join
 //! push, 6 join wait begin, 7 join wait end (payload 1 when a thief
 //! ran the half), 10 slot push, 11 slot wait end (payload 1 when the
-//! caller was still spinning), 12 slot job start, 13 slot job end;
-//! 8 and 9 are defined for a worker wake and a steal hit but no hook
-//! emits them. The wall time of the traced call is printed on
-//! stdout.
+//! caller was still spinning), 12 slot job start, 13 slot job end,
+//! 14 park enter (payload is the wait strategy, 0 kernel park, 1
+//! WAITPKG, 2 MONITORX, plus 16 when the park is half of a controller
+//! probe), 8 worker wake (payload is that wake's cost in
+//! nanoseconds), 15 wait switch (payload is the strategy now in use).
+//! 9 is defined for a steal hit and no hook emits it. The wall time
+//! of the traced call is printed on stdout.
+//!
+//! This shape emits no 14, 8 or 15 at all: over two hundred
+//! back-to-back dispatches the workers never went idle long enough to
+//! park. The parker runs between bursts of work rather than inside
+//! one, so a trace meant to catch it needs a workload with gaps.
 
 use std::str::FromStr;
 use std::time::Instant;
