@@ -442,6 +442,18 @@ impl Parker {
         const ARMS_BEFORE_JUDGING: u32 = 4;
         const ARMS_TOO_FAST_CYCLES: u64 = 1_000_000;
 
+        // Read before anything else this function does. Whether the
+        // monitor holds is a property of the part, so a finding by any
+        // parker in this process applies to all of them and is never
+        // re-tested; and on a part that has given up, everything below
+        // is cost paid on the way to a kernel park. A clock read alone
+        // measures 206 ns on this project's Windows host and 973 on
+        // its Linux guest.
+        if !monitor_holds() {
+            thread::park();
+            return;
+        }
+
         let budget = WAIT_DEADLINE_NS.saturating_mul(TSC_HZ_ESTIMATE / 1_000_000_000);
         // SAFETY: `_rdtsc` is a no-side-effect read of the TSC
         // counter; available on every x86_64 CPU produced this
@@ -449,14 +461,6 @@ impl Parker {
         let start = unsafe { core::arch::x86_64::_rdtsc() };
 
         let addr = (&raw const self.wake_counter).cast::<u8>();
-
-        // Whether the monitor holds is a property of the part, so a
-        // finding by any parker in this process applies to all of
-        // them and is never re-tested.
-        if !monitor_holds() {
-            thread::park();
-            return;
-        }
 
         let mut arms = 0u32;
         for _ in 0..MAX_ARMS {
