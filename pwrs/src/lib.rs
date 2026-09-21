@@ -266,6 +266,7 @@ pwrs::export_module! {
         gpupeer::LinalgOpKind,
         crossproc::DequeVariantKind,
     ],
+    providers: [provider::FlynnelDrive],
 }
 
 mod backends;
@@ -279,6 +280,7 @@ mod levers;
 mod observe;
 mod plan;
 mod pool;
+mod provider;
 mod rings;
 mod types;
 mod verify;

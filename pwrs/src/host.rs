@@ -99,20 +99,30 @@ pub struct CpuInfo {
 #[derive(Default)]
 pub struct GetFlynnelCpuInfo {}
 
+/// This host's processor facts, as one row.
+///
+/// Built here rather than inside the cmdlet so the Flynnel drive's
+/// `host\cpu` leaf can answer the same object rather than a second
+/// rendering of it. Two renderings of one reading drift, and a script
+/// comparing them would be comparing this module against itself.
+pub(crate) fn cpu_info_row() -> CpuInfo {
+    let info = flynnel::cpu_info::cpu_info();
+    CpuInfo {
+        logical_threads: info.logical_threads,
+        smt_threads_per_core: info.smt_threads_per_core,
+        physical_cores: info.physical_cores,
+        vendor: info.vendor.into(),
+        family: info.family,
+        model: info.model,
+        stepping: info.stepping,
+        has_waitpkg: flynnel::cpu_info::has_waitpkg(),
+        small_host_dispatch_factor: flynnel::cpu_info::small_host_dispatch_factor(),
+    }
+}
+
 impl Cmdlet for GetFlynnelCpuInfo {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let info = flynnel::cpu_info::cpu_info();
-        ps.write(CpuInfo {
-            logical_threads: info.logical_threads,
-            smt_threads_per_core: info.smt_threads_per_core,
-            physical_cores: info.physical_cores,
-            vendor: info.vendor.into(),
-            family: info.family,
-            model: info.model,
-            stepping: info.stepping,
-            has_waitpkg: flynnel::cpu_info::has_waitpkg(),
-            small_host_dispatch_factor: flynnel::cpu_info::small_host_dispatch_factor(),
-        })
+        ps.write(cpu_info_row())
     }
 }
 
@@ -430,9 +440,38 @@ pub struct LatencyTable {
 #[derive(Default)]
 pub struct GetFlynnelLatencyTable {}
 
+/// The inter-core latency table, or None on a host where the sweep
+/// could not run.
+///
+/// Built here rather than inside the cmdlet so the Flynnel drive's
+/// `host\latency` leaf answers the same object. None is the honest
+/// answer and each caller says so in its own idiom: the cmdlet warns
+/// and writes nothing, the drive reports a leaf that exists and is
+/// empty.
+pub(crate) fn latency_table_row() -> Option<LatencyTable> {
+    let table = flynnel::sched::numa_latency::topology_latency_table()?;
+    let n = table.n();
+    let mut latency_ns = Vec::with_capacity(n * n);
+    for src in 0..n {
+        for dst in 0..n {
+            latency_ns.push(table.latency_ns(src, dst));
+        }
+    }
+    Some(LatencyTable {
+        core_count: n as u32,
+        latency_ns,
+        mean_offdiag_ns: table.mean_offdiag_ns(),
+        min_offdiag_ns: table.min_offdiag_ns(),
+        max_offdiag_ns: table.max_offdiag_ns(),
+        iters: table.iters,
+        calibration_wall_ns: table.calibration_wall_ns,
+        matrix: table.format_as_matrix(),
+    })
+}
+
 impl Cmdlet for GetFlynnelLatencyTable {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let Some(table) = flynnel::sched::numa_latency::topology_latency_table() else {
+        let Some(row) = latency_table_row() else {
             pwrs::warning!(
                 ps,
                 "this host has no inter-core latency table: the ping-pong sweep could not \
@@ -440,23 +479,7 @@ impl Cmdlet for GetFlynnelLatencyTable {
             )?;
             return Ok(());
         };
-        let n = table.n();
-        let mut latency_ns = Vec::with_capacity(n * n);
-        for src in 0..n {
-            for dst in 0..n {
-                latency_ns.push(table.latency_ns(src, dst));
-            }
-        }
-        ps.write(LatencyTable {
-            core_count: n as u32,
-            latency_ns,
-            mean_offdiag_ns: table.mean_offdiag_ns(),
-            min_offdiag_ns: table.min_offdiag_ns(),
-            max_offdiag_ns: table.max_offdiag_ns(),
-            iters: table.iters,
-            calibration_wall_ns: table.calibration_wall_ns,
-            matrix: table.format_as_matrix(),
-        })
+        ps.write(row)
     }
 }
 
@@ -554,16 +577,24 @@ pub struct CacheAllocation {
 #[derive(Default)]
 pub struct GetFlynnelCacheAllocation {}
 
+/// What this host can carve out of its last-level cache, as one row.
+///
+/// Built here rather than inside the cmdlet so the Flynnel drive's
+/// `host\cache` leaf answers the same object.
+pub(crate) fn cache_allocation_row() -> CacheAllocation {
+    let cap = flynnel::sched::cat::CatCapability::detect();
+    CacheAllocation {
+        supported: cap.supported,
+        closid_count: cap.num_closids,
+        way_count: cap.cbm_bits,
+        min_ways: cap.min_cbm_bits,
+        domain_count: cap.num_domains,
+    }
+}
+
 impl Cmdlet for GetFlynnelCacheAllocation {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let cap = flynnel::sched::cat::CatCapability::detect();
-        ps.write(CacheAllocation {
-            supported: cap.supported,
-            closid_count: cap.num_closids,
-            way_count: cap.cbm_bits,
-            min_ways: cap.min_cbm_bits,
-            domain_count: cap.num_domains,
-        })
+        ps.write(cache_allocation_row())
     }
 }
 
