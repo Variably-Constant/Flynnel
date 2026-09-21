@@ -206,6 +206,18 @@ impl WaitStrategy {
     pub fn pick() -> Self {
         wait_controller().choose()
     }
+
+    /// This strategy as a trace payload.
+    ///
+    /// A number rather than the `Debug` name because a trace row
+    /// carries one `u32` and is read by a script.
+    fn trace_code(self) -> u32 {
+        match self {
+            Self::StdPark => 0,
+            Self::Waitpkg => 1,
+            Self::Monitorx => 2,
+        }
+    }
 }
 
 /// Which wait is cheapest on this host right now, learned by timing
@@ -603,6 +615,13 @@ impl WaitController {
             };
             if self.current.swap(want, Ordering::Relaxed) != want {
                 self.switches.fetch_add(1, Ordering::Relaxed);
+                // Timestamped, because the count alone cannot say
+                // whether a reading taken early in a run came from
+                // before the move or after it.
+                crate::sched::trace::emit(
+                    crate::sched::trace::TraceEvent::WaitSwitch,
+                    self.choose().trace_code(),
+                );
             }
         }
 
@@ -885,6 +904,15 @@ impl Parker {
             },
         };
 
+        // What this park actually did, for a run that has to be read
+        // rather than reasoned about. `trace::emit` returns on one
+        // relaxed load when tracing is off, which is why this sits on
+        // the path at all.
+        crate::sched::trace::emit(
+            crate::sched::trace::TraceEvent::ParkEnter,
+            strategy.trace_code() | if sampling.is_some() { 16 } else { 0 },
+        );
+
         // Dispatch on wait strategy. Either path returns to the
         // caller on wake (real or spurious); the caller's loop
         // re-attempts the work search and re-enters park_until
@@ -923,7 +951,16 @@ impl Parker {
             let stamp = self.wake_stamp.swap(0, Ordering::Relaxed);
             if stamp > SAMPLE_ARMED {
                 let now = tsc_now();
-                wait_controller().record(slot, cycles_to_ns(now.wrapping_sub(stamp)));
+                let wake_ns = cycles_to_ns(now.wrapping_sub(stamp));
+                // The cost of this one wake, before any mean folds it
+                // away. A report gives two averages; this gives the
+                // draws they were made from, which is what separates
+                // a long tail from a slow arm.
+                crate::sched::trace::emit(
+                    crate::sched::trace::TraceEvent::WorkerWake,
+                    u32::try_from(wake_ns).unwrap_or(u32::MAX),
+                );
+                wait_controller().record(slot, wake_ns);
             }
         }
 

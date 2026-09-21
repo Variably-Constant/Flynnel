@@ -69,6 +69,24 @@ pub enum TraceEvent {
     SlotJobStart = 12,
     /// The wrapped join returned on the primary. Payload = 0.
     SlotJobEnd = 13,
+    /// A parker is about to wait. Payload = the strategy it chose,
+    /// 0 kernel park, 1 WAITPKG, 2 MONITORX, plus 16 when this park
+    /// is one half of a controller probe and is therefore being
+    /// timed.
+    ///
+    /// The strategy is recorded per park rather than read from the
+    /// controller afterwards, because the controller reports where it
+    /// ended up and a run that switched partway through looks from
+    /// its report exactly like one that started there.
+    ParkEnter = 14,
+    /// The wait controller moved the process to a different strategy.
+    /// Payload = the strategy now in use, same encoding as
+    /// [`TraceEvent::ParkEnter`].
+    ///
+    /// The report says how many times this happened; this says when,
+    /// which is what tells a reader whether an early measurement was
+    /// taken before or after the move.
+    WaitSwitch = 15,
 }
 
 /// One trace event row recorded into the per-thread buffer.
