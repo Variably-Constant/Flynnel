@@ -537,6 +537,24 @@ pub(crate) struct Sleep {
     /// so an external job is found within a round instead of at
     /// the rate the slot count dilutes a random pick to.
     claimed_slots: AtomicU64,
+    /// Set once by [`Sleep::wake_all_for_shutdown`], before it wakes
+    /// anybody, and read by [`Sleep::sleep`] while that worker holds
+    /// its own `is_blocked` mutex.
+    ///
+    /// The flag is what makes shutdown durable. Waking is not: a wake
+    /// reaches only the workers that are blocked at the moment it
+    /// runs, and a worker still walking its tiers is not one of them,
+    /// so without something left behind it commits to the condvar
+    /// afterwards and nothing ever wakes it again. Measured at one
+    /// hang in 5000 runs of the lib suite, which is
+    /// `LocalArena::drop` joining a worker that will not return.
+    ///
+    /// Reading it under the mutex is the load-bearing part rather than
+    /// the flag itself. That is what orders the read against the wake:
+    /// a worker holding the mutex makes shutdown block until it is
+    /// waiting, and a worker taking the mutex afterwards reads a flag
+    /// stored before the wake it missed.
+    shutdown: AtomicBool,
 }
 
 impl Sleep {
@@ -553,6 +571,7 @@ impl Sleep {
             counters: AtomicCounters::new(),
             worker_states: states,
             claimed_slots: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
         }
     }
 
@@ -694,6 +713,15 @@ impl Sleep {
         let mut is_blocked = state.is_blocked.lock().unwrap();
         debug_assert!(!*is_blocked);
 
+        // Read under the mutex, so it cannot be missed. The wake this
+        // pairs with reaches only workers already blocked, and this
+        // worker was still walking its tiers when that ran, so the
+        // flag is the only thing that says shutdown happened.
+        if self.shutdown.load(Ordering::Acquire) {
+            idle.wake_partly();
+            return;
+        }
+
         loop {
             let counters = self.counters.load(Ordering::SeqCst);
             debug_assert!(idle.jobs_counter.is_sleepy());
@@ -796,6 +824,11 @@ impl Sleep {
     /// Wake every worker (for shutdown). Called once when the
     /// arena is being torn down.
     pub(crate) fn wake_all_for_shutdown(&self) {
+        // Stored before the sweep, never after. A worker that takes
+        // its mutex after its own slot has been swept has to find the
+        // flag already set, or it commits to the condvar behind the
+        // wake and stays there.
+        self.shutdown.store(true, Ordering::Release);
         for i in 0..self.worker_states.len() {
             self.wake_specific_thread(i);
         }
