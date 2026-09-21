@@ -31,7 +31,13 @@
 //!   emit     that same payload handed to the crate's `trace::emit`
 //!            with tracing off. Minus the payload cell it is the
 //!            guard alone; minus the control it is the whole of what
-//!            a park pays to carry a `ParkEnter` row.
+//!            a park paid to carry a `ParkEnter` row while the
+//!            payload was passed as an argument.
+//!   guarded  the same call with the switch read first and the
+//!            payload built only behind it, which is what the park
+//!            path does now. Against `emit` it prices the ordering,
+//!            since the two differ by the payload alone; against the
+//!            control it is what a park pays today.
 //!
 //! Each cell is read as its median over `REPEATS`, and the control is
 //! subtracted so the answer is the predicate's own cost rather than
@@ -173,7 +179,11 @@ fn payload_only() -> bool {
     false
 }
 
-/// The whole emit as it sits on the park path, tracing off.
+/// The emit with its payload handed straight to it, tracing off.
+///
+/// What the park path did before the switch was moved in front of the
+/// payload. Rust evaluates arguments before the call, so the payload is
+/// built on every park and discarded inside.
 #[inline]
 fn park_emit() -> bool {
     let strategy = black_box(Strategy::Monitorx);
@@ -182,6 +192,25 @@ fn park_emit() -> bool {
         TraceEvent::ParkEnter,
         strategy.code() | if sampled { 16 } else { 0 },
     );
+    false
+}
+
+/// The park path as it stands now: switch first, payload behind it.
+///
+/// Read against `park_emit` this is what moving the switch in front
+/// saved; read against `control` it is what a park still pays. The two
+/// cells differ by the payload alone, so the pair prices the ordering
+/// rather than the instrumentation.
+#[inline]
+fn guarded_emit() -> bool {
+    if trace::is_enabled() {
+        let strategy = black_box(Strategy::Monitorx);
+        let sampled = black_box(true);
+        trace::emit(
+            TraceEvent::ParkEnter,
+            strategy.code() | if sampled { 16 } else { 0 },
+        );
+    }
     false
 }
 
@@ -240,6 +269,7 @@ fn main() {
     black_box(latch_enabled());
     black_box(settable_enabled());
     black_box(park_emit());
+    black_box(guarded_emit());
     for i in 0..3 {
         black_box(strategy_from(black_box(i)).code());
     }
@@ -251,6 +281,7 @@ fn main() {
     let mut settable = Vec::with_capacity(REPEATS);
     let mut payload = Vec::with_capacity(REPEATS);
     let mut emit = Vec::with_capacity(REPEATS);
+    let mut guarded = Vec::with_capacity(REPEATS);
     // Interleaved rather than run in blocks: a frequency change or a
     // neighbour arriving partway through would otherwise land on one
     // shape and not the other, and the difference between them is the
@@ -268,6 +299,7 @@ fn main() {
         settable.push(cell(settable_enabled));
         payload.push(cell(payload_only));
         emit.push(cell(park_emit));
+        guarded.push(cell(guarded_emit));
     }
 
     let control_last = cell(control_enabled);
@@ -276,6 +308,7 @@ fn main() {
     let settable_ns = median(settable);
     let payload_ns = median(payload);
     let emit_ns = median(emit);
+    let guarded_ns = median(guarded);
     let control_spread = spread_pct(&control);
     let control_ns = median(control);
     let drift = (control_last - control_first) / control_first * 100.0;
@@ -296,7 +329,15 @@ fn main() {
         "emit     {emit_ns:.4} ns/call, {:.4} over control",
         emit_ns - control_ns
     );
+    println!(
+        "guarded  {guarded_ns:.4} ns/call, {:.4} over control",
+        guarded_ns - control_ns
+    );
     println!("guard alone, emit minus payload {:.4} ns/call", emit_ns - payload_ns);
+    println!(
+        "switch first saves {:.4} ns a park, emit minus guarded",
+        emit_ns - guarded_ns
+    );
 
     // The settable cell and the guard inside emit are the same `Once`
     // and relaxed load, reached two ways: one through a static this
@@ -357,6 +398,8 @@ fn main() {
         ("settable", settable_ns - control_ns),
         ("payload", payload_ns - control_ns),
         ("emit", emit_ns - control_ns),
+        ("guarded", guarded_ns - control_ns),
+        ("switch-first saving", emit_ns - guarded_ns),
     ] {
         if over.abs() < floor_ns {
             println!("UNRESOLVED {name}: {over:.4} ns sits inside the floor");
