@@ -254,13 +254,26 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   CPUID reports bit 29 on both parts and distinguishes them not at
   all; only the length of a real wait does.
 
-  So the wait checks that it held. Four consecutive returns under an
-  eighth of the requested timeout end it in `thread::park` and record
-  the finding process-wide, so later parks skip the attempt. That caps
-  the waste at roughly ten thousand cycles, once. The flag is never
-  cleared: a wrong `false` costs the kernel park that was already
-  there, a wrong `true` costs the regression on every park, and the
-  two directions are not worth the same.
+  So the wait checks that it held. Eight consecutive returns that did
+  not wait at all - under 16384 RDTSC cycles, against the 1600 to 2400
+  the instruction pair costs - end it in `thread::park` and record the
+  finding process-wide, so later parks skip the attempt.
+
+  **That threshold is absolute on purpose.** Expressed as a fraction
+  of the requested timeout it cannot work, and the first version was:
+  a park asks for a 10 ms budget, so a store waking it after 50 us
+  returns at a fifty-thousandth of the request and a monitor that
+  never armed returns at a ten-thousandth. Both are under any
+  reasonable fraction. What separates them is the instruction's own
+  duration, about 2400 cycles against several hundred thousand. The
+  fractional form tripped on a host whose monitor holds, and the
+  sticky flag then spent the rest of that process in the kernel park,
+  which showed up as MONITORX rows sitting exactly level with the
+  StdPark rows beside them.
+
+  The flag is never cleared: a wrong `false` costs the kernel park
+  that was already there, a wrong `true` costs the regression on
+  every park, and the two directions are not worth the same.
 
   `benches/parker_wait_strategy.rs` carries all three arms in one
   process, each at a 50 us and a 500 us inter-arrival and each both
