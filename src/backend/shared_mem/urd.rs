@@ -752,15 +752,20 @@ mod tests {
         // than a wrong answer. Read from the strategy toward the
         // probe, which is the direction that catches a `pick` whose
         // arms have been reordered out from under the detections.
+        //
+        // The spin carries no precondition, and asserting one here
+        // would be asserting something else entirely: this host has
+        // MONITORX and is picked onto the spin anyway, because the
+        // spin measured faster. That is a choice and not a failure to
+        // detect, so the executability test must not encode it.
+        // `monitorx_is_available_to_ask_for_and_is_never_chosen_on_its_own`
+        // is where the choice is pinned.
         let path = temp_path("strategy_executable");
         let u = UrdDeque::create(&path, 2).expect("create");
         match u.wait_strategy() {
             WaitStrategy::Waitpkg => assert!(has_waitpkg()),
             WaitStrategy::Monitorx => assert!(has_monitorx()),
-            WaitStrategy::PauseSpin => {
-                assert!(!has_waitpkg());
-                assert!(!has_monitorx());
-            }
+            WaitStrategy::PauseSpin => {}
         }
         remove_temp(&path);
     }
