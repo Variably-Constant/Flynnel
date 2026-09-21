@@ -905,15 +905,22 @@ impl Parker {
         };
 
         // What this park actually did, for a run that has to be read
-        // rather than reasoned about. With tracing off `trace::emit`
-        // returns on a `Once` guard and one relaxed load, timed by
-        // `examples/trace_predicate_cost`, and the payload is a
-        // three-arm match on a constant. That pair is what a park pays
-        // to be legible.
-        crate::sched::trace::emit(
-            crate::sched::trace::TraceEvent::ParkEnter,
-            strategy.trace_code() | if sampling.is_some() { 16 } else { 0 },
-        );
+        // rather than reasoned about.
+        //
+        // The switch is read before the payload is built. Rust
+        // evaluates arguments before the call, so handing the payload
+        // to `emit` directly computes it on every park and discards it
+        // when tracing is off, which is unconditional cost on the
+        // shipped path and is the thing the switch exists to gate.
+        // Behind the switch what a park pays is a `Once` guard and one
+        // relaxed load, timed by `examples/trace_predicate_cost`, whose
+        // payload and guard cells separate the two.
+        if crate::sched::trace::is_enabled() {
+            crate::sched::trace::emit(
+                crate::sched::trace::TraceEvent::ParkEnter,
+                strategy.trace_code() | if sampling.is_some() { 16 } else { 0 },
+            );
+        }
 
         // Dispatch on wait strategy. Either path returns to the
         // caller on wake (real or spurious); the caller's loop
