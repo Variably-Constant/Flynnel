@@ -261,6 +261,15 @@ fn bench_corunner(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
 }
 
 fn bench_all(c: &mut Criterion) {
+    // Which tree built this, for the same reason the parker bench
+    // prints it: two hosts carry a Flynnel-verify and they are
+    // different checkouts.
+    eprintln!(
+        "urd_thief_wait: built from {} v{}",
+        env!("CARGO_MANIFEST_DIR"),
+        env!("CARGO_PKG_VERSION")
+    );
+
     let waitpkg = flynnel::cpu_info::has_waitpkg();
     let monitorx = flynnel::cpu_info::has_monitorx();
 

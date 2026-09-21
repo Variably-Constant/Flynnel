@@ -246,6 +246,17 @@ fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
 }
 
 fn bench_all(c: &mut Criterion) {
+    // Which tree built this. Two hosts here carry a directory called
+    // Flynnel-verify and they are different checkouts, so a run can
+    // be against source several commits behind the one being reasoned
+    // about with nothing in the output to say so. Baked in at compile
+    // time, so it describes the binary rather than wherever it ran.
+    eprintln!(
+        "parker_wait_strategy: built from {} v{}",
+        env!("CARGO_MANIFEST_DIR"),
+        env!("CARGO_PKG_VERSION")
+    );
+
     let waitpkg = flynnel::cpu_info::has_waitpkg();
     let monitorx = flynnel::cpu_info::has_monitorx();
 
