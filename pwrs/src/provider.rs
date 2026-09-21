@@ -43,7 +43,7 @@ use pwrs::prelude::*;
 /// Held as a path list rather than built per call so enumerating a
 /// container is one pass over this table, and so a path that is not
 /// here is not there.
-const CONTAINERS: [&str; 3] = ["host", "pool", "pool/workers"];
+const CONTAINERS: [&str; 5] = ["host", "pool", "pool/workers", "sites", "backends"];
 
 /// Every leaf whose path is fixed, by its normalized path.
 ///
@@ -88,11 +88,32 @@ impl FlynnelDrive {
     /// The object at one leaf, or None where the host cannot take that
     /// reading.
     fn leaf_value(path: &str) -> PsResult<Option<PsObject>> {
-        // A worker's name is its index, so it is matched before the
-        // fixed paths.
+        // The three levels whose children are readings carry their key
+        // in the name, so they are matched before the fixed paths.
         if let Some(name) = path.strip_prefix("pool/workers/") {
             return match Self::worker_by_name(name) {
                 Some(w) => Ok(Some(w.into_ps()?)),
+                None => Ok(None),
+            };
+        }
+        if let Some(name) = path.strip_prefix("sites/") {
+            let sites = flynnel::registered_sites();
+            let names = Self::site_names();
+            let found = names.iter().position(|n| n == name);
+            return match found {
+                Some(i) => Ok(Some(crate::observe::call_site_row(&sites[i]).into_ps()?)),
+                None => Ok(None),
+            };
+        }
+        if let Some(name) = path.strip_prefix("backends/") {
+            let detected = flynnel::backend::detect::detect_all();
+            let found = crate::backends::BackendKind::ENUMERABLE
+                .iter()
+                .find(|k| format!("{k:?}") == name);
+            return match found {
+                Some(k) => Ok(Some(
+                    crate::backends::row_for(k.to_crate(0), &detected).into_ps()?,
+                )),
                 None => Ok(None),
             };
         }
@@ -177,7 +198,49 @@ impl FlynnelDrive {
                 out.push((format!("pool/workers/{}", w.index), false));
             }
         }
+        if path == "sites" {
+            for name in Self::site_names() {
+                out.push((format!("sites/{name}"), false));
+            }
+        }
+        if path == "backends" {
+            for name in Self::backend_names() {
+                out.push((format!("backends/{name}"), false));
+            }
+        }
         out
+    }
+
+    /// Every call site the scheduler has materialised, named by the
+    /// source location that made it.
+    ///
+    /// A site appears only once a dispatch has reached that location,
+    /// so an empty level is a process that has run no work through
+    /// Flynnel rather than a level that failed to enumerate.
+    ///
+    /// The colon a location carries between file and line cannot be a
+    /// path segment on either platform, so it becomes a hyphen. The
+    /// row still holds File, Line and Column, which is what a script
+    /// reads; the name only has to be unique and typeable.
+    fn site_names() -> Vec<String> {
+        flynnel::registered_sites()
+            .iter()
+            .map(|e| {
+                let file = e.location.file().replace(['\\', '/'], "-");
+                format!("{file}-{}", e.location.line())
+            })
+            .collect()
+    }
+
+    /// Every backend kind the taxonomy names, whether or not this host
+    /// has it. An absent device is a child that exists and reports
+    /// Registered false, never a missing child, for the same reason
+    /// Get-FlynnelBackend writes a row for it.
+    fn backend_names() -> Vec<String> {
+        crate::backends::BackendKind::ENUMERABLE
+            .iter()
+            .map(|k| format!("{k:?}"))
+            .collect()
     }
 
     fn is_container(path: &str) -> bool {
@@ -188,10 +251,16 @@ impl FlynnelDrive {
         if LEAVES.contains(&path) {
             return true;
         }
-        match path.strip_prefix("pool/workers/") {
-            Some(name) => Self::worker_by_name(name).is_some(),
-            None => false,
+        if let Some(name) = path.strip_prefix("pool/workers/") {
+            return Self::worker_by_name(name).is_some();
         }
+        if let Some(name) = path.strip_prefix("sites/") {
+            return Self::site_names().iter().any(|n| n == name);
+        }
+        if let Some(name) = path.strip_prefix("backends/") {
+            return Self::backend_names().iter().any(|n| n == name);
+        }
+        false
     }
 }
 

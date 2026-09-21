@@ -825,7 +825,7 @@ pub struct CallSite {
     pub reduce_cost_avg_cycles: Option<u64>,
 }
 
-fn call_site_row(entry: &flynnel::RegisteredSite) -> CallSite {
+pub(crate) fn call_site_row(entry: &flynnel::RegisteredSite) -> CallSite {
     let s = entry.site.get();
     let (arm_default, arm_alternative) = s.arm_ewmas();
     let (route_default, route_alternative) = s.routing_ewmas();

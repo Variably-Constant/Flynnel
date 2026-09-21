@@ -252,7 +252,7 @@ fn capabilities_into(row: &mut BackendRow, caps: &BackendCapabilities) {
     row.capabilities_known = true;
 }
 
-fn row_for(backend: CrateBackend, detected: &[CrateBackend]) -> BackendRow {
+pub(crate) fn row_for(backend: CrateBackend, detected: &[CrateBackend]) -> BackendRow {
     let kind = BackendKind::from(backend);
     let mut row = BackendRow {
         kind,

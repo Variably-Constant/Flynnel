@@ -192,6 +192,67 @@ Describe 'the pool level' {
     }
 }
 
+Describe 'the backends level' {
+    It 'has a child for every backend kind, present or not' {
+        # An absent device is a child that exists and reports
+        # Registered false, never a missing child, for the same reason
+        # Get-FlynnelBackend writes a row for it: a script cannot act
+        # on a listing that failed to enumerate.
+        $onDrive = @(Get-ChildItem Flynnel:\backends | ForEach-Object { $_.PSChildName })
+        $fromCmdlet = @(Get-FlynnelBackend | ForEach-Object { [string]$_.Kind })
+        foreach ($k in $fromCmdlet) {
+            if ($k -eq 'Custom') { continue }
+            $onDrive | Should -Contain $k
+        }
+    }
+
+    It 'answers the same row as Get-FlynnelBackend for one kind' {
+        $d = Test-SameRow -Left (Get-FlynnelBackend -Kind Cpu) `
+            -Right (Get-Item Flynnel:\backends\Cpu)
+        $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
+    }
+
+    It 'reports a device this host does not have rather than omitting it' {
+        $cuda = Get-Item Flynnel:\backends\Cuda
+        $cuda | Should -Not -BeNullOrEmpty
+        $cuda.Kind | Should -Be 'Cuda'
+    }
+}
+
+Describe 'the sites level' {
+    It 'lists a child per call site the scheduler has materialised' {
+        # A site appears only once a dispatch has reached that source
+        # location, so an empty level means this process has run no
+        # work through Flynnel, not that the level failed.
+        $onDrive = @(Get-ChildItem Flynnel:\sites)
+        $fromCmdlet = @(Get-FlynnelCallSite -WarningAction SilentlyContinue)
+        $onDrive.Count | Should -Be $fromCmdlet.Count
+    }
+
+    It 'answers the same row as Get-FlynnelCallSite for one site' {
+        $fromCmdlet = @(Get-FlynnelCallSite -WarningAction SilentlyContinue)
+        if ($fromCmdlet.Count -eq 0) {
+            Set-ItResult -Skipped -Because 'no dispatch has reached a call site in this process'
+            return
+        }
+        $first = @(Get-ChildItem Flynnel:\sites)[0]
+        $match = $fromCmdlet | Where-Object {
+            $_.File -eq $first.File -and $_.Line -eq $first.Line
+        } | Select-Object -First 1
+        $match | Should -Not -BeNullOrEmpty
+        $match.Column | Should -Be $first.Column
+    }
+
+    It 'names a site with no separator a path cannot carry' {
+        # A location's colon is not a path segment on either platform,
+        # so the name replaces it. The row still holds File, Line and
+        # Column, which is what a script reads.
+        foreach ($n in @(Get-ChildItem Flynnel:\sites | ForEach-Object { $_.PSChildName })) {
+            $n | Should -Not -Match ':'
+        }
+    }
+}
+
 Describe 'a reading this host cannot take' {
     It 'is a leaf that exists and holds nothing, not a missing path' {
         # The distinction a script cannot make for itself: "this host
