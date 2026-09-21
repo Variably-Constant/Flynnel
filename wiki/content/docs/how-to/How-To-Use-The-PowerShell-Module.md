@@ -125,9 +125,16 @@ Disposing a handle frees its ring. `Dispose` is the generated one and the garbag
 
 ## Asking what this machine can do, before asking it to
 
-Four questions answer on any host, including one with no accelerator of any kind. Each is worth asking before the work rather than after it.
+Five questions answer on any host, including one with no accelerator of any kind. Each is worth asking before the work rather than after it.
 
 ```powershell
+# What the processor is, and whether a worker here can wait without a
+# syscall. The two feature columns are separate because having
+# MONITORX and not WAITPKG is the ordinary AMD case before Zen 5.
+Get-FlynnelCpuInfo |
+    Select-Object Vendor, Family, Model, PhysicalCores, LogicalThreads,
+                  HasWaitpkg, HasMonitorx
+
 # Which backends exist, which are reachable, and which this host's own
 # sweep found. Three separate columns, because they come apart.
 Get-FlynnelBackend | Select-Object Kind, Registered, Available, Detected
@@ -148,7 +155,9 @@ Get-FlynnelWavePlan -Width 32 -BarrierNs 4000 -GenerationNs 90000 |
     Select-Object Frontier, RebalanceEvery, CostPerGenerationNs, GlobalCostNs
 ```
 
-Every one of these is a decision or a reading, never a launch. The watchdog reading loads NVML once and caches it, because neither the hardware nor the driver configuration can change under a running process; the other three touch nothing outside this process.
+Every one of these is a decision or a reading, never a launch. The watchdog reading loads NVML once and caches it, because neither the hardware nor the driver configuration can change under a running process; the other four touch nothing outside this process.
+
+**A feature column says the instruction decodes, not that it is worth using.** `HasMonitorx` true means a worker can wait in-core rather than in a kernel park, and whether that is faster is a property of the part and the load. The scheduler picks WAITPKG where present, then MONITORX, then the kernel park, and detects at runtime a host whose monitor will not hold, falling back for the life of the process when it finds one.
 
 **A failed read is not an absent answer.** Where the watchdog's driver model or registry read fails, the documented delay is taken and `Basis` names which read failed. A watchdog that is present and treated as absent ends in a device reset; one treated as present only shortens slices.
 
