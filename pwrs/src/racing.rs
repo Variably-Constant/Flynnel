@@ -113,6 +113,24 @@ pub struct RaceOutcome {
     pub count: u32,
 }
 
+/// The slowest arm's time over the winner's, which is what hedging
+/// trimmed.
+///
+/// One function because two rows carry this field and a ratio is the
+/// kind of thing that gets written the other way round: the operands
+/// here already appeared reversed in one place, stated against the
+/// code that produces them.
+///
+/// A winner of zero means the race was too short to time, and 1.0
+/// says what that is worth, which is nothing.
+fn tail_ratio_of(slowest_ns: u64, winner_ns: u64) -> f64 {
+    if winner_ns == 0 {
+        1.0
+    } else {
+        slowest_ns as f64 / winner_ns as f64
+    }
+}
+
 /// One arm's work: the declared operation over its own range, looking
 /// at the cancel token between blocks.
 fn run_arm(
@@ -330,11 +348,7 @@ impl Cmdlet for MeasureFlynnelRaceAny {
             slowest_arm_ns: slowest,
             total_ns,
             cancelled_early: cancelled.load(Ordering::Relaxed),
-            tail_ratio: if winner_ns == 0 {
-                1.0
-            } else {
-                slowest as f64 / winner_ns as f64
-            },
+            tail_ratio: tail_ratio_of(slowest, winner_ns),
             count: self.count,
         })?;
         if self.include_arms {
@@ -482,11 +496,7 @@ impl Cmdlet for MeasureFlynnelExploreSelect {
             // Nothing is cancelled in this shape, and a zero here is
             // the shape rather than a host that was even.
             cancelled_early: 0,
-            tail_ratio: if winner_ns == 0 {
-                1.0
-            } else {
-                slowest as f64 / winner_ns as f64
-            },
+            tail_ratio: tail_ratio_of(slowest, winner_ns),
             count: self.count,
         })?;
         if self.include_arms {
