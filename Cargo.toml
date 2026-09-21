@@ -202,6 +202,9 @@ name = "trace_mailbox_hang"
 name = "trace_predicate_cost"
 
 [[example]]
+name = "call_site_registry_cost"
+
+[[example]]
 name = "adaptive_dispatcher_demo"
 
 [[example]]
