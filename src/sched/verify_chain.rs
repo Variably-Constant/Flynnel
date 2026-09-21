@@ -24,7 +24,7 @@
 //! MUST use the BLAKE3 path (enable `verify-chain`).
 //!
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sched::io_pool::global_io_pool;
@@ -143,7 +143,12 @@ struct ChainShared {
     pending: AtomicUsize,
     /// (signalled flag, condvar) for finalize to wait on. Workers
     /// pulse the condvar when they decrement pending to zero.
-    notify: (Mutex<()>, Condvar),
+    /// The thread blocked in `root`, stored once when it starts
+    /// waiting. The task that drives `pending` to zero unparks it.
+    ///
+    /// One waiter: `root` consumes the chain. A second caller would
+    /// find the slot taken and never be woken.
+    waiter: OnceLock<std::thread::Thread>,
     /// Chunks that have arrived and not yet been folded in, by the
     /// index they were submitted at, and how far the fold has got.
     ///
@@ -261,7 +266,7 @@ impl VerifyChain {
             inner: Arc::new(ChainShared {
                 hasher: Mutex::new(Some(hasher)),
                 pending: AtomicUsize::new(0),
-                notify: (Mutex::new(()), Condvar::new()),
+                waiter: OnceLock::new(),
                 arrivals: Mutex::new(Arrivals::default()),
             }),
         }
@@ -286,9 +291,10 @@ impl VerifyChain {
             // Decrement pending; if we hit zero, notify any
             // finalize waiter.
             let prev = inner.pending.fetch_sub(1, Ordering::AcqRel);
-            if prev == 1 {
-                let _g = inner.notify.0.lock();
-                inner.notify.1.notify_all();
+            if prev == 1
+                && let Some(waiter) = inner.waiter.get()
+            {
+                waiter.unpark();
             }
         };
         match global_io_pool() {
@@ -310,14 +316,16 @@ impl VerifyChain {
             if self.inner.pending.load(Ordering::Acquire) == 0 {
                 break;
             }
-            let mut g = self.inner.notify.0.lock().unwrap();
-            // Re-check inside the lock to avoid lost-wakeup.
+            // Published before the count is re-read. A task that
+            // finishes after this finds the handle and unparks; one
+            // that finished before it left pending at zero, which the
+            // loop condition reads next. park keeps a permit either
+            // way, so a wake between the two is not lost.
+            self.inner.waiter.get_or_init(std::thread::current);
             if self.inner.pending.load(Ordering::Acquire) == 0 {
                 break;
             }
-            // park on the condvar; workers signal when pending = 0
-            g = self.inner.notify.1.wait(g).unwrap();
-            drop(g);
+            std::thread::park();
         }
         // Every task has run, so every slot is filled; fold in any
         // prefix a task left behind because its own predecessor had
