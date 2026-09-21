@@ -199,12 +199,30 @@ impl Parker {
             WaitStrategy::StdPark => {
                 thread::park();
             }
-            WaitStrategy::Waitpkg => {
-                self.wait_via_waitpkg(initial_wake);
-            }
-            WaitStrategy::Monitorx => {
-                self.wait_via_monitorx(initial_wake);
-            }
+            // Both monitor waits return on their own deadline as well
+            // as on a wake, and a deadline is not news. Reporting one
+            // as a wake would hand the caller a worker that nothing
+            // has given work to, and the caller would re-enter here
+            // through the whole spin floor. So the deadline is used
+            // for what it is, a chance to re-read state that a missed
+            // store would otherwise hide, and the wait is re-entered
+            // until there is something to report. That is what the
+            // StdPark arm gets from `thread::park` for free.
+            WaitStrategy::Waitpkg | WaitStrategy::Monitorx => loop {
+                match self.wait_strategy {
+                    WaitStrategy::Monitorx => self.wait_via_monitorx(initial_wake),
+                    _ => self.wait_via_waitpkg(initial_wake),
+                }
+                if self.wake_counter.load(Ordering::Acquire) != initial_wake {
+                    break;
+                }
+                if self.shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                if is_ready() {
+                    break;
+                }
+            },
         }
 
         // Final shutdown check before returning so a shutdown
