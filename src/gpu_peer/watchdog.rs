@@ -131,18 +131,23 @@ pub fn detect(ordinal: usize) -> WatchdogState {
 /// than as absent. A reader shown only the state cannot tell those
 /// apart.
 pub fn detect_with_model(ordinal: usize) -> (Result<DriverModel, String>, WatchdogState) {
+    /// Devices the cache covers. A reading is kept per ordinal and
+    /// never evicted, and a host has a handful of GPUs.
+    const CACHED_ORDINALS: usize = 64;
     type Reading = (Result<DriverModel, String>, WatchdogState);
-    static CACHE: std::sync::Mutex<Vec<(usize, Reading)>> = std::sync::Mutex::new(Vec::new());
+    static CACHE: [std::sync::OnceLock<Reading>; CACHED_ORDINALS] =
+        [const { std::sync::OnceLock::new() }; CACHED_ORDINALS];
 
-    // A poisoned cache still holds readings, and every entry in it is a
-    // value some earlier call already returned.
-    let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((_, reading)) = cache.iter().find(|(known, _)| *known == ordinal) {
-        return reading.clone();
+    // One slot per ordinal rather than one lock over all of them. The
+    // NVML load still happens once per device, which is what the slot
+    // is for; two ordinals read at the same time no longer wait on
+    // each other to do it.
+    match CACHE.get(ordinal) {
+        Some(slot) => slot.get_or_init(|| read_watchdog(ordinal)).clone(),
+        // Past the cache. Reading it uncached is right rather than
+        // refusing: the answer is the same, it is just paid for again.
+        None => read_watchdog(ordinal),
     }
-    let reading = read_watchdog(ordinal);
-    cache.push((ordinal, reading.clone()));
-    reading
 }
 
 /// One reading of the driver model and the TDR settings for `ordinal`.

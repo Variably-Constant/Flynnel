@@ -72,10 +72,9 @@ pub mod wave;
 
 mod poller;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cudarc::driver::sys as cu;
@@ -661,39 +660,112 @@ fn warn_on_foreign_context(prior: Option<cu::CUcontext>) -> bool {
     }
 }
 
-/// Composed user-op modules, keyed by their source and NVRTC options.
-type ComposedModules = HashMap<(String, Vec<String>), Ptx>;
+/// One composed user-op module and the source and options it came from.
+struct ComposedModule {
+    key: (String, Vec<String>),
+    ptx: Ptx,
+}
 
-/// Composed user-op modules compiled in this process.
-static COMPOSED_PTX: OnceLock<Mutex<ComposedModules>> = OnceLock::new();
+/// Slot count of the composed-module cache. A process compiles one
+/// module per distinct user-op source and option set, which is a
+/// handful, and nothing is ever evicted.
+const COMPOSED_SLOTS: usize = 256;
+const COMPOSED_MASK: usize = COMPOSED_SLOTS - 1;
+
+/// Composed user-op modules compiled in this process. Insert-once and
+/// never removed, so a published slot holds a complete module for the
+/// life of the process and a reader needs one atomic load per probe.
+static COMPOSED_PTX: [AtomicPtr<ComposedModule>; COMPOSED_SLOTS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; COMPOSED_SLOTS];
 
 /// NVRTC compilations of a composed user-op module in this process.
 static COMPOSED_COMPILES: AtomicU64 = AtomicU64::new(0);
 
+fn composed_key_hash(key: &(String, Vec<String>)) -> u64 {
+    use core::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+/// The module compiled earlier in this process for `key`, if any.
+fn composed_lookup(key: &(String, Vec<String>)) -> Option<Ptx> {
+    let mut idx = (composed_key_hash(key) as usize) & COMPOSED_MASK;
+    for _ in 0..COMPOSED_SLOTS {
+        let published = COMPOSED_PTX[idx].load(Ordering::Acquire);
+        if published.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null slot holds a leaked module that is never
+        // freed, moved or rehashed.
+        let entry = unsafe { &*published };
+        if entry.key == *key {
+            return Some(entry.ptx.clone());
+        }
+        idx = (idx + 1) & COMPOSED_MASK;
+    }
+    None
+}
+
 /// The module for `src` under `options`: the one compiled earlier in this
 /// process for the same pair, or a fresh NVRTC compilation that is kept.
+///
+/// Two callers that miss on the same key both compile, and the first to
+/// claim a slot is the one every later reader gets. That was true of the
+/// map this replaces as well: it dropped the lock across the compile, so
+/// the count below has always been compilations rather than distinct keys.
 fn composed_ptx(src: String, options: &[String]) -> Result<Ptx, GpuPeerError> {
-    let cache = COMPOSED_PTX.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (src, options.to_vec());
-    if let Some(ptx) = lock_composed(cache).get(&key) {
-        return Ok(ptx.clone());
+    if let Some(ptx) = composed_lookup(&key) {
+        return Ok(ptx);
     }
     let opts = cudarc::nvrtc::CompileOptions { options: key.1.clone(), ..Default::default() };
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(&key.0, opts)
         .map_err(|e| GpuPeerError::Driver(format!("user-ops NVRTC compile: {e:?}")))?;
     COMPOSED_COMPILES.fetch_add(1, Ordering::Relaxed);
-    lock_composed(cache).insert(key, ptx.clone());
-    Ok(ptx)
+    Ok(composed_publish(key, ptx))
 }
 
-/// The composed-module cache, locked. Every use holds the lock for a single
-/// map call, so a panic under it cannot leave the map part-written, and a
-/// poisoned lock still guards a whole map.
-fn lock_composed(cache: &Mutex<ComposedModules>) -> MutexGuard<'_, ComposedModules> {
-    match cache.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+/// Keep `ptx` under `key` and answer what every later reader will get,
+/// which is a peer's module when one claimed the slot first.
+fn composed_publish(key: (String, Vec<String>), ptx: Ptx) -> Ptx {
+    let hash = composed_key_hash(&key);
+    let mut prepared: Option<&'static ComposedModule> = None;
+    let mut idx = (hash as usize) & COMPOSED_MASK;
+    for _ in 0..COMPOSED_SLOTS {
+        let published = COMPOSED_PTX[idx].load(Ordering::Acquire);
+        if published.is_null() {
+            let entry = *prepared.get_or_insert_with(|| {
+                &*Box::leak(Box::new(ComposedModule { key: key.clone(), ptx: ptx.clone() }))
+            });
+            let fresh = entry as *const ComposedModule as *mut ComposedModule;
+            match COMPOSED_PTX[idx].compare_exchange(
+                core::ptr::null_mut(),
+                fresh,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return entry.ptx.clone(),
+                Err(taken) => {
+                    // SAFETY: as in composed_lookup.
+                    let other = unsafe { &*taken };
+                    if other.key == key {
+                        return other.ptx.clone();
+                    }
+                }
+            }
+        } else {
+            // SAFETY: as in composed_lookup.
+            let other = unsafe { &*published };
+            if other.key == key {
+                return other.ptx.clone();
+            }
+        }
+        idx = (idx + 1) & COMPOSED_MASK;
     }
+    // The cache is full. Handing back the fresh compilation keeps the
+    // caller working; it just will not be shared with a later one.
+    ptx
 }
 
 impl GpuPeer {
