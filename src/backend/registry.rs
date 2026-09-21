@@ -14,19 +14,125 @@
 //! register it manually. [`cpu_backend`] returns the canonical
 //! shared `Arc` for it.
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use core::sync::atomic::{AtomicPtr, Ordering};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock};
 
 use crate::backend::{Backend, BackendRef, CpuBackend, DispatchBackend};
 
-fn registry() -> &'static RwLock<HashMap<Backend, BackendRef>> {
-    static CACHE: OnceLock<RwLock<HashMap<Backend, BackendRef>>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let mut m: HashMap<Backend, BackendRef> = HashMap::new();
+/// Slot count of the backend table. One slot per distinct [`Backend`]
+/// id, which is the CPU plus one per device per accelerator class, so
+/// sixty-four leaves a multi-GPU host far from the edge. Registration
+/// replaces rather than appends, so the population does not grow with
+/// the number of hot-swaps.
+const SLOTS: usize = 64;
+const MASK: usize = SLOTS - 1;
+
+/// One registered id and whatever is currently installed under it.
+///
+/// The id is written once, when the entry claims its slot. The
+/// implementation behind it is replaceable, so it is reached through
+/// a pointer a reader loads and a registrar stores.
+struct Entry {
+    id: Backend,
+    current: AtomicPtr<BackendRef>,
+}
+
+/// Open-addressed, insert-once, never-removed table of leaked entries.
+/// A non-null slot is a complete entry, so a reader needs one atomic
+/// load per probe and no lock.
+static TABLE: [AtomicPtr<Entry>; SLOTS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; SLOTS];
+
+/// Gate for the auto-registration of the CPU backend, so first access
+/// from several threads installs it once.
+static CPU_READY: OnceLock<()> = OnceLock::new();
+
+fn key_of(id: &Backend) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish()
+}
+
+/// The entry for `id`, with the probe stopping at the first empty
+/// slot, which is where an insert for this id would go.
+fn find(id: &Backend) -> Option<&'static Entry> {
+    let mut idx = (key_of(id) as usize) & MASK;
+    for _ in 0..SLOTS {
+        let p = TABLE[idx].load(Ordering::Acquire);
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null slot holds a leaked Entry that is never
+        // freed, moved or rehashed.
+        let entry = unsafe { &*p };
+        if entry.id == *id {
+            return Some(entry);
+        }
+        idx = (idx + 1) & MASK;
+    }
+    None
+}
+
+/// Install `b` under `id`, replacing whatever was there.
+///
+/// The replaced pointer is not freed. A reader that has loaded it is
+/// about to clone through it, and there is no point at which that is
+/// known to be finished, so the alternative to leaking is a use after
+/// free. What leaks is one pointer-sized box per registration, and
+/// registration is a startup act a process performs a handful of
+/// times.
+fn install(id: Backend, b: BackendRef) {
+    let fresh = Box::into_raw(Box::new(b));
+    if let Some(entry) = find(&id) {
+        entry.current.store(fresh, Ordering::Release);
+        return;
+    }
+    let mut prepared: Option<&'static Entry> = None;
+    let mut idx = (key_of(&id) as usize) & MASK;
+    for _ in 0..SLOTS {
+        let p = TABLE[idx].load(Ordering::Acquire);
+        if p.is_null() {
+            let entry = *prepared.get_or_insert_with(|| {
+                &*Box::leak(Box::new(Entry {
+                    id,
+                    current: AtomicPtr::new(fresh),
+                }))
+            });
+            let node = entry as *const Entry as *mut Entry;
+            match TABLE[idx].compare_exchange(
+                core::ptr::null_mut(),
+                node,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(taken) => {
+                    // SAFETY: as in find.
+                    let other = unsafe { &*taken };
+                    if other.id == id {
+                        other.current.store(fresh, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        } else {
+            // SAFETY: as in find.
+            let other = unsafe { &*p };
+            if other.id == id {
+                other.current.store(fresh, Ordering::Release);
+                return;
+            }
+        }
+        idx = (idx + 1) & MASK;
+    }
+    panic!("backend table full at {SLOTS} distinct ids; {id:?} could not be registered");
+}
+
+fn ensure_cpu() {
+    CPU_READY.get_or_init(|| {
         let cpu: Arc<dyn DispatchBackend> = Arc::new(CpuBackend::new());
-        m.insert(Backend::Cpu, cpu);
-        RwLock::new(m)
-    })
+        install(Backend::Cpu, cpu);
+    });
 }
 
 /// Register a backend implementation with the process-global
@@ -35,26 +141,45 @@ fn registry() -> &'static RwLock<HashMap<Backend, BackendRef>> {
 /// hot-swap path for consumer crates that want to install a more
 /// capable backend over the default.
 pub fn register_backend(b: BackendRef) {
+    ensure_cpu();
     let id = b.id();
-    if let Ok(mut guard) = registry().write() {
-        guard.insert(id, b);
-    }
+    install(id, b);
 }
 
 /// Look up a backend by id. Returns `None` if no backend with that
 /// exact id (including matching `device_id`) is registered.
 pub fn backend_by_id(id: &Backend) -> Option<BackendRef> {
-    registry().read().ok().and_then(|g| g.get(id).cloned())
+    ensure_cpu();
+    let entry = find(id)?;
+    let p = entry.current.load(Ordering::Acquire);
+    // SAFETY: an entry's current pointer is set before the entry is
+    // published and every value ever stored in it is leaked, so it is
+    // non-null and its referent outlives this clone.
+    Some(unsafe { &*p }.clone())
 }
 
 /// Snapshot every registered backend. Useful for telemetry and
 /// for the `JobPlan::pick_backend` fallback path that picks the
 /// best-available backend when no explicit hint is set.
+///
+/// Slot order carries no meaning, and a registration landing in an
+/// earlier slot after the walk has passed it is not in the snapshot.
+/// Nothing is ever removed, so a backend the walk does report is
+/// really registered.
 pub fn backends() -> Vec<BackendRef> {
-    registry()
-        .read()
-        .map(|g| g.values().cloned().collect())
-        .unwrap_or_default()
+    ensure_cpu();
+    let mut out = Vec::new();
+    for slot in TABLE.iter() {
+        let p = slot.load(Ordering::Acquire);
+        if p.is_null() {
+            continue;
+        }
+        // SAFETY: as in find, and as in backend_by_id for the value.
+        let entry = unsafe { &*p };
+        let current = entry.current.load(Ordering::Acquire);
+        out.push(unsafe { &*current }.clone());
+    }
+    out
 }
 
 /// Canonical [`Arc`] for the always-available CPU backend.

@@ -20,7 +20,8 @@
 //! the Jacobi ops agree to rounding (tournament vs cyclic pair order).
 //! Matrices are row-major and batched contiguously.
 
-use std::sync::{Arc, Mutex};
+use core::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
 
 use cudarc::nvrtc::Ptx;
 
@@ -30,6 +31,48 @@ use super::{GpuPeer, GpuPeerError, WideKernel};
 use crate::backend::accel_op::{AccelOpId, AccelReport, bind_accel_kernel, dispatch_accel, register_accel_op};
 use crate::backend::{Backend, BackendError, KernelArg};
 use crate::sched::plan::JobPlan;
+
+/// The failure the device half of a tandem split reported, if it
+/// reported one.
+///
+/// The CPU half and the device half run concurrently and the caller
+/// frame blocks in the split until both return, so the device closure
+/// needs somewhere to leave an error that the frame reads afterwards.
+/// A later report replaces an earlier one, which is what the slot it
+/// replaces did.
+#[derive(Default)]
+struct DeviceError(AtomicPtr<GpuPeerError>);
+
+impl DeviceError {
+    fn record(&self, err: GpuPeerError) {
+        let fresh = Box::into_raw(Box::new(err));
+        let prev = self.0.swap(fresh, Ordering::AcqRel);
+        if !prev.is_null() {
+            // SAFETY: the swap took the pointer out of the slot, so
+            // this is its only owner.
+            drop(unsafe { Box::from_raw(prev) });
+        }
+    }
+
+    fn take(&self) -> Option<GpuPeerError> {
+        let held = self.0.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if held.is_null() {
+            return None;
+        }
+        // SAFETY: the swap left null behind, so only this call owns it.
+        Some(*unsafe { Box::from_raw(held) })
+    }
+}
+
+impl Drop for DeviceError {
+    fn drop(&mut self) {
+        let held = *self.0.get_mut();
+        if !held.is_null() {
+            // SAFETY: this is the last owner of the slot.
+            drop(unsafe { Box::from_raw(held) });
+        }
+    }
+}
 
 /// PTX for every kernel in this module, generated from
 /// `kernels/linalg_f64.cu` by `kernels/build_ptx.bat`.
@@ -1213,7 +1256,7 @@ pub fn gemm_tandem_batched(
     let lanes = plan.k_inner_lanes();
     let mut out = vec![0f64; bu * per_c];
     let out_addr = out.as_mut_ptr() as usize;
-    let device_err: Arc<Mutex<Option<GpuPeerError>>> = Arc::new(Mutex::new(None));
+    let device_err: Arc<DeviceError> = Arc::new(DeviceError::default());
     let err_slot = Arc::clone(&device_err);
     let (peer_addr, k_addr) = (peer as *mut GpuPeer as usize, k as *const LinalgKernels as usize);
     let (a_addr, a_len, b_addr, b_len) = (a.as_ptr() as usize, a.len(), b.as_ptr() as usize, b.len());
@@ -1247,11 +1290,11 @@ pub fn gemm_tandem_batched(
             let (lo, hi) = (r.start, r.end);
             match gemm_batched(peer, k, &a[lo * per_a..hi * per_a], &b[lo * per_b..hi * per_b], (hi - lo) as u32, m, n, kdim) {
                 Ok(c) => unsafe { scatter(out_addr, lo * per_c, &c) },
-                Err(e) => *err_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e),
+                Err(e) => err_slot.record(e),
             }
         },
     );
-    if let Some(e) = device_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
+    if let Some(e) = device_err.take() {
         return Err(e);
     }
     Ok((out, report))
@@ -1280,7 +1323,7 @@ pub fn syev_tandem_batched(
     let mut w = vec![0f64; bu * nu];
     let mut v = if want_v { vec![0f64; bu * nu * nu] } else { Vec::new() };
     let (w_addr, v_addr) = (w.as_mut_ptr() as usize, v.as_mut_ptr() as usize);
-    let device_err: Arc<Mutex<Option<GpuPeerError>>> = Arc::new(Mutex::new(None));
+    let device_err: Arc<DeviceError> = Arc::new(DeviceError::default());
     let err_slot = Arc::clone(&device_err);
     let (peer_addr, k_addr) = (peer as *mut GpuPeer as usize, k as *const LinalgKernels as usize);
     let (a_addr, a_len) = (a.as_ptr() as usize, a.len());
@@ -1314,11 +1357,11 @@ pub fn syev_tandem_batched(
                         unsafe { scatter(v_addr, lo * nu * nu, &vd) };
                     }
                 }
-                Err(e) => *err_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e),
+                Err(e) => err_slot.record(e),
             }
         },
     );
-    if let Some(e) = device_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
+    if let Some(e) = device_err.take() {
         return Err(e);
     }
     Ok(((w, if want_v { Some(v) } else { None }), report))
@@ -1350,7 +1393,7 @@ pub fn gesvd_tandem_batched(
     let mut sigma = vec![0f64; bu * nu];
     let mut v = if want_v { vec![0f64; bu * nu * nu] } else { Vec::new() };
     let (u_addr, s_addr, v_addr) = (u.as_mut_ptr() as usize, sigma.as_mut_ptr() as usize, v.as_mut_ptr() as usize);
-    let device_err: Arc<Mutex<Option<GpuPeerError>>> = Arc::new(Mutex::new(None));
+    let device_err: Arc<DeviceError> = Arc::new(DeviceError::default());
     let err_slot = Arc::clone(&device_err);
     let (peer_addr, k_addr) = (peer as *mut GpuPeer as usize, k as *const LinalgKernels as usize);
     let (a_addr, a_len) = (a.as_ptr() as usize, a.len());
@@ -1390,11 +1433,11 @@ pub fn gesvd_tandem_batched(
                         unsafe { scatter(v_addr, lo * nu * nu, &vd) };
                     }
                 }
-                Err(e) => *err_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e),
+                Err(e) => err_slot.record(e),
             }
         },
     );
-    if let Some(e) = device_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
+    if let Some(e) = device_err.take() {
         return Err(e);
     }
     Ok((GesvdResult { u, sigma, v: if want_v { Some(v) } else { None } }, report))
