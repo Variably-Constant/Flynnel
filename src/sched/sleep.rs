@@ -464,7 +464,18 @@ impl Parker {
         // ones take about four times the instruction pair, measured
         // at 2369 cycles on a 7900X and 1606 on a 2700.
         const ARMS_BEFORE_JUDGING: u32 = 4;
-        const ARMS_TOO_FAST_CYCLES: u64 = 1_000_000;
+        // Below this, four arms are impossibly fast for a monitor
+        // that armed at all. Unheld they cost about four times the
+        // pair, 9,500 cycles on a 7900X and 6,400 on a 2700. Armed
+        // and cut short by something else they measured 420,791 on a
+        // 7900X under load, about 22 microseconds each. This sits
+        // roughly eight times clear of both.
+        //
+        // A million was tried, and is why this figure is measured
+        // rather than reasoned: it caught the interrupted case, so a
+        // monitor that was working got condemned for being woken by
+        // the load the arm exists to survive.
+        const ARMS_TOO_FAST_CYCLES: u64 = 50_000;
 
         // Read before anything else this function does. Whether the
         // monitor holds is a property of the part, so a finding by any
