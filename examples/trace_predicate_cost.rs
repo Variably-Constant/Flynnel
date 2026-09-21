@@ -35,8 +35,17 @@
 //!
 //! Each cell is read as its median over `REPEATS`, and the control is
 //! subtracted so the answer is the predicate's own cost rather than
-//! the harness's. The control is also reported first and last, and a
-//! run whose two controls disagree is not readable.
+//! the harness's. The control is interleaved with the other four and
+//! its median is what gets subtracted: sampled only at the ends it
+//! would sit on the two extremes of the warm-up curve while every
+//! other cell averaged over the whole of it, which puts the one cell
+//! everything is measured against exactly where the drift is worst.
+//!
+//! The control is read at the ends as well, and that difference is
+//! reported as a diagnostic rather than as the verdict. What decides
+//! whether a difference holds is the span of the control across its
+//! own repeats: a figure smaller than that span was not resolved by
+//! the run, and one wider than five per cent leaves nothing readable.
 //!
 //! Both predicates are written out here rather than called through the
 //! crate, so one binary times both shapes and no second build is
@@ -197,6 +206,21 @@ fn median(mut xs: Vec<f64>) -> f64 {
     xs[xs.len() / 2]
 }
 
+/// The span of a cell's repeats as a percentage of its median.
+///
+/// What decides whether a subtraction holds. The endpoint controls say
+/// whether the box moved over the whole run, which an interleaved
+/// design already absorbs; this says whether the cells disagree among
+/// themselves at the moments they were actually sampled, and a
+/// subtraction between two cells that wide is not resolving anything
+/// smaller than it.
+fn spread_pct(xs: &[f64]) -> f64 {
+    let lo = xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mid = median(xs.to_vec());
+    (hi - lo) / mid * 100.0
+}
+
 fn main() {
     // The emit cell is only meaningful with tracing off, which is the
     // path it exists to measure. With tracing on it would push CALLS
@@ -222,6 +246,7 @@ fn main() {
 
     let control_first = cell(control_enabled);
 
+    let mut control = Vec::with_capacity(REPEATS);
     let mut latch = Vec::with_capacity(REPEATS);
     let mut settable = Vec::with_capacity(REPEATS);
     let mut payload = Vec::with_capacity(REPEATS);
@@ -230,7 +255,15 @@ fn main() {
     // neighbour arriving partway through would otherwise land on one
     // shape and not the other, and the difference between them is the
     // whole answer.
+    //
+    // The control is interleaved with the rest, and is what every
+    // figure below is measured against. Sampled only at the ends it
+    // sits on the two extremes of the warm-up curve while every other
+    // cell averages over the whole of it, which makes the control the
+    // one cell placed where the drift is worst and biases every
+    // difference taken from it.
     for _ in 0..REPEATS {
+        control.push(cell(control_enabled));
         latch.push(cell(latch_enabled));
         settable.push(cell(settable_enabled));
         payload.push(cell(payload_only));
@@ -243,11 +276,13 @@ fn main() {
     let settable_ns = median(settable);
     let payload_ns = median(payload);
     let emit_ns = median(emit);
-    let control_ns = (control_first + control_last) / 2.0;
+    let control_spread = spread_pct(&control);
+    let control_ns = median(control);
     let drift = (control_last - control_first) / control_first * 100.0;
 
     println!("calls per cell {CALLS}, repeats {REPEATS}");
-    println!("control  {control_first:.4} ns then {control_last:.4} ns, drift {drift:.2}%");
+    println!("control  {control_ns:.4} ns/call interleaved, spread {control_spread:.2}%");
+    println!("endpoints {control_first:.4} ns then {control_last:.4} ns, drift {drift:.2}%");
     println!("latch    {latch_ns:.4} ns/call, {:.4} over control", latch_ns - control_ns);
     println!(
         "settable {settable_ns:.4} ns/call, {:.4} over control",
@@ -312,11 +347,36 @@ fn main() {
         per_dispatch / DISPATCH_NS * 100.0
     );
 
-    // A run whose control moved across it is measuring the box.
+    // What this run could resolve. The control's span across its own
+    // repeats, in nanoseconds, is the floor: a difference smaller than
+    // the floor was not measured by this run whatever sign it carries.
+    let floor_ns = control_ns * control_spread / 100.0;
+    println!("resolution floor {floor_ns:.4} ns, the control's own span across repeats");
+    for (name, over) in [
+        ("latch", latch_ns - control_ns),
+        ("settable", settable_ns - control_ns),
+        ("payload", payload_ns - control_ns),
+        ("emit", emit_ns - control_ns),
+    ] {
+        if over.abs() < floor_ns {
+            println!("UNRESOLVED {name}: {over:.4} ns sits inside the floor");
+        }
+    }
+
+    // The endpoint drift is reported rather than used as the verdict.
+    // It is the box warming across the run, which every cell here
+    // meets equally because all five are interleaved; what would
+    // corrupt a difference is the cells disagreeing at the moments
+    // they were sampled, and that is the floor above. A large drift
+    // beside a small spread is a guest ramping its clock, not a
+    // measurement to throw away.
     if drift.abs() > 2.0 {
+        println!("NOTE: endpoints moved {drift:.2}%, absorbed by interleaving");
+    }
+    if control_spread > 5.0 {
         println!(
-            "UNREADABLE: the control moved {drift:.2}% across this run, so the \
-             difference above is not attributable to either shape"
+            "UNREADABLE: the control disagreed with itself by {control_spread:.2}% \
+             across its own repeats, so no difference here is attributable"
         );
     }
 }
