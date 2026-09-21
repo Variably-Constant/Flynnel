@@ -297,9 +297,9 @@ where
         return Vec::new();
     }
     let cancel = Arc::new(AtomicBool::new(false));
-    // One ticket per finisher, so the ticket order IS the completion
-    // order. It rides back with the result rather than through shared
-    // storage, which is what keeps the payload bound at `Send`: a
+    // One ticket per finisher, so the ticket order is exactly the
+    // completion order. It rides back with the result rather than
+    // through shared storage, which keeps the payload bound at `Send`: a
     // shared slot array would have to be `Sync` as well, and a quorum
     // replica's answer is not required to be.
     let claimed = Arc::new(AtomicUsize::new(0));

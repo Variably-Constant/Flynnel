@@ -186,7 +186,7 @@ impl SharedMemoryUrdBackend {
         Ok(handles)
     }
 
-    /// Owner-side: explicit flush of the CALLING thread's staged
+    /// Owner-side: explicit flush of the calling thread's staged
     /// items. Each staging thread accumulates and flushes its own, so
     /// this leaves every other thread's buffer where it is.
     pub fn flush(&self) -> Result<usize, BackendError> {

@@ -387,7 +387,7 @@ impl KhpdDeque {
     /// then per-line: waits for `state == STATE_EMPTY`, fills items,
     /// and Release-stores the packed state. Returns the number of
     /// lines published.
-    /// Publishes the CALLING thread's staged items and leaves every
+    /// Publishes the calling thread's staged items and leaves every
     /// other thread's where they are. A thread stages and publishes
     /// its own batch, so items from two threads land in separate
     /// publication lines rather than sharing one. The ring is claimed

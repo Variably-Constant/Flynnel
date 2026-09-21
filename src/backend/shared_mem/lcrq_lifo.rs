@@ -454,7 +454,7 @@ impl LohDeque {
         })
     }
 
-    /// Owner-side explicit flush of the CALLING thread's LIFO. Drains
+    /// Owner-side explicit flush of the calling thread's LIFO. Drains
     /// it into the ring's tail in one batch (one `tail.fetch_add(N)` +
     /// N Release-stores) and leaves every other thread's alone.
     /// Returns the number of items migrated.

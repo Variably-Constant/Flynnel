@@ -13,7 +13,7 @@
 //!
 //! # The protocol
 //!
-//! A reader PUBLISHES the pointer it intends to follow into a slot of
+//! A reader publishes the pointer it intends to follow into a slot of
 //! its own, then re-reads the source and starts again if the source
 //! has moved on. A writer unlinks first and retires second. A sweep
 //! frees a retired pointer only when no published slot holds it.

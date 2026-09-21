@@ -157,7 +157,7 @@ struct ChainShared {
     /// fold token; pushing is a compare-exchange and never waits.
     arrived: AtomicPtr<Arrival>,
     /// Held by whichever task is folding. A task that does not get it
-    /// RETURNS rather than waiting: what it deposited is already on
+    /// returns rather than waiting: what it deposited is already on
     /// `arrived`, so the holder will take it, and the holder rechecks
     /// after releasing so a deposit cannot be stranded.
     folding: AtomicBool,
