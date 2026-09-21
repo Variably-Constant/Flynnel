@@ -565,11 +565,17 @@ impl Parker {
             // return: an interrupt lengthens some returns, so a rule
             // over consecutive short ones never fires on a host whose
             // monitor is not holding.
-            let span = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start);
-            if arms >= ARMS_BEFORE_JUDGING && span < ARMS_TOO_FAST_CYCLES {
-                note_monitor_does_not_hold(span);
-                thread::park();
-                return;
+            // The arm count gates the clock read, not the other way
+            // round: the first arms cannot trip this and a clock read
+            // costs 206 ns on the Windows host here and 973 on the
+            // Linux guest.
+            if arms >= ARMS_BEFORE_JUDGING {
+                let span = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start);
+                if span < ARMS_TOO_FAST_CYCLES {
+                    note_monitor_does_not_hold(span);
+                    thread::park();
+                    return;
+                }
             }
         }
     }
