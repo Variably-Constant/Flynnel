@@ -692,7 +692,7 @@ fn bucket_distance(a: WorkloadClass, b: WorkloadClass) -> u8 {
     bucket_index(a).abs_diff(bucket_index(b))
 }
 
-/// Encoded class tag stored in [`AUTO_PENDING_TAG`]. Same
+/// Encoded class tag stored in a [`PendingRun`]. Same
 /// encoding as [`ACTIVE_PROFILE_TAG`] for the migrated portion
 /// (LatencyBound / PortBound / MemoryBound / Streaming /
 /// Unspecified) plus a TAG_FINE_GRAIN value because the
@@ -743,17 +743,69 @@ pub(crate) fn class_bucket_distance(a: WorkloadClass, b: WorkloadClass) -> u8 {
     bucket_distance(a, b)
 }
 
-/// Tag of the WorkloadClass that the most recent auto-classifier tick
-/// produced. When this matches for [`AUTO_MIGRATION_HYSTERESIS`]
-/// consecutive ticks and differs from the active class, the
-/// observer fires [`migrate_workload_class`].
-static AUTO_PENDING_TAG: AtomicU8 = AtomicU8::new(TAG_PORT_BOUND);
+/// The hysteresis state the closing-loop observer carries between
+/// ticks: the class the latest observations agreed on and how many of
+/// them in a row. Packed into one word so a tick reads it and replaces
+/// it as a unit.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PendingRun {
+    tag: u8,
+    run: u32,
+}
 
-/// Count of consecutive auto-classifier ticks that produced
-/// [`AUTO_PENDING_TAG`]. Reset to 0 when the classifier output
-/// differs from the prior pending tag.
-static AUTO_PENDING_RUN: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+impl PendingRun {
+    const fn fresh() -> Self {
+        Self {
+            tag: TAG_PORT_BOUND,
+            run: 0,
+        }
+    }
+
+    const fn packed(self) -> u64 {
+        ((self.tag as u64) << 32) | self.run as u64
+    }
+
+    const fn unpacked(word: u64) -> Self {
+        Self {
+            tag: (word >> 32) as u8,
+            run: word as u32,
+        }
+    }
+
+    /// One observation of `observed` while `active` is the active class
+    /// and the window behind it held `dcount` leaves. Returns the class
+    /// to migrate to, when this observation decides one, and the state
+    /// to carry forward.
+    ///
+    /// A class two or more buckets from the active one, backed by at
+    /// least 64 leaves, migrates at once: the static guess was far off
+    /// and one wide window is enough to say so. An adjacent class
+    /// migrates after [`AUTO_MIGRATION_HYSTERESIS`] agreeing
+    /// observations in a row. The run keeps counting past that, so a
+    /// later disagreement starts it over rather than resuming it.
+    fn observe(
+        self,
+        active: WorkloadClass,
+        observed: WorkloadClass,
+        dcount: u64,
+    ) -> (Option<WorkloadClass>, Self) {
+        let tag = workload_class_to_tag(observed);
+        if active != observed && bucket_distance(active, observed) >= 2 && dcount >= 64 {
+            return (Some(observed), Self { tag, run: 0 });
+        }
+        if self.tag != tag {
+            return (None, Self { tag, run: 1 });
+        }
+        let run = self.run.saturating_add(1);
+        let migrate = run >= AUTO_MIGRATION_HYSTERESIS && active != observed;
+        (migrate.then_some(observed), Self { tag, run })
+    }
+}
+
+/// The observer's [`PendingRun`], packed. Replaced by a compare-exchange
+/// at every tick, so two ticks landing together each count once.
+static AUTO_PENDING: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(PendingRun::fresh().packed());
 
 /// Last-seen cumulative LEAF_COUNT / LEAF_TIME_SUM_NS /
 /// LEAF_TIME_SUMSQ snapshot, captured at the prior tick. The
@@ -814,13 +866,45 @@ pub fn tick_auto_classify() {
     AUTO_LAST_ITEMS.store(stats.items, Ordering::Relaxed);
     AUTO_LAST_SUMSQ_PER_ITEM.store(stats.sumsq_per_item, Ordering::Relaxed);
 
-    // Per item, so the reading describes the work rather than the split
-    // that produced it: leaf times scale with the items in a leaf, and
-    // the split follows from the class this decides. A window whose
-    // samples carried no item count is classified on its leaf times,
-    // which is all such a sample can say.
-    let per_item = dsum.checked_div(ditems);
-    let (mean_ns, cv2) = if let Some(mean) = per_item {
+    let (mean_ns, cv2) = window_reading(dcount, dsum, dsumsq, ditems, dsumsq_per_item);
+    let observed = classify_observed(mean_ns, cv2);
+    let active = active_workload_class();
+
+    let mut word = AUTO_PENDING.load(Ordering::Relaxed);
+    loop {
+        let (migrate, next) = PendingRun::unpacked(word).observe(active, observed, dcount);
+        match AUTO_PENDING.compare_exchange_weak(
+            word,
+            next.packed(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                if let Some(class) = migrate {
+                    migrate_workload_class(class);
+                }
+                return;
+            }
+            Err(current) => word = current,
+        }
+    }
+}
+
+/// The mean and spread a delta window is classified on. Per item when
+/// the samples carried item counts, so the reading describes the work
+/// rather than the split that produced it: leaf times scale with the
+/// items in a leaf, and the split follows from the class this decides.
+/// A window whose samples carried no item count is read per leaf,
+/// which is all such a sample can say. The spread is cv^2 in parts per
+/// mille.
+fn window_reading(
+    dcount: u64,
+    dsum: u64,
+    dsumsq: u64,
+    ditems: u64,
+    dsumsq_per_item: u64,
+) -> (u64, u64) {
+    if let Some(mean) = dsum.checked_div(ditems) {
         let mean_sq = ((mean as u128).saturating_mul(mean as u128) >> 16) as u64;
         let spread = if mean_sq == 0 {
             0
@@ -841,54 +925,23 @@ pub fn tick_auto_classify() {
             var.saturating_mul(1000) / mean_sq.max(1)
         };
         (mean, spread)
-    };
-    let observed = classify_observed(mean_ns, cv2);
-    let observed_tag = workload_class_to_tag(observed);
-
-    let active = active_workload_class();
-    // Fast-adapt path: if the observed class is FAR from active
-    // (bucket distance >= 2) and the delta window has enough
-    // samples (>= 64) to be statistically meaningful, migrate
-    // immediately. The sample-count gate prevents single noisy
-    // windows from triggering the migration.
-    if active != observed
-        && bucket_distance(active, observed) >= 2
-        && dcount >= 64
-    {
-        migrate_workload_class(observed);
-        AUTO_PENDING_TAG.store(observed_tag, Ordering::Relaxed);
-        AUTO_PENDING_RUN.store(0, Ordering::Relaxed);
-        return;
-    }
-
-    let pending_tag = AUTO_PENDING_TAG.load(Ordering::Relaxed);
-    if pending_tag == observed_tag {
-        let prior_run = AUTO_PENDING_RUN.fetch_add(1, Ordering::Relaxed);
-        let new_run = prior_run.saturating_add(1);
-        if new_run >= AUTO_MIGRATION_HYSTERESIS && active != observed {
-            migrate_workload_class(observed);
-        }
-    } else {
-        AUTO_PENDING_TAG.store(observed_tag, Ordering::Relaxed);
-        AUTO_PENDING_RUN.store(1, Ordering::Relaxed);
     }
 }
 
-/// Reset the auto-classifier hysteresis state: AUTO_PENDING_TAG,
-/// AUTO_PENDING_RUN, and the AUTO_LAST_* snapshot counters that
-/// [`tick_auto_classify`] reads to compute the delta window. After
-/// reset, the next tick treats the entire current global leaf-stats
-/// counter as one fresh delta window.
+/// Reset the auto-classifier hysteresis state: the pending run and
+/// the AUTO_LAST_* snapshot counters that [`tick_auto_classify`]
+/// reads to compute the delta window. After reset, the next tick
+/// treats the entire current global leaf-stats counter as one fresh
+/// delta window.
 ///
 /// Public for observer-driven tests and for callers that need to
 /// reset the closing-loop state at a workload-phase boundary
 /// (e.g., the application starts a new bench cell with a different
 /// expected workload shape and wants the observer to converge from
 /// scratch rather than smooth across the old phase). The function
-/// is idempotent and cheap (7 Relaxed atomic stores).
+/// is idempotent and cheap (6 Relaxed atomic stores).
 pub fn reset_auto_classify_state() {
-    AUTO_PENDING_TAG.store(TAG_PORT_BOUND, Ordering::Relaxed);
-    AUTO_PENDING_RUN.store(0, Ordering::Relaxed);
+    AUTO_PENDING.store(PendingRun::fresh().packed(), Ordering::Relaxed);
     AUTO_LAST_COUNT.store(0, Ordering::Relaxed);
     AUTO_LAST_SUM_NS.store(0, Ordering::Relaxed);
     AUTO_LAST_SUMSQ.store(0, Ordering::Relaxed);
@@ -1086,63 +1139,95 @@ mod tests {
         );
     }
 
+    // The observer decides over `PendingRun::observe` and
+    // `window_reading`, and these drive those. Driving the
+    // process-global counters instead reads every other test's leaves
+    // as observations, since every dispatch in the suite feeds them.
+
     #[test]
     fn auto_classify_migrates_after_hysteresis() {
-        use crate::sched::split_observer::{
-            acquire_test_lock, record_leaf_batch, reset_leaf_stats,
-        };
-        let _stats_lock = acquire_test_lock();
-        let _guard = TestGuard::new();
-        reset_leaf_stats();
-        reset_auto_classify_state();
-        // Start with PortBound active so a Streaming classification
-        // counts as a disagreement that needs to migrate.
-        migrate_dispatch_profile(DispatchProfile::PortBound);
-        assert_eq!(active_workload_class(), WorkloadClass::PortBound);
-
-        // Inject a batch matching the Streaming signature
-        // (mean_ns >= 500, cv2 < 50). Use 64 samples of 1000 ns
-        // each: sum_ns = 64 * 1000 = 64_000; sumsq_scaled =
-        // (1000 >> 8)^2 * 64 = 3^2 * 64 = 576.
-        // Mean = 1000, variance ~= 0 -> cv2 = 0.
-        let sample_ns: u64 = 1000;
-        let count: u64 = 64;
-        let scaled = sample_ns >> 8;
-        let sumsq = scaled.saturating_mul(scaled).saturating_mul(count);
-        for _ in 0..AUTO_MIGRATION_HYSTERESIS {
-            record_leaf_batch(sample_ns * count, sumsq, count, 0, 0);
+        // Streaming sits one bucket from PortBound, so the far path does
+        // not apply and the run has to reach the hysteresis.
+        let mut state = PendingRun::fresh();
+        for seen in 1..AUTO_MIGRATION_HYSTERESIS {
+            let (migrate, next) =
+                state.observe(WorkloadClass::PortBound, WorkloadClass::Streaming, 16);
+            assert_eq!(
+                migrate, None,
+                "observation {seen} of {AUTO_MIGRATION_HYSTERESIS} migrated early"
+            );
+            state = next;
         }
-        // After `AUTO_MIGRATION_HYSTERESIS` consecutive Streaming
-        // classifications, active class should have migrated.
+        let (migrate, next) = state.observe(WorkloadClass::PortBound, WorkloadClass::Streaming, 16);
         assert_eq!(
-            active_workload_class(),
-            WorkloadClass::Streaming,
-            "auto-classifier did not migrate after {} consecutive Streaming observations",
-            AUTO_MIGRATION_HYSTERESIS,
+            migrate,
+            Some(WorkloadClass::Streaming),
+            "auto-classifier did not migrate after {AUTO_MIGRATION_HYSTERESIS} consecutive \
+             Streaming observations"
         );
+        assert_eq!(next.run, AUTO_MIGRATION_HYSTERESIS);
     }
 
     #[test]
     fn auto_classify_does_not_migrate_on_a_single_outlier() {
-        use crate::sched::split_observer::{
-            acquire_test_lock, record_leaf_batch, reset_leaf_stats,
-        };
-        let _stats_lock = acquire_test_lock();
-        let _guard = TestGuard::new();
-        reset_leaf_stats();
-        reset_auto_classify_state();
-        migrate_dispatch_profile(DispatchProfile::PortBound);
-
-        // One streaming batch is insufficient to migrate.
-        let sample_ns: u64 = 1000;
-        let count: u64 = 64;
-        let scaled = sample_ns >> 8;
-        let sumsq = scaled.saturating_mul(scaled).saturating_mul(count);
-        record_leaf_batch(sample_ns * count, sumsq, count, 0, 0);
+        let (migrate, next) =
+            PendingRun::fresh().observe(WorkloadClass::PortBound, WorkloadClass::Streaming, 16);
         assert_eq!(
-            active_workload_class(),
-            WorkloadClass::PortBound,
-            "auto-classifier migrated on a single observation; hysteresis broken",
+            migrate, None,
+            "auto-classifier migrated on a single observation; hysteresis broken"
+        );
+        assert_eq!(
+            next,
+            PendingRun {
+                tag: workload_class_to_tag(WorkloadClass::Streaming),
+                run: 1,
+            }
+        );
+        // A disagreeing observation starts the run over.
+        let (migrate, next) =
+            next.observe(WorkloadClass::PortBound, WorkloadClass::MemoryBound, 16);
+        assert_eq!(migrate, None);
+        assert_eq!(next.run, 1);
+    }
+
+    #[test]
+    fn auto_classify_migrates_at_once_when_the_observation_is_far_and_wide() {
+        // LatencyBound is two buckets from PortBound. Sixty-four leaves
+        // behind the window migrate on the first observation; fewer take
+        // the hysteresis path.
+        let (migrate, next) =
+            PendingRun::fresh().observe(WorkloadClass::PortBound, WorkloadClass::LatencyBound, 64);
+        assert_eq!(migrate, Some(WorkloadClass::LatencyBound));
+        assert_eq!(next.run, 0);
+        let (migrate, next) =
+            PendingRun::fresh().observe(WorkloadClass::PortBound, WorkloadClass::LatencyBound, 16);
+        assert_eq!(migrate, None);
+        assert_eq!(next.run, 1);
+    }
+
+    #[test]
+    fn a_window_reads_per_item_when_its_samples_carried_items() {
+        // Sixty-four leaves of a millisecond each, formed the way the
+        // recorder forms them: the scaled square per leaf, and the
+        // squared time over the items a leaf covered.
+        let leaves = 64u64;
+        let leaf_ns = 1_000_000u64;
+        let scaled = leaf_ns >> 8;
+        let dsum = leaf_ns * leaves;
+        let dsumsq = scaled * scaled * leaves;
+
+        // No items: read per leaf, a flat window.
+        assert_eq!(window_reading(leaves, dsum, dsumsq, 0, 0), (leaf_ns, 0));
+
+        // Sixteen items a leaf: read per item, still flat.
+        let items = 16u64;
+        let per_item_sq = ((leaf_ns as u128 * leaf_ns as u128) / ((items as u128) << 16)) as u64;
+        let (mean, cv2) =
+            window_reading(leaves, dsum, dsumsq, leaves * items, per_item_sq * leaves);
+        assert_eq!(mean, leaf_ns / items);
+        assert!(
+            cv2 < 50,
+            "identical leaves read as a flat window; got {cv2}"
         );
     }
 
