@@ -516,7 +516,7 @@ pub struct NewFlynnelGpuPeerConfig {
     /// A fixed path for the region, so another process can attach it.
     #[param]
     pub region_path: Option<String>,
-    /// Lanes.
+    /// Lanes in the region, each served by its own consumer.
     #[param]
     pub lanes: Option<u32>,
     /// Slot size in bytes.
@@ -525,10 +525,13 @@ pub struct NewFlynnelGpuPeerConfig {
     /// Ring depth per lane.
     #[param]
     pub slots_per_lane: Option<u32>,
-    /// Resident quantum.
+    /// How long one resident quantum runs before it exits. The
+    /// watchdog is what bounds this, so Get-FlynnelPeerWatchdog says
+    /// whether a value is safe here.
     #[param]
     pub quantum_ns: Option<u64>,
-    /// Team barrier deadline.
+    /// How long rank zero waits for the rest of its block team before
+    /// retiring the slot. Read only when BlocksPerLane is above one.
     #[param]
     pub barrier_deadline_ns: Option<u64>,
     /// Idle time before a quantum parks.
@@ -543,7 +546,8 @@ pub struct NewFlynnelGpuPeerConfig {
     /// Resident blocks; zero disables the pool.
     #[param]
     pub vram_blocks: Option<u32>,
-    /// Blocks per lane.
+    /// Blocks serving each lane. The peer clamps this to the device's
+    /// multiprocessor count and reports the width it ran.
     #[param]
     pub blocks_per_lane: Option<u32>,
     /// Blocks per lane individually, one entry per lane.

@@ -9,7 +9,7 @@ Eighty commands, fifty-four object types, twenty-six enumerations. Every command
 
 `Get-Help <command> -Full` carries the parameters, the examples and what each parameter means. This page is the map, not a substitute for it.
 
-## The host — 8 commands
+## The host - 8 commands
 
 What the scheduler reads before it sizes anything.
 
@@ -32,7 +32,7 @@ Enumerations: `Flynnel.Vendor`, `Flynnel.NumaSource`, `Flynnel.ClusterSource`, `
 
 A host with no resctrl is not an error: `Get-FlynnelCacheAllocation` comes back with `Supported` false and zero counts, because an absent row and an absent facility read alike to a script. `New-FlynnelCacheReservation` returns the ways when the reservation is released, disposed or collected, so a session that ends without releasing does not leave a class of service standing.
 
-## Plans — 5 commands
+## Plans - 5 commands
 
 A plan is the unit every other family takes. Each `With` method answers a fresh plan and leaves the one it was called on alone, so a base plan can be varied without being consumed.
 
@@ -48,7 +48,7 @@ Objects: `Flynnel.Plan`, `Flynnel.ResolvedPlan`, `Flynnel.ProfileRow`.
 
 Enumerations: `Flynnel.DispatchProfile`, `Flynnel.SchedTier`, `Flynnel.BisectVariant`, `Flynnel.DequeTier`, `Flynnel.LeafShape`, `Flynnel.CooperativeRouting`, `Flynnel.VariantRouting`, `Flynnel.WorkloadShapeKind`.
 
-## The pool — 13 commands
+## The pool - 13 commands
 
 The arena a plan dispatches into, and the dials that change how it waits.
 
@@ -80,7 +80,7 @@ Objects: `Flynnel.Pool`, `Flynnel.WorkerStat`, `Flynnel.SpinState`, `Flynnel.Spl
 
 `Get-FlynnelIoPool` writes a warning and nothing when the process has no global IO pool, rather than an empty pool: an empty pool and an absent one are different states and a null answer cannot say which.
 
-## Kernels — 17 commands
+## Kernels - 17 commands
 
 The work that actually runs on the pool. Each takes an optional `-Plan`, and `-Verbose` reports the plan that ran the work, the workers it resolved to and the leaves it asked for.
 
@@ -124,7 +124,7 @@ Enumerations: `Flynnel.MapOp` (fourteen element-wise operations), `Flynnel.ZipOp
 
 `Get-FlynnelHistogram` takes `-AsArray` to answer bare counts instead of one `Flynnel.HistogramBin` record per bin. At 50,000 bins the record shape is the pipeline's cost, not the kernel's.
 
-## Observation — 13 commands
+## Observation - 13 commands
 
 The dispatch counters, the pool's leaf statistics, occupancy, call sites, and which shape the last reduce took.
 
@@ -148,13 +148,13 @@ Objects: `Flynnel.TraceState`, `Flynnel.TraceCounters`, `Flynnel.LeafStatRow`, `
 
 Enumerations: `Flynnel.NoReadingReason`, `Flynnel.ReducePath`.
 
-`Set-FlynnelTraceState` could not exist until the crate stopped latching its flag: the ring was armed by an environment variable read once, and a module cannot set the environment of a process it is already inside. `Get-FlynnelTraceState` reports `EnabledBy` as real provenance — the variable until a setter has decided, and the command after.
+`Set-FlynnelTraceState` could not exist until the crate stopped latching its flag: the ring was armed by an environment variable read once, and a module cannot set the environment of a process it is already inside. `Get-FlynnelTraceState` reports `EnabledBy` as real provenance: the variable until a setter has decided, and the command after.
 
 `Get-FlynnelSpread` answers two statistics rather than one. The spread reads the extremes and one stalled sample moves it; the interquartile range reads the middle half and does not. A run with a wide spread and a narrow range was steady with an interruption in it, which is a different finding from one that was not steady.
 
 `Get-FlynnelCallSite` is the per-location half: the scheduler keeps a classifier per source location, so two callers of the same kernel with different workloads each get their own rather than averaging into one. `Reset-FlynnelCallSite` clears what they learned, which is what lets two arms of a comparison run in the same process. It supports `-WhatIf` and asks first.
 
-## Calibration — 15 commands
+## Calibration - 15 commands
 
 What the scheduler measured about this host, what it decided from it, and how to make it measure again.
 
@@ -186,7 +186,7 @@ The store is shared by every process on the host, so `Clear-FlynnelCalibrationSt
 
 A stored CPU record says what its trust verdict is made of. `IsTrustworthy` is `Samples` and `Confirmations` both above zero, not a spread test, because reproducibility is a property of two draws and no statistic over one draw's samples substitutes for a second draw agreeing. `OccupancyPerMille` is beside them: the spread says whether the samples agreed with each other, and only occupancy says whether they agreed on the wrong number because a neighbour held half the machine.
 
-## Rings — 9 commands
+## Rings - 9 commands
 
 The scheduler's own in-process queues, each bound over a byte payload because a script has no Rust type to offer.
 
@@ -208,7 +208,7 @@ Enumerations: `Flynnel.PushKind`, `Flynnel.PopKind`, `Flynnel.RingRole`.
 
 Methods on a push side: `Push`, `PushMany`, `Stat`. On a pop side: `Pop`, `PopMany`, `Stat`. A ring or an injector, which drives both ends, also has `Len`, `IsEmpty` and `IsFull`. A notify sender adds `Shutdown`. Every handle carries `Id`, `Role` and, where it is one of a set, `Index`.
 
-**A ring refuses; it does not park.** A full ring hands the item back and the caller decides. A push answers `Accepted`, and when it did not, carries the item it refused — so a full ring costs a retry and never costs data, including through `Send-FlynnelItem`, which writes a refused item back to the pipeline instead of dropping it.
+**A ring refuses; it does not park.** A full ring hands the item back and the caller decides. A push answers `Accepted`, and when it did not, carries the item it refused, so a full ring costs a retry and never costs data, including through `Send-FlynnelItem`, which writes a refused item back to the pipeline instead of dropping it.
 
 **A batch stops at the first refusal** rather than skipping past it, because a ring is ordered and carrying on would deliver later items ahead of an earlier one. The outcomes come back one per item attempted, so their count says how far it got.
 
@@ -219,6 +219,98 @@ Methods on a push side: `Push`, `PushMany`, `Stat`. On a pop side: `Pop`, `PopMa
 **`DepthKnown` on a stat row** says whether `Depth`, `IsEmpty` and `IsFull` mean anything for that shape. Only the general ring, the injector and the notify handles expose a reader for the ring behind them; on the rest a zero depth would otherwise read as an empty ring.
 
 The single-owner shapes are a contract the module cannot enforce. An SPSC producer and consumer carry a `Cell` cursor and no synchronization because the crate expects exactly one thread on each; handing the same producer to two runspaces corrupts the ring and nothing here can detect it. The two ends come back as two objects for that reason.
+
+## Backends and accelerator ops - 4 commands
+
+What devices this host has, and where an operation would run. This family inspects; it launches nothing.
+
+| command | alias | answers |
+|---|---|---|
+| `Get-FlynnelBackend` | `Get-FlyBackend` | a row per backend kind, on every host |
+| `Test-FlynnelBackend` | `Test-FlyBackend` | runs the probe now rather than at startup |
+| `Get-FlynnelAccelOp` | `Get-FlyAccelOp` | every registered operation and its bindings |
+| `Get-FlynnelAccelTarget` | `Get-FlyAccelTarget` | where one would route under a plan |
+
+Objects: `Flynnel.Backend`, `Flynnel.BackendProbe`, `Flynnel.AccelOp`, `Flynnel.AccelTarget`. Enumeration: `Flynnel.BackendKind`.
+
+**An absent device is a row, never a missing row.** The module ships with every backend feature on, so the code for each is present everywhere and absence is always a runtime fact.
+
+**Registered, Available and Detected are three questions.** Registered is whether an implementation is in the process registry; Available is whether the host's probe found the runtime; Detected is whether the crate's own sweep listed it. They come apart in both directions: a CUDA runtime loads on a machine with no card, and a consumer-registered backend is registered with no probe having passed. Each row also carries the text of what its probe looked at.
+
+**A capability of zero is not a capability.** An unregistered backend has no implementation to ask, so its capability columns are zeros; `CapabilitiesKnown` separates that from a measured zero, which the CPU backend genuinely has for host-to-device bandwidth.
+
+There is no Register cmdlet for either a backend or an accelerator op. `register_backend` takes an `Arc<dyn DispatchBackend>` and `register_accel_op` takes a Rust closure; a script has neither, and the Get that replaces each says so.
+
+## Hybrid - 4 commands
+
+The CPU half and the device half of one call, and what the scheduler learns from running them.
+
+| command | alias | shape |
+|---|---|---|
+| `Measure-FlynnelHybridJoin` | `Measure-FlyHybridJoin` | two halves concurrently at a fixed share |
+| `Measure-FlynnelHybridPlacement` | `Measure-FlyHybridPlacement` | the side this call site has learned to prefer |
+| `Measure-FlynnelHybridSplit` | `Measure-FlyHybridSplit` | a range divided by measured per-item cost |
+| `Measure-FlynnelHybridPipeline` | `Measure-FlyHybridPipeline` | a three-stage CPU-device-CPU pipeline |
+
+Objects: `Flynnel.HybridJoin`, `Flynnel.HybridPlacement`, `Flynnel.HybridSplit`, `Flynnel.HybridPipeline`. Enumeration: `Flynnel.Placement`.
+
+**These measure; they do not transform your data.** A hybrid shape splits one call between the calling thread and one backend thread, and `Invoke-FlynnelMap` puts the whole pool on the same work. The work these run is declared and synthetic, sized by `-Count` and weighted by `-Repetitions`, and nothing crosses the boundary but the report.
+
+**With no device registered the backend half is the CPU backend.** Both halves still run concurrently and the timings are real; every row carries `BackendIsCpu` so a reading taken that way is never read as a device measurement.
+
+**Racing is the calibration.** A cold size bucket runs both sides and times each, a warm bucket runs only the cheaper one, and every thirty-second call re-races so the model tracks drift. A bucket pays double work once rather than needing an offline pass.
+
+**The learned state belongs to the cmdlet, not to your script.** The site is this module's own source location, so every caller in a session shares one per size bucket. `Get-FlynnelCallSite` reads it and `Reset-FlynnelCallSite` clears it.
+
+**A cold size does not start even.** `Measure-FlynnelHybridSplit` reads the site's overall ratio at a size it has no data for, so an even first share means the site as a whole is even. The model records per-item cost as a whole number of nanoseconds, so at the default of one repetition both sides truncate to the same integer and no difference can be resolved; `-BackendRepetitions` makes the backend side dearer per item, which is how the model can be seen to respond on a host with no device.
+
+## The GPU peer - 6 commands
+
+The GPU joins the scheduler as a shared-memory peer over a driver-registered mapped region.
+
+| command | alias | answers |
+|---|---|---|
+| `Get-FlynnelPeerWatchdog` | `Get-FlyPeerWatchdog` | what bounds a piece of device work, on any host |
+| `Get-FlynnelWavePlan` | `Get-FlyWavePlan` | how a wave should keep its frontier |
+| `New-FlynnelGpuPeerConfig` | `New-FlyGpuPeerConfig` | the settings a peer starts from |
+| `New-FlynnelGpuPeer` | `New-FlyGpuPeer` | starts the peer |
+| `Get-FlynnelGpuPeer` | `Get-FlyGpuPeer` | the live peer, or a row saying there is none |
+| `Remove-FlynnelGpuPeer` | `Remove-FlyGpuPeer` | tears it down now |
+
+Objects: `Flynnel.PeerWatchdog`, `Flynnel.WavePlan`, `Flynnel.GpuPeerConfig`, `Flynnel.GpuPeer`. Enumerations: `Flynnel.DriverModel`, `Flynnel.Frontier`.
+
+**Two of these need no device.** The watchdog reading is the driver model and the registry, and the wave planner is a cost model over numbers the caller supplies. Both answer the same on a machine with no card, which is what makes them the two a script can rely on before a peer exists.
+
+**A failed read is treated as covered.** Where the driver model or the TDR setting cannot be read, the documented delay is taken and `Basis` says which read failed. The direction is deliberate: a watchdog that is present and treated as absent ends in a device reset, while one treated as present only shortens slices.
+
+**`DelayNs` is null, never zero.** A bound of two seconds and no bound at all must not be the same column value, and `Applies` is what a script branches on.
+
+**One peer per process.** It owns a device context, a mapped region and a resident kernel; a start made while one runs is refused. Teardown is a cmdlet rather than a Dispose on a handle, because a handle released by the garbage collector would free a device context at a moment nothing chose.
+
+**Starting a peer replaces a caller's own CUDA context.** The peer works on the device primary context. `DisplacedForeignContext` says when that happened, so a consumer learns it here rather than at a launch far from the cause.
+
+**The team width is clamped to the device.** A team wider than the device loses ranks at its barrier. `TeamSize` is what ran, `BlocksPerLaneRequested` is what was asked for, and `TeamNarrowed` says whether the clamp fired.
+
+## Verification and the mode region - 4 commands
+
+| command | alias | answers |
+|---|---|---|
+| `New-FlynnelVerifyChain` | `New-FlyVerifyChain` | a chain that roots a sequence of chunks |
+| `Compare-FlynnelVerifyChain` | `Compare-FlyVerifyChain` | whether two chains agree, and where they first do not |
+| `Get-FlynnelMatrixBackend` | `Get-FlyMatrixBackend` | every registered tile backend |
+| `Test-FlynnelModeRegion` | `Test-FlyModeRegion` | whether a region's exit pairs its enter |
+
+Objects: `Flynnel.VerifyChain`, `Flynnel.VerifyComparison`, `Flynnel.MatrixBackend`, `Flynnel.ModeRegionCheck`. Enumeration: `Flynnel.VerifyHasher`.
+
+Methods on a chain: `Add`, `AddMany`, `Root`.
+
+**The comparison names an index, not just a disagreement.** The crate's chain answers a root and nothing else, so the module keeps a digest of each chunk beside it. A chain answers its root once and holds it, because the crate's `finalize` consumes the hasher and a second call would answer thirty-two zero bytes.
+
+**A prefix is not a corrupted chunk.** Two chains of different lengths that agree on everything they both hold report `LengthsDiffer` with no diverging index.
+
+**Two hashers root differently over the same bytes.** A comparison across them says nothing about the traces, so `HashersDiffer` is a column and the cmdlet warns.
+
+**`Get-FlynnelMatrixBackend` writes one row today, the scalar fallback.** The crate carries the CGRA substrate and no tile backend implements it yet, so a host with AMX or SME has nothing here to select. That is a row saying so rather than an empty listing, which would read as a family that failed to enumerate.
 
 ## Conventions across every family
 
