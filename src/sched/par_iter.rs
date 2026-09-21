@@ -979,25 +979,67 @@ pub fn host_dispatch_profile() -> HostDispatchProfile {
     // stores until the innermost one finishes, so the nesting is
     // bounded only by how many dispatchers arrive during the window,
     // and a worker's stack is not.
-    //
-    // The mutex this replaced made a second arrival block until the
-    // first finished. This makes it return zeros instead, which route
-    // conservatively: nothing collapses inline, every leaf sizes from
-    // one item, and every dispatch takes the wake path. That holds for
-    // the tens of milliseconds one calibration takes and never again in
-    // the process, so it costs nothing a measurement can see.
     if CALIBRATING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
+        .is_ok()
     {
+        let _in_flight = CalibrationInFlight;
+        return calibrate_host_dispatch();
+    }
+    // Somebody else is measuring. Who this caller is decides what it
+    // gets, and the two cases must not be merged: the mutex this
+    // replaced made every second arrival wait, and handing every
+    // second arrival zeros instead broke the tests that expect a small
+    // job to collapse inline, because they arrived during another
+    // test's calibration and routed on a threshold of zero.
+    //
+    // A pool worker cannot wait. The calibration is waiting on the
+    // pool, possibly on this very worker, so a worker that blocked
+    // here would deadlock it. It takes zeros, which route
+    // conservatively for the one job it is running: nothing collapses
+    // inline, every leaf sizes from one item, the dispatch takes the
+    // wake path. That is the whole cost of breaking the recursion.
+    if !crate::sched::arena_local::current_worker_ctx().is_null() {
         return HostDispatchProfile {
             dispatch_cost_ns: 0,
             collapse_threshold_ns: 0,
             jec_wake_threshold_ns: 0,
         };
     }
-    let _in_flight = CalibrationInFlight;
-    calibrate_host_dispatch()
+    // Anyone else waits for the real figures, as it always did. The
+    // wait is the tens of milliseconds one calibration takes, once per
+    // process, and it spins first because the publish is usually a
+    // few microseconds away, then yields so a preempted calibrator gets
+    // its core back.
+    //
+    // A calibrator that panics drops the flag without publishing. A
+    // waiter that only watched the threshold would then spin for the
+    // life of the process, so when the flag is down and nothing is
+    // published the waiter takes the flag and measures itself.
+    let mut spins = 0u32;
+    loop {
+        let collapse = HOST_COLLAPSE_THRESHOLD_NS.load(Ordering::Acquire);
+        if collapse != 0 {
+            return HostDispatchProfile {
+                dispatch_cost_ns: HOST_DISPATCH_COST_NS.load(Ordering::Relaxed),
+                collapse_threshold_ns: collapse,
+                jec_wake_threshold_ns: HOST_JEC_WAKE_THRESHOLD_NS.load(Ordering::Relaxed),
+            };
+        }
+        if CALIBRATING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _in_flight = CalibrationInFlight;
+            return calibrate_host_dispatch();
+        }
+        if spins < 1_000 {
+            spins += 1;
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// Set for as long as a calibration started from
