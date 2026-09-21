@@ -9,25 +9,34 @@
 //! shared head/tail counter on the steal path** - each thief has
 //! its own state byte and never CASes a contended atomic.
 //!
-//! ## Wait strategy: runtime dispatch on WAITPKG
+//! ## Wait strategy: a spin floor, then whatever monitor the host has
 //!
-//! Thieves idle on their mailbox's state byte. The wait primitive
-//! is chosen at runtime by [`crate::cpu_info::has_waitpkg`]:
+//! Thieves idle on their mailbox's state byte. Every wait begins with
+//! [`SPIN_BEFORE_WAIT`] polls, so a publish already in flight is
+//! caught at spin latency and reaches no monitor at all. What follows
+//! the floor is chosen at runtime from CPUID:
 //!
 //! - **WAITPKG available** (Intel Tremont/Tiger Lake+, AMD Zen 5+):
-//!   thief uses `UMONITOR` + `UMWAIT` to halt until the cache line
-//!   transitions OR a TSC deadline fires. Power-efficient; the
-//!   thief doesn't burn pipeline slots polling.
-//! - **WAITPKG not available**: thief uses [`std::hint::spin_loop`]
-//!   (PAUSE on x86) in a tight Acquire-load loop on the state byte.
+//!   `UMONITOR` + `UMWAIT` halt until the cache line transitions OR a
+//!   TSC deadline fires. Power-efficient; the thief doesn't burn
+//!   pipeline slots polling.
+//! - **MONITORX available** (AMD 2015+, everything before Zen 5):
+//!   `MONITORX` + `MWAITX` on the same terms.
+//! - **Neither**: [`std::hint::spin_loop`] (PAUSE on x86) in a tight
+//!   Acquire-load loop on the state byte.
 //!
-//! `MONITORX` + `MWAITX` is implemented as a third strategy and is
-//! not picked automatically: measured against the spin it is slower
-//! in three cells of four. See [`WaitStrategy::pick`] for the table
-//! and for what the measurement does not cover.
+//! All three end the wait when `state` carries the ready bit for the
+//! expected epoch.
 //!
-//! Both branches end the wait when `state` carries the ready bit
-//! for the expected epoch.
+//! What the second stage buys is a core it stops occupying, and that
+//! is measured by the co-runner group in `benches/urd_thief_wait.rs`,
+//! which times the thief's neighbours rather than the thief. Until
+//! that group has run on a host, the choice above rests on the
+//! instruction being present and not on it being cheaper there:
+//! [`crate::sched::sleep::WaitController`] found the same monitor
+//! wait four to fourteen times better on one part and twenty times
+//! worse on another. Nothing here calls [`UrdDeque::wait_and_drain`]
+//! yet except that bench.
 //!
 //! ## Why this shape vs Chase-Lev / LOH / KHPD
 //!
@@ -104,9 +113,9 @@ impl WaitStrategy {
     ///
     /// The spin runs first and always, and is what makes a short wait
     /// fast. This is the second stage and its job is to stop a long
-    /// wait holding a core. Treating the two as alternatives, and
-    /// picking between them on one measurement, was the earlier
-    /// mistake here.
+    /// wait holding a core. They are stages rather than alternatives,
+    /// so a measurement that ranks one against the other is answering
+    /// a question neither of them poses.
     ///
     /// Measured on a 7900X with NO floor, so the monitor wait was
     /// doing the spin's job as well as its own, publish to drained,
