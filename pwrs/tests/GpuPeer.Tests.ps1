@@ -309,11 +309,18 @@ Describe 'Get-FlynnelLinalgMethod' {
     # when the kernels were written, so every assertion holds on a host
     # with no card.
 
-    It 'names both methods and both Jacobi shapes' {
+    It 'shapes the choice row the way its cmdlet documents' {
+        @(Get-FlynnelTypeProperty -TypeName 'Flynnel.LinalgChoice').Count |
+            Should -BeGreaterThan 0
+    }
+
+    It 'names both methods, both Jacobi shapes and both operations' {
         [enum]::GetNames([Flynnel.LinalgMethod]) | Should -Contain 'Jacobi'
         [enum]::GetNames([Flynnel.LinalgMethod]) | Should -Contain 'Bisection'
         [enum]::GetNames([Flynnel.JacobiShape]) | Should -Contain 'BlockPerMatrix'
         [enum]::GetNames([Flynnel.JacobiShape]) | Should -Contain 'ThreadPerMatrix'
+        [enum]::GetNames([Flynnel.LinalgOp]) | Should -Contain 'Syev'
+        [enum]::GetNames([Flynnel.LinalgOp]) | Should -Contain 'Gesvd'
     }
 
     It 'crosses to bisection at the measured dimension for eigenvalues' {
