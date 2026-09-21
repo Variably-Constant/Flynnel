@@ -1328,6 +1328,31 @@ reason = "internal-to-another-surface"
 note = "the routing decision, bound as Get-FlynnelCrossProcessRoute and Get-FlynnelCrossProcessVariant. DequeVariant is exported as Flynnel.DequeVariant; WorkloadShape becomes the route cmdlet's parameters and DispatcherRoutingTable's layering becomes the FromExplicitCell and HeuristicVariant columns. CrossProcessDispatcher itself submits work to a peer, which waits on a peer existing"
 
 [[entry]]
+item = "crate::backend::shared_mem::chase_lev_backend"
+reason = "unsafe-or-structural"
+note = "the DispatchBackend wrapper around the mapped-file Chase-Lev deque: constructing one maps a file and registers it, and its accessors hand out the deque itself. Get-FlynnelCrossProcessVariant reports what the variant can carry and Get-FlynnelCrossProcessRoute reports when it would be chosen, which is the part a script acts on"
+
+[[entry]]
+item = "crate::backend::shared_mem::loh_backend"
+reason = "unsafe-or-structural"
+note = "the same wrapper around the LCRQ-on-LIFO deque. Same reasoning"
+
+[[entry]]
+item = "crate::backend::shared_mem::khpd_backend"
+reason = "unsafe-or-structural"
+note = "the same wrapper around the batched publication deque. Same reasoning"
+
+[[entry]]
+item = "crate::backend::shared_mem::urd_backend"
+reason = "unsafe-or-structural"
+note = "the same wrapper around the per-thief mailbox deque. Same reasoning"
+
+[[entry]]
+item = "crate::backend::shared_mem::dispatch_calibration"
+reason = "internal-to-another-surface"
+note = "measures each variant's per-call cost on this host and pins the cells where a measurement disagrees with the fixed rule. Get-FlynnelCrossProcessRoute reports which of the two decided a routing, through FromExplicitCell and HeuristicVariant; running the calibration needs a peer draining the other end, which is the unbuilt half of this family"
+
+[[entry]]
 item = "crate::backend::shared_mem::pass_registry"
 reason = "internal-to-another-surface"
 note = "bound as Get-FlynnelPassRegistry, which answers the count and whether a named or numbered pass is registered here. register takes the handler as a Rust closure, so there is no Register cmdlet and the Get says so; execute runs one on behalf of a peer and is reached by the drain loop rather than by a caller"
