@@ -25,10 +25,12 @@
 //! tolerate running twice - the `hybrid_auto` contract. Every
 //! failure lands on the CPU impl.
 
-use std::sync::{Arc, OnceLock, RwLock};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::backend::{Backend, BackendError, KernelArg, KernelHandle, backend_by_id};
+use crate::sched::hazard::HazardDomain;
 use crate::sched::call_site::{Placement, caller_site};
 use crate::sched::plan::JobPlan;
 
@@ -57,21 +59,91 @@ struct AccelOp {
     cpu: CpuImpl,
     /// Per-backend kernel bindings in binding order. A `Vec` rather
     /// than a map so "first bound" is deterministic.
-    kernels: RwLock<Vec<(Backend, KernelHandle)>>,
+    ///
+    /// Replaced whole rather than edited in place: binding happens at
+    /// startup and reading happens on every dispatch, so the cost
+    /// belongs on the writer. A reader follows the pointer under a
+    /// hazard and the replaced list is freed once no reader holds it.
+    kernels: AtomicPtr<Bindings>,
 }
 
-fn registry() -> &'static RwLock<Vec<Arc<AccelOp>>> {
-    static REGISTRY: OnceLock<RwLock<Vec<Arc<AccelOp>>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
+type Bindings = Vec<(Backend, KernelHandle)>;
+
+/// Registered ops the table can hold. Ops are registered at startup
+/// and never removed, and an [`AccelOpId`] IS the index, so there is
+/// no hashing and no probing here.
+const MAX_OPS: usize = 1024;
+
+/// Threads that may route a dispatch, and replaced binding lists
+/// awaiting a sweep.
+const READERS: usize = 256;
+const RETIRED: usize = 64;
+
+static OPS: [AtomicPtr<AccelOp>; MAX_OPS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_OPS];
+static NEXT_OP: AtomicU32 = AtomicU32::new(0);
+static BINDINGS: HazardDomain<Bindings, READERS, RETIRED> = HazardDomain::new();
+
+fn binding_reader() -> usize {
+    thread_local! {
+        static READER: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
+    }
+    READER.with(|cell| {
+        let held = cell.get();
+        if held != usize::MAX {
+            return held;
+        }
+        let fresh = BINDINGS.claim_reader();
+        cell.set(fresh);
+        fresh
+    })
 }
 
-fn op_by_id(op: AccelOpId) -> Arc<AccelOp> {
-    registry()
-        .read()
-        .expect("accel op registry poisoned")
+fn op_by_id(op: AccelOpId) -> &'static AccelOp {
+    let slot = OPS
         .get(op.0 as usize)
-        .cloned()
-        .expect("AccelOpId not issued by register_accel_op")
+        .expect("AccelOpId not issued by register_accel_op");
+    let published = slot.load(Ordering::Acquire);
+    assert!(
+        !published.is_null(),
+        "AccelOpId {} was not issued by register_accel_op",
+        op.0
+    );
+    // SAFETY: a published slot holds a leaked AccelOp that is never
+    // freed or moved.
+    unsafe { &*published }
+}
+
+/// Replace `op`'s binding list by applying `edit` to a copy, retrying
+/// when a concurrent binding wins the swap.
+fn update_bindings(op: &'static AccelOp, edit: impl Fn(&mut Bindings)) {
+    loop {
+        let current = op.kernels.load(Ordering::Acquire);
+        // SAFETY: the list is published before the pointer and is
+        // freed only once no reader holds it; the compare-exchange
+        // below fails if it has been replaced meanwhile.
+        let mut next: Bindings = unsafe { &*current }.clone();
+        edit(&mut next);
+        let fresh = Box::into_raw(Box::new(next));
+        match op
+            .kernels
+            .compare_exchange(current, fresh, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(replaced) => {
+                // SAFETY: the compare-exchange removed it from the only
+                // source a reader can reach, and it is retired once.
+                unsafe { BINDINGS.retire(replaced) };
+                return;
+            }
+            Err(winner) => {
+                // Another binding landed first, so the copy built here
+                // is stale and the next pass rebuilds it from theirs.
+                debug_assert!(!winner.is_null(), "a binding list is never null");
+                // SAFETY: never published, so nothing else reaches it.
+                drop(unsafe { Box::from_raw(fresh) });
+            }
+        }
+    }
 }
 
 /// Register an accelerator-routable op: a CPU implementation plus a
@@ -83,15 +155,21 @@ pub fn register_accel_op<F>(name: &str, bytes_per_item: u32, cpu: F) -> AccelOpI
 where
     F: Fn(u32, &[KernelArg<'_>]) + Send + Sync + 'static,
 {
-    let mut guard = registry().write().expect("accel op registry poisoned");
-    let id = AccelOpId(guard.len() as u32);
-    guard.push(Arc::new(AccelOp {
+    let index = NEXT_OP.fetch_add(1, Ordering::AcqRel) as usize;
+    assert!(
+        index < MAX_OPS,
+        "accel op table sized for {MAX_OPS} ops, {name:?} asked to be the {index}th"
+    );
+    let op: &'static AccelOp = Box::leak(Box::new(AccelOp {
         name: name.to_string(),
         bytes_per_item,
         cpu: Arc::new(cpu),
-        kernels: RwLock::new(Vec::new()),
+        kernels: AtomicPtr::new(Box::into_raw(Box::new(Bindings::new()))),
     }));
-    id
+    // The op is complete before the pointer that publishes it, so a
+    // reader that sees a non-null slot sees a whole op.
+    OPS[index].store(op as *const AccelOp as *mut AccelOp, Ordering::Release);
+    AccelOpId(index as u32)
 }
 
 /// Compile-and-bind: register `source` (backend-native kernel text,
@@ -117,12 +195,12 @@ pub fn bind_accel_kernel(
 /// replaces the previous handle.
 pub fn bind_accel_kernel_handle(op: AccelOpId, backend: Backend, handle: KernelHandle) {
     let op = op_by_id(op);
-    let mut guard = op.kernels.write().expect("accel op kernel table poisoned");
-    if let Some(slot) = guard.iter_mut().find(|(b, _)| *b == backend) {
-        slot.1 = handle;
-    } else {
-        guard.push((backend, handle));
-    }
+    update_bindings(op, |bindings| {
+        match bindings.iter_mut().find(|(b, _)| *b == backend) {
+            Some(slot) => slot.1 = handle,
+            None => bindings.push((backend, handle)),
+        }
+    });
 }
 
 /// The accelerator this op would route to right now, or `None` when
@@ -132,9 +210,15 @@ pub fn bind_accel_kernel_handle(op: AccelOpId, backend: Backend, handle: KernelH
 /// first bound-and-registered backend.
 pub fn accel_target(plan: &JobPlan, op: AccelOpId) -> Option<(Backend, KernelHandle)> {
     let op = op_by_id(op);
-    let guard = op.kernels.read().expect("accel op kernel table poisoned");
+    let guard = BINDINGS.protect(binding_reader(), &op.kernels);
+    let bound = match guard.get() {
+        Some(bindings) => bindings,
+        // The list is installed when the op is registered, so this is
+        // unreachable rather than an empty binding set.
+        None => return None,
+    };
     let bound_and_registered = |b: Backend| -> Option<(Backend, KernelHandle)> {
-        let handle = guard.iter().find(|(k, _)| *k == b).map(|(_, h)| *h)?;
+        let handle = bound.iter().find(|(k, _)| *k == b).map(|(_, h)| *h)?;
         backend_by_id(&b)?;
         Some((b, handle))
     };
@@ -149,7 +233,7 @@ pub fn accel_target(plan: &JobPlan, op: AccelOpId) -> Option<(Backend, KernelHan
     {
         return Some(found);
     }
-    guard
+    bound
         .iter()
         .find(|(b, _)| backend_by_id(b).is_some())
         .map(|(b, h)| (*b, *h))
@@ -383,29 +467,35 @@ pub struct RegisteredAccelOp {
 /// the position anything inspecting the process from outside is in,
 /// including a binding.
 ///
-/// It takes the read lock once and copies, so nothing here holds a
-/// lock a dispatch might want. Not on any dispatch path: the routing
-/// in [`dispatch_accel`] reaches an op by index and never enumerates.
+/// It copies as it walks and holds nothing a dispatch might want. Not
+/// on any dispatch path: the routing in [`dispatch_accel`] reaches an
+/// op by index and never enumerates.
+///
+/// An op registered while the walk is past its index is not in the
+/// result. Ops are never removed, so one that is reported is real.
 pub fn registered_accel_ops() -> Vec<RegisteredAccelOp> {
-    let ops = match registry().read() {
-        Ok(guard) => guard,
-        // The registry is a vector that is only ever pushed to, so a
-        // panic elsewhere leaves it intact and refusing to read it
-        // would strand every later caller over an unrelated failure.
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    ops.iter()
-        .enumerate()
-        .map(|(index, op)| RegisteredAccelOp {
+    let reader = binding_reader();
+    let mut out = Vec::new();
+    for (index, slot) in OPS.iter().enumerate() {
+        let published = slot.load(Ordering::Acquire);
+        if published.is_null() {
+            continue;
+        }
+        // SAFETY: as in op_by_id.
+        let op = unsafe { &*published };
+        let guard = BINDINGS.protect(reader, &op.kernels);
+        let kernels = match guard.get() {
+            Some(bindings) => bindings.iter().map(|(backend, _)| *backend).collect(),
+            None => Vec::new(),
+        };
+        out.push(RegisteredAccelOp {
             op: AccelOpId(index as u32),
             name: op.name.clone(),
             bytes_per_item: op.bytes_per_item,
-            kernels: match op.kernels.read() {
-                Ok(k) => k.iter().map(|(backend, _)| *backend).collect(),
-                Err(poisoned) => poisoned.into_inner().iter().map(|(b, _)| *b).collect(),
-            },
-        })
-        .collect()
+            kernels,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
