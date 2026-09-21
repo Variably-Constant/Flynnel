@@ -134,6 +134,10 @@ pwrs::export_module! {
         verify::CompareFlynnelVerifyChain,
         verify::GetFlynnelMatrixBackend,
         verify::TestFlynnelModeRegion,
+        hybrid::MeasureFlynnelHybridJoin,
+        hybrid::MeasureFlynnelHybridPlacement,
+        hybrid::MeasureFlynnelHybridSplit,
+        hybrid::MeasureFlynnelHybridPipeline,
     ],
     classes: [
         host::CpuInfo,
@@ -201,6 +205,10 @@ pwrs::export_module! {
         verify::VerifyComparison,
         verify::MatrixBackend,
         verify::ModeRegionCheck,
+        hybrid::HybridJoin,
+        hybrid::HybridPlacement,
+        hybrid::HybridSplit,
+        hybrid::HybridPipelineRun,
     ],
     enums: [
         host::Vendor,
@@ -232,12 +240,14 @@ pwrs::export_module! {
         backends::BackendKind,
         levers::ServePolicy,
         verify::VerifyHasherKind,
+        hybrid::PlacementKind,
     ],
 }
 
 mod backends;
 mod calibration;
 mod host;
+mod hybrid;
 mod kernels;
 mod levers;
 mod observe;

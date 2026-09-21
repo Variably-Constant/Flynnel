@@ -743,6 +743,25 @@ item = "crate::backend::accel_op::LAUNCH_AMORTIZATION_FACTOR"
 reason = "internal-to-another-surface"
 note = "a constant of the routing gate, read while deciding whether a transfer is worth making. The decision it feeds is what Get-FlynnelAccelTarget reports"
 
+[[entry]]
+item = "crate::backend::accel_op::dispatch_accel"
+reason = "unsafe-or-structural"
+note = "runs one registered op, and every op registered anywhere in this crate takes its arguments as host pointers its CPU implementation dereferences: the three in gpu_peer::linalg read raw f64 addresses out of U64 arguments under an explicit registration contract that the buffers stay live, sized and unaliased for the whole call. Invoking one from a script means handing over the address of a pinned array, which is the pinning surface flynnel-118 owns. Get-FlynnelAccelTarget reports what this would route to, which is the part that needs no pointer"
+
+[[entry]]
+item = "crate::backend::accel_op::AccelReport"
+reason = "internal-to-another-surface"
+note = "what dispatch_accel answers. Its routing half is Flynnel.AccelTarget and its timing half is the Flynnel.Hybrid rows, which reach the same learned placement through join_hybrid rather than through a pointer"
+
+# ---------------------------------------------------------------------
+# Hybrid dispatch
+# ---------------------------------------------------------------------
+
+[[entry]]
+item = "crate::sched::hybrid::hybrid_auto_split"
+reason = "generic-over-caller-type"
+note = "splits a caller's own &mut [T] between the two sides, so the backend half borrows a slice it must also outlive. hybrid_auto_split_ranges is the same model over an index range and is bound as Measure-FlynnelHybridSplit; a script's data reaches the pool through the kernels family instead"
+
 # ---------------------------------------------------------------------
 # The levers: each accessor is a row rather than a cmdlet
 # ---------------------------------------------------------------------

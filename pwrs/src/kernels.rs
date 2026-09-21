@@ -397,35 +397,26 @@ pub struct InvokeFlynnelMap {
 /// element, so the closure carries plain numbers and a missing operand
 /// is refused before any work is dispatched.
 #[derive(Clone, Copy, Default)]
-struct MapOperands {
-    min: Option<f64>,
-    max: Option<f64>,
-    factor: Option<f64>,
-    addend: Option<f64>,
+pub(crate) struct MapOperands {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub factor: Option<f64>,
+    pub addend: Option<f64>,
 }
 
-/// Apply one element-wise operation across a slice on Flynnel's
-/// workers. Shared by the copying and the in-place cmdlets so the two
-/// cannot answer differently.
+/// The per-element body of one declared operation, with its operands
+/// already read. Every family that runs a declared map goes through
+/// this, so two of them cannot answer differently for the same
+/// operation.
 ///
-/// Dispatched with `for_each_chunk`, whose recursion floor is 256
-/// items, and not with `par_map_in_place`, which is one task per
-/// element. The crate says so plainly: par_map_in_place is for "few
-/// large units", the shape of per-row matrix work, and these
-/// operations are a multiply. Measured at 200,000 elements on pc2,
-/// one task an element cost 5.21 ms against a 0.16 ms input crossing,
-/// so the scheduling was 25 ns an element and the arithmetic was
-/// nothing.
-fn apply_map(
-    plan: &flynnel::JobPlan,
-    items: &mut [f64],
+/// `Send` as well as `Sync` because the hybrid family moves the body
+/// to a backend thread; the kernels family only shares it across
+/// workers.
+pub(crate) fn map_each(
     op: MapOp,
     operands: MapOperands,
-) -> PsResult<()> {
-    // Resolved once, outside the closure, so a missing operand is
-    // refused before any work is dispatched and the inner loop
-    // carries plain numbers.
-    let each: Box<dyn Fn(&mut f64) + Sync> = match op {
+) -> PsResult<Box<dyn Fn(&mut f64) + Send + Sync>> {
+    Ok(match op {
         MapOp::Clamp => {
             let (Some(lo), Some(hi)) = (operands.min, operands.max) else {
                 return Err(arg_err("Clamp needs both Min and Max").terminating());
@@ -458,7 +449,28 @@ fn apply_map(
         MapOp::Round => Box::new(|x: &mut f64| *x = x.round()),
         MapOp::Floor => Box::new(|x: &mut f64| *x = x.floor()),
         MapOp::Ceiling => Box::new(|x: &mut f64| *x = x.ceil()),
-    };
+    })
+}
+
+/// Apply one element-wise operation across a slice on Flynnel's
+/// workers. Shared by the copying and the in-place cmdlets so the two
+/// cannot answer differently.
+///
+/// Dispatched with `for_each_chunk`, whose recursion floor is 256
+/// items, and not with `par_map_in_place`, which is one task per
+/// element. The crate says so plainly: par_map_in_place is for "few
+/// large units", the shape of per-row matrix work, and these
+/// operations are a multiply. Measured at 200,000 elements on pc2,
+/// one task an element cost 5.21 ms against a 0.16 ms input crossing,
+/// so the scheduling was 25 ns an element and the arithmetic was
+/// nothing.
+fn apply_map(
+    plan: &flynnel::JobPlan,
+    items: &mut [f64],
+    op: MapOp,
+    operands: MapOperands,
+) -> PsResult<()> {
+    let each = map_each(op, operands)?;
     for_each_chunk(plan, items, |slice| {
         for x in slice {
             each(x);
