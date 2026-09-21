@@ -4429,6 +4429,7 @@ mod tests {
 
     #[test]
     fn for_each_chunk_zero_items_is_noop() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         let mut v: Vec<u32> = Vec::new();
         let plan = JobPlan::new(6, 1);
         for_each_chunk(&plan, &mut v, |slice| {
@@ -4441,6 +4442,7 @@ mod tests {
 
     #[test]
     fn bisect_variants_all_produce_identical_result() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         // Correctness baseline for the two BisectVariant entries:
         // same input through default (None, the lazy-steal path) and
         // through each variant must produce the same output. Forces n large enough that the probe-and-decide
@@ -4469,6 +4471,7 @@ mod tests {
 
     #[test]
     fn for_each_chunk_touches_every_element_exactly_once() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         let n = 10_000usize;
         let mut v: Vec<u32> = (0..n as u32).collect();
         let plan = JobPlan::new(6, n as u32);
@@ -4485,6 +4488,7 @@ mod tests {
 
     #[test]
     fn for_each_chunk_small_input_runs_serial() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         // An input carrying an authoritative per-item cost whose total
         // falls below this host's collapse threshold runs on the
         // calling thread without entering the pool.
@@ -4556,6 +4560,7 @@ mod tests {
 
     #[test]
     fn for_each_chunk_small_input_without_an_estimate() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         // The same small input with no authoritative cost. Here the
         // probe measures the body and routes on what it finds, so
         // whether the work lands on the calling thread or in the pool
@@ -4843,6 +4848,7 @@ mod tests {
 
     #[test]
     fn the_indexed_path_times_every_leaf_and_leaves_the_bracket_to_the_switch() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         // The indexed entry records through `record_leaf_bracket_sampled`,
         // which times every leaf and takes the bracket at the stride only
         // while `levers::oncore_spread` is on. That switch is read once
@@ -4967,6 +4973,7 @@ mod tests {
 
     #[test]
     fn triple_min_leaf_small_explicit_estimate_runs_on_the_caller() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         // 200 items at 1 ns each is 0.2 us of work, under any host's
         // measured dispatch cost: the body runs once, on the calling
         // thread.
@@ -4995,6 +5002,7 @@ mod tests {
 
     #[test]
     fn indexed_min_leaf_small_explicit_estimate_runs_on_the_caller() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         use std::sync::atomic::{AtomicUsize, Ordering};
         let n = 200usize;
         let mut v: Vec<u32> = vec![0; n];
@@ -5041,6 +5049,7 @@ mod tests {
 
     #[test]
     fn for_each_chunk_parallel_sum_matches_serial() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         // Use atomic counter to verify total work matches expected
         // count. for_each_chunk must produce the same total work
         // as a serial loop.
@@ -5342,6 +5351,10 @@ mod tests {
 
     #[test]
     fn for_each_chunk_propagates_panic() {
+        // Takes the lock like the others and poisons it on the way out,
+        // which the accessor tolerates. A deliberate panic here must
+        // not become a second failure in whichever test takes it next.
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         let mut v: Vec<u32> = (0..1000).collect();
         let plan = JobPlan::new(6, 1000);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -5418,6 +5431,7 @@ mod tests {
 
     #[test]
     fn for_each_chunk_ref_tiles_the_slice_once_at_the_requested_width() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         let n = 4_099usize;
         let width = 64usize;
         let v: Vec<u32> = (0..n as u32).collect();
@@ -5447,6 +5461,7 @@ mod tests {
 
     #[test]
     fn for_each_chunk_ref_empty_is_noop() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         let v: Vec<u32> = Vec::new();
         let plan = JobPlan::new(6, 0);
         for_each_chunk_ref(&plan, &v, 16, |_, _| panic!("must not run"));
@@ -5458,6 +5473,7 @@ mod tests {
     /// only `for_each_chunk`.
     #[test]
     fn a_worker_cap_of_one_keeps_every_entry_on_the_calling_thread() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         use std::sync::Mutex;
         // The dispatches below record heavy leaves into the global
         // classifier, which can migrate the process profile under a
@@ -5598,6 +5614,7 @@ mod tests {
     /// latches its site, and later calls dispatch instead.
     #[test]
     fn a_collapsed_body_that_overruns_stops_its_site_collapsing() {
+        let _stats_lock = crate::sched::split_observer::acquire_test_lock();
         use crate::sched::call_site::{CallSiteState, SiteRef};
         static SITE: CallSiteState = CallSiteState::new();
         let site = SiteRef::new(&SITE);
