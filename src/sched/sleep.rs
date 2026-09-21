@@ -139,6 +139,24 @@ pub fn monitor_doubts() -> (u32, u64) {
 /// numbers look like the StdPark ones beside it has usually fallen
 /// back, and without this that is indistinguishable from the wait
 /// being no faster.
+///
+/// # True does not mean the monitor wait ran
+///
+/// This starts true and goes false only after
+/// [`DOUBTS_BEFORE_GIVING_UP`] waits have each found the monitor not
+/// holding, and those are counted inside the MONITORX path. A process
+/// whose parker never chose that path executed no monitor wait,
+/// recorded no doubt, and leaves this reading true having observed
+/// nothing. True-after-none and true-after-thousands are the same
+/// value.
+///
+/// So this answers "has the monitor been given up on", never "was the
+/// monitor used". For the second, read
+/// [`WaitController::report`]: `switches` above zero with `in_use` of
+/// [`WaitStrategy::Monitorx`] is what says the parker moved, and
+/// `challenger_samples` of zero says the controller never sampled the
+/// arm at all. [`monitor_doubts`] beside them separates a monitor
+/// that was tried and held from one that was never tried.
 pub fn monitor_wait_held() -> bool {
     monitor_holds()
 }
