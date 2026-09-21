@@ -264,7 +264,7 @@ Objects: `Flynnel.HybridJoin`, `Flynnel.HybridPlacement`, `Flynnel.HybridSplit`,
 
 **A cold size does not start even.** `Measure-FlynnelHybridSplit` reads the site's overall ratio at a size it has no data for, so an even first share means the site as a whole is even. The model records per-item cost as a whole number of nanoseconds, so at the default of one repetition both sides truncate to the same integer and no difference can be resolved; `-BackendRepetitions` makes the backend side dearer per item, which is how the model can be seen to respond on a host with no device.
 
-## The GPU peer - 6 commands
+## The GPU peer - 7 commands
 
 The GPU joins the scheduler as a shared-memory peer over a driver-registered mapped region.
 
@@ -272,14 +272,15 @@ The GPU joins the scheduler as a shared-memory peer over a driver-registered map
 |---|---|---|
 | `Get-FlynnelPeerWatchdog` | `Get-FlyPeerWatchdog` | what bounds a piece of device work, on any host |
 | `Get-FlynnelWavePlan` | `Get-FlyWavePlan` | how a wave should keep its frontier |
+| `Get-FlynnelLinalgMethod` | `Get-FlyLinalgMethod` | which method a decomposition of this size and batch takes |
 | `New-FlynnelGpuPeerConfig` | `New-FlyGpuPeerConfig` | the settings a peer starts from |
 | `New-FlynnelGpuPeer` | `New-FlyGpuPeer` | starts the peer |
 | `Get-FlynnelGpuPeer` | `Get-FlyGpuPeer` | the live peer, or a row saying there is none |
 | `Remove-FlynnelGpuPeer` | `Remove-FlyGpuPeer` | tears it down now |
 
-Objects: `Flynnel.PeerWatchdog`, `Flynnel.WavePlan`, `Flynnel.GpuPeerConfig`, `Flynnel.GpuPeer`. Enumerations: `Flynnel.DriverModel`, `Flynnel.Frontier`.
+Objects: `Flynnel.PeerWatchdog`, `Flynnel.WavePlan`, `Flynnel.LinalgChoice`, `Flynnel.GpuPeerConfig`, `Flynnel.GpuPeer`. Enumerations: `Flynnel.DriverModel`, `Flynnel.Frontier`, `Flynnel.LinalgOp`.
 
-**Two of these need no device.** The watchdog reading is the driver model and the registry, and the wave planner is a cost model over numbers the caller supplies. Both answer the same on a machine with no card, which is what makes them the two a script can rely on before a peer exists.
+**Three of these need no device.** The watchdog reading is the driver model and the registry, the wave planner is a cost model over numbers the caller supplies, and the linalg method is a choice made from the size and the batch. All three answer the same on a machine with no card, which is what makes them the ones a script can rely on before a peer exists.
 
 **A failed read is treated as covered.** Where the driver model or the TDR setting cannot be read, the documented delay is taken and `Basis` says which read failed. The direction is deliberate: a watchdog that is present and treated as absent ends in a device reset, while one treated as present only shortens slices.
 
@@ -312,6 +313,46 @@ Methods on a chain: `Add`, `AddMany`, `Root`.
 
 **`Get-FlynnelMatrixBackend` writes one row today, the scalar fallback.** The crate carries the CGRA substrate and no tile backend implements it yet, so a host with AMX or SME has nothing here to select. That is a row saying so rather than an empty listing, which would read as a family that failed to enumerate.
 
+## Levers - 5 commands
+
+The runtime switches, the width this process is allowed, and which stored calibration it will serve.
+
+| command | alias | shape |
+|---|---|---|
+| `Get-FlynnelLever` | `Get-FlyLever` | every switch, or one by name |
+| `Set-FlynnelLever` | `Set-FlyLever` | writes one, then reads back what took effect |
+| `Get-FlynnelAllowedWidth` | `Get-FlyAllowedWidth` | the width this process may use |
+| `Get-FlynnelOccupancyFloor` | `Get-FlyOccupancyFloor` | the floor as a lever row |
+| `Get-FlynnelServePolicy` | `Get-FlyServePolicy` | which stored calibration is served to peers |
+
+Objects: `Flynnel.Lever`, `Flynnel.AllowedWidth`, `Flynnel.ServePolicyState`.
+
+**A lever resolves once, on first read, and stays resolved for the life of the process.** Each one is held in a `OnceLock`. Setting the environment variable after something has read it changes the variable and not the behavior.
+
+**So `Set-FlynnelLever` writes, reads the effective value back, and warns by name when the two disagree.** That disagreement is the case where the lever had already resolved. `Get-FlynnelLever` reports the same comparison as a column, so a script can see before it sets.
+
+**Reading resolves too.** A `Get` on a lever nothing has touched fixes it at whatever the variable says at that moment. Set first, then read.
+
+**Agreement is not proof the lever is still unresolved.** Disagreement proves it resolved before the variable was last written; agreement is consistent with both. The column is named for what it measures.
+
+## Cross-process - 3 commands
+
+Work that crosses a process boundary, and how it is routed there.
+
+| command | alias | shape |
+|---|---|---|
+| `Get-FlynnelCrossProcessVariant` | `Get-FlyCrossProcessVariant` | which deque variant a shape would use |
+| `Get-FlynnelCrossProcessRoute` | `Get-FlyCrossProcessRoute` | the routing table behind that answer |
+| `Get-FlynnelPassRegistry` | `Get-FlyPassRegistry` | the passes this process has registered |
+
+Objects: `Flynnel.DequeVariantInfo`, `Flynnel.CrossProcessRoute`, `Flynnel.PassRegistryInfo`.
+
+**The wire carries an id, never code.** A cross-process job cannot carry a closure, because the peer cannot dereference a pointer into this process's heap. It carries `(closure_id, args)` and the peer looks the id up in its own pass registry. That is the same shape the accelerator ops use at the device boundary, and it is what makes the family reachable from a script at all: a script names a pass the peer already holds.
+
+**All three answer without a peer process existing.** The variant a dispatch of a given shape would use is decided from the shape and the host, which is what a script sizing a dispatch wants before starting one; the registry reading is a reading of this process.
+
+**Submitting work to a peer is not bound.** Nor is the calibration that re-measures the routing table. Both need a second process.
+
 ## Racing - 2 commands
 
 Several attempts at one piece of work, and what taking the first of them buys.
@@ -327,7 +368,7 @@ Objects: `Flynnel.RaceOutcome`, `Flynnel.RaceArm`.
 
 **The call returns when every arm has returned.** Cancelling a loser stops it spending more; it does not hand the call back early. `SlowestArmNs` is what the call actually waited for.
 
-**`CancelledEarly` zero means different things in the two shapes.** On a race it means every loser finished before the winner's signal reached it, which is a fact about how even this host is. On an exploration it is the shape: nothing is cancelled. Raise `-Count` or `-Repetitions` to give a signal time to arrive.
+**`CancelledEarly` zero means different things in the two shapes.** On a race it means every loser finished before the winner's signal reached it, which is a fact about how even this host is. On an exploration it is the shape: nothing is canceled. Raise `-Count` or `-Repetitions` to give a signal time to arrive.
 
 **Only two of the crate's nine racing entry points are bound.** The other seven need an arm that can decline a contract it failed, refute a peer, or disagree with one. Every body this module can offer is a declared deterministic kernel, so a cmdlet over `race_agree` would always answer unanimous - a property of the binding rather than of the work.
 

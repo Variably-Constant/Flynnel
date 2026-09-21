@@ -259,7 +259,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   like the control row beside it.
 
 - **A PowerShell module, `pwrs/`, binding the scheduler surface
-  directly to the Rust.** 107 cmdlets, 78 classes and 36 enumerations
+  directly to the Rust.** 109 cmdlets, 79 classes and 36 enumerations
   over PWRS, plus a read-only `Flynnel:` drive. It is a binary module:
   no marshalling layer, no second implementation, and the objects a
   cmdlet writes are the crate's own readings.
