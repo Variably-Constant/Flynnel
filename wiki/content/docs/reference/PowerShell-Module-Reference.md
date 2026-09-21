@@ -345,7 +345,7 @@ Work that crosses a process boundary, and how it is routed there.
 | `Get-FlynnelCrossProcessRoute` | `Get-FlyCrossProcessRoute` | the routing table behind that answer |
 | `Get-FlynnelPassRegistry` | `Get-FlyPassRegistry` | the passes this process has registered |
 
-Objects: `Flynnel.DequeVariantInfo`, `Flynnel.CrossProcessRoute`, `Flynnel.PassRegistryInfo`.
+Objects: `Flynnel.DequeVariantInfo`, `Flynnel.CrossProcessRoute`, `Flynnel.PassRegistry`.
 
 **The wire carries an id, never code.** A cross-process job cannot carry a closure, because the peer cannot dereference a pointer into this process's heap. It carries `(closure_id, args)` and the peer looks the id up in its own pass registry. That is the same shape the accelerator ops use at the device boundary, and it is what makes the family reachable from a script at all: a script names a pass the peer already holds.
 

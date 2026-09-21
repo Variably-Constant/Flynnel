@@ -7,8 +7,9 @@
 //! finishes first, signalling the rest to stop. That is the
 //! tail-latency move: where an attempt's latency varies, firing a few
 //! and taking the earliest trims the slow tail. What it reports is
-//! what that trim is worth on this host - the winner's time against
-//! the slowest arm's.
+//! what that trim is worth on this host, as `TailRatio`: the slowest
+//! arm's time divided by the winner's, so 1.0 is a race that saved
+//! nothing and larger is more trimmed.
 //!
 //! `Measure-FlynnelExploreSelect` runs every attempt to completion and
 //! picks the best by a comparator. Nothing is cancelled, because a
