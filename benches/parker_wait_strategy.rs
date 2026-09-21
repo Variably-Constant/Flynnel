@@ -273,6 +273,72 @@ fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
     report_latch(&name, held_before);
 }
 
+/// Wake latency on a parker that follows the controller, with the
+/// controller's own state printed after.
+///
+/// Every other group here pins a strategy, so none of them executes
+/// the controller at all: they measure the arms it chooses between
+/// and say nothing about the choosing. This one leaves the parker
+/// unpinned, which is what a worker is.
+///
+/// Two things it answers. On a host with no second strategy it is
+/// the overhead arm: identical work to the pinned baseline group,
+/// differing only by the controller being consulted, so the gap
+/// between them is what the controller costs a host that can never
+/// use it. On a host with both it is the arm that has to end up at
+/// least as fast as the better of the two pinned groups, because
+/// otherwise the choosing is worse than either choice.
+fn bench_adaptive(c: &mut Criterion, gap_us: u64, loaded: bool) {
+    let _load = if loaded { Some(Load::spawn()) } else { None };
+    let arm = if loaded { "load" } else { "idle" };
+    let name = format!("parker_adaptive_{arm}_gap_{gap_us}us");
+    let mut group = c.benchmark_group(&name);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("unpark_to_return", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let ready = Arc::new(AtomicU32::new(0));
+                let returned = Arc::new(AtomicU32::new(0));
+                let returned_clone = Arc::clone(&returned);
+                let ready_clone = Arc::clone(&ready);
+                let (tx, rx) = std::sync::mpsc::channel::<Arc<Parker>>();
+                let owner = std::thread::spawn(move || {
+                    // Parker::new, not with_strategy: this is the
+                    // shape a worker has and the only one the
+                    // controller governs.
+                    let p = Arc::new(Parker::new(0));
+                    tx.send(Arc::clone(&p)).expect("send parker");
+                    let ok = p.park_until(|| ready.load(Ordering::Acquire) == 1);
+                    returned_clone.store(1, Ordering::Release);
+                    ok
+                });
+                let p_owner = rx.recv().expect("recv parker");
+                std::thread::sleep(Duration::from_micros(gap_us));
+                let t0 = Instant::now();
+                ready_clone.store(1, Ordering::Release);
+                p_owner.unpark();
+                while returned.load(Ordering::Acquire) == 0 {
+                    std::hint::spin_loop();
+                }
+                total += t0.elapsed();
+                owner.join().expect("owner join");
+            }
+            black_box(total)
+        });
+    });
+    group.finish();
+
+    let r = flynnel::sched::sleep::wait_controller().report();
+    eprintln!(
+        "parker_wait_strategy: after {name}, controller has baseline {} ns over {} samples, \
+         challenger {} ns over {} samples, in use {:?}, {} switch(es)",
+        r.baseline_ns, r.baseline_samples, r.challenger_ns, r.challenger_samples, r.in_use,
+        r.switches
+    );
+}
+
 fn bench_all(c: &mut Criterion) {
     // Which tree built this. Two hosts here carry a directory called
     // Flynnel-verify and they are different checkouts, so a run can
@@ -337,6 +403,16 @@ fn bench_all(c: &mut Criterion) {
                 bench_strategy(c, "monitorx", WaitStrategy::Monitorx, gap_us, loaded);
             }
         }
+    }
+
+    // The adaptive arm runs in both conditions and against the
+    // pinned groups above, which are its comparison: on a host with
+    // no challenger it should match the pinned baseline, and on one
+    // with a challenger it should end up no worse than the better
+    // pinned arm.
+    for loaded in [false, true] {
+        bench_adaptive(c, 50, loaded);
+        bench_adaptive(c, 500, loaded);
     }
 
     // Neighbours last, and only the two strategies a monitor wait can
