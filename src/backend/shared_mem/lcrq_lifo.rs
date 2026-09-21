@@ -42,10 +42,11 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering, fence};
 
 use memmap2::{MmapMut, MmapOptions};
+
+use super::stager::StagingTable;
 
 /// Magic byte sequence marking a valid LOH deque file. Reads as
 /// ASCII "FLLO" then a version byte. Distinct from the Chase-Lev
@@ -219,19 +220,21 @@ pub struct LohDeque {
     capacity_mask: i64,
     flush_threshold: usize,
     lifo_cap: usize,
-    /// Owner-side LIFO. `Mutex` is uncontended on the hot path
-    /// because, by protocol, only the originator thread pushes; the
-    /// Mutex exists to satisfy `Sync` for the surrounding
-    /// `Arc<LohDeque>` shape that `DispatchBackend` consumers want.
-    local_lifo: Mutex<Vec<LohLifoEntry>>,
+    /// Owner-side LIFOs, one per pushing thread. Only the originator
+    /// pushes, by protocol, so a buffer per thread carries that
+    /// protocol in the type rather than leaving a lock to stand in for
+    /// it while the `Arc<LohDeque>` shape that `DispatchBackend`
+    /// consumers want supplies `Sync`. See [`super::stager`] for what
+    /// the lock it replaces cost.
+    local_lifo: StagingTable<LohLifoEntry>,
 }
 
 // SAFETY: All fields are Send. Mmap handle is Send+Sync per memmap2;
 // every ring access goes through the LCRQ sequence-number protocol
 // (per-slot Acquire/Release pair) so concurrent producers and
-// consumers see a consistent view. The Mutex around the LIFO
-// linearizes owner-side accesses across any thread the originator
-// happens to schedule the push on.
+// consumers see a consistent view. The LIFOs need no linearizing:
+// each belongs to one pushing thread, so no two accesses to one
+// buffer can be concurrent.
 unsafe impl Send for LohDeque {}
 // SAFETY: Same justification as the `Send` impl directly above.
 unsafe impl Sync for LohDeque {}
@@ -319,7 +322,7 @@ impl LohDeque {
             capacity_mask: (capacity as i64) - 1,
             flush_threshold,
             lifo_cap: DEFAULT_LIFO_CAP,
-            local_lifo: Mutex::new(Vec::with_capacity(DEFAULT_LIFO_CAP)),
+            local_lifo: StagingTable::new(),
         })
     }
 
@@ -371,7 +374,7 @@ impl LohDeque {
             capacity_mask: (capacity as i64) - 1,
             flush_threshold,
             lifo_cap: DEFAULT_LIFO_CAP,
-            local_lifo: Mutex::new(Vec::with_capacity(DEFAULT_LIFO_CAP)),
+            local_lifo: StagingTable::new(),
         })
     }
 
@@ -416,55 +419,50 @@ impl LohDeque {
         let h = self.header();
         let head = h.head.load(Ordering::Acquire);
         let tail = h.tail.load(Ordering::Acquire);
-        let lifo_len = self
-            .local_lifo
-            .try_lock()
-            .map(|g| g.len())
-            .unwrap_or(0);
-        (head, tail, tail - head, lifo_len)
+        // Totals every staging thread's LIFO, so it answers what the
+        // deque is holding rather than what the caller has staged.
+        (head, tail, tail - head, self.local_lifo.staged_total())
     }
 
     /// Owner-side push. Stages the item in the local LIFO; when the
     /// LIFO reaches `flush_threshold` an automatic [`Self::flush`]
     /// fires that drains the LIFO into the ring tail.
     ///
-    /// **Only the owner process may call this.**
+    /// Each staging thread pushes into its own LIFO, so a threshold
+    /// here is a local decision and never moves because another thread
+    /// pushed.
     pub fn push(&self, entry: LohLifoEntry) -> Result<(), PushError> {
-        let mut lifo = self
-            .local_lifo
-            .lock()
-            .expect("LOH local LIFO mutex poisoned");
-        if lifo.len() >= self.lifo_cap {
-            return Err(PushError::LifoFull);
-        }
-        lifo.push(entry);
-        if lifo.len() >= self.flush_threshold {
-            // Flush from inside the lock to keep the LIFO consistent
-            // with the migration count. If the flush fails (ring at
-            // capacity), undo the push so the caller can retry with
-            // a clean LIFO state (otherwise a retried `push(same i)`
-            // would duplicate the entry, since `entry` is supposed
-            // to denote "this one item to enqueue").
-            if let Err(e) = self.flush_locked(&mut lifo) {
-                lifo.pop();
-                return Err(e);
+        self.local_lifo.with_mine(|lifo| {
+            if lifo.len() >= self.lifo_cap {
+                return Err(PushError::LifoFull);
             }
-        }
-        Ok(())
+            lifo.push(entry);
+            if lifo.len() >= self.flush_threshold {
+                // Flushed before the buffer is handed back, so the
+                // LIFO stays consistent with the migration count. If
+                // the flush fails (ring at capacity), undo the push so
+                // the caller can retry with a clean LIFO state
+                // (otherwise a retried `push(same i)` would duplicate
+                // the entry, since `entry` is supposed to denote "this
+                // one item to enqueue").
+                if let Err(e) = self.flush_staged(lifo) {
+                    lifo.pop();
+                    return Err(e);
+                }
+            }
+            Ok(())
+        })
     }
 
-    /// Owner-side explicit flush. Drains the local LIFO into the
-    /// ring's tail in one batch (one `tail.fetch_add(N)` + N Release-
-    /// stores). Returns the number of items migrated.
+    /// Owner-side explicit flush of the CALLING thread's LIFO. Drains
+    /// it into the ring's tail in one batch (one `tail.fetch_add(N)` +
+    /// N Release-stores) and leaves every other thread's alone.
+    /// Returns the number of items migrated.
     pub fn flush(&self) -> Result<usize, PushError> {
-        let mut lifo = self
-            .local_lifo
-            .lock()
-            .expect("LOH local LIFO mutex poisoned");
-        self.flush_locked(&mut lifo)
+        self.local_lifo.with_mine(|lifo| self.flush_staged(lifo))
     }
 
-    fn flush_locked(&self, lifo: &mut Vec<LohLifoEntry>) -> Result<usize, PushError> {
+    fn flush_staged(&self, lifo: &mut Vec<LohLifoEntry>) -> Result<usize, PushError> {
         let n = lifo.len();
         if n == 0 {
             return Ok(0);
@@ -510,7 +508,7 @@ impl LohDeque {
                     }
                     // diff > 0: the slot's sequence is for a future
                     // round. With a single producer and the
-                    // capacity-check guard in flush_locked, this is
+                    // capacity-check guard in flush_staged, this is
                     // unreachable; if it does happen it indicates a
                     // protocol invariant violation. Loud panic so the
                     // cause can be diagnosed instead of silently

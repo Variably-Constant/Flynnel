@@ -6,13 +6,13 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::chase_lev_backend::DispatchHandle;
 use super::khpd::{KHPD_ARGS_INLINE_BYTES, LineItem};
 use super::latch_mmf::{ERR, MmfLatchArena, SET, UNSET};
 use super::pass_registry::{self, Pass};
+use super::stager::StagingTable;
 use super::urd::{Drain, MAILBOX_ITEMS, UrdDeque};
 
 use crate::backend::{Backend, BackendCapabilities, BackendError, DispatchBackend, KernelHandle};
@@ -26,10 +26,15 @@ pub struct SharedMemoryUrdBackend {
     latches_path: PathBuf,
     caps: BackendCapabilities,
     dispatched: AtomicU64,
-    /// Owner-side staging buffer. Items accumulate here until
-    /// `flush()` (or auto-flush at MAILBOX_ITEMS) publishes one
-    /// mailbox-worth via [`UrdDeque::publish_round_robin`].
-    pending: Mutex<Vec<LineItem>>,
+    /// Staging buffers, one per staging thread. Items accumulate in
+    /// the caller's own buffer until `flush()` (or auto-flush at
+    /// MAILBOX_ITEMS) publishes one mailbox-worth via
+    /// [`UrdDeque::publish_round_robin`].
+    ///
+    /// A buffer per thread rather than one behind a mutex: staging is
+    /// owner-side, so there is nothing to exclude, and it is the
+    /// faster arm besides. See [`super::stager`] for the measurement.
+    pending: StagingTable<LineItem>,
 }
 
 impl SharedMemoryUrdBackend {
@@ -56,7 +61,7 @@ impl SharedMemoryUrdBackend {
             latches_path,
             caps,
             dispatched: AtomicU64::new(0),
-            pending: Mutex::new(Vec::with_capacity(MAILBOX_ITEMS)),
+            pending: StagingTable::new(),
         })
     }
 
@@ -81,7 +86,7 @@ impl SharedMemoryUrdBackend {
             latches_path,
             caps,
             dispatched: AtomicU64::new(0),
-            pending: Mutex::new(Vec::with_capacity(MAILBOX_ITEMS)),
+            pending: StagingTable::new(),
         })
     }
 
@@ -126,11 +131,17 @@ impl SharedMemoryUrdBackend {
         let latch_offset = self.latches.alloc();
         let item = LineItem::new(closure_id, latch_offset, args)
             .map_err(|e| BackendError::Launch(format!("URD build item: {e:?}")))?;
-        let mut p = self.pending.lock().expect("URD pending poisoned");
-        p.push(item);
-        if p.len() >= MAILBOX_ITEMS {
-            let batch = p.drain(..).collect::<Vec<_>>();
-            drop(p);
+        // Taken out of the caller's own buffer and published outside
+        // it, so the publish does not sit inside the staging borrow.
+        let batch = self.pending.with_mine(|buffer| {
+            buffer.push(item);
+            if buffer.len() >= MAILBOX_ITEMS {
+                buffer.drain(..).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        });
+        if !batch.is_empty() {
             self.deque
                 .publish_round_robin(&batch)
                 .map_err(|e| BackendError::Launch(format!("URD publish: {e:?}")))?;
@@ -175,14 +186,16 @@ impl SharedMemoryUrdBackend {
         Ok(handles)
     }
 
-    /// Owner-side: explicit flush of any pending staged items.
+    /// Owner-side: explicit flush of the CALLING thread's staged
+    /// items. Each staging thread accumulates and flushes its own, so
+    /// this leaves every other thread's buffer where it is.
     pub fn flush(&self) -> Result<usize, BackendError> {
-        let mut p = self.pending.lock().expect("URD pending poisoned");
-        if p.is_empty() {
+        let batch = self
+            .pending
+            .with_mine(|buffer| buffer.drain(..).collect::<Vec<_>>());
+        if batch.is_empty() {
             return Ok(0);
         }
-        let batch = p.drain(..).collect::<Vec<_>>();
-        drop(p);
         for chunk in batch.chunks(MAILBOX_ITEMS) {
             self.deque
                 .publish_round_robin(chunk)
