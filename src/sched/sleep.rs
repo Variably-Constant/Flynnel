@@ -144,18 +144,45 @@ pub fn monitor_wait_held() -> bool {
 }
 
 impl WaitStrategy {
-    /// Pick the best wait strategy for this host: WAITPKG where the
-    /// silicon has it, else MONITORX, else
-    /// [`WaitStrategy::StdPark`].
+    /// Pick the wait strategy for this host: WAITPKG where the
+    /// silicon has it, otherwise [`WaitStrategy::StdPark`].
     ///
-    /// WAITPKG is preferred where both are present because UMWAIT
-    /// takes the deadline this parker wants directly, so that arm
-    /// reaches its bound in one instruction.
+    /// # MONITORX is implemented and is deliberately not picked
+    ///
+    /// It wins on an idle host and loses badly on a loaded one, and
+    /// which of those a worker meets is not knowable at construction.
+    /// Wake latency, unpark to observable return, medians of two runs
+    /// on a Ryzen 9 7900X and one on a Ryzen 7 2700:
+    ///
+    /// ```text
+    ///                 7900X                  2700
+    ///            StdPark  MONITORX      StdPark  MONITORX
+    ///   idle  50   6.0       1.4          19.6      3.4
+    ///   idle 500   4.8       1.0          25.1      2.8
+    ///   load  50   6.6       1.1          14.1    319.2
+    ///   load 500   6.5       0.5          16.5    319.2
+    /// ```
+    ///
+    /// Four to fourteen times better on the 7900X in every cell, and
+    /// twenty times worse on the 2700 under load. The 2700 has eight
+    /// cores against the twelve of the 7900X and the load arm busies
+    /// half the host either way, so the loaded 2700 is the more
+    /// oversubscribed of the two; a halted core there competes to be
+    /// scheduled again where `thread::park` hands the decision to the
+    /// kernel.
+    ///
+    /// The not-holding guard does not catch it. Under that load the
+    /// arms are slow enough to clear the threshold while the wake
+    /// still costs 319 us, so the guard reports the monitor holding
+    /// and it does, uselessly.
+    ///
+    /// Nothing may get slower anywhere, so it is not the default
+    /// until a guard exists that separates those two hosts.
+    /// [`Parker::with_strategy`] selects it, which is how the numbers
+    /// above were taken.
     pub fn pick() -> Self {
         if crate::cpu_info::has_waitpkg() {
             Self::Waitpkg
-        } else if crate::cpu_info::has_monitorx() {
-            Self::Monitorx
         } else {
             Self::StdPark
         }
@@ -740,17 +767,33 @@ mod tests {
 
     #[test]
     fn wait_strategy_pick_matches_cpuid() {
-        // The order is what is asserted, not any one host's answer:
-        // WAITPKG wins where present, MONITORX takes the hosts that
-        // have only it, and the kernel park is what is left.
+        // WAITPKG where the host has it, the kernel park otherwise.
+        // MONITORX is never picked and that is asserted separately,
+        // because it is a measurement result rather than an
+        // oversight.
         let want = if crate::cpu_info::has_waitpkg() {
             WaitStrategy::Waitpkg
-        } else if crate::cpu_info::has_monitorx() {
-            WaitStrategy::Monitorx
         } else {
             WaitStrategy::StdPark
         };
         assert_eq!(WaitStrategy::pick(), want);
+    }
+
+    #[test]
+    fn monitorx_is_available_to_ask_for_and_is_never_chosen_on_its_own() {
+        // It wins on an idle host and is twenty times worse on a
+        // loaded eight-core one, and the not-holding guard cannot
+        // separate those, so defaulting to it would make the
+        // scheduler's idle path slower on a real part. It stays
+        // reachable because the benches that found that out select
+        // it. A later guard that can tell the two hosts apart
+        // changes `pick`, and this test is what will notice.
+        assert_ne!(WaitStrategy::pick(), WaitStrategy::Monitorx);
+
+        if crate::cpu_info::has_monitorx() {
+            let p = Parker::with_strategy(0, WaitStrategy::Monitorx);
+            assert_eq!(p.wait_strategy(), WaitStrategy::Monitorx);
+        }
     }
 
     #[test]
