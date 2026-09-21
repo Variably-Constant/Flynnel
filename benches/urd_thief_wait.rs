@@ -118,8 +118,8 @@ fn temp_path(name: &str) -> std::path::PathBuf {
     p
 }
 
-fn item(v: u64) -> LineItem {
-    LineItem { a: v, b: v }
+fn item(id: u32) -> LineItem {
+    LineItem::new(id, u32::MAX, &id.to_le_bytes()).expect("line item fits the inline args")
 }
 
 fn bench_strategy(
