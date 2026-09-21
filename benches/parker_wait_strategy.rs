@@ -273,6 +273,98 @@ fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
     report_latch(&name, held_before);
 }
 
+/// What a pool of parkers that are merely waiting costs a thread that
+/// is not one of them.
+///
+/// Every other group here times the parker. This one times its
+/// neighbour, and the parkers do nothing at all: they park once and
+/// stay parked for the whole measurement. The question is what a
+/// waiting worker takes from the rest of the machine while it waits.
+///
+/// It is worth asking because the arms are not alike in that respect.
+/// `thread::park` leaves the run queue, so the logical CPU goes back
+/// to the scheduler and something else can have it. `MWAITX` halts
+/// the logical processor without a syscall, so the thread never
+/// leaves the CPU from the kernel's point of view, though the halt
+/// does hand a physical core's issue width to its SMT sibling. Which
+/// of those dominates is not something the instruction set answers.
+///
+/// A pool holds one worker per logical CPU, so on a busy host this is
+/// the difference between a neighbour having the box and sharing it
+/// with two dozen residents.
+///
+/// The zero-parker row is the control and the rows only mean
+/// something against it: it is the same workload with nothing else
+/// alive, so it says what the measurement costs when there is nothing
+/// to take.
+fn bench_idle_neighbours(c: &mut Criterion, label: &str, parkers: Option<WaitStrategy>) {
+    let name = format!("parker_idle_neighbours_{label}");
+    let held_before = flynnel::sched::sleep::monitor_wait_held();
+    let mut group = c.benchmark_group(&name);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("neighbour_work", |b| {
+        b.iter_custom(|iters| {
+            let n = match parkers {
+                None => 0,
+                Some(_) => std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(4),
+            };
+            let stop = Arc::new(AtomicU32::new(0));
+            let mut waiting = Vec::with_capacity(n);
+            let mut handles = Vec::with_capacity(n);
+            for _ in 0..n {
+                let strategy = parkers.expect("n is zero when no strategy is given");
+                let stop_c = Arc::clone(&stop);
+                let (tx, rx) = std::sync::mpsc::channel::<Arc<Parker>>();
+                handles.push(std::thread::spawn(move || {
+                    let p = Arc::new(Parker::with_strategy(0, strategy));
+                    tx.send(Arc::clone(&p)).expect("send parker");
+                    // Parks and stays parked. park_until may return
+                    // without the predicate holding, so this re-enters
+                    // until it does rather than spinning out here and
+                    // becoming the very load it is meant not to be.
+                    while stop_c.load(Ordering::Acquire) == 0 {
+                        p.park_until(|| stop_c.load(Ordering::Acquire) == 1);
+                    }
+                }));
+                waiting.push(rx.recv().expect("recv parker"));
+            }
+            // Let them all reach their wait before timing anything,
+            // or the first iterations measure threads still starting.
+            if n > 0 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            let t0 = Instant::now();
+            let mut acc = 0u64;
+            for i in 0..iters {
+                // Deterministic, CPU-bound, and nothing to do with
+                // the scheduler: this is the neighbour's own work.
+                let mut x = i | 1;
+                for _ in 0..512 {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    acc = acc.wrapping_add(x >> 33);
+                }
+            }
+            let elapsed = t0.elapsed();
+            black_box(acc);
+
+            stop.store(1, Ordering::Release);
+            for p in &waiting {
+                p.unpark();
+            }
+            for h in handles {
+                h.join().expect("waiting parker join");
+            }
+            elapsed
+        });
+    });
+    group.finish();
+    report_latch(&name, held_before);
+}
+
 /// Wake latency on one parker woken repeatedly on one thread, which
 /// is the shape a pool worker has.
 ///
@@ -486,6 +578,20 @@ fn bench_all(c: &mut Criterion) {
                 bench_repeat(c, "monitorx", Some(WaitStrategy::Monitorx), gap_us, loaded);
             }
         }
+    }
+
+    // What waiting parkers cost a thread that is not one of them. The
+    // none row runs first because it is the control the others are
+    // read against, and StdPark is included here unlike the group
+    // below: this asks what a waiting thread does to the machine, and
+    // leaving the run queue is as much an answer as halting on it.
+    bench_idle_neighbours(c, "none", None);
+    bench_idle_neighbours(c, "stdpark", Some(WaitStrategy::StdPark));
+    if waitpkg {
+        bench_idle_neighbours(c, "waitpkg", Some(WaitStrategy::Waitpkg));
+    }
+    if monitorx {
+        bench_idle_neighbours(c, "monitorx", Some(WaitStrategy::Monitorx));
     }
 
     // Neighbours last, and only the two strategies a monitor wait can
