@@ -310,6 +310,22 @@ fn main() {
     }
 
     if failures.is_empty() {
+        // Saying PASS here without a manifest would be this tool
+        // reporting success for the one question it exists to answer
+        // and did not ask. Everything above still ran, so the counts
+        // are real and worth printing; what is missing is the
+        // comparison against what the module actually binds, and a
+        // caller reading an exit code cannot see the line that says
+        // so. Exit 2 for the same reason `fail` uses it: the tool was
+        // not given what it needs, which is not the same answer as a
+        // census gap.
+        if bound.is_none() {
+            eprintln!(
+                "census: NOT CHECKED, no module manifest was given, so nothing above says \
+                 whether the binding is complete"
+            );
+            std::process::exit(2);
+        }
         println!("census: PASS");
         return;
     }
