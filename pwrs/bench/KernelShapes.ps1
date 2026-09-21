@@ -1,6 +1,6 @@
 # What the declared kernels cost, measured three ways in one run.
 #
-# The three arms, per kernel, all in this process and interleaved:
+# The arms, per kernel, all in this process and interleaved:
 #
 #   flynnel  the kernel as a script would call it, the pool deciding
 #            its own width.
@@ -11,6 +11,17 @@
 #   native   the PowerShell way to get the same answer: Measure-Object,
 #            Sort-Object, Select-String, Get-FileHash. What a script
 #            would otherwise have written.
+#   pool     the same kernel routed onto the process-wide IO pool with
+#            -UseIoPool instead of the arena. One kernel has it, and
+#            only where the process was launched with a pool to route
+#            to. Without one the cmdlet warns and hashes on the arena,
+#            so an unguarded arm would put the arena's figure in the
+#            pool column and read as the route costing nothing.
+#
+# The pool arm runs quiet and loaded both. Contention is the whole of
+# its case: routing reads off the arena is a claim about what happens
+# when the arena has other work, so a quiet box is the one condition
+# that cannot test it.
 #
 # The control is a fixed arithmetic loop this module cannot reach,
 # benched first and again last. Its drift across the run is the
@@ -93,6 +104,27 @@ Import-Module $manifest -Force -ErrorAction Stop
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $commit = (& git -C $repoRoot rev-parse --short HEAD 2>&1 | Out-String).Trim()
 $dirty = @(& git -C $repoRoot status --porcelain 2>&1).Count
+
+# Whether this process has a process-wide IO pool, read before any
+# kernel dispatches.
+#
+# It is a property of how the bench was launched rather than something
+# it can arrange. global_io_pool() is a OnceLock filled when the pool
+# starts, so a process that has already dispatched cannot gain one, and
+# New-FlynnelIoPool hands back its own object instead of installing the
+# global. FLYNNEL_SCHED_SMT_AS_IO has to be set before this process
+# starts or there is nothing to route to.
+#
+# Read once here rather than at the cell that uses it, so every row in
+# a run has the same answer and the run says which answer it had.
+$ioPool = Get-FlynnelIoPool -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+$hasIoPool = $null -ne $ioPool
+if ($hasIoPool) {
+    Write-Host ("io pool present with {0} worker(s); the pool arm runs" -f $ioPool.Workers)
+} else {
+    Write-Host ('NO IO POOL in this process, so the pool arm is SKIPPED and its column ' +
+                'will read empty. Set FLYNNEL_SCHED_SMT_AS_IO=1 before launching to measure it.')
+}
 
 # The commit describes the tree this script sits in. It describes the
 # binary only when the module was built from that same tree, and this
@@ -407,9 +439,16 @@ $kernels = @(
        Serial  = { Sort-FlynnelArray -InputObject $data -Plan $serialPlan }
        Native  = { $data | Sort-Object } }
 
+    # The only kernel with a fourth arm. -UseIoPool reads the files on
+    # the process-wide pool instead of the arena, which costs a String
+    # clone and a channel per file against a dispatch that already
+    # spreads one task per file. Whether that earns itself back is what
+    # this arm is for, and the answer decides three more file kernels
+    # that have deliberately not been routed yet.
     @{ Name = 'FileHash'; Straight = $false
        Flynnel = { Measure-FlynnelFileHash -Path $files }
        Serial  = { Measure-FlynnelFileHash -Path $files -Plan $serialPlan }
+       Pool    = { Measure-FlynnelFileHash -Path $files -UseIoPool }
        Native  = { Get-FileHash -LiteralPath $files -Algorithm SHA256 } }
 
     @{ Name = 'FileLine'; Straight = $false
@@ -463,17 +502,41 @@ foreach ($k in $kernels) {
     Start-Cooldown
     $nat = Measure-Cell -Body $k.Native
     Start-Cooldown
+    # The fourth arm runs on the one kernel that has it, and only when
+    # the process has a pool to route to. Without one the cmdlet warns
+    # and hashes on the arena, so timing it would put the arena's own
+    # figure in the pool column and read as the route costing nothing.
+    $pool = $null
+    if ($hasIoPool -and $k.ContainsKey('Pool')) {
+        $pool = Measure-Cell -Body $k.Pool
+        Start-Cooldown
+    }
+    # Computed before the object, since an if is a statement and cannot
+    # sit as a value in a literal.
+    $poolMs = $null
+    $vsPool = $null
+    if ($pool) {
+        $poolMs = [Math]::Round($pool.MedianMs, 4)
+        # Flynnel is the denominator here as it is for the other two
+        # arms, so above one always means the arm is slower than the
+        # arena and the column reads the same way across the table.
+        if ($f.MedianMs -gt 0) {
+            $vsPool = [Math]::Round($pool.MedianMs / $f.MedianMs, 3)
+        }
+    }
     $rows += [PSCustomObject]@{
         Kernel          = $k.Name
         FlynnelMs       = [Math]::Round($f.MedianMs, 4)
         SerialMs        = [Math]::Round($s.MedianMs, 4)
         NativeMs        = [Math]::Round($nat.MedianMs, 4)
+        PoolMs          = $poolMs
         VsSerial        = if ($f.MedianMs -gt 0) {
                               [Math]::Round($s.MedianMs / $f.MedianMs, 3)
                           } else { $null }
         VsNative        = if ($f.MedianMs -gt 0) {
                               [Math]::Round($nat.MedianMs / $f.MedianMs, 3)
                           } else { $null }
+        VsPool          = $vsPool
         AnchorSpeaksFor = $k.Straight
     }
 }
@@ -489,14 +552,21 @@ $controlLast = Measure-Cell -Body $controlBody
 # its own control at both ends: a loaded row is read against the loaded
 # control, never against the quiet one.
 #
-# Only the flynnel arm is repeated under load. The serial arm is the
-# same code down one lane and the native arm is not this crate, so what
-# the criterion asks about is how the pool's own figure moves when the
-# box is contended.
+# The flynnel arm is repeated under load, and so is the IO-pool arm
+# where a kernel has one. The serial arm is the same code down one lane
+# and the native arm is not this crate, so what the criterion asks
+# about is how the arena's own figure moves when the box is contended.
+#
+# The IO-pool arm belongs here rather than only in the quiet pass
+# because contention is the whole of its case: routing reads off the
+# arena is a claim about what happens when the arena has other work,
+# and a quiet box is the one condition where that claim cannot be
+# tested. A route that wins only on an idle machine has not won.
 
 $loadedControlFirst = $null
 $loadedControlLast = $null
 $loaded = @{}
+$loadedPool = @{}
 if ($LoadThreads -gt 0) {
     Write-Host ("starting {0} burner(s) for the load arm" -f $LoadThreads)
     Start-Burners
@@ -506,6 +576,11 @@ if ($LoadThreads -gt 0) {
         Write-Host ("loaded cell {0}" -f $k.Name)
         $loaded[$k.Name] = Measure-Cell -Body $k.Flynnel
         Start-Cooldown
+        if ($hasIoPool -and $k.ContainsKey('Pool')) {
+            Write-Host ("loaded pool cell {0}" -f $k.Name)
+            $loadedPool[$k.Name] = Measure-Cell -Body $k.Pool
+            Start-Cooldown
+        }
     }
     $loadedControlLast = Measure-Cell -Body $controlBody
     Stop-Burners
@@ -530,6 +605,22 @@ foreach ($row in $rows) {
         $row | Add-Member -NotePropertyName LoadedMs -NotePropertyValue $null
         $row | Add-Member -NotePropertyName LoadCost -NotePropertyValue $null
     }
+
+    # The loaded IO-pool figure, and the arena's loaded figure beside
+    # it. Read against each other rather than against the quiet pair:
+    # the two passes have different controls and a loaded row compared
+    # to a quiet one carries the burners in the ratio.
+    $poolCell = $loadedPool[$row.Kernel]
+    $loadedPoolMs = $null
+    $loadedVsPool = $null
+    if ($poolCell) {
+        $loadedPoolMs = [Math]::Round($poolCell.MedianMs, 4)
+        if ($row.LoadedMs -and $row.LoadedMs -gt 0) {
+            $loadedVsPool = [Math]::Round($poolCell.MedianMs / $row.LoadedMs, 3)
+        }
+    }
+    $row | Add-Member -NotePropertyName LoadedPoolMs -NotePropertyValue $loadedPoolMs
+    $row | Add-Member -NotePropertyName LoadedVsPool -NotePropertyValue $loadedVsPool
 }
 
 # ----------------------------------------------------------------------
