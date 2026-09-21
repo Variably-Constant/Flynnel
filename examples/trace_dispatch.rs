@@ -28,10 +28,17 @@
 //! 9 is defined for a steal hit and no hook emits it. The wall time
 //! of the traced call is printed on stdout.
 //!
-//! This shape emits no 14, 8 or 15 at all: over two hundred
-//! back-to-back dispatches the workers never went idle long enough to
-//! park. The parker runs between bursts of work rather than inside
-//! one, so a trace meant to catch it needs a workload with gaps.
+//! At the default gap of zero this shape emits no 14, 8 or 15 at all:
+//! over two hundred back-to-back dispatches the workers never go idle
+//! long enough to park. The parker runs between bursts of work rather
+//! than inside one, so a trace meant to catch it needs a workload with
+//! gaps, and a run without them cannot witness the parker whatever it
+//! records. The fourth argument is that gap in milliseconds; the pool
+//! parks during it and the dispatch after has to wake parked workers.
+//!
+//! ```text
+//! cargo run --release --example trace_dispatch -- 10000 6 light 50 2> trace_gaps.csv
+//! ```
 
 use std::str::FromStr;
 use std::time::Instant;
@@ -73,6 +80,18 @@ fn main() {
     let n: usize = argument(&args, 1, 10_000, "items");
     let est: u32 = argument(&args, 2, 6, "estimate");
     let kind = args.get(3).map(String::as_str).unwrap_or("light");
+    // Milliseconds of idle between dispatches. Zero is back to back,
+    // which is what this example did and is the reason it recorded no
+    // park events at all: over two hundred consecutive dispatches the
+    // workers never went idle long enough to park, so the events meant
+    // to observe the parker could not fire and their absence read as
+    // quiet rather than as the harness being unable to see them.
+    //
+    // A gap longer than the spin floor lets the pool park, and the
+    // dispatch after it has to wake parked workers, which is the only
+    // condition under which ParkEnter, WorkerWake and WaitSwitch have
+    // anything to say.
+    let gap_ms: u64 = argument(&args, 4, 0, "gap_ms");
     if !trace::is_enabled() {
         eprintln!("the trace switch is not set; the run will time the call but record nothing");
     }
@@ -94,10 +113,21 @@ fn main() {
         }),
         _ => for_each_chunk(&plan, &mut v, |s| s.iter_mut().for_each(light)),
     };
+    let gap = std::time::Duration::from_millis(gap_ms);
     for _ in 0..200 {
         call();
+        if gap_ms > 0 {
+            std::thread::sleep(gap);
+        }
     }
     trace::reset_current_thread();
+    // The gap before the timed call is the point of the whole argument:
+    // it is what leaves the pool parked when that call arrives, so the
+    // row it records is a dispatch onto parked workers rather than onto
+    // workers still spinning from the one before.
+    if gap_ms > 0 {
+        std::thread::sleep(gap);
+    }
     let t0 = Instant::now();
     call();
     let wall = t0.elapsed();
