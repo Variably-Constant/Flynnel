@@ -191,6 +191,29 @@ pub fn total_latch_monitor_waits() -> u64 {
 
 static LATCH_MONITOR_WAITS: AtomicU64 = AtomicU64::new(0);
 
+/// Monitor armings issued inside those waits, since process start.
+///
+/// A wait that reached the monitor rung is one thing and the number of
+/// times it armed the monitor is another: the rung is a loop, so a
+/// single wait can arm once or thousands of times depending on how its
+/// per-wait budget divides into the span it stands in for. Each arming
+/// is a MONITORX and an MWAITX and the two reads of the clock around
+/// them, so this over [`total_latch_monitor_waits`] is what the rung
+/// costs per wait, and it is not visible from the wait count alone.
+pub fn total_latch_monitor_arms() -> u64 {
+    LATCH_MONITOR_ARMS.load(Ordering::Relaxed)
+}
+
+static LATCH_MONITOR_ARMS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one arming of the monitor inside a latch wait's monitor
+/// rung. Untraced: a rung can issue thousands of these and a trace
+/// event each would cost more than the thing being measured.
+#[inline]
+pub(crate) fn note_latch_monitor_arm() {
+    LATCH_MONITOR_ARMS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Record that one latch wait reached its monitor rung, and trace it
 /// where tracing is on. `slot` distinguishes the slot path's wait from
 /// a `LockLatch`'s, which take the same rung at different call sites.

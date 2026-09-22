@@ -144,6 +144,19 @@ fn main() {
     call();
     let wall = t0.elapsed();
     println!("traced call: {kind} n={n} est={est} ns/item, wall {wall:?}");
+    // The trace carries one row per wait that reached the monitor rung
+    // and none per arming inside it, because a rung can arm thousands
+    // of times and a row each would cost more than the rung. The two
+    // counters are what says which of those happened: arms over waits
+    // is how many MONITORX and MWAITX pairs one wait issued.
+    let waits = flynnel::total_latch_monitor_waits();
+    let arms = flynnel::total_latch_monitor_arms();
+    let per_wait = if waits == 0 {
+        0.0
+    } else {
+        arms as f64 / waits as f64
+    };
+    println!("latch monitor: waits={waits} arms={arms} arms_per_wait={per_wait:.1}");
     trace::dump_to_stderr("caller");
     trace::request_worker_flush();
     // Workers dump at the top of their next loop pass, and a parked

@@ -729,6 +729,7 @@ where
                     if spun == SLOT_WAIT_SPIN {
                         crate::sched::sleep::note_latch_monitor_wait(true);
                     }
+                    crate::sched::sleep::note_latch_monitor_arm();
                     // SAFETY: the line is this job's own latch state,
                     // which outlives the wait because the caller does
                     // not return until the latch is set, and the wait

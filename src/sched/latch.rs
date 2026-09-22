@@ -591,6 +591,7 @@ impl LockLatch {
             // SAFETY: `line` points at this latch's own flag, which
             // lives as long as `self`, and the wait is issued only
             // where CPUID reported the pair.
+            crate::sched::sleep::note_latch_monitor_arm();
             let waited = unsafe {
                 crate::sched::sleep::monitor_wait_once(line, budget_cycles, || self.is_set())
             };
