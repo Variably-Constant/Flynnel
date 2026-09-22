@@ -571,7 +571,7 @@ pub struct UpdateFlynnelArray {
 impl Cmdlet for UpdateFlynnelArray {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         // Asked what it is before it is pinned, because the pin
-        // compares the WIDTH of an element and not its type. An array
+        // compares how wide an element is and not what it is. An array
         // of any other eight-byte value pins cleanly, is read as
         // doubles, and is written back over the caller's own storage:
         // `[long[]]@(1,2,3,4)` squared came back `0,0,0,0`, because
