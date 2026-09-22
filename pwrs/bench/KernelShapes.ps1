@@ -839,8 +839,14 @@ foreach ($row in $rows) {
     $distancePct = if ($null -ne $row.VsSerial -and $row.VsSerial -gt 0) {
         [Math]::Abs(100.0 * ($row.VsSerial - 1.0))
     } else { $null }
-    $row | Add-Member -NotePropertyName SignHeld -NotePropertyValue (
-        if ($null -eq $distancePct) { $null } else { $distancePct -gt $bound })
+    # Computed before it is handed over, because a parenthesised `if`
+    # in an argument position is parsed as a command named `if`, which
+    # is a name nothing answers to. It passes a syntax check and fails
+    # when the line runs, which here was after every cell had been
+    # timed.
+    $signHeld = $null
+    if ($null -ne $distancePct) { $signHeld = ($distancePct -gt $bound) }
+    $row | Add-Member -NotePropertyName SignHeld -NotePropertyValue $signHeld
 }
 $runRows | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $RunStore -Encoding utf8
 
