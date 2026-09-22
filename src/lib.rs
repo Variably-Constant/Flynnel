@@ -105,7 +105,7 @@ pub use sched::call_site::{
 pub use sched::cat::{CatCapability, CatError, L3Reservation};
 pub use sched::{
     reset_spin_stats, set_spin_adaptive, set_spin_window, spin_adapt_decisions, spin_window,
-    total_idle_yields, total_monitor_rounds, total_sleepless_backoffs,
+    total_idle_yields, total_latch_monitor_waits, total_monitor_rounds, total_sleepless_backoffs,
 };
 pub use sched::hybrid::{
     SplitReport, hybrid_auto, hybrid_auto_split, hybrid_auto_split_ranges, hybrid_pipeline,

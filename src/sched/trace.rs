@@ -101,6 +101,16 @@ pub enum TraceEvent {
     /// 2 for MONITORX. Emitted once per episode, on its first round,
     /// so a traced dispatch counts episodes and not rounds.
     SpinMonitor = 18,
+    /// A caller waiting on a latch took the host's monitor for part of
+    /// its spin. Payload = 1 for WAITPKG, 2 for MONITORX, plus 32 when
+    /// the wait was the slot path's rather than a LockLatch's.
+    /// Emitted once per wait, on its first monitor round, so a traced
+    /// dispatch counts waits and not rounds.
+    ///
+    /// A run whose latch-monitor arm records none of these did not
+    /// engage, whatever its timings say, and the two cases are
+    /// otherwise identical in the output.
+    LatchMonitor = 19,
 }
 
 /// One trace event row recorded into the per-thread buffer.

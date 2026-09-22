@@ -557,6 +557,7 @@ impl LockLatch {
         // leaving it off would have spun.
         let rounds = (spin_cycles / MONITOR_SPIN_FLOOR).max(1);
         let line = (&raw const self.flag).cast::<u8>();
+        crate::sched::sleep::note_latch_monitor_wait(false);
         for _ in 0..rounds {
             if self.is_set() {
                 return;

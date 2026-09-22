@@ -174,6 +174,31 @@ pub(crate) fn monitor_wait_available() -> bool {
     (crate::cpu_info::has_waitpkg() || crate::cpu_info::has_monitorx()) && monitor_holds()
 }
 
+/// Waits that took the host's monitor for part of a latch spin, since
+/// process start. Zero unless [`crate::sched::levers::latch_monitor`]
+/// is on and the host has a monitor that holds, which is what a
+/// harness reads to tell an arm that engaged from one that did not.
+pub fn total_latch_monitor_waits() -> u64 {
+    LATCH_MONITOR_WAITS.load(Ordering::Relaxed)
+}
+
+static LATCH_MONITOR_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// Record that one latch wait reached its monitor rung, and trace it
+/// where tracing is on. `slot` distinguishes the slot path's wait from
+/// a `LockLatch`'s, which take the same rung at different call sites.
+#[inline]
+pub(crate) fn note_latch_monitor_wait(slot: bool) {
+    LATCH_MONITOR_WAITS.fetch_add(1, Ordering::Relaxed);
+    if crate::sched::trace::is_enabled() {
+        let strategy = if crate::cpu_info::has_waitpkg() { 1 } else { 2 };
+        crate::sched::trace::emit(
+            crate::sched::trace::TraceEvent::LatchMonitor,
+            strategy | (u32::from(slot) * 32),
+        );
+    }
+}
+
 /// One bounded monitor wait on the cache line holding `line`: arms the
 /// host's monitor there and waits until a store lands on the line, an
 /// interrupt arrives or `budget_cycles` of the TSC have passed,
