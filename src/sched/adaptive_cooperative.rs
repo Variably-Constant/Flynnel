@@ -67,7 +67,10 @@ const TAG_FORCE_DEQUE: u8 = 3;
 /// per-plan `cooperative_routing` field is `Auto`; flipped by
 /// [`migrate_cooperative_routing`]. Initial value: `Auto` (defer
 /// to the population heuristic).
-static ACTIVE_COOPERATIVE_TAG: AtomicU8 = AtomicU8::new(TAG_AUTO);
+static ACTIVE_COOPERATIVE_TAG: AtomicU8 = AtomicU8::new(ACTIVE_COOPERATIVE_TAG_DEFAULT);
+
+/// The tag [`ACTIVE_COOPERATIVE_TAG`] holds before anything migrates it.
+const ACTIVE_COOPERATIVE_TAG_DEFAULT: u8 = TAG_AUTO;
 
 /// Linkage confirmation marker. When the binary links this
 /// module, `nm <bin> | grep __flynnel_marker` returns this
@@ -81,11 +84,29 @@ pub static __flynnel_marker_adaptive_cooperative: u8 = 0;
 /// per-plan field is `Auto`.
 #[inline]
 pub fn active_cooperative_routing() -> CooperativeRouting {
-    match ACTIVE_COOPERATIVE_TAG.load(Ordering::Acquire) {
+    routing_of_tag(ACTIVE_COOPERATIVE_TAG.load(Ordering::Acquire))
+}
+
+/// The routing a stored tag names, `Auto` for any value no routing is
+/// stored as.
+#[inline]
+const fn routing_of_tag(tag: u8) -> CooperativeRouting {
+    match tag {
         TAG_FORCE_TREE => CooperativeRouting::ForceTree,
         TAG_FORCE_MAILBOX => CooperativeRouting::ForceMailbox,
         TAG_FORCE_DEQUE => CooperativeRouting::ForceDeque,
         _ => CooperativeRouting::Auto,
+    }
+}
+
+/// The tag a routing is stored as.
+#[inline]
+const fn tag_of_routing(routing: CooperativeRouting) -> u8 {
+    match routing {
+        CooperativeRouting::Auto => TAG_AUTO,
+        CooperativeRouting::ForceTree => TAG_FORCE_TREE,
+        CooperativeRouting::ForceMailbox => TAG_FORCE_MAILBOX,
+        CooperativeRouting::ForceDeque => TAG_FORCE_DEQUE,
     }
 }
 
@@ -96,90 +117,42 @@ pub fn active_cooperative_routing() -> CooperativeRouting {
 /// value via one Acquire-load.
 #[inline]
 pub fn migrate_cooperative_routing(routing: CooperativeRouting) {
-    let tag = match routing {
-        CooperativeRouting::Auto => TAG_AUTO,
-        CooperativeRouting::ForceTree => TAG_FORCE_TREE,
-        CooperativeRouting::ForceMailbox => TAG_FORCE_MAILBOX,
-        CooperativeRouting::ForceDeque => TAG_FORCE_DEQUE,
-    };
-    ACTIVE_COOPERATIVE_TAG.store(tag, Ordering::Release);
+    ACTIVE_COOPERATIVE_TAG.store(tag_of_routing(routing), Ordering::Release);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Process-wide mutex serializing the tests in this module so
-    /// parallel test runs do not race on the shared
-    /// ACTIVE_COOPERATIVE_TAG global: tests that mutate shared
-    /// process state serialize on one lock.
-    fn global_test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        // A panic in one test poisons the lock, and taking that as a
-        // failure here reports every later test in the module as broken
-        // too. The guard restores the default routing on drop whether
-        // or not its test panicked, so the state a later test inherits
-        // is the same either way: recover the guard and let the one
-        // test that failed be the one that reads as failed.
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// RAII guard: acquires the serializing lock and restores the
-    /// default `Auto` routing on drop so cross-test state does not
-    /// leak between runs.
-    struct TestGuard {
-        _lock: MutexGuard<'static, ()>,
-    }
-    impl TestGuard {
-        fn new() -> Self {
-            let lock = global_test_lock();
-            migrate_cooperative_routing(CooperativeRouting::Auto);
-            Self { _lock: lock }
-        }
-    }
-    impl Drop for TestGuard {
-        fn drop(&mut self) {
-            migrate_cooperative_routing(CooperativeRouting::Auto);
-        }
-    }
-
+    /// Every routing survives the round trip the global tag performs,
+    /// the cell starts on Auto, and any other tag reads as Auto.
+    ///
+    /// Over the tag rather than the process-wide cell, so this test
+    /// neither waits for the one below nor answers its reads. That
+    /// leaves exactly one test in the module writing the cell.
     #[test]
-    fn default_active_routing_is_auto() {
-        let _guard = TestGuard::new();
-        assert_eq!(active_cooperative_routing(), CooperativeRouting::Auto);
+    fn every_routing_survives_its_tag_and_the_cell_starts_auto() {
+        for routing in [
+            CooperativeRouting::Auto,
+            CooperativeRouting::ForceTree,
+            CooperativeRouting::ForceMailbox,
+            CooperativeRouting::ForceDeque,
+        ] {
+            assert_eq!(routing_of_tag(tag_of_routing(routing)), routing);
+        }
+        assert_eq!(
+            routing_of_tag(ACTIVE_COOPERATIVE_TAG_DEFAULT),
+            CooperativeRouting::Auto
+        );
+        assert_eq!(routing_of_tag(200), CooperativeRouting::Auto);
     }
 
-    #[test]
-    fn migration_changes_active_routing() {
-        let _guard = TestGuard::new();
-
-        migrate_cooperative_routing(CooperativeRouting::ForceTree);
-        assert_eq!(active_cooperative_routing(), CooperativeRouting::ForceTree);
-
-        migrate_cooperative_routing(CooperativeRouting::ForceMailbox);
-        assert_eq!(
-            active_cooperative_routing(),
-            CooperativeRouting::ForceMailbox
-        );
-
-        migrate_cooperative_routing(CooperativeRouting::ForceDeque);
-        assert_eq!(
-            active_cooperative_routing(),
-            CooperativeRouting::ForceDeque
-        );
-
-        migrate_cooperative_routing(CooperativeRouting::Auto);
-        assert_eq!(active_cooperative_routing(), CooperativeRouting::Auto);
-    }
-
+    /// The one test that writes the process-wide cell, because what it
+    /// asserts is that a store on one thread reaches another. It
+    /// restores Auto before it returns.
     #[test]
     fn migration_propagates_across_threads() {
-        let _guard = TestGuard::new();
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
         use std::time::{Duration, Instant};
 
@@ -236,6 +209,7 @@ mod tests {
             observed_mailbox.load(Ordering::Relaxed),
             "producer never saw ForceMailbox after migration"
         );
+        migrate_cooperative_routing(CooperativeRouting::Auto);
     }
 
     #[test]

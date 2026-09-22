@@ -82,7 +82,10 @@ const TAG_COMPUTE_BATCH_ADAPTIVE: u8 = 2;
 /// AMD host with vendor == Amd.
 pub const COMPUTE_BATCH_LARGE_N: u32 = 50_000;
 
-static ACTIVE_VARIANT_TAG: AtomicU8 = AtomicU8::new(TAG_AUTO);
+static ACTIVE_VARIANT_TAG: AtomicU8 = AtomicU8::new(ACTIVE_VARIANT_TAG_DEFAULT);
+
+/// The tag [`ACTIVE_VARIANT_TAG`] holds before anything migrates it.
+const ACTIVE_VARIANT_TAG_DEFAULT: u8 = TAG_AUTO;
 
 /// Linkage confirmation marker. When the binary links this
 /// module, `nm <bin> | grep __flynnel_marker` returns this
@@ -106,10 +109,30 @@ pub fn cpuid_default_routing() -> VariantRouting {
 /// CPUID-resolved default.
 #[inline]
 pub fn active_variant_routing() -> VariantRouting {
-    match ACTIVE_VARIANT_TAG.load(Ordering::Acquire) {
+    match routing_of_tag(ACTIVE_VARIANT_TAG.load(Ordering::Acquire)) {
+        VariantRouting::Auto => cpuid_default_routing(),
+        named => named,
+    }
+}
+
+/// The routing a stored tag names, `Auto` for any value no routing is
+/// stored as.
+#[inline]
+const fn routing_of_tag(tag: u8) -> VariantRouting {
+    match tag {
         TAG_DEFAULT => VariantRouting::Default,
         TAG_COMPUTE_BATCH_ADAPTIVE => VariantRouting::ComputeBatchAdaptive,
-        _ => cpuid_default_routing(),
+        _ => VariantRouting::Auto,
+    }
+}
+
+/// The tag a routing is stored as.
+#[inline]
+const fn tag_of_routing(routing: VariantRouting) -> u8 {
+    match routing {
+        VariantRouting::Auto => TAG_AUTO,
+        VariantRouting::Default => TAG_DEFAULT,
+        VariantRouting::ComputeBatchAdaptive => TAG_COMPUTE_BATCH_ADAPTIVE,
     }
 }
 
@@ -119,12 +142,7 @@ pub fn active_variant_routing() -> VariantRouting {
 /// `bisect_variant` field through the new routing.
 #[inline]
 pub fn migrate_variant_routing(routing: VariantRouting) {
-    let tag = match routing {
-        VariantRouting::Auto => TAG_AUTO,
-        VariantRouting::Default => TAG_DEFAULT,
-        VariantRouting::ComputeBatchAdaptive => TAG_COMPUTE_BATCH_ADAPTIVE,
-    };
-    ACTIVE_VARIANT_TAG.store(tag, Ordering::Release);
+    ACTIVE_VARIANT_TAG.store(tag_of_routing(routing), Ordering::Release);
 }
 
 /// Resolve a `(profile, batch_size)` pair to an experiment variant
@@ -145,9 +163,26 @@ pub fn pick_variant_for_profile(
     profile: DispatchProfile,
     batch_size: u32,
 ) -> Option<BisectVariant> {
-    match active_variant_routing() {
+    pick_variant_under(active_variant_routing(), profile, batch_size)
+}
+
+/// The same choice under a routing the caller names, so a reader of
+/// this decision does not have to move the process-wide tag to see it.
+/// `Auto` resolves to the CPUID default, as [`active_variant_routing`]
+/// does.
+#[inline]
+fn pick_variant_under(
+    routing: VariantRouting,
+    profile: DispatchProfile,
+    batch_size: u32,
+) -> Option<BisectVariant> {
+    let resolved = match routing {
+        VariantRouting::Auto => cpuid_default_routing(),
+        named => named,
+    };
+    match resolved {
         VariantRouting::Default => None,
-        VariantRouting::Auto => unreachable!("Auto resolves via active_variant_routing"),
+        VariantRouting::Auto => unreachable!("Auto resolved above"),
         VariantRouting::ComputeBatchAdaptive => {
             if profile != DispatchProfile::PortBound {
                 return None;
@@ -164,86 +199,79 @@ pub fn pick_variant_for_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    fn global_test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("global_test_lock poisoned by prior test panic")
-    }
-
-    struct TestGuard {
-        _lock: MutexGuard<'static, ()>,
-    }
-    impl TestGuard {
-        fn new() -> Self {
-            let lock = global_test_lock();
-            migrate_variant_routing(VariantRouting::Auto);
-            Self { _lock: lock }
+    /// Every routing survives the round trip the global tag performs,
+    /// and any other tag reads as Auto.
+    ///
+    /// Over the tag rather than the process-wide cell, so the tests in
+    /// this module neither wait for each other nor answer each other's
+    /// reads.
+    #[test]
+    fn every_routing_survives_its_tag() {
+        for routing in [
+            VariantRouting::Auto,
+            VariantRouting::Default,
+            VariantRouting::ComputeBatchAdaptive,
+        ] {
+            assert_eq!(routing_of_tag(tag_of_routing(routing)), routing);
         }
-    }
-    impl Drop for TestGuard {
-        fn drop(&mut self) {
-            migrate_variant_routing(VariantRouting::Auto);
-        }
+        assert_eq!(routing_of_tag(TAG_AUTO), VariantRouting::Auto);
+        assert_eq!(routing_of_tag(200), VariantRouting::Auto);
     }
 
     #[test]
-    fn default_active_routing_resolves_from_cpuid() {
-        let _guard = TestGuard::new();
-        let active = active_variant_routing();
-        // Whichever the host CPUID resolves to must match the
-        // cpuid_default_routing helper directly.
-        assert_eq!(active, cpuid_default_routing());
-    }
-
-    #[test]
-    fn migration_changes_active_routing() {
-        let _guard = TestGuard::new();
-        migrate_variant_routing(VariantRouting::Default);
-        assert_eq!(active_variant_routing(), VariantRouting::Default);
-        migrate_variant_routing(VariantRouting::ComputeBatchAdaptive);
-        assert_eq!(active_variant_routing(), VariantRouting::ComputeBatchAdaptive);
-        migrate_variant_routing(VariantRouting::Auto);
-        assert_eq!(active_variant_routing(), cpuid_default_routing());
+    fn the_cell_starts_on_the_cpuid_default() {
+        assert_eq!(
+            routing_of_tag(ACTIVE_VARIANT_TAG_DEFAULT),
+            VariantRouting::Auto,
+            "the cell's initial tag defers to CPUID"
+        );
+        assert_eq!(
+            pick_variant_under(VariantRouting::Auto, DispatchProfile::PortBound, 10_000),
+            pick_variant_under(cpuid_default_routing(), DispatchProfile::PortBound, 10_000),
+            "Auto picks what this host's CPUID default picks"
+        );
     }
 
     #[test]
     fn pick_variant_force_default_returns_none() {
-        let _guard = TestGuard::new();
-        migrate_variant_routing(VariantRouting::Default);
-        assert_eq!(pick_variant_for_profile(DispatchProfile::PortBound, 10_000), None);
-        assert_eq!(pick_variant_for_profile(DispatchProfile::PortBound, 100_000), None);
-        assert_eq!(pick_variant_for_profile(DispatchProfile::LatencyBound, 100_000), None);
+        for (profile, batch) in [
+            (DispatchProfile::PortBound, 10_000),
+            (DispatchProfile::PortBound, 100_000),
+            (DispatchProfile::LatencyBound, 100_000),
+        ] {
+            assert_eq!(
+                pick_variant_under(VariantRouting::Default, profile, batch),
+                None
+            );
+        }
     }
 
     #[test]
     fn pick_variant_amd_compute_picks_by_batch_size() {
-        let _guard = TestGuard::new();
-        migrate_variant_routing(VariantRouting::ComputeBatchAdaptive);
+        let routing = VariantRouting::ComputeBatchAdaptive;
         // Small N -> RayonStyleReplenish
         assert_eq!(
-            pick_variant_for_profile(DispatchProfile::PortBound, 10_000),
+            pick_variant_under(routing, DispatchProfile::PortBound, 10_000),
             Some(BisectVariant::RayonStyleReplenish)
         );
         // At threshold -> ProducerMaxLenWorkers
         assert_eq!(
-            pick_variant_for_profile(DispatchProfile::PortBound, COMPUTE_BATCH_LARGE_N),
+            pick_variant_under(routing, DispatchProfile::PortBound, COMPUTE_BATCH_LARGE_N),
             Some(BisectVariant::ProducerMaxLenWorkers)
         );
         // Large N -> ProducerMaxLenWorkers
         assert_eq!(
-            pick_variant_for_profile(DispatchProfile::PortBound, 100_000),
+            pick_variant_under(routing, DispatchProfile::PortBound, 100_000),
             Some(BisectVariant::ProducerMaxLenWorkers)
         );
         // Non-PortBound profile -> None
         assert_eq!(
-            pick_variant_for_profile(DispatchProfile::LatencyBound, 100_000),
+            pick_variant_under(routing, DispatchProfile::LatencyBound, 100_000),
             None
         );
         assert_eq!(
-            pick_variant_for_profile(DispatchProfile::MemoryBound, 100_000),
+            pick_variant_under(routing, DispatchProfile::MemoryBound, 100_000),
             None
         );
     }
