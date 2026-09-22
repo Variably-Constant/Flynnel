@@ -300,16 +300,24 @@ pub fn batch_weight() -> bool {
     *V.get_or_init(|| read("FLYNNEL_LEVER_BATCH_WEIGHT"))
 }
 
-/// Park an idle pool worker through the [`crate::sched::sleep::Parker`]
-/// and its wait strategy rather than through `thread::park`, so a host
-/// with MONITORX or WAITPKG wakes it without a kernel transition.
+/// Spend an idle pool worker's spin rounds in a bounded monitor wait on
+/// the sleep coordinator's counters word rather than in `yield_now`, on
+/// a host with MONITORX or WAITPKG, so a producer's store wakes the
+/// worker inside the round instead of at the scheduler's next pick. The
+/// park that follows the window stays the kernel park.
 ///
-/// Off until measured. A monitor wait holds the hardware thread while
-/// it waits where a kernel park gives it to the box, so the loaded arm
-/// of a cold-dispatch measurement is what decides it.
-pub fn jec_parker() -> bool {
+/// Off until measured. A monitor wait is a running thread to the OS
+/// for as long as it lasts, so the window bounds what it can hold: one
+/// round is the host's calibrated dispatch cost, and the round count
+/// is the spin window the coordinator already spends. Measured as the
+/// pool park it must never be, a monitor wait held every hardware
+/// thread the pool had and cost sixteen processor seconds per wall
+/// second on a 24-thread host; the loaded arm of a cold-dispatch
+/// measurement and the process's processor time beside it decide this
+/// one.
+pub fn spin_monitor() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| read("FLYNNEL_LEVER_JEC_PARKER"))
+    *V.get_or_init(|| read("FLYNNEL_LEVER_SPIN_MONITOR"))
 }
 
 /// Decide SMT from the window the site's classifier last read rather
@@ -390,13 +398,14 @@ pub fn calibration_refusal() -> bool {
 pub fn describe() -> String {
     format!(
         "oncore_spread={} batch_weight={} smt_window={} allowed_width={} \
-         calibration_refusal={} spin_adaptive={} spin_window={} \
+         calibration_refusal={} spin_monitor={} spin_adaptive={} spin_window={} \
          serve_policy={:?} occupancy_floor={}",
         oncore_spread(),
         batch_weight(),
         smt_from_window(),
         allowed_width(),
         calibration_refusal(),
+        spin_monitor(),
         crate::sched::spin_adaptive(),
         crate::sched::spin_window(),
         serve_policy(),

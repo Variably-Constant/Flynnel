@@ -13,9 +13,11 @@
 //! Each worker iterates between four phases:
 //!
 //! 1. `ACTIVE`: running a job (not counted as inactive).
-//! 2. `IDLE`: finished a job, spinning `yield_now` inside
-//!    `no_work_found`; counted as `awake_but_idle`. After
-//!    `ROUNDS_UNTIL_SLEEPY` yields the worker transitions to:
+//! 2. `IDLE`: finished a job, spinning inside `no_work_found`, one
+//!    `yield_now` a round, or one bounded monitor wait on the counters
+//!    word where the spin monitor lever is on and the host has one;
+//!    counted as `awake_but_idle`. After `ROUNDS_UNTIL_SLEEPY` rounds
+//!    the worker transitions to:
 //! 3. `SLEEPY`: announces itself by incrementing JEC (making it
 //!    even); producers will see this and bump JEC back to odd if
 //!    they post new work. Still counted as `awake_but_idle`.
@@ -121,6 +123,21 @@ impl AtomicCounters {
     #[inline]
     pub(crate) fn load(&self, ordering: Ordering) -> Counters {
         Counters { word: self.value.load(ordering) }
+    }
+
+    /// The packed word as it is, for a reader that only asks whether
+    /// it has moved.
+    #[inline]
+    fn raw(&self, ordering: Ordering) -> usize {
+        self.value.load(ordering)
+    }
+
+    /// The address of the word, for a monitor wait to watch the cache
+    /// line it sits in. Every store a producer makes to announce work
+    /// lands on this line.
+    #[inline]
+    fn line(&self) -> *const u8 {
+        (&raw const self.value).cast::<u8>()
     }
 
     #[inline]
@@ -318,6 +335,33 @@ pub fn total_sleepless_backoffs() -> u64 {
     SLEEPLESS_BACKOFFS.load(Ordering::Relaxed)
 }
 
+/// Idle rounds spent in a monitor wait since process start. Zero
+/// unless [`crate::sched::levers::spin_monitor`] is on and the host's
+/// monitor holds; a harness reads it to tell an arm that engaged from
+/// one that did not.
+pub fn total_monitor_rounds() -> u64 {
+    TOTAL_MONITOR_ROUNDS.load(Ordering::Relaxed)
+}
+
+/// TSC cycles one monitor-wait round lasts: the host's published
+/// dispatch cost, so a round is one dispatch opportunity and the spin
+/// window's round count keeps its meaning. Zero while no profile is
+/// published, which the caller takes as a round to yield.
+#[inline]
+fn spin_round_cycles() -> u64 {
+    round_cycles(
+        crate::sched::par_iter::installed_dispatch_cost_ns(),
+        crate::sched::par_iter::tsc_per_ns_16(),
+    )
+}
+
+/// `dispatch_cost_ns` in TSC cycles at `per_ns_16` sixteenths of a
+/// cycle per nanosecond.
+#[inline]
+fn round_cycles(dispatch_cost_ns: u64, per_ns_16: u64) -> u64 {
+    dispatch_cost_ns.saturating_mul(per_ns_16) / 16
+}
+
 /// Effective spin-window rounds (on top of [`ROUNDS_UNTIL_SLEEPY`]),
 /// adjusted at runtime by the adaptive controller. Starts at the
 /// tuned default.
@@ -336,9 +380,16 @@ static ADAPTIVE: AtomicBool = AtomicBool::new(false);
 /// park/unpark syscall pair).
 static PARK_EVENTS: AtomicU32 = AtomicU32::new(0);
 static RESCUE_EVENTS: AtomicU32 = AtomicU32::new(0);
-/// Total idle `yield_now` rounds, exposed for observability. This is
-/// the quantity a flamegraph attributes to `sched_yield`.
+/// Total idle rounds, exposed for observability. With the spin monitor
+/// off every one of them is a `yield_now`, the quantity a flamegraph
+/// attributes to `sched_yield`; with it on, [`TOTAL_MONITOR_ROUNDS`] of
+/// them were monitor waits instead.
 static TOTAL_YIELDS: AtomicU64 = AtomicU64::new(0);
+/// Idle rounds spent in a bounded monitor wait rather than a yield.
+/// Zero unless [`crate::sched::levers::spin_monitor`] is on and the
+/// host has a monitor that holds, which is what a harness reads to
+/// tell an arm that engaged from one that did not.
+static TOTAL_MONITOR_ROUNDS: AtomicU64 = AtomicU64::new(0);
 /// Times [`maybe_adapt`] passed its event gate and reached a decision.
 /// Counted because the window alone cannot report it: a rescue-dominated
 /// workload grows and is clamped to the default it started at.
@@ -508,12 +559,6 @@ struct WorkerSleepState {
     /// at once, so a wake that arrives between the publish below and
     /// the park is kept rather than dropped.
     handle: OnceLock<thread::Thread>,
-    /// This worker's parker, built on its own thread the first time it
-    /// sleeps with [`crate::sched::levers::jec_parker`] on, and absent
-    /// otherwise. Its wake counter is what a monitor wait watches, and
-    /// its unpark bumps that counter before it unparks the thread, so
-    /// a waker that finds it set wakes either wait through it.
-    parker: OnceLock<crate::sched::sleep::Parker>,
 }
 
 /// [`WorkerSleepState::state`] for a worker that is running.
@@ -623,7 +668,6 @@ impl Sleep {
             states.push(WorkerSleepState {
                 state: AtomicU32::new(AWAKE),
                 handle: OnceLock::new(),
-                parker: OnceLock::new(),
             });
         }
         Self {
@@ -709,6 +753,48 @@ impl Sleep {
         }
     }
 
+    /// One idle round: a bounded monitor wait on the counters word where
+    /// [`crate::sched::levers::spin_monitor`] is on and the host has a
+    /// monitor that holds, a `yield_now` otherwise.
+    ///
+    /// The wait watches the line a producer stores to when it posts
+    /// work, so the round ends when work arrives rather than when the
+    /// scheduler next picks this thread. It also ends on any other
+    /// store to that line, which costs one more search round. A round
+    /// lasts the host's published dispatch cost, so the spin window's
+    /// round count keeps the scale it was tuned at; before a profile is
+    /// published the round yields as before. The first monitor round of
+    /// an episode is traced, so a traced dispatch counts the episodes
+    /// that took the monitor.
+    #[inline]
+    fn idle_round(&self, idle: &IdleState) {
+        TOTAL_YIELDS.fetch_add(1, Ordering::Relaxed);
+        if crate::sched::levers::spin_monitor() {
+            let budget = spin_round_cycles();
+            if budget > 0 {
+                let seen = self.counters.raw(Ordering::Relaxed);
+                // SAFETY: the counters word lives as long as this
+                // coordinator, which outlives every worker's idle loop.
+                let waited = unsafe {
+                    crate::sched::sleep::monitor_wait_once(self.counters.line(), budget, || {
+                        self.counters.raw(Ordering::Relaxed) != seen
+                    })
+                };
+                if waited {
+                    TOTAL_MONITOR_ROUNDS.fetch_add(1, Ordering::Relaxed);
+                    if idle.rounds == 0 && crate::sched::trace::is_enabled() {
+                        crate::sched::trace::emit(
+                            crate::sched::trace::TraceEvent::SpinMonitor,
+                            if crate::cpu_info::has_waitpkg() { 1 } else { 2 },
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+        thread::yield_now();
+    }
+
     /// Worker-side: called when one search round produced no
     /// work. Advances the idle state through yield -> sleepy ->
     /// sleeping. `has_injected_jobs` is called inside the sleep
@@ -720,18 +806,15 @@ impl Sleep {
         has_injected_jobs: impl FnOnce() -> bool,
     ) {
         if idle.rounds < ROUNDS_UNTIL_SLEEPY {
-            TOTAL_YIELDS.fetch_add(1, Ordering::Relaxed);
-            thread::yield_now();
+            self.idle_round(idle);
             idle.rounds += 1;
         } else if idle.rounds == ROUNDS_UNTIL_SLEEPY {
             idle.jobs_counter = self.announce_sleepy();
             idle.rounds += 1;
-            TOTAL_YIELDS.fetch_add(1, Ordering::Relaxed);
-            thread::yield_now();
+            self.idle_round(idle);
         } else if idle.rounds < rounds_until_sleeping() {
             idle.rounds += 1;
-            TOTAL_YIELDS.fetch_add(1, Ordering::Relaxed);
-            thread::yield_now();
+            self.idle_round(idle);
         } else {
             self.sleep(idle, has_injected_jobs);
             // `sleep` returns without parking two ways: the JEC moved,
@@ -826,18 +909,6 @@ impl Sleep {
             // already the ordering for work arriving. Shutdown has no
             // counter.
             state.handle.get_or_init(thread::current);
-            // Built here, before the publish, so a waker that sees
-            // SLEEPING finds it. With the lever off it stays absent and
-            // the waker unparks the handle.
-            let parker = if crate::sched::levers::jec_parker() {
-                Some(
-                    state
-                        .parker
-                        .get_or_init(|| crate::sched::sleep::Parker::new(0)),
-                )
-            } else {
-                None
-            };
             state.state.store(SLEEPING, Ordering::SeqCst);
             if self.shutdown.load(Ordering::SeqCst)
                 && state
@@ -859,22 +930,13 @@ impl Sleep {
             // AWAKE ends the loop. The waker gave the sleeping count
             // back before it stored AWAKE; nothing is owed here.
             //
-            // Through the parker the wait is its strategy's: a monitor
-            // on the parker's wake counter where the host has one, the
-            // kernel park otherwise. park_until re-checks AWAKE before
-            // it waits and returns on any unpark, so the loop around it
-            // is the same loop.
-            match parker {
-                Some(parker) => {
-                    while state.state.load(Ordering::Acquire) != AWAKE {
-                        parker.park_until(|| state.state.load(Ordering::Acquire) == AWAKE);
-                    }
-                }
-                None => {
-                    while state.state.load(Ordering::Acquire) != AWAKE {
-                        thread::park();
-                    }
-                }
+            // The park is the kernel's on every host. A monitor wait
+            // here would be a running thread for as long as the worker
+            // idled, holding its hardware thread from everything else
+            // on the box; the monitor belongs in the bounded rounds
+            // before this point, in `idle_round`.
+            while state.state.load(Ordering::Acquire) != AWAKE {
+                thread::park();
             }
         }
         idle.wake_fully();
@@ -951,16 +1013,8 @@ impl Sleep {
         // is already spoken for.
         self.counters.sub_sleeping_thread();
         state.state.store(AWAKE, Ordering::SeqCst);
-        // A worker that sleeps through its parker is woken through it:
-        // the parker's unpark moves the counter its monitor wait
-        // watches and then unparks the thread, so either wait ends.
-        match state.parker.get() {
-            Some(parker) => parker.unpark(),
-            None => {
-                if let Some(handle) = state.handle.get() {
-                    handle.unpark();
-                }
-            }
+        if let Some(handle) = state.handle.get() {
+            handle.unpark();
         }
         true
     }
@@ -1004,6 +1058,20 @@ impl Sleep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_monitor_round_is_the_dispatch_cost_in_cycles_and_zero_without_a_profile() {
+        // 4 GHz is 64 sixteenths of a cycle per nanosecond.
+        assert_eq!(round_cycles(400, 64), 1_600);
+        assert_eq!(round_cycles(2_000, 55), 6_875);
+        assert_eq!(round_cycles(0, 64), 0, "no profile is no wait");
+        assert_eq!(round_cycles(400, 0), 0, "no rate is no wait");
+        assert_eq!(
+            round_cycles(u64::MAX, 64),
+            u64::MAX / 16,
+            "saturates rather than wraps"
+        );
+    }
 
     // These drive `should_adapt` and `adapted_window` rather than the
     // process-global statics those read in production. Every park

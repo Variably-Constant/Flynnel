@@ -28,13 +28,17 @@
 //! 16 pool park (a pool worker committing to park in the sleep
 //! coordinator; payload is its worker index), 17 pool wake (a
 //! producer claiming a parked pool worker; payload is that worker's
-//! index). 9 is defined for a steal hit and no hook emits it. The
-//! wall time of the traced call is printed on stdout.
+//! index), 18 spin monitor (a pool worker beginning an idle episode
+//! whose spin rounds wait on the host's monitor; payload 1 WAITPKG, 2
+//! MONITORX, once per episode). 9 is defined for a steal hit and no
+//! hook emits it. The wall time of the traced call is printed on
+//! stdout.
 //!
-//! 14, 8 and 15 belong to the latch parker a waiting caller uses; 16
-//! and 17 belong to the pool's own sleep coordinator. A dispatch that
-//! wakes the pool shows in 16 and 17 and can leave 14, 8 and 15 at
-//! zero.
+//! 14, 8 and 15 belong to the latch parker a waiting caller uses; 16,
+//! 17 and 18 belong to the pool's own sleep coordinator. A dispatch
+//! that wakes the pool shows in 16 and 17 and can leave 14, 8 and 15
+//! at zero; 18 appears only with `FLYNNEL_LEVER_SPIN_MONITOR` on and a
+//! monitor the host exposes.
 //!
 //! At the default gap of zero this shape emits none of them: over two
 //! hundred back-to-back dispatches the workers never go idle long

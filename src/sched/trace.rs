@@ -96,6 +96,11 @@ pub enum TraceEvent {
     /// [`TraceEvent::WorkerWake`], which the latch parker emits on its
     /// own return.
     PoolWake = 17,
+    /// A pool worker began an idle episode whose spin rounds wait on
+    /// the host's monitor rather than yield. Payload = 1 for WAITPKG,
+    /// 2 for MONITORX. Emitted once per episode, on its first round,
+    /// so a traced dispatch counts episodes and not rounds.
+    SpinMonitor = 18,
 }
 
 /// One trace event row recorded into the per-thread buffer.

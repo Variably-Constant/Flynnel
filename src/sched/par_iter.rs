@@ -952,6 +952,18 @@ static HOST_JEC_WAKE_THRESHOLD_NS: std::sync::atomic::AtomicU64 = std::sync::ato
 // calibrations each publish a whole triple and the later one wins; a
 // reader sees one of them entire or neither.
 
+/// The published dispatch cost in nanoseconds, or zero while nothing is
+/// published. Never measures and never waits, so a pool worker can read
+/// it from its idle loop; [`host_dispatch_profile`] is the query that
+/// calibrates when nobody has.
+pub(crate) fn installed_dispatch_cost_ns() -> u64 {
+    use std::sync::atomic::Ordering;
+    if HOST_COLLAPSE_THRESHOLD_NS.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    HOST_DISPATCH_COST_NS.load(Ordering::Relaxed)
+}
+
 /// This host's dispatch profile, measured once per process by the
 /// first query (10-40 ms on the bench hosts) or earlier by
 /// [`calibrate_host_dispatch`] at start-up. Measured on this host

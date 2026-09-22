@@ -161,6 +161,113 @@ pub fn monitor_wait_held() -> bool {
     monitor_holds()
 }
 
+/// One bounded monitor wait on the cache line holding `line`: arms the
+/// host's monitor there and waits until a store lands on the line, an
+/// interrupt arrives or `budget_cycles` of the TSC have passed,
+/// whichever is first. Returns false without waiting where the host
+/// has no monitor wait or its monitor has been found not to hold, so
+/// the caller can yield instead.
+///
+/// `armed` runs between arming and waiting and returns true when the
+/// event the caller is waiting for has already happened, in which case
+/// nothing waits; a store that landed before the monitor was armed
+/// would otherwise go unseen until the budget ran out.
+///
+/// A return says nothing about why the wait ended, and on Zen 3 and
+/// later the monitor also fires on PREFETCHW, CLWB and some transient
+/// writes to the line, so the caller re-reads whatever it waits for.
+/// UMWAIT asks for C0.1 and MWAITX for C0, the lightest state each
+/// pair offers. The count handed to MWAITX is at least one, since a
+/// zero count with the timer bit set is an unbounded wait on Zen 1 and
+/// Zen+.
+///
+/// # Safety
+///
+/// `line` must point into a live object for the whole call. The
+/// opcodes are issued only where CPUID reports them.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn monitor_wait_once(
+    line: *const u8,
+    budget_cycles: u64,
+    armed: impl FnOnce() -> bool,
+) -> bool {
+    if !monitor_holds() {
+        return false;
+    }
+    let budget = budget_cycles.max(1);
+    if crate::cpu_info::has_waitpkg() {
+        // SAFETY: has_waitpkg() reported the instruction pair; `line`
+        // is live by the caller's contract.
+        unsafe {
+            core::arch::asm!(
+                "umonitor rax",
+                in("rax") line,
+                options(nostack, preserves_flags),
+            );
+        }
+        if armed() {
+            return true;
+        }
+        let deadline = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_add(budget);
+        // SAFETY: as above. UMWAIT sets CF on return, so flags are not
+        // preserved.
+        unsafe {
+            core::arch::asm!(
+                "umwait {hint:e}",
+                hint = in(reg) 1u32,
+                in("eax") deadline as u32,
+                in("edx") (deadline >> 32) as u32,
+                options(nostack),
+            );
+        }
+        return true;
+    }
+    if crate::cpu_info::has_monitorx() {
+        // SAFETY: has_monitorx() reported the pair; `line` is live by
+        // the caller's contract. ECX and EDX carry the only defined
+        // values, zero and zero.
+        unsafe {
+            core::arch::asm!(
+                ".byte 0x0f, 0x01, 0xfa",
+                in("rax") line,
+                in("ecx") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+        }
+        if armed() {
+            return true;
+        }
+        let ask = u32::try_from(budget).unwrap_or(u32::MAX);
+        // SAFETY: as above. rbx is reserved by LLVM, so it is saved
+        // and restored inside the block, which is why the block does
+        // not claim nostack. MWAITX sets CF on return.
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "mov ebx, {ask:e}",
+                ".byte 0x0f, 0x01, 0xfb",
+                "pop rbx",
+                ask = in(reg) ask,
+                inout("eax") 0xF0u32 => _,
+                inout("ecx") 2u32 => _,
+            );
+        }
+        return true;
+    }
+    false
+}
+
+/// Off x86_64 there is no monitor wait, so the caller yields.
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn monitor_wait_once(
+    _line: *const u8,
+    _budget_cycles: u64,
+    _armed: impl FnOnce() -> bool,
+) -> bool {
+    false
+}
+
 impl WaitStrategy {
     /// The strategy a parker built by [`Parker::new`] starts on, and
     /// the one it returns to whenever the controller has no verdict.
