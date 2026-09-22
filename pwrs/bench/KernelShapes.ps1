@@ -77,6 +77,13 @@ param(
     [string]$OutDir = $PSScriptRoot,
     # A name for this run in the output file.
     [string]$Tag = 'kernelshapes',
+    # Ceiling on the warm-up, which stops early once the box's own
+    # readings settle. Not a limit on what the run measures: the cells
+    # are timed either way and the warm-up line says whether it settled.
+    [double]$WarmupMaxSeconds = 60,
+    # How close two consecutive warm-up blocks must read before the box
+    # counts as settled.
+    [double]$WarmupTolerancePct = 3,
     # How many burner processes contend for the box during the load
     # arm. Half the logical processors, which is the ratio the
     # campaign's own loaded rotations used: 12 burners on a 24-thread
@@ -281,19 +288,55 @@ $emptyBody = { Get-FlynnelKBand -KOuter 8 }
 $anchorBuffer = 1..65536 | ForEach-Object { [double]($_ % 1024) }
 $anchorBody = { Measure-FlynnelReduce -InputObject $anchorBuffer -Operation Sum }
 
-# The box runs the control body for this long before anything is
-# measured, so the first cell is timed at the clock the rest of the run
-# will hold. An idle host sits at a low P-state and ramps over roughly a
-# second of full-core work: on the Linux guest, runs beginning after
-# five idle minutes read their control 22 to 24 per cent faster at the
-# end than at the start, against 1.5 per cent for a run that began
-# straight after a build, and the anchor spanned 148 to 265 ms across
-# four runs of one binary.
-$warmSeconds = 3
+# The box is warmed until its own readings stop moving, so the first
+# cell is timed at the clock the rest of the run will hold rather than
+# at whatever the host was doing beforehand.
+#
+# The warm-up runs the anchor body, which dispatches across the pool,
+# because what the run does to the box is multi-core work and that is
+# the state the cells have to be timed in. Three seconds of the
+# single-threaded control body was tried first: it raised one core's
+# clock, the anchor read its lowest of five runs, and the closing
+# control then read 74 per cent slower than the opening one, because
+# the minutes of kernel cells in between heated the package and the
+# warm-up had not.
+#
+# Convergence rather than a duration, since how long a host takes is a
+# property of the host: warm in half-second blocks until two
+# consecutive block medians agree within WarmupTolerancePct, and report
+# what happened either way. A run that never converges is not stopped,
+# because a warm-up is not the measurement; the line says so and the
+# control at both ends remains the check.
+$warmBlocks = @()
 $warmClock = [System.Diagnostics.Stopwatch]::StartNew()
-while ($warmClock.Elapsed.TotalSeconds -lt $warmSeconds) { $null = & $controlBody }
+$warmSettled = $false
+while ($warmClock.Elapsed.TotalSeconds -lt $WarmupMaxSeconds) {
+    $block = [System.Diagnostics.Stopwatch]::StartNew()
+    $samples = @()
+    while ($block.Elapsed.TotalMilliseconds -lt 500) {
+        $one = [System.Diagnostics.Stopwatch]::StartNew()
+        $null = & $anchorBody
+        $one.Stop()
+        $samples += $one.Elapsed.TotalMilliseconds
+    }
+    $block.Stop()
+    $sorted = $samples | Sort-Object
+    $warmBlocks += $sorted[[int]($sorted.Count / 2)]
+    if ($warmBlocks.Count -ge 2) {
+        $a = $warmBlocks[-2]
+        $b = $warmBlocks[-1]
+        if ($a -gt 0 -and ([Math]::Abs($b - $a) / $a * 100.0) -le $WarmupTolerancePct) {
+            $warmSettled = $true
+            break
+        }
+    }
+}
 $warmClock.Stop()
-Write-Host ("warmed the box for {0:N1} s before the first reading" -f $warmClock.Elapsed.TotalSeconds)
+$warmMoved = if ($warmBlocks.Count -ge 2 -and $warmBlocks[-2] -gt 0) {
+    [Math]::Round([Math]::Abs($warmBlocks[-1] - $warmBlocks[-2]) / $warmBlocks[-2] * 100.0, 2)
+} else { -1 }
+Write-Host ("warmed the box for {0:N1} s over {1} block(s); settled={2}, last two blocks differ by {3}%" -f
+    $warmClock.Elapsed.TotalSeconds, $warmBlocks.Count, $warmSettled, $warmMoved)
 
 Write-Host 'anchor first, before anything else in this run'
 $anchor = Measure-Cell -Body $anchorBody
