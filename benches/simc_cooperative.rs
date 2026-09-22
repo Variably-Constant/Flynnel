@@ -60,18 +60,20 @@
 //! the sweep be read on a shared host, which is the only kind
 //! available here.
 //!
-//! ## The stall report
+//! ## The two stall instruments
 //!
-//! `FLYNNEL_BENCH_STALL_REPORT=1` makes every closure record that it
-//! started and finished, and makes a watchdog print what a dispatch
-//! reached if it stops advancing.
+//! Both arm a watchdog that prints what a dispatch reached when it
+//! stops advancing and then ends the process. They differ in what they
+//! cost a closure, and that difference decides which one can see this
+//! bench's stall at all.
 //!
-//! It answers a stall with sets rather than an event log: the indices
-//! that never started, the ones that started and never finished, and
-//! the threads that ran anything. Those are bounded by the fan-out
-//! width whatever the iteration count, where an event log is bounded by
-//! iterations times width, which at this bench's counts is tens of
-//! millions of records across forty-nine threads.
+//! `FLYNNEL_BENCH_STALL_REPORT=1` records, in every closure, that it
+//! started and finished. It answers a stall with sets rather than an
+//! event log: the indices that never started, the ones that started and
+//! never finished, and the threads that ran anything. Those are bounded
+//! by the fan-out width whatever the iteration count, where an event
+//! log is bounded by iterations times width, which at this bench's
+//! counts is tens of millions of records across forty-nine threads.
 //!
 //! Reading it: indices that never started with workers missing from the
 //! thread list is work nothing was woken to take; indices that never
@@ -79,9 +81,23 @@
 //! looks; started-and-unfinished is a closure that is running or a
 //! thread that died inside one.
 //!
-//! It is off by default because it puts two atomic stores and one lock
-//! acquisition in each closure, which moves the numbers this bench
-//! exists to take. A run with it on diagnoses and does not measure.
+//! `FLYNNEL_BENCH_STALL_CENSUS=1` records nothing inside a closure. It
+//! stamps a generation once per dispatch, on the calling thread before
+//! the fan-out, and on a stall reports which arm stopped, at what
+//! width, and which mailboxes still hold work.
+//!
+//! The census exists because the report suppresses what it is pointed
+//! at. Nine of twelve unarmed runs of the n1024 group stall, every one
+//! in the mailbox or routed arm and none in the deque arm; none of
+//! eleven runs armed with the report stalls at all. Two atomic stores
+//! and a lock per closure, across 1024 closures and sixteen workers, is
+//! enough to close whatever window this needs. The census writes once
+//! per dispatch instead of once per closure, and touches no worker
+//! thread, so a run carrying it is still a run that can stall.
+//!
+//! Neither is on by default and neither measures: a run with either one
+//! diagnoses. Prefer the census first, because a stall it catches is a
+//! stall the report would have prevented.
 
 #![allow(clippy::missing_docs_in_private_items)]
 
@@ -113,19 +129,58 @@ fn fixed_cost_work(seed: u64) -> u64 {
     x
 }
 
-/// Whether the stall report is armed, from `FLYNNEL_BENCH_STALL_REPORT`.
+/// What the stall instrument records.
 ///
-/// Off by default. When it is on every closure writes two atomic bits
-/// and, the first time a thread runs one in a dispatch, takes a lock,
-/// which moves the timings this bench exists to take. A run with it on
-/// diagnoses; a run with it off measures.
-fn stall_report_armed() -> bool {
-    static ARMED: OnceLock<bool> = OnceLock::new();
+/// Ordered by what it costs a closure, which is the axis that decides
+/// whether a run carrying it can still stall.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Instrument {
+    /// Nothing recorded and no watchdog. What a measuring run uses.
+    Off,
+    /// A generation stamped once per dispatch, on the calling thread,
+    /// and a watchdog. Nothing inside a closure and nothing written by
+    /// a worker.
+    Census,
+    /// The census plus two atomic stores in every closure and a lock
+    /// once per thread per dispatch, which is what names the indices
+    /// that never ran, and what suppresses the stall.
+    Report,
+}
+
+/// Whether `name` is set to an affirmative value.
+///
+/// An unset variable is off, which is the default and not a failure. A
+/// variable set to bytes that are not unicode is neither: it was set
+/// deliberately and cannot be read, so it says so rather than reading
+/// as unset and leaving a diagnostic run silently unarmed.
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => value == "1" || value == "true",
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            eprintln!("{name} is set to {raw:?}, which is not unicode; leaving it off");
+            false
+        }
+    }
+}
+
+/// Which instrument the environment arms.
+///
+/// Read once. `FLYNNEL_BENCH_STALL_REPORT` wins over
+/// `FLYNNEL_BENCH_STALL_CENSUS` when both are set, because the report
+/// is the census plus the per-closure marking: a run asking for both
+/// gets the one that records more, and takes the report's timings and
+/// the report's odds of stalling with it.
+fn instrument() -> Instrument {
+    static ARMED: OnceLock<Instrument> = OnceLock::new();
     *ARMED.get_or_init(|| {
-        matches!(
-            std::env::var("FLYNNEL_BENCH_STALL_REPORT").as_deref(),
-            Ok("1") | Ok("true")
-        )
+        if env_flag("FLYNNEL_BENCH_STALL_REPORT") {
+            Instrument::Report
+        } else if env_flag("FLYNNEL_BENCH_STALL_CENSUS") {
+            Instrument::Census
+        } else {
+            Instrument::Off
+        }
     })
 }
 
@@ -250,10 +305,50 @@ impl StallWatch {
     }
 
     /// Print what the stalled dispatch reached.
+    ///
+    /// The index and thread sets are printed only when the report
+    /// armed them. Under the census nothing writes them, so printing
+    /// them would say every closure never started and no thread ran
+    /// one, which is what a genuinely stranded fan-out looks like.
     fn report(&self) {
         let generation = self.generation.load(Ordering::Acquire);
         let n = self.width.load(Ordering::Relaxed).min(WIDEST_FAN_OUT);
         let arm = self.arm.lock().expect("stall watch arm").clone();
+
+        eprintln!("STALL in {arm} at fan-out {n}, dispatch {generation}");
+
+        // Every node rather than this thread's: the watchdog is its own
+        // thread and resolves its own node, which need not be the node
+        // the stalled fan-out ran on, and a census of the wrong node
+        // prints an empty list that reads as an answer.
+        let by_node = flynnel::sched::arena::global_local_arena().mailbox_census_by_node();
+        let held: usize = by_node.iter().map(Vec::len).sum();
+        if held == 0 {
+            eprintln!(
+                "  mailboxes: all empty on all {} node(s), so nothing is stranded \
+                 where only its own worker could take it",
+                by_node.len()
+            );
+        } else {
+            for (node, holding) in by_node.iter().enumerate() {
+                if !holding.is_empty() {
+                    eprintln!(
+                        "  node {node}: mailboxes still holding work, by worker \
+                         index: {holding:?}"
+                    );
+                }
+            }
+        }
+
+        if instrument() != Instrument::Report {
+            eprintln!(
+                "  which closures ran is not recorded under the census; re-run \
+                 with FLYNNEL_BENCH_STALL_REPORT=1 for that, and note it has so \
+                 far prevented the stall"
+            );
+            return;
+        }
+
         let never: Vec<usize> = (0..n)
             .filter(|&i| self.started[i].load(Ordering::Relaxed) != generation)
             .collect();
@@ -275,7 +370,6 @@ impl StallWatch {
             .map(|(name, _)| name)
             .collect();
 
-        eprintln!("STALL in {arm} at fan-out {n}, dispatch {generation}");
         eprintln!("  threads that ran a closure in it: {}", ran.len());
         for t in &ran {
             eprintln!("    {t}");
@@ -384,7 +478,7 @@ impl Arm {
 /// Rebuilt per iteration because each variant consumes it, so the
 /// allocation is inside every arm's timed region and not only some.
 fn closures(n: usize) -> Vec<Box<dyn FnOnce() -> u64 + Send>> {
-    let armed = stall_report_armed();
+    let armed = instrument() == Instrument::Report;
     (0..n)
         .map(|i| {
             let b: Box<dyn FnOnce() -> u64 + Send> = if armed {
@@ -407,7 +501,7 @@ fn closures(n: usize) -> Vec<Box<dyn FnOnce() -> u64 + Send>> {
 /// Every arm produces a `Vec<u64>` in caller order, so the timed region
 /// covers the result-gather phase equally.
 fn run_arm(arm: Arm, plan: &JobPlan, n: usize) {
-    if stall_report_armed() {
+    if instrument() != Instrument::Off {
         stall_watch().begin(arm.name(), n);
     }
     match arm {
@@ -462,14 +556,28 @@ fn bench_n(c: &mut Criterion, n_closures: usize) {
 }
 
 fn bench_simc_cooperative(c: &mut Criterion) {
-    if stall_report_armed() {
-        eprintln!(
-            "stall report armed: closures record which of them ran, and a \
-             dispatch that does not advance for {STALL_AFTER:?} is reported \
-             and the process ends. Timings from this run are not comparable \
-             with a run without it."
-        );
-        spawn_stall_watchdog();
+    match instrument() {
+        Instrument::Off => {}
+        Instrument::Census => {
+            eprintln!(
+                "stall census armed: nothing is recorded inside a closure, and a \
+                 dispatch that does not advance for {STALL_AFTER:?} reports which \
+                 arm stopped and which mailboxes still hold work, then ends the \
+                 process. Timings from this run are not comparable with a run \
+                 without it."
+            );
+            spawn_stall_watchdog();
+        }
+        Instrument::Report => {
+            eprintln!(
+                "stall report armed: closures record which of them ran, and a \
+                 dispatch that does not advance for {STALL_AFTER:?} is reported \
+                 and the process ends. Timings from this run are not comparable \
+                 with a run without it, and the per-closure recording has so far \
+                 prevented every stall it was pointed at."
+            );
+            spawn_stall_watchdog();
+        }
     }
     // The sweep straddles the gate, which sits at the worker count.
     // Below it both flynnel shape arms run the same deque path.
