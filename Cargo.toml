@@ -456,6 +456,10 @@ harness = false
 required-features = ["wasm-reference"]
 
 [[bench]]
+name = "jax_bridge_transport"
+harness = false
+
+[[bench]]
 name = "simc_n12_bisect"
 harness = false
 
