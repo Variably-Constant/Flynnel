@@ -281,6 +281,20 @@ $emptyBody = { Get-FlynnelKBand -KOuter 8 }
 $anchorBuffer = 1..65536 | ForEach-Object { [double]($_ % 1024) }
 $anchorBody = { Measure-FlynnelReduce -InputObject $anchorBuffer -Operation Sum }
 
+# The box runs the control body for this long before anything is
+# measured, so the first cell is timed at the clock the rest of the run
+# will hold. An idle host sits at a low P-state and ramps over roughly a
+# second of full-core work: on the Linux guest, runs beginning after
+# five idle minutes read their control 22 to 24 per cent faster at the
+# end than at the start, against 1.5 per cent for a run that began
+# straight after a build, and the anchor spanned 148 to 265 ms across
+# four runs of one binary.
+$warmSeconds = 3
+$warmClock = [System.Diagnostics.Stopwatch]::StartNew()
+while ($warmClock.Elapsed.TotalSeconds -lt $warmSeconds) { $null = & $controlBody }
+$warmClock.Stop()
+Write-Host ("warmed the box for {0:N1} s before the first reading" -f $warmClock.Elapsed.TotalSeconds)
+
 Write-Host 'anchor first, before anything else in this run'
 $anchor = Measure-Cell -Body $anchorBody
 Start-Cooldown
@@ -288,9 +302,9 @@ Start-Cooldown
 # compiles it after that, and the control is the one body this run
 # calls more than sixteen times: measured on Windows PowerShell 5.1,
 # its median reads 19.3 ms over calls one to seven, 16.6 over eight to
-# fourteen and 15.8 from the fifteenth call on. Twenty warm calls put
-# the first reading on the same tier as the last, so the drift between
-# them is the box and not the interpreter.
+# fourteen and 15.8 from the fifteenth call on. The warm-up above
+# already carries it past that threshold; the count here holds whatever
+# the warm-up's duration does not.
 $controlFirst = Measure-Cell -Body $controlBody -Warmup 20
 Start-Cooldown
 $empty = Measure-Cell -Body $emptyBody
