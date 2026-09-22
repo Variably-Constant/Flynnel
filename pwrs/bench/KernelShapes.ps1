@@ -905,9 +905,9 @@ Write-Host 'The repeats inside one invocation are samples sharing a process, not
 Write-Host 'RunSpread of null means one run is on record and there is nothing to compare.'
 Write-Host 'VsSerial is how many times faster the pool is than one worker running the same'
 Write-Host 'kernel. VsNative is against the PowerShell way to get the same answer.'
-Write-Host 'RowDriftPct is the control measured at both ends of that row own arms, so it is'
-Write-Host 'what bounds the ratios in that row. The run-wide control drift above covers'
-Write-Host 'minutes and bounds comparisons BETWEEN rows; reading one row against it discards'
+Write-Host "RowDriftPct is the control measured at both ends of that row's own arms, so it"
+Write-Host 'is what bounds the ratios in that row. The run-wide control drift above covers'
+Write-Host 'minutes and bounds comparisons between rows; reading one row against it discards'
 Write-Host 'rows that were never exposed to it.'
 Write-Host 'LoadCost is the same kernel under contention over itself on a quiet box, and is'
 Write-Host 'read against ControlLoadCost above: a row that rose by less than the control did'
