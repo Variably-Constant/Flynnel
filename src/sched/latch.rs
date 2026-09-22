@@ -578,7 +578,7 @@ impl LockLatch {
         // ended, so both arms park at the same moment and differ only
         // in what this thread did while waiting.
         //
-        // Each wait is bounded by what is LEFT of the rung rather than
+        // Each wait is bounded by what remains of the rung rather than
         // by one dispatch cost. A store to the line ends a long wait
         // exactly as fast as a short one: the monitor is armed before
         // the flag is read, and a store landing between the arming and
