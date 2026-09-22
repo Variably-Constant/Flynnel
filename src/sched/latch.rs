@@ -544,21 +544,31 @@ impl LockLatch {
         // The floor, sized as the mailbox thief's is: long enough that
         // a set already in flight lands here, short enough that the
         // pipeline is not held for a wait that was never going to be
-        // short.
+        // short. It is also timed, and that timing is what sizes the
+        // rung below it: a PAUSE costs a different number of cycles on
+        // every part, so the only way to spend the same wall time the
+        // other arm spends is to measure this host's PAUSE here, on
+        // polls that were going to run anyway.
+        let floor_start = crate::sched::sleep::cycles_now();
         for _ in 0..MONITOR_SPIN_FLOOR {
             if self.is_set() {
                 return;
             }
             std::hint::spin_loop();
         }
-        // The middle rung, bounded twice: each wait by one dispatch
-        // cost, and the ladder by the spin the caller asked for, so
-        // turning the lever on never holds this thread longer than
-        // leaving it off would have spun.
-        let rounds = (spin_cycles / MONITOR_SPIN_FLOOR).max(1);
+        let per_poll = crate::sched::sleep::cycles_now().saturating_sub(floor_start)
+            / MONITOR_SPIN_FLOOR as u64;
+        // The middle rung ends when the spin it replaces would have
+        // ended, so both arms park at the same moment and differ only
+        // in what this thread did while waiting. Each wait inside it is
+        // bounded by one dispatch cost, so a store that lands early is
+        // seen a dispatch cost later at worst.
+        let ladder_cycles =
+            (spin_cycles.saturating_sub(MONITOR_SPIN_FLOOR) as u64).saturating_mul(per_poll);
         let line = (&raw const self.flag).cast::<u8>();
         crate::sched::sleep::note_latch_monitor_wait(false);
-        for _ in 0..rounds {
+        let ladder_start = crate::sched::sleep::cycles_now();
+        while crate::sched::sleep::cycles_now().saturating_sub(ladder_start) < ladder_cycles {
             if self.is_set() {
                 return;
             }

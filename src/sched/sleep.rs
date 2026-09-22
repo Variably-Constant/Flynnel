@@ -174,6 +174,13 @@ pub(crate) fn monitor_wait_available() -> bool {
     (crate::cpu_info::has_waitpkg() || crate::cpu_info::has_monitorx()) && monitor_holds()
 }
 
+/// The cycle counter, for a caller sizing one wait against another on
+/// this host and this moment rather than against a constant.
+#[inline]
+pub(crate) fn cycles_now() -> u64 {
+    tsc_now()
+}
+
 /// Waits that took the host's monitor for part of a latch spin, since
 /// process start. Zero unless [`crate::sched::levers::latch_monitor`]
 /// is on and the host has a monitor that holds, which is what a
