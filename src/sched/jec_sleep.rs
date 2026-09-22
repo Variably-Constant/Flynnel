@@ -1035,6 +1035,23 @@ impl Sleep {
         if idx >= self.worker_states.len() {
             return false;
         }
+        // Read before exchanging. A failing compare-exchange still
+        // takes the line exclusive, and a wide fan-out mails every
+        // peer, so without this a thousand-job dispatch bounces
+        // fifteen other cores' state words once per job and the target
+        // is awake for nearly all of them.
+        //
+        // Giving up on a plain read is safe, and it is the park-side
+        // recheck that makes it so. If the target parks right after
+        // this read, its own recheck after publishing SLEEPING reads
+        // the mailbox and finds this job. That read and the push are
+        // Acquire and Release on the same ring, so seeing it does not
+        // depend on this state word sitting in any total order with
+        // them; the SeqCst on the state word is for the wake, which is
+        // what this arm is declining to send.
+        if self.worker_states[idx].state.load(Ordering::Acquire) != SLEEPING {
+            return false;
+        }
         let woke = self.wake_specific_thread(idx);
         if woke {
             crate::sched::trace::emit(crate::sched::trace::TraceEvent::PoolWake, idx as u32);
