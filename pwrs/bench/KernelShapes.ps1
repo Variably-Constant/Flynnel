@@ -788,6 +788,12 @@ foreach ($row in $rows) {
         Edition   = $hostInfo.Edition
         When      = (Get-Date -Format 'o')
         Kernel    = $row.Kernel
+        # How many timed samples the medians below are of. A run of one
+        # is a single sample wearing the word median, and comparing it
+        # with a run of seven measures the difference between two
+        # estimators rather than between two runs, so the spread below
+        # pairs only runs that took the same number.
+        Repeats   = $Repeats
         FlynnelMs = $row.FlynnelMs
         SerialMs  = $row.SerialMs
         VsSerial  = $row.VsSerial
@@ -798,6 +804,7 @@ foreach ($row in $rows) {
     $mine = @($runRows | Where-Object {
         $_.Commit -eq $commit -and $_.Machine -eq $hostInfo.Machine -and
         $_.Edition -eq $hostInfo.Edition -and $_.Kernel -eq $row.Kernel -and
+        $_.PSObject.Properties.Name -contains 'Repeats' -and $_.Repeats -eq $Repeats -and
         $null -ne $_.FlynnelMs -and $_.FlynnelMs -gt 0
     })
     $row | Add-Member -NotePropertyName Runs -NotePropertyValue $mine.Count
