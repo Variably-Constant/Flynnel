@@ -1213,17 +1213,25 @@ impl Parker {
             }
 
             let spent = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start);
-            let Some(left) = budget.checked_sub(spent) else {
-                return;
+            // A budget with nothing left has nothing to wait for, and
+            // the count it would pass is the one MWAITX must never see
+            // with the timer bit set.
+            let left = match budget.checked_sub(spent) {
+                Some(left) if left > 0 => left,
+                _ => return,
             };
             // EBX is 32 bits. A remaining budget past that asks for
             // the longest wait the register can express and the next
             // iteration asks for the rest.
             let ask = u32::try_from(left).unwrap_or(u32::MAX);
 
-            // MWAITX: EAX = 0 requests C0, the light state matching
-            // the WAITPKG arm's C0.1 hint; ECX bit 1 enables the EBX
-            // timer; EBX carries the count.
+            // MWAITX: EAX[7:4] is the requested C-state minus one, so
+            // 0xF0 requests C0, the light state matching the WAITPKG
+            // arm's C0.1 hint and the hint the Linux delay loop passes;
+            // EAX = 0 would ask for C1. ECX bit 1 enables the EBX
+            // timer; EBX carries the count and is never zero here,
+            // since a zero count with the timer bit set is an
+            // unbounded wait on Zen 1 and Zen+.
             //
             // rbx is reserved by LLVM and cannot be an operand, so it
             // is saved and restored inside the block. That is why this
