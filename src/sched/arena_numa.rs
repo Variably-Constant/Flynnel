@@ -234,6 +234,27 @@ impl NumaArena {
         self.nodes[self.resolve_node_idx(None)].worker_count()
     }
 
+    /// Which mailboxes on the calling thread's own node still hold
+    /// work, by index.
+    ///
+    /// For asking a dispatch that has stopped making progress where
+    /// its work went. A mailbox is drained only by its own worker, so
+    /// an index here while every worker is parked names work that
+    /// peer-steal cannot reach; an empty result says the remaining
+    /// work is somewhere a thief could have taken, or that none
+    /// remains and something else is holding the caller.
+    ///
+    /// One node, because a fan-out reaches the workers of the node it
+    /// was dispatched from, which is the same population
+    /// [`Self::local_worker_count`] reports and the mailbox gates
+    /// compare against.
+    ///
+    /// Reads `is_empty` on each ring and nothing else. No dispatch
+    /// path calls this, so it adds nothing to one.
+    pub fn mailbox_census(&self) -> Vec<usize> {
+        self.nodes[self.resolve_node_idx(None)].mailbox_census()
+    }
+
     /// Iterate every per-worker stats handle across every node.
     /// Used by [`crate::sched::split_observer`] to compute pool-
     /// wide steal pressure.
