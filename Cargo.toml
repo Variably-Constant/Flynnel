@@ -451,6 +451,11 @@ name = "seed_depth_smoothness"
 harness = false
 
 [[bench]]
+name = "wasm_store_locality"
+harness = false
+required-features = ["wasm-reference"]
+
+[[bench]]
 name = "simc_n12_bisect"
 harness = false
 
