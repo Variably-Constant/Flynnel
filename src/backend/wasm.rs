@@ -62,13 +62,84 @@ struct SharedInstance {
     func: wasmtime::Func,
 }
 
+/// Distinguishes one backend's kernels from another's in the
+/// thread-local table below. Handles come from a counter per backend
+/// and every backend's first kernel is handle one, so the handle alone
+/// does not say whose kernel it is.
+static NEXT_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
+
 thread_local! {
     /// This thread's own store per kernel, indexed by handle, built on
     /// its first dispatch of that kernel. Nothing here is shared, so
     /// nothing here needs excluding; a `RefCell` is the whole of the
     /// discipline because only this thread can reach it.
-    static LOCAL_INSTANCES: RefCell<Vec<Option<SharedInstance>>> =
+    ///
+    /// A slot carries the id of the backend whose kernel built it. The
+    /// table belongs to the thread rather than to a backend, so two
+    /// backends in one process both start at handle one and would
+    /// otherwise share the slot: a dispatch through the second would
+    /// run the first one's function, with no error anywhere because
+    /// both are valid. Where the id does not match, the slot belongs to
+    /// someone else and is rebuilt.
+    static LOCAL_INSTANCES: RefCell<Vec<Option<(u64, SharedInstance)>>> =
         const { RefCell::new(Vec::new()) };
+}
+
+/// Run `call` on this thread's own instance for `handle`, building one
+/// where the slot is empty or holds another backend's.
+///
+/// The slot is keyed by handle alone because that is what a dispatch
+/// has, and carries the owning backend's id because a handle does not
+/// say whose it is. A mismatch means another backend reached this
+/// index first, and its instance is replaced rather than called.
+fn with_local_instance<R>(
+    owner: u64,
+    handle: u64,
+    build: impl FnOnce() -> Result<SharedInstance, BackendError>,
+    call: impl FnOnce(&mut SharedInstance) -> Result<R, BackendError>,
+) -> Result<R, BackendError> {
+    let index = (handle - 1) as usize;
+    LOCAL_INSTANCES.with(|cell| {
+        let mut mine = cell.borrow_mut();
+        if mine.len() <= index {
+            mine.resize_with(index + 1, || None);
+        }
+        let mismatched = match &mine[index] {
+            Some((held, _)) => *held != owner,
+            None => true,
+        };
+        if mismatched {
+            // This thread's first dispatch of this kernel pays the
+            // instantiation. Registration paid it once for the shared
+            // store; here every thread that runs the kernel pays it
+            // once, which is the cost this arm is measured on.
+            mine[index] = Some((owner, build()?));
+        }
+        let (_, instance) = mine[index]
+            .as_mut()
+            .expect("the slot was filled above or the call returned");
+        call(instance)
+    })
+}
+
+/// Which backend owns this thread's slot for `handle`, or `None` where
+/// the slot is empty.
+///
+/// The collision this guards against is not observable from a
+/// dispatch: two backends holding the same module at the same handle
+/// return the same answer either way, and a store with no memory has
+/// no state to tell them apart. Building a second module to make it
+/// observable would mean a second `.wasm` asset and a `wat` feature
+/// this crate does not take, so the bookkeeping is what is checked.
+#[cfg(test)]
+fn local_slot_owner(handle: u64) -> Option<u64> {
+    let index = (handle - 1) as usize;
+    LOCAL_INSTANCES.with(|cell| {
+        let mine = cell.borrow();
+        mine.get(index)
+            .and_then(|slot| slot.as_ref())
+            .map(|(owner, _)| *owner)
+    })
 }
 
 /// Entries one block of [`KernelTable`] holds.
@@ -177,6 +248,10 @@ pub struct WasmBackend {
     device_id: u32,
     engine: Engine,
     caps: BackendCapabilities,
+    /// Tells this backend's kernels from another's in the per-thread
+    /// store table, where handles alone do not, since every backend's
+    /// first kernel is handle one.
+    backend_id: u64,
     next_handle: AtomicU64,
     /// Registered kernels, indexed by handle. Each entry owns its
     /// own `Store`, so dispatches on different handles do not wait on
@@ -244,6 +319,7 @@ impl WasmBackend {
             device_id,
             engine,
             caps: probe_capabilities(),
+            backend_id: NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed),
             next_handle: AtomicU64::new(1),
             kernels: KernelTable::new(),
             worker_hub,
@@ -409,25 +485,12 @@ impl DispatchBackend for WasmBackend {
             BackendError::Launch(format!("wasm kernel handle {} not registered", handle.0))
         })?;
         if crate::sched::levers::wasm_local_store() {
-            let index = (handle.0 - 1) as usize;
-            return LOCAL_INSTANCES.with(|cell| {
-                let mut mine = cell.borrow_mut();
-                if mine.len() <= index {
-                    mine.resize_with(index + 1, || None);
-                }
-                if mine[index].is_none() {
-                    // This thread's first dispatch of this kernel pays
-                    // the instantiation. Registration paid it once for
-                    // the shared store; here every thread that runs the
-                    // kernel pays it once, which is the cost this arm
-                    // is measured on.
-                    mine[index] = Some(instantiate(&entry_arc)?);
-                }
-                let instance = mine[index]
-                    .as_mut()
-                    .expect("the slot was filled above or the call returned");
-                call_instance(instance, &vals)
-            });
+            return with_local_instance(
+                self.backend_id,
+                handle.0,
+                || instantiate(&entry_arc),
+                |instance| call_instance(instance, &vals),
+            );
         }
         let mut shared = entry_arc
             .shared
@@ -476,6 +539,39 @@ mod tests {
             module,
             export: "add".to_string(),
         })
+    }
+
+    #[test]
+    fn a_second_backend_does_not_inherit_the_first_ones_slot() {
+        let engine = Engine::default();
+        // Two backends both start their handles at one, and the
+        // per-thread table is keyed by handle, so without the owner id
+        // the second one's dispatch would run the first one's
+        // function. Both hold the same module here, so the answer
+        // would be right either way and only the bookkeeping shows it.
+        let entry = table_entry(&engine);
+        let build = || instantiate(&entry);
+
+        with_local_instance(101, 1, build, |_| Ok(())).expect("the first backend builds its slot");
+        assert_eq!(
+            local_slot_owner(1),
+            Some(101),
+            "the slot belongs to whichever backend built it"
+        );
+
+        with_local_instance(202, 1, build, |_| Ok(())).expect("the second backend builds its own");
+        assert_eq!(
+            local_slot_owner(1),
+            Some(202),
+            "a slot another backend holds is rebuilt rather than reused"
+        );
+
+        with_local_instance(101, 1, build, |_| Ok(())).expect("the first backend builds again");
+        assert_eq!(
+            local_slot_owner(1),
+            Some(101),
+            "and back again, because the slot follows whoever asked last"
+        );
     }
 
     #[test]
