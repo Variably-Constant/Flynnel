@@ -142,7 +142,7 @@ fn internal_err(what: &str) -> PsError {
 /// Hierarchical to Local on a single-NUMA host and has no such
 /// collapse for Federated, so a box with one node would otherwise be
 /// asked for per-node arenas it does not have.
-fn band_for(n: usize) -> u8 {
+pub(crate) fn band_for(n: usize) -> u8 {
     if n <= 1 {
         return 0;
     }

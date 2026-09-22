@@ -150,8 +150,10 @@ pwrs::export_module! {
         crossproc::GetFlynnelPassRegistry,
         racing::MeasureFlynnelRaceAny,
         racing::MeasureFlynnelExploreSelect,
+        native::GetFlynnelNativeEntry,
     ],
     classes: [
+        native::NativeEntry,
         host::CpuInfo,
         host::Topology,
         host::NumaDistance,
@@ -281,6 +283,7 @@ mod host;
 mod hybrid;
 mod kernels;
 mod levers;
+mod native;
 mod observe;
 mod plan;
 mod pool;

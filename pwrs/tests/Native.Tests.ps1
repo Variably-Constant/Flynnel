@@ -1,0 +1,44 @@
+# The native entry points: that Get-FlynnelNativeEntry hands out an
+# address and an ABI version another native library can call, in the
+# types that library reads them as.
+#
+# What the entry does when called is covered in Rust, in native.rs,
+# because a script cannot call a native function pointer. What only a
+# script can check is the hand-off: that the object comes through the
+# engine at all, and that its numbers keep the widths the ABI needs.
+
+BeforeAll {
+    . (Join-Path $PSScriptRoot 'Common.ps1')
+    Import-FlynnelModule
+}
+
+Describe 'Get-FlynnelNativeEntry' {
+    BeforeAll {
+        $script:Entry = Get-FlynnelNativeEntry
+    }
+
+    It 'answers one Flynnel.NativeEntry' {
+        @($script:Entry).Count | Should -Be 1
+        $script:Entry.GetType().FullName | Should -Be 'Flynnel.NativeEntry'
+    }
+
+    It 'reports ABI version 1 as a UInt32' {
+        # The caller branches on this, so it has to arrive as the width
+        # the native side wrote rather than widened.
+        $script:Entry.AbiVersion | Should -Be 1
+        $script:Entry.AbiVersion.GetType().FullName | Should -Be 'System.UInt32'
+    }
+
+    It 'reports the run-chunks entry as a nonzero UInt64' {
+        # An address wider than 32 bits is the ordinary case on a 64-bit
+        # process, so anything narrower than UInt64 would truncate it.
+        $script:Entry.RunChunksV1 | Should -Not -Be 0
+        $script:Entry.RunChunksV1.GetType().FullName | Should -Be 'System.UInt64'
+    }
+
+    It 'answers the same address twice in one session' {
+        # One loaded copy of the library, one address. A caller that asks
+        # per dispatch sees a change only when a reload loads a new copy.
+        (Get-FlynnelNativeEntry).RunChunksV1 | Should -Be $script:Entry.RunChunksV1
+    }
+}
