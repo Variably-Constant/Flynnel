@@ -65,6 +65,11 @@ use flynnel::backend::{DispatchBackend, KernelArg, KernelHandle};
 /// The `(i32, i32) -> i32` add module the backend's own tests use.
 const ADD_WASM: &[u8] = include_bytes!("../kernels/add_i32.wasm");
 
+/// The module's export. `register_kernel` looks up the export by the
+/// name it is given, so this is the name inside the module and not the
+/// name of the file holding it, which is add_i32.
+const ADD_EXPORT: &str = "add";
+
 /// Spins before a courtesy yield, so a waiter on an oversubscribed
 /// host gives up its core instead of holding it against the thread it
 /// is waiting for.
@@ -267,21 +272,25 @@ fn arm_label() -> &'static str {
     }
 }
 
-fn bench_shapes(c: &mut Criterion, loaded: bool) {
+/// Returns whether any row was timed, so the closing line can tell a
+/// clean run from one that measured nothing. Every dispatch completing
+/// is true of a run with no dispatches in it, and on its own it reads
+/// like a pass.
+fn bench_shapes(c: &mut Criterion, loaded: bool) -> bool {
     let backend = match WasmBackend::new() {
         Ok(b) => Arc::new(b),
         Err(e) => {
             eprintln!("wasm_store_locality: no wasm backend on this host ({e}), nothing measured");
-            return;
+            return false;
         }
     };
-    let handle = match backend.register_kernel("add_i32", ADD_WASM) {
+    let handle = match backend.register_kernel(ADD_EXPORT, ADD_WASM) {
         Ok(h) => h,
         Err(e) => {
             eprintln!(
                 "wasm_store_locality: the add module did not register ({e}), nothing measured"
             );
-            return;
+            return false;
         }
     };
 
@@ -322,6 +331,7 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) {
     }
 
     group.finish();
+    true
 }
 
 fn bench_all(c: &mut Criterion) {
@@ -332,10 +342,14 @@ fn bench_all(c: &mut Criterion) {
             .map(|p| p.get())
             .unwrap_or(0)
     );
-    bench_shapes(c, false);
-    bench_shapes(c, true);
+    let idle = bench_shapes(c, false);
+    let loaded = bench_shapes(c, true);
     let unfinished = UNFINISHED.load(Ordering::Relaxed);
-    if unfinished > 0 {
+    if !idle && !loaded {
+        eprintln!(
+            "wasm_store_locality: nothing measured in either shape, so there is no result here to read"
+        );
+    } else if unfinished > 0 {
         eprintln!(
             "wasm_store_locality: {unfinished} shares did not complete, so these timings are of a run that was not doing all of its work"
         );

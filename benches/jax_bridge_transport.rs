@@ -357,7 +357,12 @@ where
     });
 }
 
-fn bench_shapes(c: &mut Criterion, loaded: bool) {
+/// Returns whether any row was timed, so the closing line can tell a
+/// clean run from one that measured nothing. Every round trip coming
+/// back is true of a run with no round trips in it, and on its own it
+/// reads like a pass.
+fn bench_shapes(c: &mut Criterion, loaded: bool) -> bool {
+    let mut timed = false;
     let cores = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4);
@@ -376,12 +381,14 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) {
             eprintln!(
                 "jax_bridge_transport: no interpreter on PATH echoed a line, nothing measured"
             );
-            return;
+            group.finish();
+            return timed;
         };
         let owned = Owned::new(owned_pipe);
         group.bench_function(format!("owner_thread/c{callers}"), |b| {
             b.iter(|| fan_out(callers, 8, |body| owned.call(body)));
         });
+        timed = true;
         drop(owned);
         drop(owned_child);
 
@@ -389,7 +396,8 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) {
             eprintln!(
                 "jax_bridge_transport: no interpreter on PATH echoed a line, nothing measured"
             );
-            return;
+            group.finish();
+            return timed;
         };
         let locked = Locked::new(locked_pipe);
         group.bench_function(format!("held_lock/c{callers}"), |b| {
@@ -400,6 +408,7 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) {
     }
 
     group.finish();
+    timed
 }
 
 fn bench_all(c: &mut Criterion) {
@@ -409,10 +418,14 @@ fn bench_all(c: &mut Criterion) {
             .map(|p| p.get())
             .unwrap_or(0)
     );
-    bench_shapes(c, false);
-    bench_shapes(c, true);
+    let idle = bench_shapes(c, false);
+    let loaded = bench_shapes(c, true);
     let failed = FAILED.load(Ordering::Relaxed);
-    if failed > 0 {
+    if !idle && !loaded {
+        eprintln!(
+            "jax_bridge_transport: nothing measured in either shape, so there is no result here to read"
+        );
+    } else if failed > 0 {
         eprintln!(
             "jax_bridge_transport: {failed} round trips did not come back, so these timings are of a run that was not doing all of its work"
         );
