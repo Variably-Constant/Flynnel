@@ -4955,9 +4955,17 @@ mod tests {
         // the entry probes the body, and a probe that reads the whole
         // call under the host's collapse threshold runs it on the
         // caller as one leaf, through a recorder that never brackets.
+        // The bracket is taken one leaf in the stride on each thread and
+        // a leaf reaches the site when its thread has batched four for
+        // the site, so which dispatch first lands a bracketed leaf at
+        // the site depends on how the leaves were spread over the
+        // workers. The dispatches repeat until one has, up to a bound
+        // far past what the cadence allows.
         let n = 4 * MIN_LEAF_ITEMS;
         let mut v: Vec<u64> = (0..n as u64).collect();
-        for _ in 0..(LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4) {
+        let bound = LocalLeafBuffer::FLUSH_THRESHOLD as usize * 64;
+        let mut dispatches = 0usize;
+        while dispatches < bound && SITE.oncore_items() == 0 {
             let plan = JobPlan::new(0, n as u32)
                 .with_site(site)
                 .with_estimated_per_item_ns(5_000);
@@ -4970,6 +4978,7 @@ mod tests {
                     *slot = std::hint::black_box(acc);
                 }
             });
+            dispatches += 1;
         }
 
         assert!(
@@ -4979,7 +4988,8 @@ mod tests {
         assert!(
             SITE.oncore_items() > 0,
             "the indexed entry reaches the bracket, which `oncore_spread` leaves on by \
-             default; a zero here means the recorder never takes it"
+             default; no bracketed leaf reached the site in {dispatches} dispatches, so \
+             the recorder never takes it"
         );
         // That the bracket is gated by the switch rather than taken
         // unconditionally is asserted by
@@ -5000,13 +5010,16 @@ mod tests {
             crate::sched::call_site::CallSiteState::new();
         let site = crate::sched::call_site::SiteRef::new(&SITE);
 
-        // The estimate keeps every dispatch on the pool, for the reason
-        // the indexed test gives.
+        // The estimate keeps every dispatch on the pool, and the
+        // dispatches repeat until a bracketed leaf has reached the site,
+        // for the reasons the indexed test gives.
         let n = 4 * MIN_LEAF_ITEMS;
         let a: Vec<u64> = (0..n as u64).collect();
         let b: Vec<u64> = (0..n as u64).map(|x| x ^ 0x5DEE_CE66).collect();
         let mut out: Vec<u64> = vec![0; n];
-        for _ in 0..(LocalLeafBuffer::FLUSH_THRESHOLD as usize * 4) {
+        let bound = LocalLeafBuffer::FLUSH_THRESHOLD as usize * 64;
+        let mut dispatches = 0usize;
+        while dispatches < bound && SITE.oncore_items() == 0 {
             let plan = JobPlan::new(0, n as u32)
                 .with_site(site)
                 .with_estimated_per_item_ns(5_000);
@@ -5026,6 +5039,7 @@ mod tests {
                     }
                 },
             );
+            dispatches += 1;
         }
 
         assert!(
@@ -5035,7 +5049,8 @@ mod tests {
         assert!(
             SITE.oncore_items() > 0,
             "the triple entry reaches the bracket, which `oncore_spread` leaves on by \
-             default; a zero here means the recorder never takes it"
+             default; no bracketed leaf reached the site in {dispatches} dispatches, so \
+             the recorder never takes it"
         );
         assert!(SITE.per_item_oncore_cv2_per_mille().is_some());
     }
