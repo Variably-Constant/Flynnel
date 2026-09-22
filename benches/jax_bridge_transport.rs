@@ -213,11 +213,11 @@ impl Owned {
 impl Drop for Owned {
     fn drop(&mut self) {
         self.hub.shutdown();
-        if let Some(worker) = self.worker.take() {
-            if worker.join().is_err() {
-                eprintln!("jax_bridge_transport: the owning thread panicked");
-                FAILED.fetch_add(1, Ordering::Relaxed);
-            }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            eprintln!("jax_bridge_transport: the owning thread panicked");
+            FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -321,7 +321,11 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) {
     let mut group = c.benchmark_group(format!("jax_transport/{suffix}"));
     group.measurement_time(Duration::from_secs(10));
 
-    for callers in [1usize, 2, cores.max(2)] {
+    // Deduplicated, because criterion refuses two benchmarks with one
+    // id and a host of two cores would otherwise ask for c2 twice.
+    let mut widths = vec![1usize, 2, cores.max(2)];
+    widths.dedup();
+    for callers in widths {
         let Some((owned_child, owned_pipe)) = Echo::spawn() else {
             eprintln!("jax_bridge_transport: no python3 on PATH, nothing measured");
             return;

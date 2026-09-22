@@ -295,11 +295,17 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) {
 
     let mut group = c.benchmark_group(format!("wasm_store/{suffix}"));
     group.measurement_time(Duration::from_secs(8));
+    // Deduplicated, because criterion refuses two benchmarks with one
+    // id and a host of one core would otherwise ask for t1 twice. The
+    // floor of two on `wide` covers that already; this holds if the
+    // floor ever moves.
+    let mut widths = vec![1usize, wide];
+    widths.dedup();
 
     // One dispatch per freshly started thread. The local arm
     // instantiates once per thread here and the shared arm does not,
     // so this is where the lever pays before it can earn anything.
-    for threads in [1usize, wide] {
+    for threads in widths.iter().copied() {
         group.bench_function(format!("first_dispatch/{arm}/t{threads}"), |b| {
             b.iter(|| fan_out(&backend, handle, threads, 1));
         });
@@ -308,7 +314,7 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) {
     // Many dispatches from a crew that is already running. Past its
     // first round the local arm has its stores and the shared arm
     // still has the lock.
-    for threads in [1usize, wide] {
+    for threads in widths.iter().copied() {
         let crew = Crew::spawn(&backend, handle, threads, 64);
         group.bench_function(format!("settled/{arm}/t{threads}"), |b| {
             b.iter(|| crew.round());
