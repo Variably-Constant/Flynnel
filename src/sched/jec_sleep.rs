@@ -898,17 +898,6 @@ impl Sleep {
             self.counters.sub_sleeping_thread();
             idle.sleepless = idle.sleepless.saturating_add(1);
         } else {
-            // Committing to a park: the spin did not rescue this
-            // worker. Feed the controller before blocking.
-            idle.parked = true;
-            idle.sleepless = 0;
-            PARK_EVENTS.fetch_add(1, Ordering::Relaxed);
-            crate::sched::trace::emit(
-                crate::sched::trace::TraceEvent::PoolPark,
-                idle.worker_index as u32,
-            );
-            maybe_adapt();
-
             // Publish first, then re-read. A waker arriving from here
             // on sees SLEEPING and claims it; one that arrived earlier
             // stored the flag this reads next. Both orders are covered
@@ -947,9 +936,31 @@ impl Sleep {
                 // loop below and is released by its waker, which gives
                 // the count back itself.
                 self.counters.sub_sleeping_thread();
+                // A rescue is a third way out of here without parking,
+                // so it feeds the same counter the other two do. Work
+                // this worker alone can drain is work it will get, but
+                // work in the injector may be gone by the time it
+                // looks; a rescue that keeps finding nothing would
+                // re-run the spin window at one hundred percent of a
+                // core, which is what the backoff exists to stop.
+                idle.sleepless = idle.sleepless.saturating_add(1);
                 idle.wake_fully();
                 return;
             }
+
+            // Committing to a park: neither the spin nor the recheck
+            // above rescued this worker. Counted here rather than at
+            // the decision to sleep, so a worker that rescued itself
+            // is not counted as having parked and PARK_EVENTS means
+            // what its name says. Feed the controller before blocking.
+            idle.parked = true;
+            idle.sleepless = 0;
+            PARK_EVENTS.fetch_add(1, Ordering::Relaxed);
+            crate::sched::trace::emit(
+                crate::sched::trace::TraceEvent::PoolPark,
+                idle.worker_index as u32,
+            );
+            maybe_adapt();
 
             // park returns on a permit, on an unpark, and spuriously,
             // and a claimed worker is still owed its release, so only
