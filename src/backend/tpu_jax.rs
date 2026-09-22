@@ -199,8 +199,18 @@ fn owner_loop(mut state: BridgeState, hub: &NotifyHub<BridgeRequest>) {
     }
     if let Some(mut child) = state.child.take() {
         match child.wait() {
-            Ok(status) => drop(status),
-            Err(unwaitable) => drop(unwaitable),
+            // The bridge was told to shut down a few lines above, so
+            // a status other than success is the child having ended
+            // of something else, which the next run would otherwise
+            // meet as an unexplained missing bridge.
+            Ok(status) => {
+                if !status.success() {
+                    eprintln!("tpu_jax: the bridge process ended with {status}");
+                }
+            }
+            Err(unwaitable) => {
+                eprintln!("tpu_jax: the bridge process could not be waited for: {unwaitable}");
+            }
         }
     }
     match std::fs::remove_file(&state.script_path) {
