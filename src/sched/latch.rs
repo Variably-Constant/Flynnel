@@ -71,6 +71,14 @@ impl CoreLatch {
         }
     }
 
+    /// The address of the state byte, for a monitor wait to watch the
+    /// cache line it sits in. Every store that sets this latch, or
+    /// moves it through the sleepy handshake, lands on that line.
+    #[inline]
+    pub(crate) fn line(&self) -> *const u8 {
+        (&raw const self.state).cast::<u8>()
+    }
+
     /// First phase of the sleep handshake. The owning thread calls
     /// this to declare intent to park. Returns `true` if the
     /// transition `UNSET -> SLEEPY` succeeded and the caller may

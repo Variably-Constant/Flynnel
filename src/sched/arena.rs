@@ -696,6 +696,22 @@ where
         const SLOT_WAIT_SPIN: usize = 256;
         crate::sched::trace::emit(crate::sched::trace::TraceEvent::SlotPush, 0);
         let spin_budget_ns = plan.effective_spin_before_yield_ns();
+        // Cycles one monitor wait covers, or zero where the lever is
+        // off or the host has no monitor that holds. Read once, so the
+        // arm a wait takes cannot change partway through this loop.
+        // The budget above still bounds the whole spin either way; what
+        // this changes is what the thread does between its polls, which
+        // is a PAUSE that issues into the pipeline or a wait on the
+        // latch's own line that issues nothing.
+        let monitor_cycles = if crate::sched::levers::latch_monitor()
+            && crate::sched::sleep::monitor_wait_available()
+        {
+            crate::sched::par_iter::installed_dispatch_cost_ns()
+                .saturating_mul(crate::sched::par_iter::tsc_per_ns_16())
+                / 16
+        } else {
+            0
+        };
         let wait_started = std::time::Instant::now();
         let mut spun = 0usize;
         let mut parked = false;
@@ -706,7 +722,24 @@ where
             let keep_spinning = spun < SLOT_WAIT_SPIN
                 || wait_started.elapsed().as_nanos() < u128::from(spin_budget_ns);
             if keep_spinning {
-                std::hint::spin_loop();
+                // The fixed floor stays a PAUSE spin, so a set already
+                // in flight is caught by the polls it was sized for;
+                // only the budget-driven remainder waits on the line.
+                if monitor_cycles > 0 && spun >= SLOT_WAIT_SPIN {
+                    // SAFETY: the line is this job's own latch state,
+                    // which outlives the wait because the caller does
+                    // not return until the latch is set, and the wait
+                    // is issued only where CPUID reported the pair.
+                    unsafe {
+                        crate::sched::sleep::monitor_wait_once(
+                            job.latch.core.line(),
+                            monitor_cycles,
+                            || job.latch.is_set(),
+                        );
+                    }
+                } else {
+                    std::hint::spin_loop();
+                }
                 spun += 1;
                 continue;
             }
