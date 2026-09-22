@@ -687,12 +687,10 @@ where
         Vec::new()
     };
 
-    // LockLatch (Mutex+Condvar) so the foreign caller blocks
-    // directly on the wrapper completion instead of polling via
-    // park_timeout. Mirrors the wiring in arena::external_dispatch:
-    // the wrapper-running worker holds CPU during the fan-out
-    // while the caller sleeps on the condvar; wake latency is
-    // bounded by mutex acquisition + notify_one (microseconds).
+    // A LockLatch, so the foreign caller blocks on the wrapper's
+    // completion instead of polling with park_timeout. Same wiring as
+    // arena::external_dispatch: the worker running the wrapper holds a
+    // core through the fan-out while the caller waits on the latch.
     let plan_copy = *plan;
     let wrapper = StackJob::new(
         move |_stolen: bool| -> Vec<R> {
@@ -718,22 +716,11 @@ where
         arena.submit(r, plan.numa_hint);
     }
 
-    // Hybrid sleep policy mirroring arena::external_dispatch: a
-    // brief spin on the LockLatch's fast-path AtomicBool catches
-    // sub-200us fan-outs without paying mutex+condvar latency,
-    // then the loop falls through to wait() which sleeps on the
-    // Mutex+Condvar pair for longer dispatches.
+    // The same ladder arena::external_dispatch uses: a spin on the
+    // latch's fast-path flag catches a fan-out that finishes inside
+    // the window, and a longer one falls through to the park.
     const SPIN_CYCLES: usize = 500_000;
-    for _ in 0..SPIN_CYCLES {
-        if wrapper.latch.is_set() {
-            // SAFETY: latch is set => wrapper closure ran to
-            // completion and wrote the result slot.
-            return unsafe { wrapper.into_result() };
-        }
-        std::hint::spin_loop();
-    }
-    // Spin window expired; block on the LockLatch condvar.
-    wrapper.latch.wait();
+    wrapper.latch.wait_spin_then_monitor(SPIN_CYCLES);
 
     // SAFETY: latch is set => wrapper closure ran to completion
     // and wrote the result slot.

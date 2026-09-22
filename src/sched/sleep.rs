@@ -161,6 +161,19 @@ pub fn monitor_wait_held() -> bool {
     monitor_holds()
 }
 
+/// Whether a monitor wait on this host would actually wait: the
+/// silicon has one of the two instruction pairs and no wait has found
+/// it not to hold.
+///
+/// For a caller deciding once, before a ladder starts, whether to take
+/// the monitor rung at all. [`monitor_wait_once`] answers the same
+/// question per call by returning false, which is the right shape
+/// inside a loop and the wrong one for a caller whose other rung has
+/// to be sized differently.
+pub(crate) fn monitor_wait_available() -> bool {
+    (crate::cpu_info::has_waitpkg() || crate::cpu_info::has_monitorx()) && monitor_holds()
+}
+
 /// One bounded monitor wait on the cache line holding `line`: arms the
 /// host's monitor there and waits until a store lands on the line, an
 /// interrupt arrives or `budget_cycles` of the TSC have passed,

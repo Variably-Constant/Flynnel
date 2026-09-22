@@ -300,6 +300,22 @@ pub fn batch_weight() -> bool {
     *V.get_or_init(|| read("FLYNNEL_LEVER_BATCH_WEIGHT"))
 }
 
+/// Wait for a foreign caller's latch through a spin floor, then bounded
+/// monitor waits on the latch flag's own line, then the park, instead
+/// of spinning the caller's whole window on `PAUSE`.
+///
+/// Off until measured. This is the one placement the monitor wait is
+/// built for and the pool's idle search is not: the event waited on is
+/// a single store to a known line, the waiter has nothing else it
+/// could be doing, and the alternative it replaces is a spin rather
+/// than a yield or a park. A monitor wait ends on the same store a
+/// spin would, issues nothing into the pipeline while it waits, and
+/// holds the logical processor no longer than the spin it replaces.
+pub fn latch_monitor() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| read("FLYNNEL_LEVER_LATCH_MONITOR"))
+}
+
 /// Spend an idle pool worker's spin rounds in a bounded monitor wait on
 /// the sleep coordinator's counters word rather than in `yield_now`, on
 /// a host with MONITORX or WAITPKG, so a producer's store wakes the
@@ -398,13 +414,14 @@ pub fn calibration_refusal() -> bool {
 pub fn describe() -> String {
     format!(
         "oncore_spread={} batch_weight={} smt_window={} allowed_width={} \
-         calibration_refusal={} spin_monitor={} spin_adaptive={} spin_window={} \
-         serve_policy={:?} occupancy_floor={}",
+         calibration_refusal={} latch_monitor={} spin_monitor={} spin_adaptive={} \
+         spin_window={} serve_policy={:?} occupancy_floor={}",
         oncore_spread(),
         batch_weight(),
         smt_from_window(),
         allowed_width(),
         calibration_refusal(),
+        latch_monitor(),
         spin_monitor(),
         crate::sched::spin_adaptive(),
         crate::sched::spin_window(),

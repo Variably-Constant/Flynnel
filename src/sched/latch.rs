@@ -490,7 +490,87 @@ impl LockLatch {
     pub fn is_set(&self) -> bool {
         self.flag.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// Wait for the latch through the ladder a foreign caller wants:
+    /// `spin_cycles` of `PAUSE` first, then [`Self::wait`].
+    ///
+    /// With [`crate::sched::levers::latch_monitor`] on and a host that
+    /// has a monitor wait, the ladder gains a middle rung: a short
+    /// spin floor, then bounded waits on the flag's own cache line,
+    /// then the park. The three rungs are one mechanism rather than
+    /// three choices. A `PAUSE` spin is the fastest wake there is,
+    /// because it never stopped looking, and the most expensive way to
+    /// be idle, because it issues into the pipeline the whole time; a
+    /// monitor wait ends on the same store and issues nothing, so the
+    /// hardware thread's sibling gets the core's pipelines; the park
+    /// gives the logical processor back and costs a syscall to wake.
+    /// Which rung a wait ends on is decided by how long it turns out
+    /// to be, which is not knowable when it starts.
+    ///
+    /// Returns without waiting once the flag reads set, on any rung.
+    pub fn wait_spin_then_monitor(&self, spin_cycles: usize) {
+        // Decided once, before either ladder starts. A host with no
+        // monitor, or one whose monitor has been found not to hold,
+        // takes the spin the caller asked for and the park after it,
+        // which is what it would take with the lever off; deciding
+        // this per round instead would cut that spin to the floor and
+        // make the lever two changes rather than one.
+        let budget_cycles = crate::sched::par_iter::installed_dispatch_cost_ns()
+            .saturating_mul(crate::sched::par_iter::tsc_per_ns_16())
+            / 16;
+        let use_monitor = crate::sched::levers::latch_monitor()
+            && budget_cycles > 0
+            && crate::sched::sleep::monitor_wait_available();
+
+        if !use_monitor {
+            for _ in 0..spin_cycles {
+                if self.is_set() {
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+            self.wait();
+            return;
+        }
+
+        // The floor, sized as the mailbox thief's is: long enough that
+        // a set already in flight lands here, short enough that the
+        // pipeline is not held for a wait that was never going to be
+        // short.
+        for _ in 0..MONITOR_SPIN_FLOOR {
+            if self.is_set() {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        // The middle rung, bounded twice: each wait by one dispatch
+        // cost, and the ladder by the spin the caller asked for, so
+        // turning the lever on never holds this thread longer than
+        // leaving it off would have spun.
+        let rounds = (spin_cycles / MONITOR_SPIN_FLOOR).max(1);
+        let line = (&raw const self.flag).cast::<u8>();
+        for _ in 0..rounds {
+            if self.is_set() {
+                return;
+            }
+            // SAFETY: `line` points at this latch's own flag, which
+            // lives as long as `self`, and the wait is issued only
+            // where CPUID reported the pair.
+            let waited = unsafe {
+                crate::sched::sleep::monitor_wait_once(line, budget_cycles, || self.is_set())
+            };
+            if !waited {
+                break;
+            }
+        }
+        self.wait();
+    }
 }
+
+/// `PAUSE` polls a monitor-waiting latch spins before its first
+/// monitor wait. 512, as the mailbox thief's floor is, because both
+/// are covering the same thing: a store already on its way.
+const MONITOR_SPIN_FLOOR: usize = 512;
 
 /// Diagnostic gate for LockLatch.wait() entry/exit logging. Reads
 /// the env var once via OnceLock so the hot wait path pays just a

@@ -770,13 +770,7 @@ where
         Some(ns) => (ns / 3).clamp(1_000, 500_000) as usize,
         None => 200_000,
     };
-    for _ in 0..spin_cycles {
-        if wrapper.latch.is_set() {
-            return unsafe { wrapper.into_result() };
-        }
-        std::hint::spin_loop();
-    }
-    wrapper.latch.wait();
+    wrapper.latch.wait_spin_then_monitor(spin_cycles);
     unsafe { wrapper.into_result() }
 }
 

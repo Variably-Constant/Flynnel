@@ -712,8 +712,11 @@ unsafe fn wait_with_monitorx(state_addr: *const u8, deadline_tsc: u64) {
             in("edx") 0u32,
             options(nostack, preserves_flags),
         );
-        // EAX = 0 requests C0, matching the WAITPKG arm's C0.1 hint;
-        // ECX bit 1 enables the EBX timer; EBX carries the count.
+        // EAX[7:4] is the requested C-state minus one, so 0xF0 asks
+        // for C0, matching the WAITPKG arm's C0.1 hint; ECX bit 1
+        // enables the EBX timer and EBX carries the count, which
+        // `remaining` floors at one because a zero count with that bit
+        // set is an unbounded wait on Zen 1 and Zen+.
         //
         // rbx is reserved by LLVM and cannot be an operand, so it is
         // saved and restored inside the block. That is why this one
@@ -727,7 +730,7 @@ unsafe fn wait_with_monitorx(state_addr: *const u8, deadline_tsc: u64) {
             ".byte 0x0f, 0x01, 0xfb",
             "pop rbx",
             ask = in(reg) ask,
-            inout("eax") 0u32 => _,
+            inout("eax") 0xF0u32 => _,
             inout("ecx") 2u32 => _,
         );
     }
