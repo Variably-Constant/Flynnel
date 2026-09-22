@@ -212,8 +212,17 @@ impl Owned {
     fn new(mut pipe: Pipe) -> Self {
         let hub = NotifyHub::<Request>::new(256, 1);
         let tx = hub.sender();
-        let rx = hub.register_consumer();
+        let hub_for_owner = hub.clone();
         let worker = std::thread::spawn(move || {
+            // Registered HERE, on the thread that will receive. A
+            // NotifyReceiver captures the parker of whichever thread
+            // registered it, and a send wakes that thread, so
+            // registering on the spawning thread and moving the
+            // receiver across wakes the wrong one: the worker parks,
+            // nobody wakes it, and the first call never returns. That
+            // is what the shipped bridge does too, by registering
+            // inside its owner loop.
+            let rx = hub_for_owner.register_consumer();
             while let Some(request) = rx.recv() {
                 let outcome = pipe.round_trip(&request.body);
                 if request.reply.send(outcome).is_err() {
