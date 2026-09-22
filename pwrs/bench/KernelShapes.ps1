@@ -617,9 +617,10 @@ foreach ($k in $kernels) {
                           } else { $null }
         VsPool          = $vsPool
         AnchorSpeaksFor = $k.Straight
-        # How far the box moved across this row's own arms. A ratio in
-        # this row is readable when this is small, whatever the run-wide
-        # control did.
+        # How far the box moved across this row's own arms. This is a
+        # floor under the row's error and not the error itself: the
+        # control body is not the kernel, so it carries the box and
+        # nothing the kernel brings. BoundPct below is the readable one.
         RowDriftPct     = $rowDriftPct
     }
     Write-Host ("  row drift {0}% across this row's arms" -f $rowDriftPct)
@@ -788,6 +789,8 @@ foreach ($row in $rows) {
         When      = (Get-Date -Format 'o')
         Kernel    = $row.Kernel
         FlynnelMs = $row.FlynnelMs
+        SerialMs  = $row.SerialMs
+        VsSerial  = $row.VsSerial
         LoadedMs  = $row.LoadedMs
     }
 }
@@ -807,6 +810,37 @@ foreach ($row in $rows) {
         $row | Add-Member -NotePropertyName RunSpread -NotePropertyValue (
             [Math]::Round($values[-1] / $values[0], 3))
     }
+    # The ratio is what a reader acts on, so the ratio is what needs a
+    # bound. Its numerator and denominator move together in part, so
+    # the spread of the ratio is its own measurement and not something
+    # the two arms' spreads can be combined into.
+    $ratios = @($mine | Where-Object {
+        $null -ne $_.VsSerial -and $_.VsSerial -gt 0
+    } | ForEach-Object VsSerial | Sort-Object)
+    $ratioSpreadPct = if ($ratios.Count -lt 2) { $null } else {
+        [Math]::Round(100.0 * ($ratios[-1] - $ratios[0]) / $ratios[0], 1)
+    }
+    # The row control moves with the box and the ratio moves with
+    # everything the box does not cover, so neither bounds the other and
+    # the readable bound is whichever is wider. Where the row has been
+    # run once, the control is all there is and the column says so by
+    # carrying the control's own figure.
+    $bound = if ($null -eq $row.RowDriftPct) { 0.0 } else {
+        [Math]::Abs([double]$row.RowDriftPct)
+    }
+    if ($null -ne $ratioSpreadPct -and $ratioSpreadPct -gt $bound) {
+        $bound = $ratioSpreadPct
+    }
+    $row | Add-Member -NotePropertyName RatioSpreadPct -NotePropertyValue $ratioSpreadPct
+    $row | Add-Member -NotePropertyName BoundPct -NotePropertyValue ([Math]::Round($bound, 1))
+    # A ratio sits this far from parity; when the bound reaches that far
+    # the row has not measured which side of parity it is on, whatever
+    # the ratio prints.
+    $distancePct = if ($null -ne $row.VsSerial -and $row.VsSerial -gt 0) {
+        [Math]::Abs(100.0 * ($row.VsSerial - 1.0))
+    } else { $null }
+    $row | Add-Member -NotePropertyName SignHeld -NotePropertyValue (
+        if ($null -eq $distancePct) { $null } else { $distancePct -gt $bound })
 }
 $runRows | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $RunStore -Encoding utf8
 
@@ -897,7 +931,8 @@ if ($LoadThreads -gt 0) {
 }
 Write-Host ''
 $rows | Format-Table Kernel, FlynnelMs, SerialMs, NativeMs, LoadedMs, VsSerial, VsNative,
-    LoadCost, RowDriftPct, Runs, RunSpread, AnchorSpeaksFor, CrossBuild -AutoSize
+    LoadCost, RowDriftPct, RatioSpreadPct, BoundPct, SignHeld, Runs, RunSpread,
+    AnchorSpeaksFor, CrossBuild -AutoSize
 Write-Host ''
 Write-Host 'Runs is how many invocations of this script are on record for this commit, host'
 Write-Host 'and edition, and RunSpread is the widest over the narrowest of their medians.'
@@ -906,9 +941,18 @@ Write-Host 'RunSpread of null means one run is on record and there is nothing to
 Write-Host 'VsSerial is how many times faster the pool is than one worker running the same'
 Write-Host 'kernel. VsNative is against the PowerShell way to get the same answer.'
 Write-Host "RowDriftPct is the control measured at both ends of that row's own arms, so it"
-Write-Host 'is what bounds the ratios in that row. The run-wide control drift above covers'
-Write-Host 'minutes and bounds comparisons between rows; reading one row against it discards'
-Write-Host 'rows that were never exposed to it.'
+Write-Host 'is how far the box moved while the row was being taken. It is not the error on'
+Write-Host "the row's ratio: the control is a different body, so it carries none of what the"
+Write-Host 'kernel itself brings to a reading. Measured on the Linux guest, thirteen of'
+Write-Host 'sixteen rows moved further between runs than their own control reported, one of'
+Write-Host 'them by 878% against a control that said 11%. The run-wide control drift above'
+Write-Host 'covers minutes and bounds comparisons between rows; reading one row against it'
+Write-Host 'discards rows that were never exposed to it.'
+Write-Host 'RatioSpreadPct is how far VsSerial itself moved across the runs on record, which'
+Write-Host 'is the only figure that has the kernel in it. BoundPct is the wider of the two,'
+Write-Host 'and SignHeld is false where the ratio sits closer to parity than BoundPct, which'
+Write-Host 'means this row has not established which side of parity it is on. A SignHeld of'
+Write-Host 'null is a row measured once, where nothing yet bounds the ratio.'
 Write-Host 'LoadCost is the same kernel under contention over itself on a quiet box, and is'
 Write-Host 'read against ControlLoadCost above: a row that rose by less than the control did'
 Write-Host 'was not slowed by the load. A null LoadCost means the arm did not run, which is'
