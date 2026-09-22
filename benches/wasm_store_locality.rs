@@ -80,6 +80,18 @@ const SPINS_PER_YIELD: u64 = 1024;
 /// aborting the run that found it.
 static UNFINISHED: AtomicU64 = AtomicU64::new(0);
 
+/// The first dispatch failure, said once.
+///
+/// A backend that has stopped answering fails every later call the
+/// same way, and a line each would bury the run's own output under
+/// thousands of copies of one fact, in a log a chain then greps. The
+/// count in `UNFINISHED` is what says how many there were.
+static SAID: std::sync::Once = std::sync::Once::new();
+
+fn say_once(what: impl FnOnce() -> String) {
+    SAID.call_once(|| eprintln!("{}", what()));
+}
+
 /// Busy threads occupying half the host, joined when this is dropped.
 struct Load {
     stop: Arc<AtomicU32>,
@@ -133,7 +145,7 @@ fn dispatch_n(backend: &Arc<WasmBackend>, handle: KernelHandle, count: u32) {
         match backend.dispatch_kernel(handle, 1, &[KernelArg::I32(a), KernelArg::I32(b)]) {
             Ok(()) => {}
             Err(e) => {
-                eprintln!("wasm_store_locality: dispatch failed: {e}");
+                say_once(|| format!("wasm_store_locality: dispatch failed: {e}"));
                 UNFINISHED.fetch_add(1, Ordering::Relaxed);
                 return;
             }
