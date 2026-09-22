@@ -576,25 +576,43 @@ impl LockLatch {
         }
         // The middle rung ends when the spin it replaces would have
         // ended, so both arms park at the same moment and differ only
-        // in what this thread did while waiting. Each wait inside it is
-        // bounded by one dispatch cost, so a store that lands early is
-        // seen a dispatch cost later at worst.
+        // in what this thread did while waiting.
+        //
+        // Each wait is bounded by what is LEFT of the rung rather than
+        // by one dispatch cost. A store to the line ends a long wait
+        // exactly as fast as a short one: the monitor is armed before
+        // the flag is read, and a store landing between the arming and
+        // the wait leaves the monitor triggered, so the wait returns at
+        // once and no wake is lost. A short bound therefore buys no
+        // promptness and costs an arming. Measured on pc2 at 141c29d,
+        // 1494 armings over 196 waits, so about seven of every eight
+        // were timeouts that found nothing and armed again. The rung
+        // still bounds each wait, so a monitor cleared without a store
+        // costs at most the rest of a rung this thread was spending on
+        // the flag anyway.
         let ladder_cycles =
             (spin_cycles.saturating_sub(MONITOR_SPIN_FLOOR) as u64).saturating_mul(per_poll);
         let line = (&raw const self.flag).cast::<u8>();
         crate::sched::sleep::note_latch_monitor_wait(false);
         let ladder_start = crate::sched::sleep::cycles_now();
-        while crate::sched::sleep::cycles_now().saturating_sub(ladder_start) < ladder_cycles {
+        loop {
+            // The flag first, because it is a load and the clock is
+            // not, and this is the exit every wait that ends well
+            // takes.
             if self.is_set() {
                 return;
             }
+            let spent = crate::sched::sleep::cycles_now().saturating_sub(ladder_start);
+            let left = ladder_cycles.saturating_sub(spent);
+            if left == 0 {
+                break;
+            }
+            crate::sched::sleep::note_latch_monitor_arm();
             // SAFETY: `line` points at this latch's own flag, which
             // lives as long as `self`, and the wait is issued only
             // where CPUID reported the pair.
-            crate::sched::sleep::note_latch_monitor_arm();
-            let waited = unsafe {
-                crate::sched::sleep::monitor_wait_once(line, budget_cycles, || self.is_set())
-            };
+            let waited =
+                unsafe { crate::sched::sleep::monitor_wait_once(line, left, || self.is_set()) };
             if !waited {
                 break;
             }
