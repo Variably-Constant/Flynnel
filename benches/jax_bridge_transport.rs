@@ -214,8 +214,9 @@ impl Owned {
         let tx = hub.sender();
         let hub_for_owner = hub.clone();
         let worker = std::thread::spawn(move || {
-            // Registered HERE, on the thread that will receive. A
-            // NotifyReceiver captures the parker of whichever thread
+            // Registered on the thread that will receive, and not on
+            // the one that spawns it. A NotifyReceiver captures the
+            // parker of whichever thread
             // registered it, and a send wakes that thread, so
             // registering on the spawning thread and moving the
             // receiver across wakes the wrong one: the worker parks,
