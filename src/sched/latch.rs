@@ -558,6 +558,22 @@ impl LockLatch {
         }
         let per_poll = crate::sched::sleep::cycles_now().saturating_sub(floor_start)
             / MONITOR_SPIN_FLOOR as u64;
+        // A floor the scheduler interrupted measures the interruption
+        // rather than a PAUSE, and sizing the rung from it would hold
+        // this thread for far longer than the spin it stands in for. A
+        // poll costs 20 to 140 cycles on the parts here, so a reading
+        // past this ceiling is not one, and the wait takes the spin the
+        // other arm takes instead of a rung it cannot size.
+        if per_poll == 0 || per_poll > MAX_MEASURED_POLL_CYCLES {
+            for _ in MONITOR_SPIN_FLOOR..spin_cycles {
+                if self.is_set() {
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+            self.wait();
+            return;
+        }
         // The middle rung ends when the spin it replaces would have
         // ended, so both arms park at the same moment and differ only
         // in what this thread did while waiting. Each wait inside it is
@@ -590,6 +606,12 @@ impl LockLatch {
 /// monitor wait. 512, as the mailbox thief's floor is, because both
 /// are covering the same thing: a store already on its way.
 const MONITOR_SPIN_FLOOR: usize = 512;
+
+/// Cycles per poll above which the floor's timing is read as an
+/// interruption rather than as this host's `PAUSE`. A poll costs 20 to
+/// 140 cycles on the parts this runs on, so anything past four times
+/// the widest of those is something else.
+const MAX_MEASURED_POLL_CYCLES: u64 = 512;
 
 /// Diagnostic gate for LockLatch.wait() entry/exit logging. Reads
 /// the env var once via OnceLock so the hot wait path pays just a
