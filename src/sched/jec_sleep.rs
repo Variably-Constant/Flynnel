@@ -508,6 +508,12 @@ struct WorkerSleepState {
     /// at once, so a wake that arrives between the publish below and
     /// the park is kept rather than dropped.
     handle: OnceLock<thread::Thread>,
+    /// This worker's parker, built on its own thread the first time it
+    /// sleeps with [`crate::sched::levers::jec_parker`] on, and absent
+    /// otherwise. Its wake counter is what a monitor wait watches, and
+    /// its unpark bumps that counter before it unparks the thread, so
+    /// a waker that finds it set wakes either wait through it.
+    parker: OnceLock<crate::sched::sleep::Parker>,
 }
 
 /// [`WorkerSleepState::state`] for a worker that is running.
@@ -617,6 +623,7 @@ impl Sleep {
             states.push(WorkerSleepState {
                 state: AtomicU32::new(AWAKE),
                 handle: OnceLock::new(),
+                parker: OnceLock::new(),
             });
         }
         Self {
@@ -819,6 +826,18 @@ impl Sleep {
             // already the ordering for work arriving. Shutdown has no
             // counter.
             state.handle.get_or_init(thread::current);
+            // Built here, before the publish, so a waker that sees
+            // SLEEPING finds it. With the lever off it stays absent and
+            // the waker unparks the handle.
+            let parker = if crate::sched::levers::jec_parker() {
+                Some(
+                    state
+                        .parker
+                        .get_or_init(|| crate::sched::sleep::Parker::new(0)),
+                )
+            } else {
+                None
+            };
             state.state.store(SLEEPING, Ordering::SeqCst);
             if self.shutdown.load(Ordering::SeqCst)
                 && state
@@ -839,8 +858,23 @@ impl Sleep {
             // and a claimed worker is still owed its release, so only
             // AWAKE ends the loop. The waker gave the sleeping count
             // back before it stored AWAKE; nothing is owed here.
-            while state.state.load(Ordering::Acquire) != AWAKE {
-                thread::park();
+            //
+            // Through the parker the wait is its strategy's: a monitor
+            // on the parker's wake counter where the host has one, the
+            // kernel park otherwise. park_until re-checks AWAKE before
+            // it waits and returns on any unpark, so the loop around it
+            // is the same loop.
+            match parker {
+                Some(parker) => {
+                    while state.state.load(Ordering::Acquire) != AWAKE {
+                        parker.park_until(|| state.state.load(Ordering::Acquire) == AWAKE);
+                    }
+                }
+                None => {
+                    while state.state.load(Ordering::Acquire) != AWAKE {
+                        thread::park();
+                    }
+                }
             }
         }
         idle.wake_fully();
@@ -917,8 +951,16 @@ impl Sleep {
         // is already spoken for.
         self.counters.sub_sleeping_thread();
         state.state.store(AWAKE, Ordering::SeqCst);
-        if let Some(handle) = state.handle.get() {
-            handle.unpark();
+        // A worker that sleeps through its parker is woken through it:
+        // the parker's unpark moves the counter its monitor wait
+        // watches and then unparks the thread, so either wait ends.
+        match state.parker.get() {
+            Some(parker) => parker.unpark(),
+            None => {
+                if let Some(handle) = state.handle.get() {
+                    handle.unpark();
+                }
+            }
         }
         true
     }

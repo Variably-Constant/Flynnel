@@ -300,6 +300,18 @@ pub fn batch_weight() -> bool {
     *V.get_or_init(|| read("FLYNNEL_LEVER_BATCH_WEIGHT"))
 }
 
+/// Park an idle pool worker through the [`crate::sched::sleep::Parker`]
+/// and its wait strategy rather than through `thread::park`, so a host
+/// with MONITORX or WAITPKG wakes it without a kernel transition.
+///
+/// Off until measured. A monitor wait holds the hardware thread while
+/// it waits where a kernel park gives it to the box, so the loaded arm
+/// of a cold-dispatch measurement is what decides it.
+pub fn jec_parker() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| read("FLYNNEL_LEVER_JEC_PARKER"))
+}
+
 /// Decide SMT from the window the site's classifier last read rather
 /// than from its lifetime cv^2, which never decays.
 ///
