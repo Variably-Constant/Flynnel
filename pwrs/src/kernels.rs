@@ -570,35 +570,13 @@ pub struct UpdateFlynnelArray {
 
 impl Cmdlet for UpdateFlynnelArray {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        // Asked what it is before it is pinned, because the pin
-        // compares how wide an element is and not what it is. An array
-        // of any other eight-byte value pins cleanly, is read as
-        // doubles, and is written back over the caller's own storage:
-        // `[long[]]@(1,2,3,4)` squared came back `0,0,0,0`, because
-        // those bit patterns are denormals that square to zero.
-        //
-        // The module's own refusal test passes a boxed collection,
-        // which the runtime declines to pin for a different reason, so
-        // it never reached this.
-        let observed = self.input_object.type_name().map_err(|e| {
-            arg_err(format!(
-                "InputObject must be a typed double array to be updated in place, and its \
-                 type could not be read: {e}. Cast it once with [double[]]$x, or use \
-                 Invoke-FlynnelMap, which takes any collection and answers a new array."
-            ))
-            .terminating()
-        })?;
-        if observed != "System.Double[]" {
-            return Err(arg_err(format!(
-                "InputObject must be a typed double array to be updated in place, and this \
-                 is a {observed}. Cast it once with [double[]]$x, or use Invoke-FlynnelMap, \
-                 which takes any collection and answers a new array."
-            ))
-            .terminating());
-        }
         // Pinned rather than copied. Silently copying instead would
         // answer correctly and cost exactly what this cmdlet exists to
         // avoid.
+        //
+        // The pin checks the element type as well as its width, so an
+        // array of another eight-byte value is refused here rather than
+        // read as doubles and written back over the caller's storage.
         let mut pinned = self.input_object.pin::<f64>().map_err(|e| {
             arg_err(format!(
                 "InputObject must be a typed double array to be updated in place: {e}. \

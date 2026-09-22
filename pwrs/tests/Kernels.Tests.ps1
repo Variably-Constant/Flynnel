@@ -196,10 +196,10 @@ Describe 'Update-FlynnelArray' {
     It 'refuses an array of the same width and another type, and leaves it alone' {
         # The case above is refused by the runtime, which declines to
         # pin a boxed collection at all. A long array is blittable and
-        # eight bytes wide, so it pins, and what refuses it has to be a
-        # check on the element type. Without one it is read as doubles
-        # and written back: these four values squared came back as
-        # zeroes, in the caller's own array.
+        # eight bytes wide, so a check on width alone would pin it; what
+        # refuses it is the pin's check on the element type. Without
+        # that it is read as doubles and written back, and these four
+        # values squared come back as zeroes in the caller's own array.
         $longs = [long[]]@(1, 2, 3, 4)
         { Update-FlynnelArray -InputObject $longs -Operation Square -ErrorAction Stop } |
             Should -Throw -ExpectedMessage '*typed double array*'
