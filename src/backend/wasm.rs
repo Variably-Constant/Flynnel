@@ -25,6 +25,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -40,13 +41,34 @@ use crate::sched::notify_ring::{NotifyHub, NotifySender};
 /// the `dispatch_one` channel.
 type WorkItem = Box<dyn FnOnce() + Send + 'static>;
 
-/// Stored per registered kernel: the instance keeps the module
-/// memory alive while the typed-call wrapper holds the resolved
-/// function. Both live in a single store; the store + instance
-/// must be locked together (wasmtime APIs require `&mut Store`).
+/// Stored per registered kernel.
+///
+/// `shared` is the store every thread dispatches through, and the lock
+/// on it is what a wasmtime store requires rather than a choice: a
+/// store is not `Sync` and the call takes a mutable one, so two
+/// dispatches of one kernel take turns. `module` and `export` are what
+/// a thread needs to build a store of its own instead, which is what
+/// [`crate::sched::levers::wasm_local_store`] turns on.
 struct KernelEntry {
+    shared: Mutex<SharedInstance>,
+    module: Module,
+    export: String,
+}
+
+/// A store and the function resolved in it. The instance keeps the
+/// module memory alive while the wrapper holds the function.
+struct SharedInstance {
     store: Store<()>,
     func: wasmtime::Func,
+}
+
+thread_local! {
+    /// This thread's own store per kernel, indexed by handle, built on
+    /// its first dispatch of that kernel. Nothing here is shared, so
+    /// nothing here needs excluding; a `RefCell` is the whole of the
+    /// discipline because only this thread can reach it.
+    static LOCAL_INSTANCES: RefCell<Vec<Option<SharedInstance>>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Entries one block of [`KernelTable`] holds.
@@ -65,7 +87,7 @@ struct KernelTable {
 }
 
 struct Block {
-    entries: [AtomicPtr<Arc<Mutex<KernelEntry>>>; KERNEL_BLOCK],
+    entries: [AtomicPtr<Arc<KernelEntry>>; KERNEL_BLOCK],
     next: AtomicPtr<Block>,
 }
 
@@ -117,7 +139,7 @@ impl KernelTable {
 
     /// Publish `entry` at `handle`. Handles are unique, so no slot is
     /// written twice.
-    fn insert(&self, handle: u64, entry: Arc<Mutex<KernelEntry>>) {
+    fn insert(&self, handle: u64, entry: Arc<KernelEntry>) {
         let index = (handle - 1) as usize;
         let block = self.block_for(index);
         let slot = &block.entries[index % KERNEL_BLOCK];
@@ -126,7 +148,7 @@ impl KernelTable {
 
     /// The entry at `handle`, or `None` where nothing was registered
     /// under it.
-    fn get(&self, handle: u64) -> Option<Arc<Mutex<KernelEntry>>> {
+    fn get(&self, handle: u64) -> Option<Arc<KernelEntry>> {
         if handle == 0 {
             return None;
         }
@@ -231,6 +253,52 @@ impl WasmBackend {
     }
 }
 
+/// Build a store of this thread's own for `entry`, resolving the same
+/// export the shared one holds.
+fn instantiate(entry: &KernelEntry) -> Result<SharedInstance, BackendError> {
+    let mut store: Store<()> = Store::new(entry.module.engine(), ());
+    let instance = Instance::new(&mut store, &entry.module, &[]).map_err(|e| {
+        BackendError::Launch(format!(
+            "wasm instance create failed for kernel `{}`: {e}",
+            entry.export
+        ))
+    })?;
+    let func = instance
+        .get_func(&mut store, &entry.export)
+        .ok_or_else(|| {
+            BackendError::Launch(format!(
+                "wasm export `{}` not found in module",
+                entry.export
+            ))
+        })?;
+    Ok(SharedInstance { store, func })
+}
+
+/// Call `instance` with `vals`, checking the arity first.
+///
+/// wasmtime errors at call time on a wrong count, so this only makes
+/// the message say which count was expected and which arrived.
+fn call_instance(instance: &mut SharedInstance, vals: &[Val]) -> Result<(), BackendError> {
+    let func_ty = instance.func.ty(&instance.store);
+    let expected_params = func_ty.params().len();
+    if expected_params != vals.len() {
+        return Err(BackendError::Launch(format!(
+            "wasm kernel arg count mismatch: function expects {} params, caller provided {}",
+            expected_params,
+            vals.len(),
+        )));
+    }
+    let n_results = func_ty.results().len();
+    let mut results: Vec<Val> = (0..n_results).map(|_| Val::I32(0)).collect();
+    let SharedInstance {
+        ref mut store,
+        ref func,
+    } = *instance;
+    func.call(store, vals, &mut results)
+        .map_err(|e| BackendError::Launch(format!("wasm kernel call failed: {e}")))?;
+    Ok(())
+}
+
 fn probe_capabilities() -> BackendCapabilities {
     // WASM execution is scalar single-threaded. Conservative
     // numbers: 1-wide, host-thread-count for max in-flight (host-
@@ -249,18 +317,16 @@ fn probe_capabilities() -> BackendCapabilities {
 
 impl DispatchBackend for WasmBackend {
     fn id(&self) -> Backend {
-        Backend::Wasm { device_id: self.device_id }
+        Backend::Wasm {
+            device_id: self.device_id,
+        }
     }
 
     fn capabilities(&self) -> BackendCapabilities {
         self.caps
     }
 
-    fn dispatch_parallel_for(
-        &self,
-        count: u32,
-        work: &(dyn Fn(u32) + Send + Sync),
-    ) {
+    fn dispatch_parallel_for(&self, count: u32, work: &(dyn Fn(u32) + Send + Sync)) {
         // Host-side fan-out via the global flynnel scheduler arena.
         // The closure body is a CPU-runnable Rust closure (not a
         // WASM kernel); for WASM kernel parallel fan-out, call
@@ -286,15 +352,10 @@ impl DispatchBackend for WasmBackend {
         drop(self.worker_tx.send(work));
     }
 
-    fn register_kernel(
-        &self,
-        name: &str,
-        source: &[u8],
-    ) -> Result<KernelHandle, BackendError> {
+    fn register_kernel(&self, name: &str, source: &[u8]) -> Result<KernelHandle, BackendError> {
         // Compile the .wasm module via the engine's cranelift JIT.
-        let module = Module::new(&self.engine, source).map_err(|e| {
-            BackendError::KernelCompile(format!("wasm module compile failed: {e}"))
-        })?;
+        let module = Module::new(&self.engine, source)
+            .map_err(|e| BackendError::KernelCompile(format!("wasm module compile failed: {e}")))?;
         // Each kernel owns its own Store. Empty host imports (no
         // host functions exported to the kernel; the kernel is
         // pure compute over its arguments and linear memory).
@@ -305,16 +366,19 @@ impl DispatchBackend for WasmBackend {
             ))
         })?;
         // Look up the named export and confirm it is a function.
-        let func = instance
-            .get_func(&mut store, name)
-            .ok_or_else(|| {
-                BackendError::KernelCompile(format!(
-                    "wasm export `{name}` not found in module"
-                ))
-            })?;
+        let func = instance.get_func(&mut store, name).ok_or_else(|| {
+            BackendError::KernelCompile(format!("wasm export `{name}` not found in module"))
+        })?;
         let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
-        let entry = KernelEntry { store, func };
-        self.kernels.insert(handle_id, Arc::new(Mutex::new(entry)));
+        // The module and the export name are kept beside the shared
+        // store, because a thread building a store of its own needs
+        // both and neither can be recovered from the store.
+        let entry = KernelEntry {
+            shared: Mutex::new(SharedInstance { store, func }),
+            module,
+            export: name.to_string(),
+        };
+        self.kernels.insert(handle_id, Arc::new(entry));
         Ok(KernelHandle(handle_id))
     }
 
@@ -344,27 +408,32 @@ impl DispatchBackend for WasmBackend {
         let entry_arc = self.kernels.get(handle.0).ok_or_else(|| {
             BackendError::Launch(format!("wasm kernel handle {} not registered", handle.0))
         })?;
-        let mut entry = entry_arc.lock().unwrap();
-        // Function arity check: wasmtime will error at call time
-        // if the count is wrong, but we surface a clearer message
-        // here.
-        let func_ty = entry.func.ty(&entry.store);
-        let expected_params = func_ty.params().len();
-        if expected_params != vals.len() {
-            return Err(BackendError::Launch(format!(
-                "wasm kernel arg count mismatch: function expects {} \
-                 params, caller provided {}",
-                expected_params,
-                vals.len(),
-            )));
+        if crate::sched::levers::wasm_local_store() {
+            let index = (handle.0 - 1) as usize;
+            return LOCAL_INSTANCES.with(|cell| {
+                let mut mine = cell.borrow_mut();
+                if mine.len() <= index {
+                    mine.resize_with(index + 1, || None);
+                }
+                if mine[index].is_none() {
+                    // This thread's first dispatch of this kernel pays
+                    // the instantiation. Registration paid it once for
+                    // the shared store; here every thread that runs the
+                    // kernel pays it once, which is the cost this arm
+                    // is measured on.
+                    mine[index] = Some(instantiate(&entry_arc)?);
+                }
+                let instance = mine[index]
+                    .as_mut()
+                    .expect("the slot was filled above or the call returned");
+                call_instance(instance, &vals)
+            });
         }
-        let n_results = func_ty.results().len();
-        let mut results: Vec<Val> = (0..n_results).map(|_| Val::I32(0)).collect();
-        let KernelEntry { ref mut store, ref func } = *entry;
-        func.call(store, &vals, &mut results).map_err(|e| {
-            BackendError::Launch(format!("wasm kernel call failed: {e}"))
-        })?;
-        Ok(())
+        let mut shared = entry_arc
+            .shared
+            .lock()
+            .map_err(|_| BackendError::Launch("wasm kernel store mutex poisoned".into()))?;
+        call_instance(&mut shared, &vals)
     }
 }
 
@@ -395,12 +464,18 @@ mod tests {
 
     /// A stand-in entry, so the table's own behaviour is tested
     /// without building a wasmtime store for every slot.
-    fn table_entry(engine: &Engine) -> Arc<Mutex<KernelEntry>> {
+    fn table_entry(engine: &Engine) -> Arc<KernelEntry> {
         let module = Module::new(engine, ADD_WASM).expect("the add module builds");
         let mut store: Store<()> = Store::new(engine, ());
         let instance = Instance::new(&mut store, &module, &[]).expect("it instantiates");
-        let func = instance.get_func(&mut store, "add").expect("add is exported");
-        Arc::new(Mutex::new(KernelEntry { store, func }))
+        let func = instance
+            .get_func(&mut store, "add")
+            .expect("add is exported");
+        Arc::new(KernelEntry {
+            shared: Mutex::new(SharedInstance { store, func }),
+            module,
+            export: "add".to_string(),
+        })
     }
 
     #[test]
@@ -473,10 +548,8 @@ mod tests {
         // type section: 1 type, (i32, i32) -> (i32)
         0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
         // function section: 1 function, type 0
-        0x03, 0x02, 0x01, 0x00,
-        // export section: 1 export, "add" func 0
-        0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00,
-        // code section: 1 body
+        0x03, 0x02, 0x01, 0x00, // export section: 1 export, "add" func 0
+        0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00, // code section: 1 body
         0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
     ];
 

@@ -300,6 +300,24 @@ pub fn batch_weight() -> bool {
     *V.get_or_init(|| read("FLYNNEL_LEVER_BATCH_WEIGHT"))
 }
 
+/// Give each thread its own wasmtime store per kernel, instantiated on
+/// that thread's first dispatch of it, instead of sharing one store
+/// behind a lock.
+///
+/// Off until measured. A wasmtime store is not `Sync` and its API
+/// takes a mutable store, so two dispatches of one kernel on the
+/// shared store take turns; that lock is the last one the crate has
+/// that an external type forces. A store per thread removes the
+/// sharing rather than the waiting, which is why it can remove the
+/// lock at all, and it moves instantiation out of registration and
+/// into each thread's first dispatch. An arm that measures only the
+/// steady state reports a win a short-lived dispatch never sees, so
+/// the instantiation has to be inside the measured span.
+pub fn wasm_local_store() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| read("FLYNNEL_LEVER_WASM_LOCAL_STORE"))
+}
+
 /// Wait for a foreign caller's latch through a spin floor, then bounded
 /// monitor waits on the latch flag's own line, then the park, instead
 /// of spinning the caller's whole window on `PAUSE`.
