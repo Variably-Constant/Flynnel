@@ -309,8 +309,8 @@ impl WorkerCtx {
     /// the target's mailbox is full (caller falls back to a
     /// regular tiered push).
     ///
-    /// Issues a wake notification through the JEC coordinator so
-    /// a parked target worker has the chance to find the new work.
+    /// Wakes `target_idx` itself, and only it, because it is the only
+    /// worker that can run what was just pushed.
     ///
     /// Sets the process-global [`MAILBOX_EVER_USED`] flag on first
     /// successful push so subsequent `find_work` calls know to
@@ -325,7 +325,6 @@ impl WorkerCtx {
         if target_idx >= self.peer_mailboxes.len() {
             return Err(job);
         }
-        let was_empty = self.peer_mailboxes[target_idx].is_empty();
         match self.peer_mailboxes[target_idx].push(job) {
             PushResult::Ok => {}
             PushResult::Full(j) => return Err(j),
@@ -337,11 +336,27 @@ impl WorkerCtx {
         // no one uses mailbox routing pays a wasted FlynnelRing pop
         // per find_work poll.
         MAILBOX_EVER_USED.store(true, Ordering::Release);
-        // Same wake protocol as a deque push: notify JEC so a
-        // parked target sees the work on its next loop iter.
-        if DISPATCH_USE_JEC_WAKE.with(|c| c.get()) {
-            self.sleep.new_internal_jobs(1, was_empty);
-        }
+        // Wake the target and nobody else, whatever the dispatch-wide
+        // wake scope says.
+        //
+        // Not the deque protocol, because this is not a deque. A deque
+        // push may wake any worker, since whichever one wakes can steal
+        // the job. This job is reachable only by `target_idx`, so the
+        // generic notification is wrong twice over: it walks from index
+        // zero and wakes workers that cannot run this job, and it can
+        // return having woken its quota without ever reaching the one
+        // worker that matters.
+        //
+        // The scope is still honoured for the burst accumulator, whose
+        // jobs land on a deque and do have other takers. It is not
+        // honoured here: suppressing a targeted wake leaves the job
+        // behind a wake that never comes, and the batched broadcast
+        // afterwards reaches only whoever is parked at that instant.
+        //
+        // Cost is one compare-exchange against the target's state,
+        // which fails immediately while that worker is awake, and that
+        // is the common case on a busy pool.
+        self.sleep.wake_worker(target_idx);
         Ok(())
     }
 

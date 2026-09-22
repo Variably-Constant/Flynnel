@@ -1020,6 +1020,28 @@ impl Sleep {
         }
     }
 
+    /// Wake the one worker at `idx`, if it is parked and unclaimed.
+    ///
+    /// For work only that worker can run. [`Self::new_internal_jobs`]
+    /// wakes whichever workers happen to be parked, walking from index
+    /// zero, which is right for a deque because any worker that wakes
+    /// can drain it. A mailbox has one consumer, so waking somebody
+    /// else leaves the job where it was and costs a worker the trip.
+    ///
+    /// Returns whether this call claimed it. False means it was awake
+    /// or another caller claimed it, and in both cases something other
+    /// than this call is responsible for the job being found.
+    pub(crate) fn wake_worker(&self, idx: usize) -> bool {
+        if idx >= self.worker_states.len() {
+            return false;
+        }
+        let woke = self.wake_specific_thread(idx);
+        if woke {
+            crate::sched::trace::emit(crate::sched::trace::TraceEvent::PoolWake, idx as u32);
+        }
+        woke
+    }
+
     /// Wake up to `num` sleeping workers. Walks the worker_states
     /// in order until enough have been woken (or all probed).
     fn wake_any_threads(&self, mut num: u32) {
