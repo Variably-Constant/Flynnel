@@ -25,8 +25,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -50,24 +49,126 @@ struct KernelEntry {
     func: wasmtime::Func,
 }
 
+/// Entries one block of [`KernelTable`] holds.
+const KERNEL_BLOCK: usize = 64;
+
+/// Registered kernels, indexed by handle.
+///
+/// Handles are handed out by one counter from one, so they are dense
+/// and a table indexed by them needs no hashing and no probing. A
+/// block is published once and never replaced or removed, so a reader
+/// walks to its block and loads one pointer, and nothing has to be
+/// reclaimed. Blocks chain rather than sitting in a fixed array, so
+/// there is no count of kernels past which registering fails.
+struct KernelTable {
+    head: Block,
+}
+
+struct Block {
+    entries: [AtomicPtr<Arc<Mutex<KernelEntry>>>; KERNEL_BLOCK],
+    next: AtomicPtr<Block>,
+}
+
+impl Block {
+    fn new() -> Self {
+        Self {
+            entries: [const { AtomicPtr::new(core::ptr::null_mut()) }; KERNEL_BLOCK],
+            next: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+}
+
+impl KernelTable {
+    fn new() -> Self {
+        Self { head: Block::new() }
+    }
+
+    /// The block holding `index`, appending blocks until it exists.
+    ///
+    /// Two registrations racing on the same missing block both build
+    /// one and one wins the exchange; the loser's is dropped before it
+    /// is ever published, so no reader can have seen it.
+    fn block_for(&self, index: usize) -> &Block {
+        let mut block = &self.head;
+        for _ in 0..(index / KERNEL_BLOCK) {
+            let mut next = block.next.load(Ordering::Acquire);
+            if next.is_null() {
+                let fresh = Box::into_raw(Box::new(Block::new()));
+                match block.next.compare_exchange(
+                    core::ptr::null_mut(),
+                    fresh,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => next = fresh,
+                    Err(theirs) => {
+                        // SAFETY: `fresh` was never published, so this
+                        // thread holds the only pointer to it.
+                        drop(unsafe { Box::from_raw(fresh) });
+                        next = theirs;
+                    }
+                }
+            }
+            // SAFETY: a published block is never freed or replaced.
+            block = unsafe { &*next };
+        }
+        block
+    }
+
+    /// Publish `entry` at `handle`. Handles are unique, so no slot is
+    /// written twice.
+    fn insert(&self, handle: u64, entry: Arc<Mutex<KernelEntry>>) {
+        let index = (handle - 1) as usize;
+        let block = self.block_for(index);
+        let slot = &block.entries[index % KERNEL_BLOCK];
+        slot.store(Box::into_raw(Box::new(entry)), Ordering::Release);
+    }
+
+    /// The entry at `handle`, or `None` where nothing was registered
+    /// under it.
+    fn get(&self, handle: u64) -> Option<Arc<Mutex<KernelEntry>>> {
+        if handle == 0 {
+            return None;
+        }
+        let index = (handle - 1) as usize;
+        let mut block = &self.head;
+        for _ in 0..(index / KERNEL_BLOCK) {
+            let next = block.next.load(Ordering::Acquire);
+            if next.is_null() {
+                return None;
+            }
+            // SAFETY: a published block is never freed or replaced.
+            block = unsafe { &*next };
+        }
+        let held = block.entries[index % KERNEL_BLOCK].load(Ordering::Acquire);
+        if held.is_null() {
+            return None;
+        }
+        // SAFETY: a published entry is never freed or replaced, and
+        // the clone is of the Arc rather than of what it points at.
+        Some(unsafe { (*held).clone() })
+    }
+}
+
 /// wasmtime-backed reference WebAssembly backend.
 pub struct WasmBackend {
     device_id: u32,
     engine: Engine,
     caps: BackendCapabilities,
     next_handle: AtomicU64,
-    /// Registered kernels, keyed by handle. Each entry owns its
-    /// own `Store` so concurrent `dispatch_kernel` calls on
-    /// different handles do not contend on a single store lock
-    /// (wasmtime stores are not Sync; per-handle `Mutex<Store>`
-    /// preserves Send across worker threads).
-    kernels: Mutex<HashMap<u64, Arc<Mutex<KernelEntry>>>>,
+    /// Registered kernels, indexed by handle. Each entry owns its
+    /// own `Store`, so dispatches on different handles do not wait on
+    /// each other; two on the same handle still do, because a
+    /// wasmtime store is not Sync and its API takes `&mut Store`.
+    kernels: KernelTable,
     /// Persistent worker thread for `dispatch_one`. Routed
     /// through a flynnel notify hub (FlynnelRing + Parker).
     worker_hub: NotifyHub<WorkItem>,
     /// Cached sender so `dispatch_one` avoids `Arc::clone` per call.
     worker_tx: NotifySender<WorkItem>,
-    worker_handle: Mutex<Option<JoinHandle<()>>>,
+    /// The dispatch worker, taken by `Drop`, which holds this
+    /// exclusively and so needs nothing to guard it.
+    worker_handle: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for WasmBackend {
@@ -122,10 +223,10 @@ impl WasmBackend {
             engine,
             caps: probe_capabilities(),
             next_handle: AtomicU64::new(1),
-            kernels: Mutex::new(HashMap::new()),
+            kernels: KernelTable::new(),
             worker_hub,
             worker_tx,
-            worker_handle: Mutex::new(Some(worker_handle)),
+            worker_handle: Some(worker_handle),
         })
     }
 }
@@ -213,8 +314,7 @@ impl DispatchBackend for WasmBackend {
             })?;
         let handle_id = self.next_handle.fetch_add(1, Ordering::SeqCst);
         let entry = KernelEntry { store, func };
-        let mut guard = self.kernels.lock().unwrap();
-        guard.insert(handle_id, Arc::new(Mutex::new(entry)));
+        self.kernels.insert(handle_id, Arc::new(Mutex::new(entry)));
         Ok(KernelHandle(handle_id))
     }
 
@@ -241,18 +341,9 @@ impl DispatchBackend for WasmBackend {
             }
         }
         // Locate the kernel entry and call its function.
-        let entry_arc = {
-            let guard = self.kernels.lock().unwrap();
-            guard
-                .get(&handle.0)
-                .cloned()
-                .ok_or_else(|| {
-                    BackendError::Launch(format!(
-                        "wasm kernel handle {} not registered",
-                        handle.0
-                    ))
-                })?
-        };
+        let entry_arc = self.kernels.get(handle.0).ok_or_else(|| {
+            BackendError::Launch(format!("wasm kernel handle {} not registered", handle.0))
+        })?;
         let mut entry = entry_arc.lock().unwrap();
         // Function arity check: wasmtime will error at call time
         // if the count is wrong, but we surface a clearer message
@@ -282,12 +373,14 @@ impl Drop for WasmBackend {
         // Shut down the notify hub so the worker's recv() returns
         // None and it exits cleanly after draining queued work.
         self.worker_hub.shutdown();
-        let mut handle_guard = self.worker_handle.lock().unwrap();
-        if let Some(handle) = handle_guard.take() {
-            // Join failure here only means the worker panicked
-            // (best-effort); we cannot meaningfully recover during
-            // Drop.
-            handle.join().ok();
+        if let Some(handle) = self.worker_handle.take() {
+            match handle.join() {
+                Ok(()) => {}
+                // The worker panicked. Drop cannot recover, and
+                // reporting it here would replace whatever is already
+                // unwinding.
+                Err(panicked) => drop(panicked),
+            }
         }
     }
 }
@@ -299,6 +392,70 @@ impl Drop for WasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in entry, so the table's own behaviour is tested
+    /// without building a wasmtime store for every slot.
+    fn table_entry(engine: &Engine) -> Arc<Mutex<KernelEntry>> {
+        let module = Module::new(engine, ADD_WASM).expect("the add module builds");
+        let mut store: Store<()> = Store::new(engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("it instantiates");
+        let func = instance.get_func(&mut store, "add").expect("add is exported");
+        Arc::new(Mutex::new(KernelEntry { store, func }))
+    }
+
+    #[test]
+    fn the_kernel_table_holds_every_handle_across_blocks() {
+        let engine = Engine::default();
+        let table = KernelTable::new();
+        // Past two block boundaries, so the walk and the appending are
+        // both exercised rather than only the head block.
+        let count = (KERNEL_BLOCK * 2 + 3) as u64;
+        for handle in 1..=count {
+            table.insert(handle, table_entry(&engine));
+        }
+        for handle in 1..=count {
+            assert!(
+                table.get(handle).is_some(),
+                "handle {handle} was registered and must be found"
+            );
+        }
+        assert!(table.get(0).is_none(), "zero is never a handle");
+        assert!(
+            table.get(count + 1).is_none(),
+            "a handle nothing registered under reads as absent"
+        );
+        assert!(
+            table.get(count + KERNEL_BLOCK as u64 * 4).is_none(),
+            "so does one whose block was never appended"
+        );
+    }
+
+    #[test]
+    fn two_registrations_racing_on_one_missing_block_both_land() {
+        let engine = Engine::default();
+        let table = Arc::new(KernelTable::new());
+        // Handles chosen so both need the same block appended, which
+        // is the case the exchange in block_for exists for.
+        let first = KERNEL_BLOCK as u64 * 3 + 1;
+        let second = first + 1;
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for handle in [first, second] {
+            let table = Arc::clone(&table);
+            let barrier = Arc::clone(&barrier);
+            let engine = engine.clone();
+            threads.push(std::thread::spawn(move || {
+                let entry = table_entry(&engine);
+                barrier.wait();
+                table.insert(handle, entry);
+            }));
+        }
+        for t in threads {
+            t.join().expect("a registering thread must not panic");
+        }
+        assert!(table.get(first).is_some(), "the first handle is present");
+        assert!(table.get(second).is_some(), "and so is the second");
+    }
 
     /// Tiny WASM module exporting a function `add` that takes two
     /// i32 parameters and returns their sum. Hand-assembled binary

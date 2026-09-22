@@ -33,24 +33,30 @@
 //! request, writes it to the child's stdin, reads one line from the
 //! child's stdout, and parses the JSON response.
 //!
-//! Concurrency: the bridge is request-response over a single
-//! channel; the backend serializes calls through a [`Mutex`] so
-//! concurrent `dispatch_kernel` callers cannot interleave traffic.
-//! Throughput-wise the bridge is single-flight, which matches
-//! JAX's actual TPU launch semantics (per-device).
+//! Concurrency: the bridge is request-response over one pipe, and a
+//! response carries no request id, so it can only be matched to its
+//! request by order. One thread owns the pipe and performs every
+//! exchange; callers hand it a serialized request and a reply slot
+//! and wait for that slot. Two callers therefore cannot interleave
+//! lines, which is what the protocol needs, and no caller excludes
+//! another from anything but the pipe itself. Throughput-wise the
+//! bridge is single-flight either way, which matches JAX's actual TPU
+//! launch semantics (per-device).
 
 #![allow(clippy::missing_errors_doc)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
 
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{
     Backend, BackendCapabilities, BackendError, DispatchBackend, KernelArg, KernelHandle,
 };
+use crate::sched::notify_ring::{NotifyHub, NotifySendResult, NotifySender};
 
 /// Embedded Python bridge script. Compile-time `include_str!` so the
 /// crate ships as a single artifact (no external file dependency at
@@ -61,17 +67,45 @@ const BRIDGE_PY: &str = include_str!("tpu_jax_bridge.py");
 pub struct TpuJaxBackend {
     device_id: u32,
     caps: BackendCapabilities,
-    bridge: Mutex<BridgeState>,
+    /// What the handshake reported. Fixed once the child has
+    /// answered, so it is read without asking the bridge.
+    devices: Vec<String>,
+    /// Requests to the thread that owns the pipe.
+    hub: NotifyHub<BridgeRequest>,
+    /// Cached sender, so a transaction does not clone the hub.
+    tx: NotifySender<BridgeRequest>,
+    /// The owning thread, taken by `Drop`, which holds this
+    /// exclusively and so needs nothing to guard it.
+    owner: Option<JoinHandle<()>>,
 }
 
-/// State the bridge wrapper holds. Kept in a Mutex so only one
-/// request-response transaction is in flight at a time.
+/// State the owning thread holds. It is reached from that thread
+/// alone, which is what removes the exclusion the pipe used to need.
 struct BridgeState {
     child: Option<Child>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     script_path: PathBuf,
     devices: Vec<String>,
+}
+
+/// One exchange for the owning thread: a serialized request and the
+/// slot its response goes to.
+struct BridgeRequest {
+    body: String,
+    reply: std::sync::mpsc::Sender<Result<String, BackendError>>,
+}
+
+/// Responses the owning thread produced for a caller that had already
+/// stopped waiting. Nonzero means a caller timed out or was dropped
+/// mid-transaction, not that the bridge lost anything: the exchange
+/// completed and the line was read.
+static REPLIES_UNCLAIMED: AtomicU64 = AtomicU64::new(0);
+
+/// Responses that completed with nobody left to take them, since
+/// process start.
+pub fn replies_unclaimed() -> u64 {
+    REPLIES_UNCLAIMED.load(Ordering::Relaxed)
 }
 
 impl std::fmt::Debug for TpuJaxBackend {
@@ -102,38 +136,93 @@ impl TpuJaxBackend {
             script_path,
             devices: Vec::new(),
         };
+        // The handshake runs here, on the constructing thread, before
+        // the state moves: a backend that cannot answer `ping` is not
+        // constructed, so the owning thread never starts for one.
         let pong = ping_handshake(&mut state)?;
         state.devices = pong.devices;
-        let caps = probe_capabilities();
+        let devices = state.devices.clone();
+
+        // A ring deep enough that callers hand over their requests
+        // rather than queue on the handover itself. The bridge is
+        // single-flight, so depth past the callers that can be waiting
+        // buys nothing and this is already more than the pool has
+        // workers on the hosts here.
+        const BRIDGE_RING_CAPACITY: usize = 256;
+        let hub = NotifyHub::<BridgeRequest>::new(BRIDGE_RING_CAPACITY, 1);
+        let tx = hub.sender();
+        let hub_for_owner = hub.clone();
+        let owner = std::thread::Builder::new()
+            .name(format!("flynnel-tpu-jax-{device_id}"))
+            .spawn(move || owner_loop(state, &hub_for_owner))
+            .map_err(|_| BackendError::DeviceUnavailable(Backend::Tpu { device_id }))?;
+
         Ok(Self {
             device_id,
-            caps,
-            bridge: Mutex::new(state),
+            caps: probe_capabilities(),
+            devices,
+            hub,
+            tx,
+            owner: Some(owner),
         })
     }
 
     /// Devices the JAX runtime reported during the handshake (e.g.
     /// `["TpuDevice(id=0, ...)"]`). Useful for telemetry.
     pub fn devices(&self) -> Vec<String> {
-        self.bridge
-            .lock()
-            .map(|g| g.devices.clone())
-            .unwrap_or_default()
+        self.devices.clone()
+    }
+}
+
+/// The thread that owns the pipe: one exchange at a time, in the order
+/// the requests arrived, then the polite shutdown once the hub closes.
+fn owner_loop(mut state: BridgeState, hub: &NotifyHub<BridgeRequest>) {
+    let rx = hub.register_consumer();
+    while let Some(request) = rx.recv() {
+        let outcome = exchange(&mut state, &request.body);
+        if let Err(unclaimed) = request.reply.send(outcome) {
+            // The caller stopped waiting before its answer arrived.
+            // The exchange itself completed, so the pipe is still in
+            // step; what is lost is one response nobody wants.
+            REPLIES_UNCLAIMED.fetch_add(1, Ordering::Relaxed);
+            drop(unclaimed);
+        }
+    }
+    // The hub is closed, so no further request can arrive and this
+    // thread is the only one that can still reach the child.
+    let farewell = serde_json::json!({"op": "shutdown"});
+    match writeln!(state.stdin, "{farewell}") {
+        Ok(()) => {}
+        // The child is already gone, which is the common way to reach
+        // this line and needs no answer beyond not waiting for one.
+        Err(gone) => drop(gone),
+    }
+    if let Some(mut child) = state.child.take() {
+        match child.wait() {
+            Ok(status) => drop(status),
+            Err(unwaitable) => drop(unwaitable),
+        }
+    }
+    match std::fs::remove_file(&state.script_path) {
+        Ok(()) => {}
+        // The temp directory may have been swept already.
+        Err(absent) => drop(absent),
     }
 }
 
 impl Drop for TpuJaxBackend {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.bridge.lock() {
-            // Best-effort polite shutdown; ignore errors because
-            // Drop must not panic.
-            let req = serde_json::json!({"op": "shutdown"});
-            let _ignored = writeln!(state.stdin, "{req}");
-            if let Some(mut child) = state.child.take() {
-                let _ignored = child.wait();
+        // Closing the hub is what ends the owning thread's loop and
+        // starts its shutdown; joining is what makes the child's exit
+        // and the script's removal have happened before this returns.
+        self.hub.shutdown();
+        if let Some(owner) = self.owner.take() {
+            match owner.join() {
+                Ok(()) => {}
+                // The owning thread panicked. Drop cannot recover, and
+                // the child is reaped by the OS.
+                Err(panicked) => drop(panicked),
             }
-            // Best-effort cleanup of the temp script.
-            let _ignored = std::fs::remove_file(&state.script_path);
         }
     }
 }
@@ -194,7 +283,7 @@ impl DispatchBackend for TpuJaxBackend {
             name,
             source: source_str,
         };
-        let resp: RegisterResponse = transact(&self.bridge, &req)?;
+        let resp: RegisterResponse = transact(&self.tx, &req)?;
         if !resp.ok {
             return Err(BackendError::KernelCompile(
                 resp.error.unwrap_or_else(|| "register failed".into()),
@@ -221,7 +310,7 @@ impl DispatchBackend for TpuJaxBackend {
             count,
             args: json_args,
         };
-        let resp: PlainResponse = transact(&self.bridge, &req)?;
+        let resp: PlainResponse = transact(&self.tx, &req)?;
         if !resp.ok {
             return Err(BackendError::Launch(
                 resp.error.unwrap_or_else(|| "dispatch failed".into()),
@@ -362,29 +451,49 @@ fn ping_handshake(state: &mut BridgeState) -> Result<PingResponse, BackendError>
     Ok(pong)
 }
 
-fn transact<Req, Resp>(
-    bridge: &Mutex<BridgeState>,
-    req: &Req,
-) -> Result<Resp, BackendError>
+/// One request out and one response line back, performed by whichever
+/// thread owns the pipe.
+fn exchange(state: &mut BridgeState, body: &str) -> Result<String, BackendError> {
+    writeln!(state.stdin, "{body}")
+        .map_err(|e| BackendError::Launch(format!("stdin write: {e}")))?;
+    state
+        .stdin
+        .flush()
+        .map_err(|e| BackendError::Launch(format!("stdin flush: {e}")))?;
+    let mut line = String::new();
+    state
+        .stdout
+        .read_line(&mut line)
+        .map_err(|e| BackendError::Launch(format!("stdout read: {e}")))?;
+    Ok(line)
+}
+
+/// Hand one request to the thread that owns the pipe and wait for its
+/// answer.
+///
+/// The wait is on this request's own reply slot rather than on the
+/// pipe, so a second caller queues behind this one at the hub instead
+/// of excluding it from anything.
+fn transact<Req, Resp>(tx: &NotifySender<BridgeRequest>, req: &Req) -> Result<Resp, BackendError>
 where
     Req: Serialize,
     Resp: for<'de> Deserialize<'de>,
 {
-    let mut guard = bridge.lock().map_err(|_| {
-        BackendError::Launch("bridge mutex poisoned".into())
-    })?;
-    let body = serde_json::to_string(req).map_err(|e| {
-        BackendError::Launch(format!("request serialize: {e}"))
-    })?;
-    writeln!(guard.stdin, "{body}")
-        .map_err(|e| BackendError::Launch(format!("stdin write: {e}")))?;
-    guard.stdin
-        .flush()
-        .map_err(|e| BackendError::Launch(format!("stdin flush: {e}")))?;
-    let mut line = String::new();
-    guard.stdout
-        .read_line(&mut line)
-        .map_err(|e| BackendError::Launch(format!("stdout read: {e}")))?;
+    let body = serde_json::to_string(req)
+        .map_err(|e| BackendError::Launch(format!("request serialize: {e}")))?;
+    let (reply, answer) = std::sync::mpsc::channel();
+    match tx.send(BridgeRequest { body, reply }) {
+        NotifySendResult::Ok => {}
+        NotifySendResult::Closed(refused) => {
+            drop(refused);
+            return Err(BackendError::Launch(
+                "the bridge is shut down, so this request was not sent".into(),
+            ));
+        }
+    }
+    let line = answer
+        .recv()
+        .map_err(|_| BackendError::Launch("the bridge thread ended before answering".into()))??;
     serde_json::from_str(line.trim())
         .map_err(|e| BackendError::Launch(format!("response parse `{}`: {e}", line.trim())))
 }
