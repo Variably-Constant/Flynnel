@@ -275,17 +275,29 @@ fn main() {
             // this is not work stranded in a mailbox, and a latch that
             // never reached zero with nothing left to run is the other
             // thing that looks like this from outside.
-            let holding = global_local_arena().mailbox_census();
-            if holding.is_empty() {
+            //
+            // Every node, not the calling thread's: the fan-out runs on
+            // the thread spawned above and this reads from main, so the
+            // two resolve independently and a census of one node while
+            // the work sits on another would print an empty list that
+            // reads as an answer.
+            let by_node = global_local_arena().mailbox_census_by_node();
+            let total: usize = by_node.iter().map(Vec::len).sum();
+            if total == 0 {
                 println!(
-                    "mailboxes: all empty, so nothing is stranded where only its \
-                     own worker could take it"
+                    "mailboxes: all empty on all {} node(s), so nothing is stranded \
+                     where only its own worker could take it",
+                    by_node.len()
                 );
             } else {
-                println!(
-                    "mailboxes still holding work, by worker index: {holding:?} \
-                     of {workers} workers"
-                );
+                for (node, holding) in by_node.iter().enumerate() {
+                    if !holding.is_empty() {
+                        println!(
+                            "node {node}: mailboxes still holding work, by worker \
+                             index: {holding:?} of {workers} workers"
+                        );
+                    }
+                }
             }
         }
         Err(RecvTimeoutError::Disconnected) => {

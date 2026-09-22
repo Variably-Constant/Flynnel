@@ -255,6 +255,23 @@ impl NumaArena {
         self.nodes[self.resolve_node_idx(None)].mailbox_census()
     }
 
+    /// Which mailboxes still hold work on every node, by node index and
+    /// then mailbox index.
+    ///
+    /// For the same question as [`Self::mailbox_census`] asked from a
+    /// thread that is not the one that dispatched. A watchdog or a
+    /// harness thread resolves to its own node, which need not be the
+    /// node a stalled fan-out ran on, and a census of the wrong node
+    /// reports an empty list that reads as a finding. Every node cannot
+    /// be the wrong one.
+    ///
+    /// Prefer [`Self::mailbox_census`] when the caller is the thread
+    /// that dispatched, where one node is the answer and the node index
+    /// is noise.
+    pub fn mailbox_census_by_node(&self) -> Vec<Vec<usize>> {
+        self.nodes.iter().map(|node| node.mailbox_census()).collect()
+    }
+
     /// Iterate every per-worker stats handle across every node.
     /// Used by [`crate::sched::split_observer`] to compute pool-
     /// wide steal pressure.
