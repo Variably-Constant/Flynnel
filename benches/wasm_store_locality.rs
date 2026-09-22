@@ -298,10 +298,16 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) -> bool {
         .map(|p| p.get())
         .unwrap_or(4)
         .max(2);
-    let arm = arm_label();
     let suffix = if loaded { "loaded" } else { "idle" };
     let _load = if loaded { Some(Load::spawn()) } else { None };
 
+    // A cell's name does not carry the arm. The lever is read once per
+    // process, so the two arms are two runs of this binary, and a
+    // report pairs a cell in one run with the cell of the same name in
+    // the other. Naming the arm there gives the two runs disjoint
+    // names, nothing pairs, and the comparison reports no rows at all.
+    // Which arm a run was is on its first line and in the file it was
+    // written to.
     let mut group = c.benchmark_group(format!("wasm_store/{suffix}"));
     group.measurement_time(Duration::from_secs(8));
     // Deduplicated, because criterion refuses two benchmarks with one
@@ -315,7 +321,7 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) -> bool {
     // instantiates once per thread here and the shared arm does not,
     // so this is where the lever pays before it can earn anything.
     for threads in widths.iter().copied() {
-        group.bench_function(format!("first_dispatch/{arm}/t{threads}"), |b| {
+        group.bench_function(format!("first_dispatch/t{threads}"), |b| {
             b.iter(|| fan_out(&backend, handle, threads, 1));
         });
     }
@@ -325,7 +331,7 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) -> bool {
     // still has the lock.
     for threads in widths.iter().copied() {
         let crew = Crew::spawn(&backend, handle, threads, 64);
-        group.bench_function(format!("settled/{arm}/t{threads}"), |b| {
+        group.bench_function(format!("settled/t{threads}"), |b| {
             b.iter(|| crew.round());
         });
     }
