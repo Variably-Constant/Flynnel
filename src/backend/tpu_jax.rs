@@ -395,11 +395,10 @@ fn write_bridge_script() -> Result<PathBuf, BackendError> {
 /// Starting is not the test. Windows ships an execution alias named
 /// `python3` that starts, says where Python can be installed and
 /// exits, so a spawn that succeeds says nothing about whether an
-/// interpreter is there. A host with that alias and a real `python`
-/// beside it reported no TPU backend while it had one, because the
-/// alias was taken and the list was not walked past it. The handshake
-/// is the test, and an interpreter that fails it is reaped and the
-/// next one tried.
+/// interpreter is there, and a host carrying that alias beside a real
+/// `python` has the working one second in this list. The handshake is
+/// the test, and an interpreter that fails it is reaped and the next
+/// one tried.
 fn open_bridge(script_path: PathBuf) -> Result<(BridgeState, PingResponse), BackendError> {
     let mut last = String::from("no python3 or python interpreter on PATH");
     for interpreter in ["python3", "python"] {

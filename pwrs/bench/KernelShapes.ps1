@@ -849,8 +849,8 @@ foreach ($row in $rows) {
     # Computed before it is handed over, because a parenthesised `if`
     # in an argument position is parsed as a command named `if`, which
     # is a name nothing answers to. It passes a syntax check and fails
-    # when the line runs, which here was after every cell had been
-    # timed.
+    # only when the line runs, and everything in this block runs after
+    # the last cell is timed.
     $signHeld = $null
     if ($null -ne $distancePct) { $signHeld = ($distancePct -gt $bound) }
     $row | Add-Member -NotePropertyName SignHeld -NotePropertyValue $signHeld

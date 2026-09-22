@@ -578,18 +578,17 @@ impl LockLatch {
         // ended, so both arms park at the same moment and differ only
         // in what this thread did while waiting.
         //
-        // Each wait is bounded by what remains of the rung rather than
-        // by one dispatch cost. A store to the line ends a long wait
-        // exactly as fast as a short one: the monitor is armed before
-        // the flag is read, and a store landing between the arming and
-        // the wait leaves the monitor triggered, so the wait returns at
-        // once and no wake is lost. A short bound therefore buys no
-        // promptness and costs an arming. Measured on pc2 at 141c29d,
-        // 1494 armings over 196 waits, so about seven of every eight
-        // were timeouts that found nothing and armed again. The rung
-        // still bounds each wait, so a monitor cleared without a store
-        // costs at most the rest of a rung this thread was spending on
-        // the flag anyway.
+        // Each wait is bounded by what remains of the rung, which makes
+        // the common case one arming. A store to the line ends a long
+        // wait exactly as fast as a short one: the monitor is armed
+        // before the flag is read, and a store landing between the
+        // arming and the wait leaves the monitor triggered, so the wait
+        // returns at once and no wake is lost. A bound shorter than the
+        // rung therefore buys no promptness, and costs an arming for
+        // every width of it the wait turns out to span. The rung still
+        // bounds each wait, so a monitor cleared without a store costs
+        // at most the rest of a span this thread was spending on the
+        // flag anyway.
         let ladder_cycles =
             (spin_cycles.saturating_sub(MONITOR_SPIN_FLOOR) as u64).saturating_mul(per_poll);
         let line = (&raw const self.flag).cast::<u8>();
