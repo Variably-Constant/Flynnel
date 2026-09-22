@@ -913,6 +913,15 @@ pub struct LocalArena {
     /// AdaptiveWorker's active backing with a single Release-store
     /// pass.
     pub(crate) k_gating_tags: Vec<[Arc<core::sync::atomic::AtomicU32>; N_TIERS]>,
+    /// Every worker's and slot's mailbox, indexed as the workers are.
+    ///
+    /// Held so a stalled dispatch can be asked what is left where. A
+    /// mailbox is drained only by the worker it belongs to, so work
+    /// sitting in one while every worker is parked is not reachable by
+    /// peer-steal, and that is a different condition from work left on
+    /// a deque. Read by [`Self::mailbox_census`] and by nothing on a
+    /// dispatch path.
+    mailboxes: Vec<Arc<FlynnelRing<JobRef>>>,
     /// External-worker slot pool. Pre-allocated at arena
     /// construction; external callers claim a slot, become a
     /// temporary worker for the duration of one external_dispatch,
@@ -1354,8 +1363,29 @@ impl LocalArena {
             shutdown_flag,
             sleep: sleep_arc,
             k_gating_tags,
+            mailboxes,
             external_slots,
         })
+    }
+
+    /// Which mailboxes still hold work, by index.
+    ///
+    /// For asking a dispatch that has stopped making progress where
+    /// its work went. A mailbox is drained only by its own worker, so
+    /// an index here while every worker is parked names work that
+    /// peer-steal cannot reach; an empty result says the remaining
+    /// work is somewhere a thief could have taken, or that none
+    /// remains and something else is holding the caller.
+    ///
+    /// Reads `is_empty` on each ring and nothing else. No dispatch
+    /// path calls this, so it adds nothing to one.
+    pub fn mailbox_census(&self) -> Vec<usize> {
+        self.mailboxes
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.is_empty())
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Try to claim an unused external slot. Returns `Some(guard)`

@@ -268,6 +268,25 @@ fn main() {
                 "STALLED: no progress in {STALL_AFTER:?} at fan-out {n}, \
                  in shape {shape} on iteration {iteration} of {repeats}"
             );
+            // Where the work that is left is sitting. A mailbox is
+            // drained only by its own worker, so an index here while
+            // the fan-out is stopped names work peer-steal cannot
+            // reach. An empty list says the opposite: whatever holds
+            // this is not work stranded in a mailbox, and a latch that
+            // never reached zero with nothing left to run is the other
+            // thing that looks like this from outside.
+            let holding = global_local_arena().mailbox_census();
+            if holding.is_empty() {
+                println!(
+                    "mailboxes: all empty, so nothing is stranded where only its \
+                     own worker could take it"
+                );
+            } else {
+                println!(
+                    "mailboxes still holding work, by worker index: {holding:?} \
+                     of {workers} workers"
+                );
+            }
         }
         Err(RecvTimeoutError::Disconnected) => {
             // The fan-out thread ended without sending, so a closure or
