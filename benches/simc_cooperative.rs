@@ -631,6 +631,11 @@ fn bench_simc_cooperative(c: &mut Criterion) {
     bench_n(c, 640);
     bench_n(c, 768);
     bench_n(c, 896);
+    // Timer backoffs over every group this process ran, which a filter
+    // narrows. Zero on a healthy pool. Read against the same count under
+    // the other value of a lever, it says whether one arm is denying
+    // its workers a park and putting them on a timer instead.
+    eprintln!("SLEEPLESS_BACKOFFS {}", flynnel::total_sleepless_backoffs());
 }
 
 criterion_group!(benches, bench_simc_cooperative);
