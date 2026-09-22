@@ -935,7 +935,8 @@ impl Sleep {
             // queue reads inside `has_reachable_work` carry it too
             // whatever ordering they use internally.
             std::sync::atomic::fence(Ordering::SeqCst);
-            if (self.shutdown.load(Ordering::SeqCst) || has_reachable_work())
+            let recheck_work = !crate::sched::levers::mailbox_wake_legacy();
+            if (self.shutdown.load(Ordering::SeqCst) || (recheck_work && has_reachable_work()))
                 && state
                     .state
                     .compare_exchange(SLEEPING, AWAKE, Ordering::SeqCst, Ordering::SeqCst)

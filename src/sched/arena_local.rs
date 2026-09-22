@@ -353,10 +353,17 @@ impl WorkerCtx {
         // behind a wake that never comes, and the batched broadcast
         // afterwards reaches only whoever is parked at that instant.
         //
-        // Cost is one compare-exchange against the target's state,
-        // which fails immediately while that worker is awake, and that
-        // is the common case on a busy pool.
-        self.sleep.wake_worker(target_idx);
+        // Cost is one plain load of the target's state, and a
+        // compare-exchange only when that load says the target is
+        // parked.
+        if crate::sched::levers::mailbox_wake_legacy() {
+            let was_empty = self.peer_mailboxes[target_idx].is_empty();
+            if DISPATCH_USE_JEC_WAKE.with(|c| c.get()) {
+                self.sleep.new_internal_jobs(1, was_empty);
+            }
+        } else {
+            self.sleep.wake_worker(target_idx);
+        }
         Ok(())
     }
 
@@ -2373,9 +2380,11 @@ fn worker_loop(
         let idle = jec_idle.get_or_insert_with(|| ctx.sleep.start_looking(idx));
         let inj_ref = &ctx.injector;
         let mailbox_ref = &ctx.mailbox;
+        let legacy = crate::sched::levers::mailbox_wake_legacy();
         ctx.sleep.no_work_found(idle, || {
             !inj_ref.is_empty()
-                || (MAILBOX_EVER_USED.load(core::sync::atomic::Ordering::Acquire)
+                || (!legacy
+                    && MAILBOX_EVER_USED.load(core::sync::atomic::Ordering::Acquire)
                     && !mailbox_ref.is_empty())
         });
     }
