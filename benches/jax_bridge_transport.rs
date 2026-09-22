@@ -72,16 +72,22 @@ const ECHO: &str =
 /// with instead of aborting the run that found it.
 static FAILED: AtomicU64 = AtomicU64::new(0);
 
-/// The first round-trip failure, said once.
+/// The first failure of each kind, said once.
 ///
 /// A child that has gone makes every later call fail the same way, and
 /// a line each would bury the run's own output under thousands of
 /// copies of one fact, in a log a chain then greps. The count in
 /// `FAILED` is what says how many there were.
-static SAID: std::sync::Once = std::sync::Once::new();
+///
+/// One gate per transport, not one for the file: the two arms fail for
+/// their own reasons, and a single gate would let whichever failed
+/// first silence the other, which is the one thing a comparison
+/// between them must not do.
+static SAID_OWNED: std::sync::Once = std::sync::Once::new();
+static SAID_LOCKED: std::sync::Once = std::sync::Once::new();
 
-fn say_once(what: impl FnOnce() -> String) {
-    SAID.call_once(|| eprintln!("{}", what()));
+fn say_once(gate: &'static std::sync::Once, what: impl FnOnce() -> String) {
+    gate.call_once(|| eprintln!("{}", what()));
 }
 
 /// The ends of the pipe, together, because the two arms both need
@@ -268,7 +274,9 @@ impl Owned {
         match answer.recv() {
             Ok(Ok(_line)) => {}
             Ok(Err(broken)) => {
-                say_once(|| format!("jax_bridge_transport: owned round trip failed: {broken}"));
+                say_once(&SAID_OWNED, || {
+                    format!("jax_bridge_transport: owned round trip failed: {broken}")
+                });
                 FAILED.fetch_add(1, Ordering::Relaxed);
             }
             Err(_) => {
@@ -308,7 +316,7 @@ impl Locked {
             Ok(mut held) => match held.round_trip(body) {
                 Ok(_line) => {}
                 Err(broken) => {
-                    say_once(|| {
+                    say_once(&SAID_LOCKED, || {
                         format!("jax_bridge_transport: locked round trip failed: {broken}")
                     });
                     FAILED.fetch_add(1, Ordering::Relaxed);
