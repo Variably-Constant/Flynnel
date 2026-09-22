@@ -284,7 +284,14 @@ $anchorBody = { Measure-FlynnelReduce -InputObject $anchorBuffer -Operation Sum 
 Write-Host 'anchor first, before anything else in this run'
 $anchor = Measure-Cell -Body $anchorBody
 Start-Cooldown
-$controlFirst = Measure-Cell -Body $controlBody
+# PowerShell interprets a script block for its first sixteen calls and
+# compiles it after that, and the control is the one body this run
+# calls more than sixteen times: measured on Windows PowerShell 5.1,
+# its median reads 19.3 ms over calls one to seven, 16.6 over eight to
+# fourteen and 15.8 from the fifteenth call on. Twenty warm calls put
+# the first reading on the same tier as the last, so the drift between
+# them is the box and not the interpreter.
+$controlFirst = Measure-Cell -Body $controlBody -Warmup 20
 Start-Cooldown
 $empty = Measure-Cell -Body $emptyBody
 Start-Cooldown
