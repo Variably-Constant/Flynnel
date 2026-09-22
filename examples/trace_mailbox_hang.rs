@@ -17,13 +17,20 @@
 //! completion in one and a stall in the other attributes the difference
 //! to the foreign pool.
 //!
-//! The shape argument is a sequence rather than a single choice because
-//! neither shape alone reproduces the stall: 300 iterations of 1024
-//! closures complete in under a tenth of a second in both, while the
-//! criterion sweep stalls on a deque arm that ran directly after a
-//! mailbox arm in the same process. A single shape cannot express a run
-//! whose earlier arm leaves state behind, so the sequence is the
-//! experiment and one shape on its own is the control for it.
+//! The shape argument is a sequence rather than a single choice
+//! because a single shape cannot express a run whose earlier arm
+//! leaves state behind, and the criterion sweep that does stall stops
+//! on an arm that ran directly after a different one in the same
+//! process.
+//!
+//! Neither arrangement reproduces that stall here. 300 iterations of
+//! 1024 closures complete in under a tenth of a second in either shape
+//! alone, and the deque-then-mailbox sequence at fan-out 1024
+//! completes in eight of eight attempts on an idle sixteen-worker
+//! host. The reproducer is benches/simc_cooperative, whose census
+//! instrument reports the same mailbox state this prints, at the one
+//! place the stall appears. Reach for this example to ask what a
+//! fan-out does, not to catch that stall.
 //!
 //! The repeat count exists because a single call is the one thing this
 //! does that a criterion sweep does not: criterion calls the same
