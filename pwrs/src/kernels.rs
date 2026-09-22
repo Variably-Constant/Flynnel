@@ -1711,6 +1711,17 @@ fn matching_lines(hay: &[u8], needle: &[u8], ignore_case: bool) -> Vec<(u64, Str
 /// is a dependency this module does not take, and a literal search is
 /// what the parallel shape is for.
 ///
+/// Matching is ordinal, over bytes, and `-IgnoreCase` folds the ASCII
+/// range and nothing else. The PowerShell ways to get the same answer
+/// do not match that way: `-like` and `Select-String` fold case
+/// through .NET's culture-aware casing, which comes from ICU under
+/// PowerShell 7 and from the older NLS tables under Windows
+/// PowerShell 5.1, and falls back to NLS where ICU cannot be loaded.
+/// Casing is one of the areas those two libraries are documented to
+/// differ in, so the same script can fold a pair outside ASCII in one
+/// shell and not in the other. This cmdlet gives the same answer on
+/// every host, and differs from both of them on such a pair.
+///
 /// # Examples
 ///
 /// `Search-FlynnelFile -Pattern 'panic' -Path $files`
