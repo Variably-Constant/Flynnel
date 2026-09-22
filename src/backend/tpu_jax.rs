@@ -128,20 +128,13 @@ impl TpuJaxBackend {
     /// `jax.devices()` order).
     pub fn with_device(device_id: u32) -> Result<Self, BackendError> {
         let script_path = write_bridge_script()?;
-        let (child, stdin, stdout) = spawn_python(&script_path)?;
-        let mut state = BridgeState {
-            child: Some(child),
-            stdin,
-            stdout: BufReader::new(stdout),
-            script_path,
-            devices: Vec::new(),
-        };
-        // The handshake runs here, on the constructing thread, before
-        // the state moves: a backend that cannot answer `ping` is not
-        // constructed, so the owning thread never starts for one.
-        let pong = ping_handshake(&mut state)?;
-        state.devices = pong.devices;
-        let devices = state.devices.clone();
+        // The handshake runs on the constructing thread, before the
+        // state moves and before any thread starts: a backend that
+        // cannot answer `ping` is not constructed, so the owning
+        // thread never starts for one. It is also what chooses the
+        // interpreter, because starting one proves nothing.
+        let (state, pong) = open_bridge(script_path)?;
+        let devices = pong.devices;
 
         // A ring deep enough that callers hand over their requests
         // rather than queue on the handover itself. The bridge is
@@ -397,28 +390,82 @@ fn write_bridge_script() -> Result<PathBuf, BackendError> {
     Ok(path)
 }
 
-fn spawn_python(script: &PathBuf) -> Result<(Child, ChildStdin, ChildStdout), BackendError> {
+/// Start the bridge on the first interpreter that answers `ping`.
+///
+/// Starting is not the test. Windows ships an execution alias named
+/// `python3` that starts, says where Python can be installed and
+/// exits, so a spawn that succeeds says nothing about whether an
+/// interpreter is there. A host with that alias and a real `python`
+/// beside it reported no TPU backend while it had one, because the
+/// alias was taken and the list was not walked past it. The handshake
+/// is the test, and an interpreter that fails it is reaped and the
+/// next one tried.
+fn open_bridge(script_path: PathBuf) -> Result<(BridgeState, PingResponse), BackendError> {
+    let mut last = String::from("no python3 or python interpreter on PATH");
     for interpreter in ["python3", "python"] {
-        let res = Command::new(interpreter)
-            .arg(script)
+        let started = Command::new(interpreter)
+            .arg(&script_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn();
-        if let Ok(mut child) = res {
-            let stdin = child.stdin.take().ok_or_else(|| {
-                BackendError::DeviceUnavailable(Backend::Tpu { device_id: 0 })
-                    .map_io_context("child stdin missing".into())
-            })?;
-            let stdout = child.stdout.take().ok_or_else(|| {
-                BackendError::DeviceUnavailable(Backend::Tpu { device_id: 0 })
-                    .map_io_context("child stdout missing".into())
-            })?;
-            return Ok((child, stdin, stdout));
+        let mut child = match started {
+            Ok(child) => child,
+            Err(absent) => {
+                last = format!("{interpreter}: {absent}");
+                continue;
+            }
+        };
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            last = format!("{interpreter}: started without both pipes");
+            reap(interpreter, child);
+            continue;
+        };
+        let mut state = BridgeState {
+            child: Some(child),
+            stdin,
+            stdout: BufReader::new(stdout),
+            script_path: script_path.clone(),
+            devices: Vec::new(),
+        };
+        match ping_handshake(&mut state) {
+            Ok(pong) => {
+                state.devices = pong.devices.clone();
+                return Ok((state, pong));
+            }
+            Err(refused) => {
+                last = format!("{interpreter}: {refused}");
+                if let Some(child) = state.child.take() {
+                    reap(interpreter, child);
+                }
+            }
         }
     }
-    Err(BackendError::DeviceUnavailable(Backend::Tpu { device_id: 0 })
-        .map_io_context("no python3 / python interpreter on PATH".into()))
+    match std::fs::remove_file(&script_path) {
+        Ok(()) => {}
+        // No interpreter got as far as owning the script, so nothing
+        // else will remove it, and a temp directory that has already
+        // been swept is the ordinary way to reach this.
+        Err(absent) => drop(absent),
+    }
+    Err(BackendError::DeviceUnavailable(Backend::Tpu { device_id: 0 }).map_io_context(last))
+}
+
+/// End a child that will not be used and wait for it, so a rejected
+/// interpreter leaves no process behind.
+fn reap(interpreter: &str, mut child: Child) {
+    match child.kill() {
+        Ok(()) => {}
+        Err(gone) => {
+            eprintln!("tpu_jax: the {interpreter} child was already gone: {gone}");
+        }
+    }
+    match child.wait() {
+        Ok(_ended) => {}
+        Err(unwaitable) => {
+            eprintln!("tpu_jax: the {interpreter} child could not be waited for: {unwaitable}");
+        }
+    }
 }
 
 fn ping_handshake(state: &mut BridgeState) -> Result<PingResponse, BackendError> {

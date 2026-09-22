@@ -143,7 +143,7 @@ fn spin_until<F: Fn() -> bool>(ready: F) {
     while !ready() {
         std::hint::spin_loop();
         spins += 1;
-        if spins % SPINS_PER_YIELD == 0 {
+        if spins.is_multiple_of(SPINS_PER_YIELD) {
             std::thread::yield_now();
         }
     }
@@ -193,7 +193,7 @@ impl Crew {
                             }
                             std::hint::spin_loop();
                             spins += 1;
-                            if spins % SPINS_PER_YIELD == 0 {
+                            if spins.is_multiple_of(SPINS_PER_YIELD) {
                                 std::thread::yield_now();
                             }
                         }
