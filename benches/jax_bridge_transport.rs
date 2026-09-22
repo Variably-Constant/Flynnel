@@ -47,7 +47,9 @@
 //!   them but cannot reverse it. A crew outliving the iterations
 //!   would carry less, at the cost of a second copy of one.
 //!
-//! Needs `python3` on PATH for the echo child. Without one it reports
+//! Needs an interpreter on PATH for the echo child, tried as `python3`
+//! then `python`, and the one it takes is the first that echoes a probe
+//! line back rather than the first that starts. Without one it reports
 //! that it measured nothing rather than reporting an empty pass.
 
 use std::io::{BufRead, BufReader, Write};
@@ -80,11 +82,20 @@ struct Pipe {
 impl Pipe {
     /// One line out and one line back. This is the whole of what the
     /// shipped `exchange` does.
+    ///
+    /// A read that returns nothing is the child having gone, which
+    /// reaches a caller as a successful read of an empty line and
+    /// would let a whole run time an empty loop. It is an error here.
     fn round_trip(&mut self, body: &str) -> std::io::Result<String> {
         writeln!(self.stdin, "{body}")?;
         self.stdin.flush()?;
         let mut line = String::new();
-        self.stdout.read_line(&mut line)?;
+        if self.stdout.read_line(&mut line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the echo child closed its output",
+            ));
+        }
         Ok(line)
     }
 }
@@ -95,26 +106,61 @@ struct Echo {
 }
 
 impl Echo {
-    fn spawn() -> Option<(Self, Pipe)> {
-        let mut child = Command::new("python3")
-            .arg("-c")
-            .arg(ECHO)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let stdin = child.stdin.take()?;
-        let stdout = child.stdout.take()?;
-        Some((
-            Self { child },
-            Pipe {
+    /// Start the echo on the first interpreter that echoes.
+    ///
+    /// Starting one is not the test. Windows ships an execution alias
+    /// named `python3` that starts, says where Python can be
+    /// installed and exits, so a spawn that succeeds proves nothing
+    /// and the pipe behind it returns end of file on every read. A
+    /// bench that took it would time an empty read loop and report
+    /// the two transports as identically fast, which is the one wrong
+    /// answer that looks like a result.
+    fn start() -> Option<(Self, Pipe)> {
+        for interpreter in ["python3", "python"] {
+            let mut child = match Command::new(interpreter)
+                .arg("-c")
+                .arg(ECHO)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(absent) => {
+                    eprintln!("jax_bridge_transport: {interpreter} did not start: {absent}");
+                    continue;
+                }
+            };
+            let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+                eprintln!("jax_bridge_transport: {interpreter} started without both pipes");
+                drop(Self { child });
+                continue;
+            };
+            let mut pipe = Pipe {
                 stdin,
                 stdout: BufReader::new(stdout),
-            },
-        ))
+            };
+            match pipe.round_trip(PROBE) {
+                Ok(back) if back.trim() == PROBE => return Some((Self { child }, pipe)),
+                Ok(other) => {
+                    eprintln!(
+                        "jax_bridge_transport: {interpreter} answered {:?} rather than echoing",
+                        other.trim()
+                    );
+                }
+                Err(broken) => {
+                    eprintln!("jax_bridge_transport: {interpreter} did not echo: {broken}");
+                }
+            }
+            drop(pipe);
+            drop(Self { child });
+        }
+        None
     }
 }
+
+/// The line `start` sends to decide whether a child is an echo.
+const PROBE: &str = "{\"op\":\"probe\"}";
 
 impl Drop for Echo {
     fn drop(&mut self) {
@@ -326,8 +372,10 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) {
     let mut widths = vec![1usize, 2, cores.max(2)];
     widths.dedup();
     for callers in widths {
-        let Some((owned_child, owned_pipe)) = Echo::spawn() else {
-            eprintln!("jax_bridge_transport: no python3 on PATH, nothing measured");
+        let Some((owned_child, owned_pipe)) = Echo::start() else {
+            eprintln!(
+                "jax_bridge_transport: no interpreter on PATH echoed a line, nothing measured"
+            );
             return;
         };
         let owned = Owned::new(owned_pipe);
@@ -337,8 +385,10 @@ fn bench_shapes(c: &mut Criterion, loaded: bool) {
         drop(owned);
         drop(owned_child);
 
-        let Some((locked_child, locked_pipe)) = Echo::spawn() else {
-            eprintln!("jax_bridge_transport: no python3 on PATH, nothing measured");
+        let Some((locked_child, locked_pipe)) = Echo::start() else {
+            eprintln!(
+                "jax_bridge_transport: no interpreter on PATH echoed a line, nothing measured"
+            );
             return;
         };
         let locked = Locked::new(locked_pipe);
