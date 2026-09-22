@@ -924,6 +924,17 @@ impl Sleep {
             // here rather than relying on a waker reaching it.
             state.handle.get_or_init(thread::current);
             state.state.store(SLEEPING, Ordering::SeqCst);
+            // The store above and the producer's claim must not both
+            // fail to see each other, which needs the read below to be
+            // ordered after it rather than hoisted over it. The SeqCst
+            // shutdown load supplies that today because it is the left
+            // operand, and a reader who swapped the operands would take
+            // the barrier away without touching anything that looks
+            // like one. Stated here instead, so it does not depend on
+            // the order two conditions are written in, and so the
+            // queue reads inside `has_reachable_work` carry it too
+            // whatever ordering they use internally.
+            std::sync::atomic::fence(Ordering::SeqCst);
             if (self.shutdown.load(Ordering::SeqCst) || has_reachable_work())
                 && state
                     .state
