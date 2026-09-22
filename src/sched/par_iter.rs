@@ -4604,9 +4604,6 @@ mod tests {
         // must come from the calling thread. That is what separates
         // inline-collapse from pool dispatch.
         use std::sync::atomic::{AtomicUsize, Ordering};
-        // Hold the profile lock so the migration tests cannot move the
-        // global profile underneath this one.
-        let _profile = crate::sched::adaptive_profile::global_profile_test_lock();
         crate::sched::adaptive_profile::migrate_dispatch_profile(
             crate::DispatchProfile::PortBound,
         );
@@ -4664,7 +4661,6 @@ mod tests {
         // defect. What must hold either way is that the walk covers
         // the slice exactly once.
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let _profile = crate::sched::adaptive_profile::global_profile_test_lock();
         crate::sched::adaptive_profile::migrate_dispatch_profile(
             crate::DispatchProfile::PortBound,
         );
@@ -5630,10 +5626,6 @@ mod tests {
     /// only `for_each_chunk`.
     #[test]
     fn a_worker_cap_of_one_keeps_every_entry_on_the_calling_thread() {
-        // The dispatches below record heavy leaves into the global
-        // classifier, which can migrate the process profile under a
-        // test that pins it. Hold the same lock those tests hold.
-        let _profile = crate::sched::adaptive_profile::global_profile_test_lock();
         let caller = std::thread::current().id();
         use std::sync::atomic::AtomicUsize;
         // Two counters rather than the thread ids themselves. The

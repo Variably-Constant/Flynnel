@@ -2069,8 +2069,8 @@ mod tests {
         assert_eq!(pinned_heavy.effective_spin_before_yield_ns(), 4321,
             "an explicit budget wins even where the item cost would zero it");
 
-        // Force the host profile so the comparison has a known budget.
-        let _profile = crate::sched::adaptive_profile::global_profile_test_lock();
+        // The host's own measured budget, which every branch below is
+        // read against.
         let host = crate::sched::par_iter::host_dispatch_profile().collapse_threshold_ns;
         assert!(host > 0, "the profile is measured by the query above");
 

@@ -168,7 +168,10 @@ const TAG_STREAMING: u8 = 4;
 /// [`migrate_workload_class`]. Initial value: PortBound (the
 /// flynnel calibration default for Zen+ R7 2700 - see the
 /// realistic_bench results in the WorkerCtx swap commit).
-static ACTIVE_PROFILE_TAG: AtomicU8 = AtomicU8::new(TAG_PORT_BOUND);
+static ACTIVE_PROFILE_TAG: AtomicU8 = AtomicU8::new(ACTIVE_PROFILE_TAG_DEFAULT);
+
+/// The tag [`ACTIVE_PROFILE_TAG`] holds before anything migrates it.
+const ACTIVE_PROFILE_TAG_DEFAULT: u8 = TAG_PORT_BOUND;
 
 /// Linkage confirmation marker. When the binary links this
 /// module, `nm <bin> | grep __flynnel_marker` returns this
@@ -177,12 +180,11 @@ static ACTIVE_PROFILE_TAG: AtomicU8 = AtomicU8::new(TAG_PORT_BOUND);
 #[unsafe(no_mangle)]
 pub static __flynnel_marker_adaptive_profile: u8 = 0;
 
-/// Read the active DispatchProfile via one AtomicU8 Acquire-load.
-/// Used by the scheduler to pick default plan knobs when the
-/// caller doesn't specify a profile explicitly.
+/// The profile a stored tag names. Any value that is not a profile's
+/// tag reads as [`DispatchProfile::Unspecified`].
 #[inline]
-pub fn active_dispatch_profile() -> DispatchProfile {
-    match ACTIVE_PROFILE_TAG.load(Ordering::Acquire) {
+const fn profile_of_tag(tag: u8) -> DispatchProfile {
+    match tag {
         TAG_LATENCY_BOUND => DispatchProfile::LatencyBound,
         TAG_PORT_BOUND => DispatchProfile::PortBound,
         TAG_MEMORY_BOUND => DispatchProfile::MemoryBound,
@@ -191,20 +193,37 @@ pub fn active_dispatch_profile() -> DispatchProfile {
     }
 }
 
-/// Migrate the global active DispatchProfile via one AtomicU8
-/// Release-store. Subsequent dispatches that consult
-/// [`active_dispatch_profile`] see the new value; per-op cost on
-/// the deque hot path is unchanged.
+/// The tag a profile is stored as.
 #[inline]
-pub fn migrate_dispatch_profile(profile: DispatchProfile) {
-    let tag = match profile {
+const fn tag_of_profile(profile: DispatchProfile) -> u8 {
+    match profile {
         DispatchProfile::LatencyBound => TAG_LATENCY_BOUND,
         DispatchProfile::PortBound => TAG_PORT_BOUND,
         DispatchProfile::MemoryBound => TAG_MEMORY_BOUND,
         DispatchProfile::Streaming => TAG_STREAMING,
         DispatchProfile::Unspecified => TAG_UNSPECIFIED,
-    };
-    ACTIVE_PROFILE_TAG.store(tag, Ordering::Release);
+    }
+}
+
+/// Read the active DispatchProfile via one AtomicU8 Acquire-load.
+/// Used by the scheduler to pick default plan knobs when the
+/// caller doesn't specify a profile explicitly.
+#[inline]
+pub fn active_dispatch_profile() -> DispatchProfile {
+    profile_of_tag(ACTIVE_PROFILE_TAG.load(Ordering::Acquire))
+}
+
+/// Migrate the global active DispatchProfile via one AtomicU8
+/// Release-store. Subsequent dispatches that consult
+/// [`active_dispatch_profile`] see the new value; per-op cost on
+/// the deque hot path is unchanged.
+///
+/// [`tick_auto_classify`] calls this from whichever thread ran a
+/// dispatch, so the value is the whole process's and any reader can
+/// find it changed between two of its own reads.
+#[inline]
+pub fn migrate_dispatch_profile(profile: DispatchProfile) {
+    ACTIVE_PROFILE_TAG.store(tag_of_profile(profile), Ordering::Release);
 }
 
 /// High-level WorkloadClass migration. Maps to the underlying
@@ -228,7 +247,14 @@ pub fn migrate_workload_class(class: WorkloadClass) {
 ///   [`WorkloadClass`] variant.
 #[inline]
 pub fn active_workload_class() -> WorkloadClass {
-    match active_dispatch_profile() {
+    class_of_profile(active_dispatch_profile())
+}
+
+/// The class a profile stands for, with the collapse
+/// [`active_workload_class`] documents.
+#[inline]
+const fn class_of_profile(profile: DispatchProfile) -> WorkloadClass {
+    match profile {
         DispatchProfile::LatencyBound => WorkloadClass::LatencyBound,
         DispatchProfile::PortBound => WorkloadClass::PortBound,
         DispatchProfile::MemoryBound => WorkloadClass::MemoryBound,
@@ -949,15 +975,6 @@ pub fn reset_auto_classify_state() {
     AUTO_LAST_SUMSQ_PER_ITEM.store(0, Ordering::Relaxed);
 }
 
-/// Serializes tests that migrate or depend on the process-wide
-/// dispatch profile; poison-tolerant so one failing test does not
-/// cascade.
-#[cfg(test)]
-pub(crate) fn global_profile_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,12 +1016,6 @@ mod tests {
         );
     }
 
-    fn restore_default_profile() {
-        // Reset to PortBound between tests so cross-test state
-        // doesn't leak via the global ACTIVE_PROFILE_TAG.
-        migrate_dispatch_profile(DispatchProfile::PortBound);
-    }
-
     #[test]
     fn workload_class_maps_to_dispatch_profile() {
         assert_eq!(WorkloadClass::FineGrain.to_dispatch_profile(), DispatchProfile::PortBound);
@@ -1014,25 +1025,35 @@ mod tests {
         assert_eq!(WorkloadClass::Streaming.to_dispatch_profile(), DispatchProfile::Streaming);
     }
 
+    /// Every profile survives the round trip the global cell performs,
+    /// and the cell starts at PortBound.
+    ///
+    /// Over the tag rather than the process-wide cell: `tick_auto_classify`
+    /// migrates that cell from whichever thread ran a dispatch, so any
+    /// test that stored a profile and read it back could be answered by
+    /// a neighbouring test's classifier instead of by its own store.
     #[test]
-    fn migration_changes_active_profile() {
-        let _guard = TestGuard::new();
-        // Default per static init.
-        let initial = active_dispatch_profile();
-        assert!(matches!(initial, DispatchProfile::PortBound),
-            "default expected PortBound, got {initial:?}");
-
-        migrate_dispatch_profile(DispatchProfile::LatencyBound);
-        assert_eq!(active_dispatch_profile(), DispatchProfile::LatencyBound);
-
-        migrate_dispatch_profile(DispatchProfile::MemoryBound);
-        assert_eq!(active_dispatch_profile(), DispatchProfile::MemoryBound);
-
-        migrate_dispatch_profile(DispatchProfile::Streaming);
-        assert_eq!(active_dispatch_profile(), DispatchProfile::Streaming);
-
-        migrate_dispatch_profile(DispatchProfile::PortBound);
-        assert_eq!(active_dispatch_profile(), DispatchProfile::PortBound);
+    fn every_profile_survives_its_tag_and_the_cell_starts_port_bound() {
+        for profile in [
+            DispatchProfile::LatencyBound,
+            DispatchProfile::PortBound,
+            DispatchProfile::MemoryBound,
+            DispatchProfile::Streaming,
+            DispatchProfile::Unspecified,
+        ] {
+            assert_eq!(profile_of_tag(tag_of_profile(profile)), profile);
+        }
+        assert_eq!(profile_of_tag(TAG_PORT_BOUND), DispatchProfile::PortBound);
+        assert_eq!(
+            profile_of_tag(ACTIVE_PROFILE_TAG_DEFAULT),
+            DispatchProfile::PortBound,
+            "the cell's initial value is the calibration default"
+        );
+        assert_eq!(
+            profile_of_tag(200),
+            DispatchProfile::Unspecified,
+            "a tag no profile is stored as reads as unspecified"
+        );
     }
 
     #[test]
@@ -1231,37 +1252,31 @@ mod tests {
         );
     }
 
+    /// A class reaches the cell as its profile and comes back as a
+    /// class, over the whole round trip a migration performs, and
+    /// FineGrain comes back as PortBound because the profile side has
+    /// no such variant.
     #[test]
-    fn workload_class_migration_propagates() {
-        let _guard = TestGuard::new();
-        migrate_workload_class(WorkloadClass::LatencyBound);
-        assert_eq!(active_dispatch_profile(), DispatchProfile::LatencyBound);
-        assert_eq!(active_workload_class(), WorkloadClass::LatencyBound);
-
-        migrate_workload_class(WorkloadClass::MemoryBound);
-        assert_eq!(active_dispatch_profile(), DispatchProfile::MemoryBound);
-        assert_eq!(active_workload_class(), WorkloadClass::MemoryBound);
-    }
-
-    // RAII guard holding the global-profile test lock and restoring
-    // the default profile on both ends, so a test that migrates the
-    // process-wide profile neither races a test that reads it nor
-    // leaks its last value.
-    struct TestGuard {
-        lock: std::sync::MutexGuard<'static, ()>,
-    }
-    impl TestGuard {
-        fn new() -> Self {
-            let lock = super::global_profile_test_lock();
-            restore_default_profile();
-            Self { lock }
+    fn a_class_survives_the_round_trip_a_migration_performs() {
+        for class in [
+            WorkloadClass::LatencyBound,
+            WorkloadClass::MemoryBound,
+            WorkloadClass::Streaming,
+            WorkloadClass::PortBound,
+        ] {
+            let profile = class.to_dispatch_profile();
+            assert_eq!(
+                class_of_profile(profile_of_tag(tag_of_profile(profile))),
+                class
+            );
         }
+        assert_eq!(
+            class_of_profile(profile_of_tag(tag_of_profile(
+                WorkloadClass::FineGrain.to_dispatch_profile()
+            ))),
+            WorkloadClass::PortBound,
+            "the profile side has no FineGrain, so it collapses to PortBound"
+        );
     }
-    impl Drop for TestGuard {
-        fn drop(&mut self) {
-            // Restore while the lock is still held, then release it.
-            restore_default_profile();
-            let _still_held = &self.lock;
-        }
-    }
+
 }
