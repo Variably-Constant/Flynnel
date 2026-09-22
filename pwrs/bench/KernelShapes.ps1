@@ -560,6 +560,15 @@ $kernels = @(
 $rows = @()
 foreach ($k in $kernels) {
     Write-Host ("cell {0}" -f $k.Name)
+    # The control at both ends of this row's own arms, as well as at
+    # both ends of the run. The two answer different questions and the
+    # run-wide pair cannot answer this one: a ratio between arms is
+    # exposed only to what the box did across those arms, which is tens
+    # of seconds, while the run-wide figure covers minutes and reads
+    # far larger. Reading a row against the run-wide drift discards
+    # rows that were never at risk.
+    $rowControlFirst = Measure-Cell -Body $controlBody
+    Start-Cooldown
     $f = Measure-Cell -Body $k.Flynnel
     Start-Cooldown
     $s = Measure-Cell -Body $k.Serial
@@ -588,6 +597,12 @@ foreach ($k in $kernels) {
             $vsPool = [Math]::Round($pool.MedianMs / $f.MedianMs, 3)
         }
     }
+    $rowControlLast = Measure-Cell -Body $controlBody
+    $rowDriftPct = if ($rowControlFirst.MedianMs -gt 0) {
+        [Math]::Round(
+            100.0 * ($rowControlLast.MedianMs - $rowControlFirst.MedianMs) /
+                $rowControlFirst.MedianMs, 2)
+    } else { $null }
     $rows += [PSCustomObject]@{
         Kernel          = $k.Name
         FlynnelMs       = [Math]::Round($f.MedianMs, 4)
@@ -602,7 +617,12 @@ foreach ($k in $kernels) {
                           } else { $null }
         VsPool          = $vsPool
         AnchorSpeaksFor = $k.Straight
+        # How far the box moved across this row's own arms. A ratio in
+        # this row is readable when this is small, whatever the run-wide
+        # control did.
+        RowDriftPct     = $rowDriftPct
     }
+    Write-Host ("  row drift {0}% across this row's arms" -f $rowDriftPct)
 }
 
 $controlLast = Measure-Cell -Body $controlBody
@@ -877,7 +897,7 @@ if ($LoadThreads -gt 0) {
 }
 Write-Host ''
 $rows | Format-Table Kernel, FlynnelMs, SerialMs, NativeMs, LoadedMs, VsSerial, VsNative,
-    LoadCost, Runs, RunSpread, AnchorSpeaksFor, CrossBuild -AutoSize
+    LoadCost, RowDriftPct, Runs, RunSpread, AnchorSpeaksFor, CrossBuild -AutoSize
 Write-Host ''
 Write-Host 'Runs is how many invocations of this script are on record for this commit, host'
 Write-Host 'and edition, and RunSpread is the widest over the narrowest of their medians.'
@@ -885,6 +905,10 @@ Write-Host 'The repeats inside one invocation are samples sharing a process, not
 Write-Host 'RunSpread of null means one run is on record and there is nothing to compare.'
 Write-Host 'VsSerial is how many times faster the pool is than one worker running the same'
 Write-Host 'kernel. VsNative is against the PowerShell way to get the same answer.'
+Write-Host 'RowDriftPct is the control measured at both ends of that row own arms, so it is'
+Write-Host 'what bounds the ratios in that row. The run-wide control drift above covers'
+Write-Host 'minutes and bounds comparisons BETWEEN rows; reading one row against it discards'
+Write-Host 'rows that were never exposed to it.'
 Write-Host 'LoadCost is the same kernel under contention over itself on a quiet box, and is'
 Write-Host 'read against ControlLoadCost above: a row that rose by less than the control did'
 Write-Host 'was not slowed by the load. A null LoadCost means the arm did not run, which is'
