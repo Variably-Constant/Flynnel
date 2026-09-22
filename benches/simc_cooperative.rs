@@ -321,7 +321,9 @@ impl StallWatch {
         // thread and resolves its own node, which need not be the node
         // the stalled fan-out ran on, and a census of the wrong node
         // prints an empty list that reads as an answer.
-        let by_node = flynnel::sched::arena::global_local_arena().mailbox_census_by_node();
+        let arena = flynnel::sched::arena::global_local_arena();
+        let by_node = arena.mailbox_census_by_node();
+        let parked_by_node = arena.parked_census_by_node();
         let held: usize = by_node.iter().map(Vec::len).sum();
         if held == 0 {
             eprintln!(
@@ -331,12 +333,31 @@ impl StallWatch {
             );
         } else {
             for (node, holding) in by_node.iter().enumerate() {
-                if !holding.is_empty() {
-                    eprintln!(
-                        "  node {node}: mailboxes still holding work, by worker \
-                         index: {holding:?}"
-                    );
+                if holding.is_empty() {
+                    continue;
                 }
+                let parked: &[usize] = parked_by_node
+                    .get(node)
+                    .map_or(&[], |p: &Vec<usize>| p.as_slice());
+                // Split by whether the holder is parked, because the two
+                // are different defects. Parked on a full mailbox is a
+                // wake that did not arrive or did not stick. Awake on
+                // one is a worker that is running and not looking at
+                // the one queue nobody else can drain for it.
+                let asleep: Vec<usize> = holding
+                    .iter()
+                    .copied()
+                    .filter(|i| parked.contains(i))
+                    .collect();
+                let awake: Vec<usize> =
+                    holding.iter().copied().filter(|i| !parked.contains(i)).collect();
+                eprintln!(
+                    "  node {node}: mailboxes still holding work, by worker \
+                     index: {holding:?}"
+                );
+                eprintln!("    of those, parked: {asleep:?}");
+                eprintln!("    of those, awake:  {awake:?}");
+                eprintln!("    every parked worker on this node: {parked:?}");
             }
         }
 

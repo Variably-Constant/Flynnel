@@ -1388,6 +1388,33 @@ impl LocalArena {
             .collect()
     }
 
+    /// Which workers the sleep coordinator has parked, by index.
+    ///
+    /// Read beside [`Self::mailbox_census`] it separates two failures
+    /// that look identical from outside. A worker whose index is in
+    /// both lists is parked on top of work only it can take, so
+    /// whatever should have woken it did not. A worker holding a
+    /// mailbox and absent from this list is awake and not looking,
+    /// which is a different defect with a different fix.
+    ///
+    /// The indices agree because both are positions in the same
+    /// per-worker ordering: mailboxes at or above the worker count
+    /// belong to external slots, which have no entry here.
+    ///
+    /// A sampled read with nothing held, so an unstopped pool can
+    /// change under it. That is why it is for a dispatch that has
+    /// already stopped, where nothing is moving to begin with.
+    pub fn parked_census(&self) -> Vec<usize> {
+        self.sleep
+            .debug_state()
+            .blocked
+            .iter()
+            .enumerate()
+            .filter(|(_, parked)| **parked)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Try to claim an unused external slot. Returns `Some(guard)`
     /// holding the slot and an installed TLS WorkerCtx pointer so
     /// the calling thread can run `join_in_worker` directly on

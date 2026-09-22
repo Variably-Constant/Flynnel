@@ -272,6 +272,18 @@ impl NumaArena {
         self.nodes.iter().map(|node| node.mailbox_census()).collect()
     }
 
+    /// Which workers each node's sleep coordinator has parked, by node
+    /// index and then worker index.
+    ///
+    /// The companion to [`Self::mailbox_census_by_node`], read the
+    /// same way and for the same reason: from a thread that did not
+    /// dispatch, every node is asked because the right one is not
+    /// known. An index present in both a node's lists is a worker
+    /// parked on top of work only it can take.
+    pub fn parked_census_by_node(&self) -> Vec<Vec<usize>> {
+        self.nodes.iter().map(|node| node.parked_census()).collect()
+    }
+
     /// Iterate every per-worker stats handle across every node.
     /// Used by [`crate::sched::split_observer`] to compute pool-
     /// wide steal pressure.
