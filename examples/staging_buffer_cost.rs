@@ -51,8 +51,9 @@
 //! predicts, since the buffer is documented owner-side. The loaded row
 //! is what happens if that contract is ever broken by a caller
 //! reaching a backend through an `Arc<dyn DispatchBackend>`, which the
-//! `&self` signature permits. For the khpd cell the loaded siblings
-//! split into publishers and consumers of the same ring, and the cell
+//! `&self` signature permits. For the khpd cell the timed thread stays
+//! the deque's one publisher and every sibling steals from its ring,
+//! which is the contention the deque is built for, and the cell
 //! reports how many of its publishes found the ring full.
 //!
 //! Each cell is read as its median over `REPEATS`, and the control is
@@ -442,12 +443,17 @@ fn main() {
         h.join().expect("a helper thread panicked");
     }
 
-    // The shipped path under load: siblings staging and publishing into
-    // the same deque while others drain it, so the ring stays a ring.
-    // Half the siblings consume, so the timed publisher rarely finds
-    // it full; the times it does are counted and printed, because a
-    // cell dominated by waiting for ring space measures the consumers
-    // rather than the buffer.
+    // The shipped path under load: the timed thread is the deque's one
+    // publisher, as the owner is in production, and every sibling
+    // steals lines from it, so the ring stays a ring and the contention
+    // is the one the deque is built for. The times a publish finds the
+    // ring full are counted and printed, because a cell dominated by
+    // waiting for ring space measures the consumers rather than the
+    // buffer.
+    //
+    // Siblings do not publish: the deque has one owner and its
+    // contention is thieves against that owner, which is what these
+    // consumers are.
     let loaded_path = std::env::temp_dir().join(format!(
         "flynnel_staging_cost_loaded_{}.khpd",
         std::process::id()
@@ -456,12 +462,10 @@ fn main() {
         KhpdDeque::create(&loaded_path, REAL_LOADED_CAPACITY)
             .expect("a temp-dir deque of the loaded capacity"),
     );
-    let siblings = threads.saturating_sub(1);
-    let consumers = siblings / 2;
-    let publishers = siblings - consumers;
+    let consumers = threads.saturating_sub(1);
     let stop = Arc::new(AtomicBool::new(false));
-    let barrier = Arc::new(Barrier::new(siblings + 1));
-    let mut helpers = Vec::with_capacity(siblings);
+    let barrier = Arc::new(Barrier::new(consumers + 1));
+    let mut helpers = Vec::with_capacity(consumers);
     for _ in 0..consumers {
         let stop = Arc::clone(&stop);
         let barrier = Arc::clone(&barrier);
@@ -480,24 +484,8 @@ fn main() {
             }
         }));
     }
-    for _ in 0..publishers {
-        let stop = Arc::clone(&stop);
-        let barrier = Arc::clone(&barrier);
-        let deque = Arc::clone(&deque);
-        helpers.push(std::thread::spawn(move || {
-            barrier.wait();
-            let mut i = 0u64;
-            while !stop.load(Ordering::Relaxed) {
-                let staged = deque.stage(line_item(i)).expect("staging never fails");
-                if staged >= LINE_ITEMS {
-                    publish_or_wait(&deque);
-                }
-                i += 1;
-            }
-        }));
-    }
     barrier.wait();
-    println!("shipped_loaded siblings={siblings} publishers={publishers} consumers={consumers}");
+    println!("shipped_loaded consumers={consumers} publishers=1");
     let (real_control, khpd_cell, full_waits) = measure_shipped(&deque);
     report_shipped("shipped_loaded", real_control, khpd_cell, full_waits);
     stop.store(true, Ordering::Relaxed);

@@ -391,8 +391,9 @@ impl KhpdDeque {
     /// other thread's where they are. A thread stages and publishes
     /// its own batch, so items from two threads land in separate
     /// publication lines rather than sharing one. The ring is claimed
-    /// per line through `tail.fetch_add`, so concurrent publishers
-    /// take disjoint lines.
+    /// per batch through a compare-exchange on `tail` against the
+    /// `head` the full check read, so concurrent publishers take
+    /// disjoint lines and never together reserve past capacity.
     pub fn publish(&self) -> Result<usize, PushError> {
         self.pending.with_mine(|buffer| self.publish_staged(buffer))
     }
@@ -407,15 +408,31 @@ impl KhpdDeque {
         // How many lines do we need?
         let total = p.len();
         let n_lines = total.div_ceil(LINE_ITEMS);
-        // Reserve `n_lines` ring slots. If the ring would overflow,
-        // back off without consuming tail.
+        // Reserve `n_lines` ring slots, or back off without moving
+        // tail when the ring would overflow. The check and the claim
+        // are one compare-exchange on tail, so two publishers that read
+        // the same head cannot both pass the check and together reserve
+        // past capacity. A reservation past capacity waits below on a
+        // slot whose line the consumer at head has not reached, and
+        // when head is a line another publisher reserved and is itself
+        // waiting to fill, neither side moves.
         let h = self.header();
-        let head_snap = h.head.load(Ordering::Acquire);
-        let tail_snap = h.tail.load(Ordering::Relaxed);
-        if (tail_snap - head_snap + n_lines as i64) > self.capacity as i64 {
-            return Err(PushError::Full);
-        }
-        let base = h.tail.fetch_add(n_lines as i64, Ordering::AcqRel);
+        let mut tail_snap = h.tail.load(Ordering::Relaxed);
+        let base = loop {
+            let head_snap = h.head.load(Ordering::Acquire);
+            if (tail_snap - head_snap + n_lines as i64) > self.capacity as i64 {
+                return Err(PushError::Full);
+            }
+            match h.tail.compare_exchange_weak(
+                tail_snap,
+                tail_snap + n_lines as i64,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(claimed) => break claimed,
+                Err(current) => tail_snap = current,
+            }
+        };
 
         let mut item_iter = p.drain(..);
         for line_i in 0..n_lines {
