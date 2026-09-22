@@ -120,7 +120,7 @@ $dirty = @(& git -C $repoRoot status --porcelain 2>&1).Count
 $ioPool = Get-FlynnelIoPool -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
 $hasIoPool = $null -ne $ioPool
 if ($hasIoPool) {
-    Write-Host ("io pool present with {0} worker(s); the pool arm runs" -f $ioPool.Workers)
+    Write-Host ("io pool present with {0} worker(s); the pool arm runs" -f $ioPool.WorkerCount)
 } else {
     Write-Host ('NO IO POOL in this process, so the pool arm is SKIPPED and its column ' +
                 'will read empty. Set FLYNNEL_SCHED_SMT_AS_IO=1 before launching to measure it.')

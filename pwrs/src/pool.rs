@@ -608,7 +608,7 @@ impl IoPool {
 ///
 /// `$io = New-FlynnelIoPool -WorkerCount 4`
 ///
-/// `(New-FlynnelIoPool -WorkerCount 4).Workers`
+/// `(New-FlynnelIoPool -WorkerCount 4).WorkerCount`
 #[cmdlet(
     verb = "New",
     noun = "FlynnelIoPool",
