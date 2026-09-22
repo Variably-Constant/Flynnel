@@ -803,7 +803,7 @@ impl Sleep {
     pub(crate) fn no_work_found(
         &self,
         idle: &mut IdleState,
-        has_injected_jobs: impl FnOnce() -> bool,
+        has_reachable_work: impl Fn() -> bool,
     ) {
         if idle.rounds < ROUNDS_UNTIL_SLEEPY {
             self.idle_round(idle);
@@ -816,7 +816,7 @@ impl Sleep {
             idle.rounds += 1;
             self.idle_round(idle);
         } else {
-            self.sleep(idle, has_injected_jobs);
+            self.sleep(idle, has_reachable_work);
             // `sleep` returns without parking two ways: the JEC moved,
             // or the injector held a job. Both send the worker back to
             // searching and neither yields, so while the condition
@@ -843,13 +843,26 @@ impl Sleep {
             .jobs_counter()
     }
 
-    /// Worker-side: actually park after the
-    /// sleepy phase. Returns immediately if the JEC has changed
-    /// (i.e. a producer posted work in the meantime).
+    /// Worker-side: actually park after the sleepy phase.
+    ///
+    /// Returns without parking three ways: the JEC changed, so a
+    /// producer posted work while this worker was sleepy;
+    /// `has_reachable_work` answered true before the sleeping state
+    /// was published; or it answered true after, in which case this
+    /// worker takes itself back out of the sleeping count. The third
+    /// is the one a waker cannot cover, because between the counter
+    /// CAS and the state store a worker is counted as sleeping and is
+    /// not yet claimable.
+    ///
+    /// `has_reachable_work` is asked twice and so is `Fn`, not
+    /// `FnOnce`. It must report every queue this worker alone can
+    /// drain, not merely the shared ones: a queue with other
+    /// consumers survives a missed wake because another consumer
+    /// takes the job, and a single-consumer queue does not.
     fn sleep(
         &self,
         idle: &mut IdleState,
-        has_injected_jobs: impl FnOnce() -> bool,
+        has_reachable_work: impl Fn() -> bool,
     ) {
         let state = &self.worker_states[idle.worker_index];
         debug_assert_eq!(state.state.load(Ordering::Relaxed), AWAKE);
@@ -877,11 +890,11 @@ impl Sleep {
             }
         }
 
-        // Registered as sleeping. One last check for injected
-        // jobs (closes the deadlock race where work was injected
+        // Registered as sleeping. One last check for reachable
+        // work (closes the deadlock race where work arrived
         // while we were sleepy and our JEC bump rolled over).
         std::sync::atomic::fence(Ordering::SeqCst);
-        if has_injected_jobs() {
+        if has_reachable_work() {
             self.counters.sub_sleeping_thread();
             idle.sleepless = idle.sleepless.saturating_add(1);
         } else {
@@ -903,23 +916,36 @@ impl Sleep {
             // on the claim in wake_specific_thread puts all four
             // operations in one total order.
             //
-            // Jobs do not need this treatment. A producer bumps the
-            // packed counter, and try_add_sleeping_thread above is a
-            // CAS that fails when it moves, so the counter word is
-            // already the ordering for work arriving. Shutdown has no
-            // counter.
+            // Jobs need it too, and for the same reason. The counter
+            // word orders only what arrives before
+            // try_add_sleeping_thread, which has already succeeded
+            // here, and the producer's bump is conditional on some
+            // worker being sleepy, so a push landing in this window
+            // moves nothing this worker reads. The producer does call
+            // wake_any_threads, but wake_specific_thread claims a
+            // worker only once its state reads SLEEPING, and in this
+            // window it does not: the worker counts toward
+            // sleeping_threads and is unclaimable at the same time.
+            //
+            // For the injector that is survivable, since any worker
+            // drains it and another one takes the job. A mailbox is
+            // popped only by its owner, so there is no other worker,
+            // and the job waits for a wake that has already been
+            // issued and landed nowhere. So the worker rescues itself
+            // here rather than relying on a waker reaching it.
             state.handle.get_or_init(thread::current);
             state.state.store(SLEEPING, Ordering::SeqCst);
-            if self.shutdown.load(Ordering::SeqCst)
+            if (self.shutdown.load(Ordering::SeqCst) || has_reachable_work())
                 && state
                     .state
                     .compare_exchange(SLEEPING, AWAKE, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
             {
-                // Shutdown landed and no waker has claimed this worker,
-                // so the sleeping count is this thread's to give back.
-                // A claimed worker falls through to the loop below and
-                // is released by its waker.
+                // Shutdown or work landed, and no waker has claimed
+                // this worker, so the sleeping count is this thread's
+                // to give back. A claimed worker falls through to the
+                // loop below and is released by its waker, which gives
+                // the count back itself.
                 self.counters.sub_sleeping_thread();
                 idle.wake_fully();
                 return;

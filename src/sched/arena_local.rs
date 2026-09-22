@@ -2309,21 +2309,33 @@ fn worker_loop(
                 .peer_steal_misses
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
-        // (4) Park until unparked or shutdown. The predicate
-        // checks only own local + injector + shutdown, never peer
-        // stealers: a peer-walking predicate costs 448 atomic
-        // reads per spin window per parked worker and contests
-        // the line the productive worker writes on every push.
-        // Wakes come from the producer side instead:
+        // (4) Park until unparked or shutdown. The predicate covers
+        // the injector and this worker's own mailbox, and no peer
+        // stealer: a peer-walking predicate costs 448 atomic reads
+        // per spin window per parked worker and contests the line
+        // the productive worker writes on every push. A peer's deque
+        // does not need covering, because a job left on one has
+        // other thieves and one of them takes it. A mailbox does,
+        // because it has exactly one consumer, so a wake that misses
+        // its owner reaches nobody else and the job is stranded.
+        //
+        // Wakes still come from the producer side as well:
         // `WorkerCtx::push_tier` calls
         // `sleep.new_internal_jobs(1, was_empty)` and the JEC
         // coordinator wakes one condvar-parked worker as needed.
         // The idle path advances yield -> sleepy -> sleeping per
-        // call; `has_injected_jobs` is consulted in the sleep()
-        // race-recovery path for a job that landed mid-transition.
+        // call, and the predicate is consulted twice inside sleep():
+        // once before this worker publishes that it is sleeping, and
+        // once after, which is the window where it counts as sleeping
+        // and a waker cannot yet claim it.
         let idle = jec_idle.get_or_insert_with(|| ctx.sleep.start_looking(idx));
         let inj_ref = &ctx.injector;
-        ctx.sleep.no_work_found(idle, || !inj_ref.is_empty());
+        let mailbox_ref = &ctx.mailbox;
+        ctx.sleep.no_work_found(idle, || {
+            !inj_ref.is_empty()
+                || (MAILBOX_EVER_USED.load(core::sync::atomic::Ordering::Acquire)
+                    && !mailbox_ref.is_empty())
+        });
     }
     // Final accounting: if we exit the loop while still idle,
     // balance the JEC inactive counter so the arena's Drop
