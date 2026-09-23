@@ -525,6 +525,7 @@ where
         // latch has not yet been set so no joining thread has
         // observed the result cell.
         unsafe { core::ptr::write(this.result.get(), result) };
+        crate::sched::trace::emit(crate::sched::trace::TraceEvent::LatchSet, 0);
         // After the next line the parent may resume, observe
         // is_set, and drop the StackJob. We must not read `this`
         // after the set call returns.

@@ -459,9 +459,15 @@ where
     // we observe job_b.latch set (the thief ran it) or we find
     // another job to execute.
     let mut idle_since: Option<std::time::Instant> = None;
+    // The last yield's length in microseconds, recorded only while the
+    // trace ring is on.
+    let mut last_yield_us: Option<u32> = None;
     let spin_budget_ns = plan.effective_spin_before_yield_ns();
     loop {
         if job_b.latch.is_set() {
+            if let Some(us) = last_yield_us {
+                crate::sched::trace::emit(crate::sched::trace::TraceEvent::JoinLastYield, us);
+            }
             crate::sched::trace::emit(crate::sched::trace::TraceEvent::JoinWaitEnd, 1);
             if traced {
                 let t_wait_end = dispatch_tsc();
@@ -483,6 +489,9 @@ where
         }
         if let Some(job) = ctx.find_work() {
             if job.id() == job_b_id {
+                if let Some(us) = last_yield_us {
+                    crate::sched::trace::emit(crate::sched::trace::TraceEvent::JoinLastYield, us);
+                }
                 crate::sched::trace::emit(crate::sched::trace::TraceEvent::JoinWaitEnd, 0);
                 if traced {
                     let t_wait_end = dispatch_tsc();
@@ -535,7 +544,12 @@ where
             // would only deny a core to the thief running it.
             let idle_since = idle_since.get_or_insert_with(std::time::Instant::now);
             if idle_since.elapsed().as_nanos() >= u128::from(spin_budget_ns) {
+                let yield_started = crate::sched::trace::is_enabled().then(std::time::Instant::now);
                 std::thread::yield_now();
+                if let Some(started) = yield_started {
+                    let us = started.elapsed().as_micros().min(u128::from(u32::MAX));
+                    last_yield_us = Some(us as u32);
+                }
             } else {
                 std::hint::spin_loop();
             }

@@ -111,6 +111,17 @@ pub enum TraceEvent {
     /// engage, whatever its timings say, and the two cases are
     /// otherwise identical in the output.
     LatchMonitor = 19,
+    /// A thief is about to set the latch of a stolen job it has just
+    /// run. Payload = 0. The joining thread may observe the latch at
+    /// any time after this row.
+    LatchSet = 20,
+    /// A join waiter's wait ended after at least one yield. Payload =
+    /// the last yield's length in microseconds, saturating at
+    /// `u32::MAX`. Emitted just before the wait's
+    /// [`TraceEvent::JoinWaitEnd`], so a last yield that ends long after
+    /// the awaited job's [`TraceEvent::LatchSet`] is a waiter that was
+    /// off its core while its latch was set.
+    JoinLastYield = 21,
 }
 
 /// One trace event row recorded into the per-thread buffer.
