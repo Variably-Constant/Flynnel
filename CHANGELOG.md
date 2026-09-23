@@ -276,15 +276,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   no `Arc`. `total_join_parks()` counts the parks, so a run can show it
   reached them.
 
-  Both stay off, on four arms of that reproducer (neither, each, both;
-  three rounds, positions rotating). On the 24-thread host `JOIN_PARK`
-  took the loaded median from 3.02 to 0.95 ms and the p99 from 31.3 to
-  1.8 ms, with calls of 5 ms or more falling from 211 to none, at no
-  quiet cost: 0.468 ms against 0.471. On a 16-vCPU Linux guest it raised
-  the quiet median from about 1.3 to 3.1 ms in each round, with the
-  serial control level across the arms, because a parked thread halts
-  its vCPU and the wake through the hypervisor costs far more than the
-  yield it replaced. `SLOT_PARK_NOW` moved nothing on either host.
+  Both stay off. On the 24-thread host, with its idle profile pinned
+  and three rounds of that reproducer against the same code with every
+  switch off, `JOIN_PARK` left the loaded median level, 1.17 ms against
+  1.13, and cut the tail: p99 15.2 ms against 32.2, and calls of 5 ms or
+  more 23 against 128 in the median round. Its quiet median rose 5.8 per
+  cent beside a serial control that rose 3.7. On a 16-vCPU Linux guest
+  it raised the quiet median from about 1.3 to 3.1 ms in each round,
+  with the serial control level across the arms, because a parked
+  thread halts its vCPU and the wake through the hypervisor costs far
+  more than the yield it replaced. `SLOT_PARK_NOW` moved nothing on
+  either host, in four arms of the reproducer (neither, each, both;
+  three rounds, positions rotating), on a 24-thread run that routed on
+  a profile drawn on a pool worker (see Fixed).
 
 - `FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED`, off: the join park, taken
   only while a yield somewhere in the process has lately given its core

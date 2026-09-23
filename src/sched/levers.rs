@@ -371,7 +371,9 @@ pub fn mailbox_wake_legacy() -> bool {
 /// Off: measured to change nothing. In four arms of the oversubscribed
 /// caller, on pc2 at faa0d05 and on a 16-vCPU guest at 517dba9, this arm
 /// sat with the arm that had no switch on, quiet and loaded, and adding
-/// it to [`join_park`] moved nothing that arm had not.
+/// it to [`join_park`] moved nothing that arm had not. The pc2 run routed
+/// on a profile drawn on a pool worker, dispatch 100 ns and collapse
+/// 20561 ns, where the host's idle profile is about 1400 and 11500.
 pub fn slot_park_now() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| read("FLYNNEL_LEVER_SLOT_PARK_NOW"))
@@ -387,13 +389,17 @@ pub fn slot_park_now() -> bool {
 /// after its last leaf had a waiter whose last yield covered most of
 /// that time after its latch was set.
 ///
-/// Off, and measured not to be never-slower. On pc2 at faa0d05, with 18
-/// spinners beside 24 workers, it took a loaded dispatch's median from
-/// 3.02 to 0.95 ms and its p99 from 31.3 to 1.8 ms, at no quiet cost.
-/// On a 16-vCPU guest at 517dba9 it raised the quiet median from about
-/// 1.3 to 3.1 ms in each of three rounds, with the serial control level
-/// across the arms: a parked thread halts its vCPU, and the wake through
-/// the hypervisor costs far more than the yield it replaced.
+/// Off, and measured not to be never-slower. On pc2 at 32b92da, with 18
+/// spinners beside 24 workers and the host's idle profile pinned, three
+/// rounds against the same code with every switch off: the loaded
+/// median stayed level, 1.17 ms against 1.13, and the tail fell, p99
+/// 15.2 ms against 32.2 and calls of 5 ms or more 23 against 128 in the
+/// median round; the quiet median rose 5.8 per cent beside a serial
+/// control that rose 3.7. On a 16-vCPU guest at 517dba9 it raised the
+/// quiet median from about 1.3 to 3.1 ms in each of three rounds, with
+/// the serial control level across the arms: a parked thread halts its
+/// vCPU, and the wake through the hypervisor costs far more than the
+/// yield it replaced.
 /// [`join_park_oversubscribed`] parks only where a yield would lose the
 /// core.
 pub fn join_park() -> bool {
