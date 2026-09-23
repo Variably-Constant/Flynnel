@@ -335,6 +335,36 @@ pub fn total_sleepless_backoffs() -> u64 {
     SLEEPLESS_BACKOFFS.load(Ordering::Relaxed)
 }
 
+/// Times a worker that had published itself as sleeping found work or
+/// shutdown on its recheck and stayed awake, since process start.
+///
+/// Neither park nor rescue evidence counts these: the worker never
+/// parks, and it clears its idle rounds before it next finds work, so
+/// `work_found` does not see a spin that paid off. With
+/// [`crate::sched::levers::mailbox_wake_legacy`] on, the recheck reads
+/// only shutdown, so the count stays at zero until the pool shuts down.
+static SELF_RESCUES: AtomicU64 = AtomicU64::new(0);
+
+/// Times a worker was rescued by its own recheck after publishing
+/// itself as sleeping, since process start.
+pub fn total_self_rescues() -> u64 {
+    SELF_RESCUES.load(Ordering::Relaxed)
+}
+
+/// Workers that committed to a park, since process start or the last
+/// [`reset_spin_stats`]. With the adaptive controller on, each of its
+/// decisions restarts this count as well, so a harness reading it as a
+/// total runs with the controller off, which is the default.
+pub fn total_park_events() -> u64 {
+    u64::from(PARK_EVENTS.load(Ordering::Relaxed))
+}
+
+/// Workers that found work inside the spin window after going sleepy
+/// and without parking, counted as [`total_park_events`] is.
+pub fn total_rescue_events() -> u64 {
+    u64::from(RESCUE_EVENTS.load(Ordering::Relaxed))
+}
+
 /// Idle rounds spent in a monitor wait since process start. Zero
 /// unless [`crate::sched::levers::spin_monitor`] is on and the host's
 /// monitor holds; a harness reads it to tell an arm that engaged from
@@ -948,6 +978,7 @@ impl Sleep {
                 // loop below and is released by its waker, which gives
                 // the count back itself.
                 self.counters.sub_sleeping_thread();
+                SELF_RESCUES.fetch_add(1, Ordering::Relaxed);
                 // A rescue is a third way out of here without parking,
                 // so it feeds the same counter the other two do. Work
                 // this worker alone can drain is work it will get, but

@@ -636,6 +636,18 @@ fn bench_simc_cooperative(c: &mut Criterion) {
     // the other value of a lever, it says whether one arm is denying
     // its workers a park and putting them on a timer instead.
     eprintln!("SLEEPLESS_BACKOFFS {}", flynnel::total_sleepless_backoffs());
+    // How the workers left the idle path over the same groups: parked,
+    // found work inside the spin window, or rescued by the recheck made
+    // after publishing themselves as sleeping. The recheck is what the
+    // mailbox fix added, so its count against the legacy arm's zero is
+    // the fix engaging, and the park count beside it is what that
+    // engagement bought or cost.
+    eprintln!(
+        "IDLE_EXITS parks={} spin_rescues={} self_rescues={}",
+        flynnel::total_park_events(),
+        flynnel::total_rescue_events(),
+        flynnel::total_self_rescues()
+    );
 }
 
 criterion_group!(benches, bench_simc_cooperative);
