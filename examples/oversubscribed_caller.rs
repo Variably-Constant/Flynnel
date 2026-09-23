@@ -21,12 +21,19 @@
 //! Defaults: three quarters of the logical processors as spinners, 4
 //! rounds, 200 calls per arm per phase, 1,000,000 items, 2 square roots
 //! per item.
+//!
+//! With `FLYNNEL_TRACE=1` in the environment it times nothing of the
+//! above. It runs `calls` parallel calls with the spinners on, prints
+//! one `CALL index nanoseconds` line each and the trace clock's rate,
+//! and dumps every thread's trace buffer to stderr as `TRACE,` rows, so
+//! a slow call can be split into its pickup and its join's longest leaf.
 
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use flynnel::sched::trace;
 use flynnel::{JobPlan, for_each_chunk};
 
 /// `flops` chained square roots on one item.
@@ -115,6 +122,62 @@ fn buckets(samples: &[u64]) -> String {
     )
 }
 
+/// Ticks of the trace clock per nanosecond. The trace stamps events with
+/// the time-stamp counter on x86_64, measured here against the monotonic
+/// clock over a fifth of a second, and with nanoseconds elsewhere.
+fn trace_clock_per_ns() -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: RDTSC has no preconditions on x86_64.
+        let c0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let t0 = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // SAFETY: as above.
+        let c1 = unsafe { core::arch::x86_64::_rdtsc() };
+        let elapsed = t0.elapsed().as_nanos() as f64;
+        (c1.wrapping_sub(c0)) as f64 / elapsed
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        1.0
+    }
+}
+
+/// The traced run: parallel calls under the spinners only, then every
+/// thread's buffer dumped. Workers dump at the top of their next loop
+/// pass, so wide dispatches are driven until each has, as
+/// `examples/trace_dispatch.rs` does.
+fn traced(spinners: usize, calls: usize, plan: &JobPlan, data: &mut [f64], flops: u32) {
+    println!("TRACE_CLOCK_PER_NS {:.6}", trace_clock_per_ns());
+    let load = Spinners::start(spinners);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    trace::reset_current_thread();
+    for i in 0..calls {
+        let t0 = Instant::now();
+        for_each_chunk(plan, &mut *data, |s| s.iter_mut().for_each(|x| work(x, flops)));
+        println!("CALL {i} {}", t0.elapsed().as_nanos());
+    }
+    load.stop();
+    trace::dump_to_stderr("caller");
+    trace::request_worker_flush();
+    let mut wide = vec![1.5f64; 1 << 20];
+    let wide_plan = JobPlan::new(6, wide.len() as u32).with_estimated_per_item_ns(50).with_smt();
+    let expected = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let done = loop {
+        for_each_chunk(&wide_plan, &mut wide, |s| s.iter_mut().for_each(|x| work(x, 16)));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let done = trace::worker_flushes_done();
+        if done >= expected || Instant::now() > deadline {
+            break done;
+        }
+    };
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    println!("WORKER_DUMPS {done} of {expected}");
+    trace::clear_worker_flush_request();
+    std::hint::black_box(&wide);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -135,6 +198,10 @@ fn main() {
     // Warm the pool and the clock before anything is recorded.
     for _ in 0..50 {
         for_each_chunk(&plan, &mut data, |s| s.iter_mut().for_each(|x| work(x, flops)));
+    }
+    if trace::is_enabled() {
+        traced(spinners, calls, &plan, &mut data, flops);
+        return;
     }
 
     // Per phase: parallel samples and serial samples, in nanoseconds.
