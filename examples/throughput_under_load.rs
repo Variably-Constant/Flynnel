@@ -355,7 +355,8 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
          cv2_oncore={} cv2_window={} cv2_window_min={} cv2_window_max={} \
          window_ticks={} class={:?} workers={} allowed={} smt={} \
          smt_declined={} smt_allowed={} \
-         spin_adaptive={} spin_window={} spin_adapts={} idle_yields={}",
+         spin_adaptive={} spin_window={} spin_adapts={} idle_yields={} \
+         join_park={} join_parks={} slot_park_now={}",
         site.leaf_count(),
         site.oncore_items(),
         reading(site.per_item_ns()),
@@ -375,6 +376,9 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
         flynnel::sched::spin_window(),
         flynnel::sched::spin_adapt_decisions(),
         flynnel::sched::total_idle_yields(),
+        flynnel::sched::levers::join_park(),
+        flynnel::total_join_parks(),
+        flynnel::sched::levers::slot_park_now(),
     );
 }
 
