@@ -205,6 +205,26 @@ Describe 'the IO pool' {
             Should -Throw -ExpectedMessage '*at least one*'
     }
 
+    It 'makes through its constructor the pool New-FlynnelIoPool makes' {
+        # New-FlynnelIoPool builds its pool through this constructor, so
+        # the two routes are one piece of code; this checks the route a
+        # script reaches directly.
+        $made = [Flynnel.IoPool]::new(2)
+        $cmdlet = New-FlynnelIoPool -WorkerCount 2
+        try {
+            $made | Should -BeOfType [Flynnel.IoPool]
+            $made.WorkerCount | Should -Be $cmdlet.WorkerCount
+            $made.Workers() | Should -Be 2
+        } finally {
+            $made.Dispose()
+            $cmdlet.Dispose()
+        }
+    }
+
+    It 'refuses through its constructor a pool with no workers' {
+        { [Flynnel.IoPool]::new(0) } | Should -Throw -ExpectedMessage '*at least one*'
+    }
+
     It 'says when the process has no global pool rather than writing an empty one' {
         $warnings = @()
         $global = Get-FlynnelIoPool -WarningVariable warnings

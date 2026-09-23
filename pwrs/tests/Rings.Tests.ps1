@@ -407,6 +407,84 @@ Describe 'New-FlynnelInjector' {
     }
 }
 
+Describe 'the Ring and Injector constructors' {
+    # Each New- cmdlet builds its object through the class's constructor,
+    # so these check that the constructor a script calls directly makes
+    # the object the cmdlet makes, and refuses what the cmdlet refuses.
+    It 'makes the ring New-FlynnelRing makes' {
+        $made = [Flynnel.Ring]::new(1000)
+        $cmdlet = New-FlynnelRing -Capacity 1000
+        try {
+            $made | Should -BeOfType [Flynnel.Ring]
+            $made.Capacity | Should -Be $cmdlet.Capacity
+            $made.Role | Should -Be $cmdlet.Role
+            $made.Id | Should -Not -Be $cmdlet.Id -Because 'each route registers a ring of its own'
+        } finally {
+            $made.Dispose()
+            $cmdlet.Dispose()
+        }
+    }
+
+    It 'makes a ring whose items round-trip byte for byte' {
+        $ring = [Flynnel.Ring]::new(8)
+        try {
+            $sent = New-Payload -Seed 21
+            $ring.Push($sent).Accepted | Should -BeTrue
+            $pop = $ring.Pop()
+            $pop.GotItem | Should -BeTrue
+            Should-MatchBytes -Actual $pop.Item -Expected $sent -What 'the constructed ring''s item'
+        } finally {
+            $ring.Dispose()
+        }
+    }
+
+    It 'refuses the capacities New-FlynnelRing refuses' {
+        { [Flynnel.Ring]::new(0) } | Should -Throw -ExpectedMessage '*describes no ring*'
+        { [Flynnel.Ring]::new(-8) } | Should -Throw -ExpectedMessage '*describes no ring*'
+    }
+
+    It 'frees the ring on Dispose' {
+        $ring = [Flynnel.Ring]::new(8)
+        $ring.Dispose()
+        $ring.IsDisposed | Should -BeTrue
+        { $ring.Pop() } | Should -Throw
+    }
+
+    It 'makes an injector at the crate default when no capacity is given' {
+        $made = [Flynnel.Injector]::new()
+        $cmdlet = New-FlynnelInjector
+        try {
+            $made | Should -BeOfType [Flynnel.Injector]
+            $made.Capacity | Should -Be $cmdlet.Capacity
+            $made.Capacity | Should -Be 4096
+        } finally {
+            $made.Dispose()
+            $cmdlet.Dispose()
+        }
+    }
+
+    It 'makes the injector New-FlynnelInjector makes for a named capacity' {
+        $made = [Flynnel.Injector]::new(16)
+        $cmdlet = New-FlynnelInjector -Capacity 16
+        try {
+            $made.Capacity | Should -Be $cmdlet.Capacity
+            $made.Role | Should -Be $cmdlet.Role
+            $sent = New-Payload -Seed 22 -Length 24
+            $made.Push($sent).Accepted | Should -BeTrue
+            $pop = $made.Pop()
+            $pop.Kind | Should -Be 'Ok'
+            Should-MatchBytes -Actual $pop.Item -Expected $sent -What 'the constructed injector''s item'
+        } finally {
+            $made.Dispose()
+            $cmdlet.Dispose()
+        }
+    }
+
+    It 'refuses an injector capacity that describes no queue' {
+        { [Flynnel.Injector]::new(0) } | Should -Throw -ExpectedMessage '*describes no ring*'
+    }
+}
+
 Describe 'New-FlynnelNotifyRing' {
     It 'writes the sender first and then one receiver per consumer slot' {
         $s, $receivers = New-FlynnelNotifyRing -Capacity 16 -Consumers 2

@@ -46,6 +46,47 @@ Describe 'the types and enums this family exports' {
     }
 }
 
+Describe 'the VerifyChain constructor' {
+    # New-FlynnelVerifyChain builds its chain through this constructor,
+    # so the two routes are one piece of code. What makes two chains the
+    # same is the root they answer, so that is what is compared.
+    It 'makes a BLAKE3 chain that roots as the cmdlet''s does' {
+        $trace = New-Trace
+        $made = [Flynnel.VerifyChain]::new()
+        $cmdlet = New-FlynnelVerifyChain
+        try {
+            $made | Should -BeOfType [Flynnel.VerifyChain]
+            $made.Hasher | Should -Be 'Blake3'
+            $made.Hasher | Should -Be $cmdlet.Hasher
+            $made.AddMany($trace) | Out-Null
+            $cmdlet.AddMany($trace) | Out-Null
+            $made.Root() | Should -Be $cmdlet.Root()
+        } finally {
+            $made.Dispose()
+            $cmdlet.Dispose()
+        }
+    }
+
+    It 'makes a chain with the hasher it is given' {
+        $trace = New-Trace
+        $made = [Flynnel.VerifyChain]::new('FxFallback')
+        $cmdlet = New-FlynnelVerifyChain -Hasher FxFallback
+        try {
+            $made.Hasher | Should -Be 'FxFallback'
+            $made.AddMany($trace) | Out-Null
+            $cmdlet.AddMany($trace) | Out-Null
+            $made.Root() | Should -Be $cmdlet.Root()
+        } finally {
+            $made.Dispose()
+            $cmdlet.Dispose()
+        }
+    }
+
+    It 'refuses a hasher that does not exist' {
+        { [Flynnel.VerifyChain]::new('Md5') } | Should -Throw
+    }
+}
+
 Describe 'the same bytes give the same root' {
     It 'roots two chains over identical traces the same' {
         # The claim the family rests on. Everything else here is a way

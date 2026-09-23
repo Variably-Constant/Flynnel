@@ -175,6 +175,32 @@ impl Drop for ChainGuard {
 /// The operations of a `Flynnel.VerifyChain`.
 #[psmethods]
 impl VerifyChainHandle {
+    /// A chain that roots with Hasher, or with BLAKE3 when Hasher is
+    /// omitted.
+    ///
+    /// A script reaches this as `[Flynnel.VerifyChain]::new()` or
+    /// `[Flynnel.VerifyChain]::new('FxFallback')`. New-FlynnelVerifyChain
+    /// builds its chain here as well, so the two routes make the same
+    /// object.
+    pub fn new(hasher: Option<VerifyHasherKind>) -> PsResult<VerifyChainHandle> {
+        let kind = hasher.unwrap_or(VerifyHasherKind::Blake3);
+        let chain = match kind {
+            VerifyHasherKind::Blake3 => CrateChain::new(),
+            VerifyHasherKind::FxFallback => {
+                CrateChain::with_hasher(Box::new(FxFallbackHasher::new()))
+            }
+        };
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        chains().push(ChainEntry {
+            id,
+            hasher: kind,
+            chain: Some(chain),
+            digests: Vec::new(),
+            root: None,
+        });
+        Ok(VerifyChainHandle { id, hasher: kind, guard: ChainGuard(id) })
+    }
+
     /// Adds one chunk, answering how many the chain now holds.
     ///
     /// Costs a crossing per chunk. AddMany is the form for more than
@@ -264,22 +290,7 @@ pub struct NewFlynnelVerifyChain {
 
 impl Cmdlet for NewFlynnelVerifyChain {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let kind = self.hasher.unwrap_or(VerifyHasherKind::Blake3);
-        let chain = match kind {
-            VerifyHasherKind::Blake3 => CrateChain::new(),
-            VerifyHasherKind::FxFallback => {
-                CrateChain::with_hasher(Box::new(FxFallbackHasher::new()))
-            }
-        };
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        chains().push(ChainEntry {
-            id,
-            hasher: kind,
-            chain: Some(chain),
-            digests: Vec::new(),
-            root: None,
-        });
-        ps.write(VerifyChainHandle { id, hasher: kind, guard: ChainGuard(id) })
+        ps.write(VerifyChainHandle::new(self.hasher)?)
     }
 }
 

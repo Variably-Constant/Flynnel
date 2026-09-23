@@ -671,6 +671,19 @@ pub struct Ring {
 /// The operations of a `Flynnel.Ring`.
 #[psmethods]
 impl Ring {
+    /// A ring of at least Capacity slots, rounded up to a power of two.
+    ///
+    /// A script reaches this as `[Flynnel.Ring]::new(1024)`.
+    /// New-FlynnelRing builds its ring here as well, so the two routes
+    /// make the same object.
+    pub fn new(capacity: i64) -> PsResult<Ring> {
+        let cap = checked_capacity(capacity)?;
+        let inner = FlynnelRing::<Payload>::new(cap);
+        let capacity = inner.capacity() as u64;
+        let id = register(Handle::Ring(inner));
+        Ok(Ring { id, role: RingRole::Ring, capacity, guard: HandleGuard(id) })
+    }
+
     /// Pushes one item, answering whether the ring took it.
     ///
     /// Costs a boundary crossing per item. Use PushMany for more than a
@@ -747,11 +760,7 @@ pub struct NewFlynnelRing {
 
 impl Cmdlet for NewFlynnelRing {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let cap = checked_capacity(self.capacity)?;
-        let inner = FlynnelRing::<Payload>::new(cap);
-        let capacity = inner.capacity() as u64;
-        let id = register(Handle::Ring(inner));
-        ps.write(Ring { id, role: RingRole::Ring, capacity, guard: HandleGuard(id) })
+        ps.write(Ring::new(self.capacity)?)
     }
 }
 
@@ -1329,6 +1338,23 @@ pub struct Injector {
 /// The operations of a `Flynnel.Injector`.
 #[psmethods]
 impl Injector {
+    /// A free-standing injector of at least Capacity slots, or of the
+    /// crate's own 4096 when Capacity is omitted.
+    ///
+    /// A script reaches this as `[Flynnel.Injector]::new()` or
+    /// `[Flynnel.Injector]::new(65536)`. New-FlynnelInjector builds its
+    /// queue here as well, so the two routes make the same object.
+    pub fn new(capacity: Option<i64>) -> PsResult<Injector> {
+        let cap = match capacity {
+            Some(c) => checked_capacity(c)?,
+            None => DEFAULT_INJECTOR_CAPACITY,
+        };
+        let inner = InjectorInner::<Payload>::with_capacity(cap);
+        let capacity = inner.capacity() as u64;
+        let id = register(Handle::Injector(inner));
+        Ok(Injector { id, role: RingRole::Ring, capacity, guard: HandleGuard(id) })
+    }
+
     /// Pushes one item, answering whether the queue took it.
     ///
     /// This is the crate's `try_push`. Its `push` is not bound: that one
@@ -1401,14 +1427,7 @@ pub struct NewFlynnelInjector {
 
 impl Cmdlet for NewFlynnelInjector {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let cap = match self.capacity {
-            Some(c) => checked_capacity(c)?,
-            None => DEFAULT_INJECTOR_CAPACITY,
-        };
-        let inner = InjectorInner::<Payload>::with_capacity(cap);
-        let capacity = inner.capacity() as u64;
-        let id = register(Handle::Injector(inner));
-        ps.write(Injector { id, role: RingRole::Ring, capacity, guard: HandleGuard(id) })
+        ps.write(Injector::new(self.capacity)?)
     }
 }
 

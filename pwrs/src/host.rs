@@ -628,6 +628,24 @@ pub struct CacheReservation {
 /// The operations of a `Flynnel.CacheReservation`.
 #[psmethods]
 impl CacheReservation {
+    /// Reserves NumWays contiguous L3 ways starting at FirstWay in the
+    /// resctrl group Name, and binds this process to it.
+    ///
+    /// A script reaches this as
+    /// `[Flynnel.CacheReservation]::new('hot', 0, 4)`.
+    /// New-FlynnelCacheReservation reserves here as well, so the two
+    /// routes make the same object and refuse the same requests.
+    pub fn new(name: String, first_way: u32, num_ways: u32) -> PsResult<CacheReservation> {
+        let inner = flynnel::sched::cat::L3Reservation::reserve_ways(&name, first_way, num_ways)
+            .map_err(|e| unsupported_err("reserving L3 ways", e))?;
+        Ok(CacheReservation {
+            name,
+            first_way,
+            way_count: num_ways,
+            inner: Some(inner),
+        })
+    }
+
     /// The resctrl schemata line the reservation wrote, which is what
     /// the kernel will act on.
     pub fn schemata(&self) -> PsResult<String> {
@@ -680,17 +698,10 @@ pub struct NewFlynnelCacheReservation {
 
 impl Cmdlet for NewFlynnelCacheReservation {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let inner = flynnel::sched::cat::L3Reservation::reserve_ways(
-            &self.name,
+        ps.write(CacheReservation::new(
+            self.name.clone(),
             self.first_way,
             self.num_ways,
-        )
-        .map_err(|e| unsupported_err("reserving L3 ways", e))?;
-        ps.write(CacheReservation {
-            name: self.name.clone(),
-            first_way: self.first_way,
-            way_count: self.num_ways,
-            inner: Some(inner),
-        })
+        )?)
     }
 }

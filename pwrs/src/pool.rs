@@ -570,6 +570,28 @@ pub struct IoPool {
 /// The operations of a `Flynnel.IoPool`.
 #[psmethods]
 impl IoPool {
+    /// A pool of WorkerCount threads for blocking work.
+    ///
+    /// A script reaches this as `[Flynnel.IoPool]::new(4)`.
+    /// New-FlynnelIoPool builds its pool here as well, so the two routes
+    /// make the same object, and nothing submits to either:
+    /// New-FlynnelIoPool's help says why.
+    pub fn new(worker_count: u32) -> PsResult<IoPool> {
+        if worker_count == 0 {
+            return Err(PsError::new(
+                ErrorCategory::InvalidArgument,
+                "FlynnelArgument",
+                "WorkerCount must be at least one",
+            )
+            .terminating());
+        }
+        let inner = flynnel::sched::io_pool::IoPool::new(worker_count as usize);
+        Ok(IoPool {
+            worker_count: inner.worker_count() as u64,
+            inner,
+        })
+    }
+
     /// Threads in this pool.
     pub fn workers(&self) -> PsResult<u64> {
         Ok(self.inner.worker_count() as u64)
@@ -624,19 +646,7 @@ pub struct NewFlynnelIoPool {
 
 impl Cmdlet for NewFlynnelIoPool {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        if self.worker_count == 0 {
-            return Err(PsError::new(
-                ErrorCategory::InvalidArgument,
-                "FlynnelArgument",
-                "WorkerCount must be at least one",
-            )
-            .terminating());
-        }
-        let inner = flynnel::sched::io_pool::IoPool::new(self.worker_count as usize);
-        ps.write(IoPool {
-            worker_count: inner.worker_count() as u64,
-            inner,
-        })
+        ps.write(IoPool::new(self.worker_count)?)
     }
 }
 

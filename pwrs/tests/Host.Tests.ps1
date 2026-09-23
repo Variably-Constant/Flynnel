@@ -240,4 +240,26 @@ Describe 'New-FlynnelCacheReservation' {
         { New-FlynnelCacheReservation -Name flynnel_pester_wide -FirstWay 0 -NumWays 9999 -ErrorAction Stop } |
             Should -Throw
     }
+
+    It 'reserves or refuses through its constructor as the cmdlet does' {
+        # New-FlynnelCacheReservation reserves through this constructor,
+        # so the two routes are one piece of code; this checks the route
+        # a script reaches directly.
+        $cap = Get-FlynnelCacheAllocation
+        if (-not $cap.Supported) {
+            { [Flynnel.CacheReservation]::new('pester', 0, 1) } |
+                Should -Throw -ExpectedMessage '*not available on this host*'
+            return
+        }
+        $ways = [Flynnel.CacheReservation]::new('flynnel_pester_ctor', 0, 1)
+        try {
+            $ways | Should -BeOfType [Flynnel.CacheReservation]
+            $ways.Name | Should -Be 'flynnel_pester_ctor'
+            $ways.FirstWay | Should -Be 0
+            $ways.WayCount | Should -Be 1
+            $ways.Schemata() | Should -Not -BeNullOrEmpty
+        } finally {
+            $ways.Release()
+        }
+    }
 }
