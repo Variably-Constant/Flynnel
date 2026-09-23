@@ -478,6 +478,7 @@ dependencies = [
  "core_affinity",
  "criterion",
  "cudarc",
+ "libc",
  "libloading",
  "memmap2",
  "rayon",
