@@ -208,6 +208,7 @@ pwrs::export_module! {
         rings::Injector,
         rings::NotifySender,
         rings::NotifyReceiver,
+        rings::Rings,
         backends::BackendRow,
         backends::BackendProbe,
         backends::AccelOp,

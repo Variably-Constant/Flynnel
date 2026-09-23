@@ -485,6 +485,119 @@ Describe 'the Ring and Injector constructors' {
     }
 }
 
+Describe 'the Flynnel.Rings factory' {
+    # The New- cmdlet for each shape that comes as several objects builds
+    # through the same function as its static here. These check that a
+    # static returns what its cmdlet writes, in the same order, and
+    # refuses what the cmdlet refuses. An object's shape here is its
+    # type, role and capacity, which every handle class carries.
+    It 'returns the SPSC ends New-FlynnelSpscRing writes, producer first' {
+        $made = @([Flynnel.Rings]::Spsc(8))
+        $cmdlet = @(New-FlynnelSpscRing -Capacity 8)
+        try {
+            $shape = @($made | ForEach-Object { "$($_.GetType().FullName) $($_.Role) $($_.Capacity)" })
+            $shape | Should -Be @($cmdlet | ForEach-Object { "$($_.GetType().FullName) $($_.Role) $($_.Capacity)" })
+            @($made | ForEach-Object { $_.GetType().FullName }) |
+                Should -Be @('Flynnel.SpscProducer', 'Flynnel.SpscConsumer')
+            $p, $c = $made
+            $sent = New-Payload -Seed 31
+            $p.Push($sent).Accepted | Should -BeTrue
+            $pop = $c.Pop()
+            $pop.GotItem | Should -BeTrue
+            Should-MatchBytes -Actual $pop.Item -Expected $sent -What 'the factory SPSC item'
+        } finally {
+            foreach ($o in $made + $cmdlet) { $o.Dispose() }
+        }
+    }
+
+    It 'returns the MPSC consumer and producers New-FlynnelMpscRing writes' {
+        $made = @([Flynnel.Rings]::Mpsc(64, 3))
+        $cmdlet = @(New-FlynnelMpscRing -Capacity 64 -Producers 3)
+        try {
+            $made.Count | Should -Be 4
+            $shape = @($made | ForEach-Object { "$($_.GetType().FullName) $($_.Role) $($_.Capacity)" })
+            $shape | Should -Be @($cmdlet | ForEach-Object { "$($_.GetType().FullName) $($_.Role) $($_.Capacity)" })
+            $made[0] | Should -BeOfType [Flynnel.MpscConsumer]
+            @($made[1..3] | ForEach-Object { $_.Index }) | Should -Be @(0, 1, 2)
+            $sent = New-Payload -Seed 32
+            $made[2].Push($sent).Accepted | Should -BeTrue
+            $pop = $made[0].Pop()
+            $pop.GotItem | Should -BeTrue
+            Should-MatchBytes -Actual $pop.Item -Expected $sent -What 'the factory MPSC item'
+        } finally {
+            foreach ($o in $made + $cmdlet) { $o.Dispose() }
+        }
+    }
+
+    It 'returns the composed MPSC New-FlynnelComposedMpsc writes, consumer first' {
+        $made = @([Flynnel.Rings]::ComposedMpsc(16, 2))
+        $cmdlet = @(New-FlynnelComposedMpsc -Capacity 16 -Producers 2)
+        try {
+            $shape = @($made | ForEach-Object { "$($_.GetType().FullName) $($_.Role) $($_.Capacity)" })
+            $shape | Should -Be @($cmdlet | ForEach-Object { "$($_.GetType().FullName) $($_.Role) $($_.Capacity)" })
+            $made[0] | Should -BeOfType [Flynnel.ComposedConsumer]
+            $made[0].RingCount | Should -Be 2
+            @($made[1..2] | ForEach-Object { $_.GetType().FullName }) |
+                Should -Be @('Flynnel.SpscProducer', 'Flynnel.SpscProducer')
+            $sent = New-Payload -Seed 33
+            $made[1].Push($sent).Accepted | Should -BeTrue
+            $pop = $made[0].Pop()
+            $pop.GotItem | Should -BeTrue
+            Should-MatchBytes -Actual $pop.Item -Expected $sent -What 'the factory composed item'
+        } finally {
+            foreach ($o in $made + $cmdlet) { $o.Dispose() }
+        }
+    }
+
+    It 'returns the grid New-FlynnelComposedMpmc writes, producers first' {
+        $made = @([Flynnel.Rings]::ComposedMpmc(16, 2, 3))
+        $cmdlet = @(New-FlynnelComposedMpmc -Capacity 16 -Producers 2 -Consumers 3)
+        try {
+            $made.Count | Should -Be 5
+            $shape = @($made | ForEach-Object { "$($_.GetType().FullName) $($_.Role) $($_.Capacity)" })
+            $shape | Should -Be @($cmdlet | ForEach-Object { "$($_.GetType().FullName) $($_.Role) $($_.Capacity)" })
+            @($made[0..1] | ForEach-Object { $_.ConsumerCount }) | Should -Be @(3, 3)
+            @($made[2..4] | ForEach-Object { $_.ProducerCount }) | Should -Be @(2, 2, 2)
+        } finally {
+            foreach ($o in $made + $cmdlet) { $o.Dispose() }
+        }
+    }
+
+    It 'returns the notify hub New-FlynnelNotifyRing writes, sender first' {
+        $made = @([Flynnel.Rings]::Notify(16, 2))
+        $cmdlet = @(New-FlynnelNotifyRing -Capacity 16 -Consumers 2)
+        try {
+            $shape = @($made | ForEach-Object { "$($_.GetType().FullName) $($_.Role) $($_.Capacity)" })
+            $shape | Should -Be @($cmdlet | ForEach-Object { "$($_.GetType().FullName) $($_.Role) $($_.Capacity)" })
+            $made[0] | Should -BeOfType [Flynnel.NotifySender]
+            $made[0].ConsumerCount | Should -Be 2
+            @($made[1..2] | ForEach-Object { $_.Index }) | Should -Be @(0, 1)
+            $sent = New-Payload -Seed 34
+            $made[0].Push($sent).Accepted | Should -BeTrue
+            $pop = $made[1].Pop()
+            if (-not $pop.GotItem) { $pop = $made[2].Pop() }
+            $pop.GotItem | Should -BeTrue -Because 'the item went to one of the receivers'
+            Should-MatchBytes -Actual $pop.Item -Expected $sent -What 'the factory notify item'
+            $made[0].Shutdown()
+        } finally {
+            foreach ($o in $made + $cmdlet) { $o.Dispose() }
+        }
+    }
+
+    It 'refuses what the cmdlets refuse' {
+        { [Flynnel.Rings]::Spsc(0) } | Should -Throw -ExpectedMessage '*describes no ring*'
+        { [Flynnel.Rings]::Mpsc(8, 0) } | Should -Throw -ExpectedMessage '*Producers must be at least one*'
+        { [Flynnel.Rings]::ComposedMpsc(8, 0) } | Should -Throw -ExpectedMessage '*Producers must be at least one*'
+        { [Flynnel.Rings]::ComposedMpmc(8, 1, 0) } | Should -Throw -ExpectedMessage '*Consumers must be at least one*'
+        { [Flynnel.Rings]::Notify(8, 0) } | Should -Throw -ExpectedMessage '*Consumers must be at least one*'
+    }
+
+    It 'has no public constructor, because it only carries statics' {
+        @([Flynnel.Rings].GetConstructors()).Count | Should -Be 0
+        { [Flynnel.Rings]::new() } | Should -Throw
+    }
+}
+
 Describe 'New-FlynnelNotifyRing' {
     It 'writes the sender first and then one receiver per consumer slot' {
         $s, $receivers = New-FlynnelNotifyRing -Capacity 16 -Consumers 2

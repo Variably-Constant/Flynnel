@@ -745,6 +745,9 @@ impl Ring {
 /// `$ring = New-FlynnelRing -Capacity 1024`
 ///
 /// `$ring.PushMany(@($a, $b, $c)) | Where-Object { -not $_.Accepted }`
+///
+/// `$ring = [Flynnel.Ring]::new(1024)` builds the same ring without the
+/// cmdlet.
 #[cmdlet(
     verb = "New",
     noun = "FlynnelRing",
@@ -861,6 +864,9 @@ impl SpscConsumer {
 /// `$p, $c = New-FlynnelSpscRing -Capacity 1024`
 ///
 /// `$p.PushMany($batch); $c.PopMany(256)`
+///
+/// `$p, $c = [Flynnel.Rings]::Spsc(1024)` builds the same pair without
+/// the cmdlet.
 #[cmdlet(
     verb = "New",
     noun = "FlynnelSpscRing",
@@ -877,24 +883,33 @@ pub struct NewFlynnelSpscRing {
 
 impl Cmdlet for NewFlynnelSpscRing {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let cap = checked_capacity(self.capacity)?;
-        let (p, c) = new_spsc::<Payload>(cap);
-        let producer_id = register(Handle::SpscProducer(p));
-        ps.write(SpscProducer {
-            id: producer_id,
-            role: RingRole::Producer,
-            index: 0,
-            capacity: cap as u64,
-            guard: HandleGuard(producer_id),
-        })?;
-        let consumer_id = register(Handle::SpscConsumer(c));
-        ps.write(SpscConsumer {
-            id: consumer_id,
-            role: RingRole::Consumer,
-            capacity: cap as u64,
-            guard: HandleGuard(consumer_id),
-        })
+        let (producer, consumer) = spsc_ends(self.capacity)?;
+        ps.write(producer)?;
+        ps.write(consumer)
     }
+}
+
+/// An SPSC ring's two ends, producer first. New-FlynnelSpscRing and
+/// `[Flynnel.Rings]::Spsc` both build here.
+fn spsc_ends(capacity: i64) -> PsResult<(SpscProducer, SpscConsumer)> {
+    let cap = checked_capacity(capacity)?;
+    let (p, c) = new_spsc::<Payload>(cap);
+    let producer_id = register(Handle::SpscProducer(p));
+    let producer = SpscProducer {
+        id: producer_id,
+        role: RingRole::Producer,
+        index: 0,
+        capacity: cap as u64,
+        guard: HandleGuard(producer_id),
+    };
+    let consumer_id = register(Handle::SpscConsumer(c));
+    let consumer = SpscConsumer {
+        id: consumer_id,
+        role: RingRole::Consumer,
+        capacity: cap as u64,
+        guard: HandleGuard(consumer_id),
+    };
+    Ok((producer, consumer))
 }
 
 // ---------------------------------------------------------------------
@@ -993,6 +1008,9 @@ impl MpscConsumerHandle {
 /// `$c, $producers = New-FlynnelMpscRing -Capacity 4096 -Producers 4`
 ///
 /// `$producers | ForEach-Object { $_.Index }`
+///
+/// `$c, $producers = [Flynnel.Rings]::Mpsc(4096, 4)` builds the same
+/// objects without the cmdlet.
 #[cmdlet(
     verb = "New",
     noun = "FlynnelMpscRing",
@@ -1011,28 +1029,45 @@ pub struct NewFlynnelMpscRing {
 
 impl Cmdlet for NewFlynnelMpscRing {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let cap = checked_capacity(self.capacity)?;
-        let n = checked_handles(self.producers, "Producers")?;
-        let (p, c) = new_mpsc::<Payload>(cap);
-        let consumer_id = register(Handle::MpscConsumer(c));
-        ps.write(MpscConsumerHandle {
-            id: consumer_id,
-            role: RingRole::Consumer,
-            capacity: cap as u64,
-            guard: HandleGuard(consumer_id),
-        })?;
-        for index in 0..n {
+        let (consumer, producers) = mpsc_ends(self.capacity, self.producers)?;
+        ps.write(consumer)?;
+        for producer in producers {
+            ps.write(producer)?;
+        }
+        Ok(())
+    }
+}
+
+/// An MPSC ring's consumer and one producer per requested producer,
+/// consumer first. New-FlynnelMpscRing and `[Flynnel.Rings]::Mpsc` both
+/// build here.
+fn mpsc_ends(
+    capacity: i64,
+    producers: i64,
+) -> PsResult<(MpscConsumerHandle, Vec<MpscProducerHandle>)> {
+    let cap = checked_capacity(capacity)?;
+    let n = checked_handles(producers, "Producers")?;
+    let (p, c) = new_mpsc::<Payload>(cap);
+    let consumer_id = register(Handle::MpscConsumer(c));
+    let consumer = MpscConsumerHandle {
+        id: consumer_id,
+        role: RingRole::Consumer,
+        capacity: cap as u64,
+        guard: HandleGuard(consumer_id),
+    };
+    let handles = (0..n)
+        .map(|index| {
             let id = register(Handle::MpscProducer(p.clone()));
-            ps.write(MpscProducerHandle {
+            MpscProducerHandle {
                 id,
                 role: RingRole::Producer,
                 index: index as u64,
                 capacity: cap as u64,
                 guard: HandleGuard(id),
-            })?;
-        }
-        Ok(())
-    }
+            }
+        })
+        .collect();
+    Ok((consumer, handles))
 }
 
 // ---------------------------------------------------------------------
@@ -1101,6 +1136,9 @@ impl ComposedConsumer {
 /// # Examples
 ///
 /// `$c, $producers = New-FlynnelComposedMpsc -Capacity 256 -Producers 8`
+///
+/// `$c, $producers = [Flynnel.Rings]::ComposedMpsc(256, 8)` builds the
+/// same objects without the cmdlet.
 #[cmdlet(
     verb = "New",
     noun = "FlynnelComposedMpsc",
@@ -1119,30 +1157,50 @@ pub struct NewFlynnelComposedMpsc {
 
 impl Cmdlet for NewFlynnelComposedMpsc {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let cap = checked_capacity(self.capacity)?;
-        let n = checked_handles(self.producers, "Producers")?;
-        let composed = new_composed_mpsc::<Payload>(n, cap);
-        let ring_count = composed.consumer.ring_count() as u64;
-        let consumer_id = register(Handle::ComposedConsumer(composed.consumer));
-        ps.write(ComposedConsumer {
-            id: consumer_id,
-            role: RingRole::Consumer,
-            ring_count,
-            capacity: cap as u64,
-            guard: HandleGuard(consumer_id),
-        })?;
-        for (index, p) in composed.producers.into_iter().enumerate() {
+        let (consumer, producers) = composed_mpsc_ends(self.capacity, self.producers)?;
+        ps.write(consumer)?;
+        for producer in producers {
+            ps.write(producer)?;
+        }
+        Ok(())
+    }
+}
+
+/// A composed MPSC's consumer and one producer per requested producer,
+/// consumer first. New-FlynnelComposedMpsc and
+/// `[Flynnel.Rings]::ComposedMpsc` both build here.
+fn composed_mpsc_ends(
+    capacity: i64,
+    producers: i64,
+) -> PsResult<(ComposedConsumer, Vec<SpscProducer>)> {
+    let cap = checked_capacity(capacity)?;
+    let n = checked_handles(producers, "Producers")?;
+    let composed = new_composed_mpsc::<Payload>(n, cap);
+    let ring_count = composed.consumer.ring_count() as u64;
+    let consumer_id = register(Handle::ComposedConsumer(composed.consumer));
+    let consumer = ComposedConsumer {
+        id: consumer_id,
+        role: RingRole::Consumer,
+        ring_count,
+        capacity: cap as u64,
+        guard: HandleGuard(consumer_id),
+    };
+    let handles = composed
+        .producers
+        .into_iter()
+        .enumerate()
+        .map(|(index, p)| {
             let id = register(Handle::SpscProducer(p));
-            ps.write(SpscProducer {
+            SpscProducer {
                 id,
                 role: RingRole::Producer,
                 index: index as u64,
                 capacity: cap as u64,
                 guard: HandleGuard(id),
-            })?;
-        }
-        Ok(())
-    }
+            }
+        })
+        .collect();
+    Ok((consumer, handles))
 }
 
 // ---------------------------------------------------------------------
@@ -1255,6 +1313,9 @@ impl GridConsumerHandle {
 /// `$all = New-FlynnelComposedMpmc -Capacity 256 -Producers 4 -Consumers 2`
 ///
 /// `$prod = $all | Where-Object Role -eq Producer`
+///
+/// `$all = [Flynnel.Rings]::ComposedMpmc(256, 4, 2)` builds the same
+/// grid without the cmdlet.
 #[cmdlet(
     verb = "New",
     noun = "FlynnelComposedMpmc",
@@ -1276,36 +1337,65 @@ pub struct NewFlynnelComposedMpmc {
 
 impl Cmdlet for NewFlynnelComposedMpmc {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let cap = checked_capacity(self.capacity)?;
-        let n = checked_handles(self.producers, "Producers")?;
-        let m = checked_handles(self.consumers, "Consumers")?;
-        let grid = new_composed_mpmc::<Payload>(n, m, cap);
-        for (index, p) in grid.producers.into_iter().enumerate() {
+        let (producers, consumers) =
+            composed_mpmc_ends(self.capacity, self.producers, self.consumers)?;
+        for producer in producers {
+            ps.write(producer)?;
+        }
+        for consumer in consumers {
+            ps.write(consumer)?;
+        }
+        Ok(())
+    }
+}
+
+/// An MPMC grid's producers and then its consumers, one per requested
+/// row and column. New-FlynnelComposedMpmc and
+/// `[Flynnel.Rings]::ComposedMpmc` both build here.
+fn composed_mpmc_ends(
+    capacity: i64,
+    producers: i64,
+    consumers: i64,
+) -> PsResult<(Vec<GridProducerHandle>, Vec<GridConsumerHandle>)> {
+    let cap = checked_capacity(capacity)?;
+    let n = checked_handles(producers, "Producers")?;
+    let m = checked_handles(consumers, "Consumers")?;
+    let grid = new_composed_mpmc::<Payload>(n, m, cap);
+    let producer_handles = grid
+        .producers
+        .into_iter()
+        .enumerate()
+        .map(|(index, p)| {
             let consumer_count = p.consumer_count() as u64;
             let id = register(Handle::GridProducer(p));
-            ps.write(GridProducerHandle {
+            GridProducerHandle {
                 id,
                 role: RingRole::Producer,
                 index: index as u64,
                 consumer_count,
                 capacity: cap as u64,
                 guard: HandleGuard(id),
-            })?;
-        }
-        for (index, c) in grid.consumers.into_iter().enumerate() {
+            }
+        })
+        .collect();
+    let consumer_handles = grid
+        .consumers
+        .into_iter()
+        .enumerate()
+        .map(|(index, c)| {
             let producer_count = c.producer_count() as u64;
             let id = register(Handle::GridConsumer(c));
-            ps.write(GridConsumerHandle {
+            GridConsumerHandle {
                 id,
                 role: RingRole::Consumer,
                 index: index as u64,
                 producer_count,
                 capacity: cap as u64,
                 guard: HandleGuard(id),
-            })?;
-        }
-        Ok(())
-    }
+            }
+        })
+        .collect();
+    Ok((producer_handles, consumer_handles))
 }
 
 // ---------------------------------------------------------------------
@@ -1412,6 +1502,9 @@ impl Injector {
 /// `$q = New-FlynnelInjector`
 ///
 /// `$q = New-FlynnelInjector -Capacity 65536`
+///
+/// `$q = [Flynnel.Injector]::new(65536)` builds the same queue without
+/// the cmdlet.
 #[cmdlet(
     verb = "New",
     noun = "FlynnelInjector",
@@ -1590,6 +1683,9 @@ impl NotifyReceiver {
 /// `$s, $receivers = New-FlynnelNotifyRing -Capacity 1024 -Consumers 2`
 ///
 /// `try { ... } finally { $s.Shutdown() }`
+///
+/// `$s, $receivers = [Flynnel.Rings]::Notify(1024, 2)` builds the same
+/// hub without the cmdlet.
 #[cmdlet(
     verb = "New",
     noun = "FlynnelNotifyRing",
@@ -1608,29 +1704,118 @@ pub struct NewFlynnelNotifyRing {
 
 impl Cmdlet for NewFlynnelNotifyRing {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let cap = checked_capacity(self.capacity)?;
-        let m = checked_handles(self.consumers, "Consumers")?;
-        let hub = NotifyHub::<Payload>::new(cap, m);
-        let sender_id = register(Handle::NotifySender(hub.sender(), hub.clone()));
-        ps.write(NotifySender {
-            id: sender_id,
-            role: RingRole::Producer,
-            consumer_count: m as u64,
-            capacity: cap as u64,
-            guard: HandleGuard(sender_id),
-        })?;
-        for index in 0..m {
+        let (sender, receivers) = notify_ends(self.capacity, self.consumers)?;
+        ps.write(sender)?;
+        for receiver in receivers {
+            ps.write(receiver)?;
+        }
+        Ok(())
+    }
+}
+
+/// A notify hub's sender and one receiver per requested consumer slot,
+/// sender first. New-FlynnelNotifyRing and `[Flynnel.Rings]::Notify`
+/// both build here.
+fn notify_ends(capacity: i64, consumers: i64) -> PsResult<(NotifySender, Vec<NotifyReceiver>)> {
+    let cap = checked_capacity(capacity)?;
+    let m = checked_handles(consumers, "Consumers")?;
+    let hub = NotifyHub::<Payload>::new(cap, m);
+    let sender_id = register(Handle::NotifySender(hub.sender(), hub.clone()));
+    let sender = NotifySender {
+        id: sender_id,
+        role: RingRole::Producer,
+        consumer_count: m as u64,
+        capacity: cap as u64,
+        guard: HandleGuard(sender_id),
+    };
+    let receivers = (0..m)
+        .map(|index| {
             let id = register(Handle::NotifyReceiver(hub.register_consumer(), hub.clone()));
-            ps.write(NotifyReceiver {
+            NotifyReceiver {
                 id,
                 role: RingRole::Consumer,
                 index: index as u64,
                 capacity: cap as u64,
                 guard: HandleGuard(id),
-            })?;
-        }
-        Ok(())
+            }
+        })
+        .collect();
+    Ok((sender, receivers))
+}
+
+// ---------------------------------------------------------------------
+// The factory for the shapes that come as several objects
+// ---------------------------------------------------------------------
+
+/// Builds the ring shapes that come as several objects: a ring's two
+/// ends, or one end with the handles on the other side.
+///
+/// Each method returns the objects in the order its New- cmdlet writes
+/// them, so `$p, $c = [Flynnel.Rings]::Spsc(1024)` unpacks the way
+/// `$p, $c = New-FlynnelSpscRing -Capacity 1024` does, and the cmdlet
+/// builds through the same function. A single ring and the injector are
+/// one object each and have constructors of their own,
+/// `[Flynnel.Ring]::new(...)` and `[Flynnel.Injector]::new(...)`.
+///
+/// Nothing makes a Rings object. The type carries only these statics.
+#[psclass(name = "Flynnel.Rings", mode = proxy)]
+pub struct Rings {}
+
+/// The statics of `Flynnel.Rings`.
+#[psmethods]
+impl Rings {
+    /// A single-producer single-consumer ring: the producer, then the
+    /// consumer, as New-FlynnelSpscRing writes them.
+    pub fn spsc(capacity: i64) -> PsResult<Vec<PsObject>> {
+        let (producer, consumer) = spsc_ends(capacity)?;
+        Ok(vec![producer.into_ps()?, consumer.into_ps()?])
     }
+
+    /// A multi-producer single-consumer ring: the consumer, then one
+    /// producer per requested producer, as New-FlynnelMpscRing writes
+    /// them.
+    pub fn mpsc(capacity: i64, producers: i64) -> PsResult<Vec<PsObject>> {
+        let (consumer, handles) = mpsc_ends(capacity, producers)?;
+        one_then_many(consumer, handles)
+    }
+
+    /// A composed MPSC, one dedicated ring per producer: the consumer,
+    /// then the producers, as New-FlynnelComposedMpsc writes them.
+    pub fn composed_mpsc(capacity: i64, producers: i64) -> PsResult<Vec<PsObject>> {
+        let (consumer, handles) = composed_mpsc_ends(capacity, producers)?;
+        one_then_many(consumer, handles)
+    }
+
+    /// An N-by-M grid of dedicated rings: the producers, then the
+    /// consumers, as New-FlynnelComposedMpmc writes them.
+    pub fn composed_mpmc(capacity: i64, producers: i64, consumers: i64) -> PsResult<Vec<PsObject>> {
+        let (producer_handles, consumer_handles) = composed_mpmc_ends(capacity, producers, consumers)?;
+        let mut out = Vec::with_capacity(producer_handles.len() + consumer_handles.len());
+        for p in producer_handles {
+            out.push(p.into_ps()?);
+        }
+        for c in consumer_handles {
+            out.push(c.into_ps()?);
+        }
+        Ok(out)
+    }
+
+    /// A notify hub: the sender, then one receiver per consumer slot, as
+    /// New-FlynnelNotifyRing writes them.
+    pub fn notify(capacity: i64, consumers: i64) -> PsResult<Vec<PsObject>> {
+        let (sender, receivers) = notify_ends(capacity, consumers)?;
+        one_then_many(sender, receivers)
+    }
+}
+
+/// One object followed by several, as the objects a script unpacks.
+fn one_then_many<A: IntoPs, B: IntoPs>(first: A, rest: Vec<B>) -> PsResult<Vec<PsObject>> {
+    let mut out = Vec::with_capacity(1 + rest.len());
+    out.push(first.into_ps()?);
+    for r in rest {
+        out.push(r.into_ps()?);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------
