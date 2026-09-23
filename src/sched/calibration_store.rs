@@ -66,7 +66,7 @@ pub const CALIBRATION_MAGIC: u64 = 0x464C_4342_0000_0001;
 /// a spuriously fast reading stands for the life of the stamp: nothing
 /// later can be cheaper than a wrong floor, and neither a fresh draw nor
 /// `FLYNNEL_CALIBRATION_MAX_AGE_S` ageing one out will beat it.
-pub const LAYOUT_VERSION: u32 = 8;
+pub const LAYOUT_VERSION: u32 = 9;
 
 /// Devices a table records. A host with more reports the first
 /// [`MAX_ACCEL`] and the rest go unrecorded rather than overflowing.

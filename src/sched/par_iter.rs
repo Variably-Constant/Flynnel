@@ -970,6 +970,10 @@ pub(crate) fn installed_dispatch_cost_ns() -> u64 {
 /// unless `FLYNNEL_HOST_PROFILE_NS` pins it, which a comparison
 /// against a non-adaptive scheduler needs so both sides face the same
 /// dispatch cost.
+///
+/// A first query from one of the pool's own workers is measured on a
+/// thread outside the pool while that worker runs pool jobs, so the
+/// figure is an outside caller's dispatch whichever thread asks.
 pub fn host_dispatch_profile() -> HostDispatchProfile {
     use std::sync::atomic::Ordering;
     // Acquire, and first: it pairs with the Release in
@@ -1125,8 +1129,13 @@ pub fn jec_wake_threshold_ns() -> u64 {
     host_dispatch_profile().jec_wake_threshold_ns
 }
 
-/// Measure this host's dispatch profile now, on the calling thread,
-/// and install it.
+/// Measure this host's dispatch profile now and install it.
+///
+/// The draw runs on the calling thread, or, when that thread is one of
+/// the pool's workers, on a thread outside the pool while the worker
+/// runs pool jobs. A worker's own joins pop back the half they pushed
+/// before a parked peer can take it, so drawn there the figure would be
+/// an inline pass rather than a dispatch.
 ///
 /// A compute-bound body, eight dependent multiply-rotate steps per
 /// item, is timed serial against dispatched through the pool after
@@ -1198,7 +1207,7 @@ fn stored_or_measured() -> HostDispatchProfile {
     };
     let Some(dir) = calibration_dir() else {
         // No cache location on this platform; nothing to report.
-        return measure_host_dispatch().0;
+        return draw_host_dispatch().profile;
     };
     let stamp = HostStamp::detect();
     let store = match CalibrationStore::open_or_create(&dir, &stamp) {
@@ -1209,7 +1218,7 @@ fn stored_or_measured() -> HostDispatchProfile {
                  this process measures its own dispatch profile",
                 dir.display()
             );
-            return measure_host_dispatch().0;
+            return draw_host_dispatch().profile;
         }
     };
     if let Some((cpu, _accel)) = store.read()
@@ -1243,17 +1252,13 @@ fn stored_or_measured() -> HostDispatchProfile {
             jec_wake_threshold_ns: cpu.jec_wake_threshold_ns,
         };
     }
-    // The sample spread already decides whether a record stands as the
-    // host's calibration, through `is_trustworthy` above and
-    // `PROVISIONAL_SPREAD_PER_MILLE`. Occupancy is reported beside it
-    // and gates nothing: what figure marks a contended measurement is
-    // not known, and a threshold picked ahead of the distribution
-    // describes whoever picked it.
-    let occupancy_window = crate::sched::occupancy::OccupancyWindow::start();
-    let (profile, spread) = measure_host_dispatch();
-    // Sampled once and both reported and stored, so the figure a reader
-    // sees on stderr is the one the record carries.
-    let drawn_at = occupancy_window.sample().per_mille();
+    // Occupancy is reported beside the draw and gates nothing: what
+    // figure marks a contended measurement is not known, and a threshold
+    // picked ahead of the distribution describes whoever picked it. It is
+    // sampled once, on the thread that measured, and both reported and
+    // stored, so the figure a reader sees on stderr is the one the record
+    // carries.
+    let Draw { profile, spread, occupancy: drawn_at, publishable } = draw_host_dispatch();
     if std::env::var_os("FLYNNEL_OCCUPANCY").is_some() {
         // An unmeasured interval is reported as unmeasured. Printing a
         // number for it would tell a reader the calibration ran on a
@@ -1281,6 +1286,13 @@ fn stored_or_measured() -> HostDispatchProfile {
                  spread {spread} per mille",
             ),
         }
+    }
+    if !publishable {
+        eprintln!(
+            "flynnel: this draw was taken on a pool worker, whose joins time its own inline \
+             pass rather than a dispatch, so it routes this process and is not stored"
+        );
+        return profile;
     }
     match store.try_acquire_writer() {
         Ok(writer) => {
@@ -1444,7 +1456,112 @@ fn now_unix_s() -> u64 {
 /// The measured profile, with nothing persisted.
 #[cfg(not(feature = "persisted-calibration"))]
 fn stored_or_measured() -> HostDispatchProfile {
-    measure_host_dispatch().0
+    draw_host_dispatch().profile
+}
+
+/// One draw of this host's dispatch profile.
+#[cfg_attr(
+    not(feature = "persisted-calibration"),
+    expect(dead_code, reason = "only the persisted path stores a draw, so only it reads these")
+)]
+struct Draw {
+    profile: HostDispatchProfile,
+    /// The spread of the samples behind it, in parts per thousand.
+    spread: u32,
+    /// The share of a core the measuring thread held while it drew, in
+    /// parts per thousand, or `None` where the platform has no thread
+    /// clock.
+    occupancy: Option<u32>,
+    /// Whether it timed an outside caller's dispatch, and so may be
+    /// stored for other processes to read.
+    publishable: bool,
+}
+
+/// Draw the profile as an outside caller's dispatch sees it, whichever
+/// thread asks.
+///
+/// On a pool worker the draw's joins would be the worker's own. It
+/// pushes the right half to its own deque, runs the one-item left half
+/// and pops the right half back before a parked peer can take it, so the
+/// median times an inline pass: 100 ns on a 24-thread Windows host and
+/// 170 to 181 ns on a 16-vCPU Linux guest, where an outside caller's
+/// draw reads 1300 to 4800 and 1300 to 2200. So a worker hands the draw
+/// to a thread outside the pool and runs pool jobs until it ends. That
+/// is also what keeps a pool of one worker from waiting on itself: the
+/// draw's dispatches land in queues this worker's search reaches, its
+/// own mailbox and the held outside-caller slots among them.
+///
+/// A worker that cannot start the thread draws on itself and says so,
+/// and that draw routes its own process but is not stored.
+fn draw_host_dispatch() -> Draw {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let ctx_ptr = crate::sched::arena_local::current_worker_ctx();
+    if ctx_ptr.is_null() {
+        return draw_on_this_thread(true);
+    }
+    // SAFETY: worker_loop set this pointer on this thread, and it stays
+    // valid until worker_loop returns, which it cannot do while this
+    // frame is on the worker's stack.
+    let ctx = unsafe { &*ctx_ptr };
+    let ended = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name("flynnel-calibration".to_string())
+            .spawn_scoped(scope, || {
+                let _ended = SetOnDrop(&ended);
+                draw_on_this_thread(true)
+            });
+        let helper = match spawned {
+            Ok(helper) => helper,
+            Err(e) => {
+                eprintln!(
+                    "flynnel: could not start a thread to calibrate outside the pool ({e}); \
+                     this worker draws on itself, so its dispatch cost times its own inline \
+                     pass, and the draw is not stored"
+                );
+                return draw_on_this_thread(false);
+            }
+        };
+        // The same wait an outside caller of the profile takes while
+        // another thread calibrates, spinning first and yielding after,
+        // with the pool's work run in between.
+        let mut idle_rounds = 0u32;
+        while !ended.load(Ordering::Acquire) {
+            match ctx.find_work() {
+                Some(job) => {
+                    // SAFETY: find_work hands each JobRef out once, and
+                    // this executes it exactly once.
+                    unsafe { job.execute() };
+                    idle_rounds = 0;
+                }
+                None if idle_rounds < 1_000 => {
+                    idle_rounds += 1;
+                    std::hint::spin_loop();
+                }
+                None => std::thread::yield_now(),
+            }
+        }
+        match helper.join() {
+            Ok(draw) => draw,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+/// Measure on the calling thread, with that thread's occupancy.
+fn draw_on_this_thread(publishable: bool) -> Draw {
+    let window = crate::sched::occupancy::OccupancyWindow::start();
+    let (profile, spread) = measure_host_dispatch();
+    Draw { profile, spread, occupancy: window.sample().per_mille(), publishable }
+}
+
+/// Sets its flag when dropped, which includes a panic unwinding past it.
+struct SetOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Place the crossover between the last two timed counts.
