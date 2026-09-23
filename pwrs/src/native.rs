@@ -165,10 +165,17 @@ pub struct NativeEntry {
 /// PWRS loads is a renamed copy in a per-process temp folder, so an entry
 /// cannot be found by name; this answers from the copy that is loaded.
 ///
-/// Ask once per dispatch rather than caching the answer. A re-import
-/// after a rebuild can load a new copy of the library at a new address,
-/// with a pool of its own, and a cached address would keep calling the
-/// old one.
+/// An address stays callable for the life of the process, because PWRS
+/// never frees a library it has loaded. It can go stale: a reload after a
+/// rebuild loads a new copy at a new address, with a pool of its own, and
+/// a cached address keeps running work on the old copy's pool. So a
+/// caller may cache the answer, and asks again whenever the process has
+/// loaded a native library since the answer was taken.
+///
+/// A rebuild that changes the module's cmdlets gets a load context of its
+/// own, so runspaces that imported the module before it and after it run
+/// different copies. A caller serving several runspaces keeps one answer
+/// per runspace, taken in that runspace.
 ///
 /// # Examples
 ///
