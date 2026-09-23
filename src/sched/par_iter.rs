@@ -1221,10 +1221,15 @@ fn stored_or_measured() -> HostDispatchProfile {
         // the same variable that reports a draw, because the question
         // a reader has is which of the two happened.
         if std::env::var_os("FLYNNEL_OCCUPANCY").is_some() {
+            let age_s = now_unix_s().saturating_sub(cpu.measured_unix_s);
+            let lasts = match configured_max_age_s() {
+                Some(bound) if bound > 0 => format!("serves until it is {bound} s old"),
+                _ => "serves until the layout version changes".to_string(),
+            };
             eprintln!(
                 "flynnel: host profile {},{},{} READ from the stored record, not \
-                 measured; it was drawn at {} per mille occupancy with spread {} per \
-                 mille and stands until the layout version changes",
+                 measured; it was drawn {age_s} s ago at {} per mille occupancy with \
+                 spread {} per mille and {lasts}",
                 cpu.dispatch_cost_ns,
                 cpu.collapse_threshold_ns,
                 cpu.jec_wake_threshold_ns,
@@ -1345,11 +1350,13 @@ fn stored_or_measured() -> HostDispatchProfile {
 /// `WriterGuard::publish_if_better`, so that guard's comparison never
 /// sees a record in this state.
 ///
-/// `max_age_s` of `None` is the shipped behavior: a record that clears
-/// its trust check stands until the layout version changes. A bound of
-/// zero is read as no bound, since re-measuring at every start is what
-/// the store exists to avoid and is not something a caller asks for by
-/// typing a number.
+/// `max_age_s` of `None` is no age bound: a record that clears its
+/// trust check stands until the layout version changes. The shipped
+/// bound is [`DEFAULT_CALIBRATION_MAX_AGE_S`], which
+/// `configured_max_age_s` answers unless `FLYNNEL_CALIBRATION_MAX_AGE_S`
+/// says otherwise. A bound of zero is also read as no bound, since
+/// re-measuring at every start is what the store exists to avoid and is
+/// not something a caller asks for by typing a number.
 ///
 /// A record stamped in the future is a clock that moved rather than a
 /// fresh draw, so saturating leaves it aged zero and it stands.
