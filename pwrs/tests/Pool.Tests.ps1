@@ -144,6 +144,24 @@ Describe 'the spin dials' {
         $null = Reset-FlynnelSpinStats
         (Get-FlynnelSpinWindow).AdaptDecisions | Should -BeGreaterOrEqual $before
     }
+
+    It 'reports the join parks and the timed yields, and nothing while their levers are off' {
+        # A join waiter parks only under one of the two join-park levers,
+        # and yields are timed only under the gated one. A column that
+        # read non-zero with its lever off would be counting something
+        # other than what it names.
+        $s = Get-FlynnelSpinWindow
+        @($s.YieldHistogram).Count | Should -Be 16
+        $always = (Get-FlynnelLever -Name join_park).Value -eq 'true'
+        $gated = (Get-FlynnelLever -Name join_park_oversubscribed).Value -eq 'true'
+        if (-not $always -and -not $gated) {
+            $s.JoinParks | Should -Be 0
+        }
+        if (-not $gated) {
+            $s.LongYields | Should -Be 0
+            (@($s.YieldHistogram) | Measure-Object -Sum).Sum | Should -Be 0
+        }
+    }
 }
 
 Describe 'the split dials' {

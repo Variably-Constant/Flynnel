@@ -47,11 +47,14 @@ Describe 'the types and enums this family exports' {
 Describe 'Get-FlynnelLever' {
     It 'writes a row for every switch the crate reports' {
         # The list the crate's own describe prints, which is what a
-        # reader of its logs will have seen.
+        # reader of its logs will have seen, and the two switches it
+        # leaves out, which a script can still set.
         $names = @($script:Levers | ForEach-Object Name)
         foreach ($lever in 'oncore_spread', 'batch_weight', 'smt_window', 'allowed_width',
-                           'calibration_refusal', 'spin_adaptive', 'spin_window',
-                           'serve_policy', 'occupancy_floor') {
+                           'calibration_refusal', 'latch_monitor', 'spin_monitor', 'join_park',
+                           'join_park_oversubscribed', 'slot_park_now', 'spin_adaptive',
+                           'spin_window', 'serve_policy', 'occupancy_floor',
+                           'mailbox_wake_legacy', 'wasm_local_store') {
             $names | Should -Contain $lever
         }
     }
@@ -85,17 +88,28 @@ Describe 'Get-FlynnelLever' {
     }
 
     It 'carries a measured price on each switch that defaults on' {
-        # A switch that ships on has to say what it costs. The two that
-        # default off carry no price, and that is honest rather than an
-        # omission: nothing has measured them.
+        # A switch that ships on has to say what it costs. A switch that
+        # nothing has measured yet carries no price, and that is honest
+        # rather than an omission.
         foreach ($name in 'oncore_spread', 'allowed_width', 'calibration_refusal') {
             $row = $script:Levers | Where-Object Name -eq $name
             $row.Default | Should -Be 'true'
             $row.Price | Should -Not -BeNullOrEmpty -Because "$name ships on and must say what it costs"
         }
-        foreach ($name in 'batch_weight', 'smt_window') {
+        foreach ($name in 'batch_weight', 'smt_window', 'latch_monitor', 'spin_monitor',
+                          'join_park', 'join_park_oversubscribed', 'slot_park_now',
+                          'mailbox_wake_legacy', 'wasm_local_store') {
             $row = $script:Levers | Where-Object Name -eq $name
             $row.Default | Should -Be 'false'
+        }
+    }
+
+    It 'says why each switch that was measured and kept off stays off' {
+        # The row is where a script reads why a switch it might reach for
+        # is off, so a switch a measurement turned down carries it.
+        foreach ($name in 'join_park', 'slot_park_now', 'mailbox_wake_legacy', 'wasm_local_store') {
+            $row = $script:Levers | Where-Object Name -eq $name
+            $row.Price | Should -Not -BeNullOrEmpty -Because "$name was measured and is off"
         }
     }
 

@@ -182,8 +182,8 @@ pub struct Lever {
     /// pool exposes real setters for, which can be moved at any time.
     pub latches_on_first_read: bool,
     /// What it was measured to cost, with the conditions of the
-    /// measurement. Empty where nothing has been measured, which is
-    /// the honest state for the two that default off.
+    /// measurement. Empty where nothing has been measured yet, which is
+    /// the honest state for a switch that stays off until it is.
     pub price: String,
 }
 
@@ -205,6 +205,26 @@ const ALLOWED_WIDTH_PRICE: &str = "One affinity query every 250 ms, paid for not
 const REFUSAL_PRICE: &str = "16 draws at each of three load levels on a 12-core host: the \
     dispatch cost read 1300 to 1500 ns idle and 3.2 to 7.0 million saturated, with no overlap. \
     So the cheaper record is the quieter draw and the ordering needs no threshold.";
+
+const JOIN_PARK_PRICE: &str = "Off, and measured not to be never-slower. Four arms of the \
+    oversubscribed caller, three rounds each: on a 24-thread Windows bare-metal box with 18 \
+    spinners it took a loaded median from 3.02 to 0.95 ms and a p99 from 31.3 to 1.8 ms, at no \
+    quiet cost, 0.468 against 0.471 ms; on a 16-vCPU Linux guest it raised the quiet median from \
+    about 1.3 to 3.1 ms, because a parked thread halts its vCPU and the wake goes through the \
+    hypervisor.";
+
+const SLOT_PARK_PRICE: &str = "Off, and measured to change nothing: in four arms of the \
+    oversubscribed caller on a 24-thread Windows bare-metal box and on a 16-vCPU Linux guest it \
+    sat with the arm that had no switch on, quiet and loaded.";
+
+const MAILBOX_LEGACY_PRICE: &str = "Not a mode to run: on reinstates a hang. 11 of 12 runs of \
+    simc_cooperative_n1024 stop with fifteen of sixteen mailboxes still holding jobs. It exists \
+    so the fix can be priced in one binary.";
+
+const WASM_STORE_PRICE: &str = "Off, and measured to lose. On a 24-thread Windows host a store \
+    per thread is 4.4x faster with every worker settled on an idle box and 5x slower in the same \
+    shape under load, 1222 against 6316 us, and every first-dispatch cell is 5 to 7 per cent \
+    slower.";
 
 const NO_PRICE: &str = "";
 
@@ -270,6 +290,55 @@ fn all_levers() -> Vec<Lever> {
             levers::calibration_refusal(),
             true,
             REFUSAL_PRICE,
+        ),
+        switch_row(
+            "latch_monitor",
+            "FLYNNEL_LEVER_LATCH_MONITOR",
+            levers::latch_monitor(),
+            false,
+            NO_PRICE,
+        ),
+        switch_row(
+            "spin_monitor",
+            "FLYNNEL_LEVER_SPIN_MONITOR",
+            levers::spin_monitor(),
+            false,
+            NO_PRICE,
+        ),
+        switch_row(
+            "join_park",
+            "FLYNNEL_LEVER_JOIN_PARK",
+            levers::join_park(),
+            false,
+            JOIN_PARK_PRICE,
+        ),
+        switch_row(
+            "join_park_oversubscribed",
+            "FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED",
+            levers::join_park_oversubscribed(),
+            false,
+            NO_PRICE,
+        ),
+        switch_row(
+            "slot_park_now",
+            "FLYNNEL_LEVER_SLOT_PARK_NOW",
+            levers::slot_park_now(),
+            false,
+            SLOT_PARK_PRICE,
+        ),
+        switch_row(
+            "mailbox_wake_legacy",
+            "FLYNNEL_LEVER_MAILBOX_WAKE_LEGACY",
+            levers::mailbox_wake_legacy(),
+            false,
+            MAILBOX_LEGACY_PRICE,
+        ),
+        switch_row(
+            "wasm_local_store",
+            "FLYNNEL_LEVER_WASM_LOCAL_STORE",
+            levers::wasm_local_store(),
+            false,
+            WASM_STORE_PRICE,
         ),
     ];
 
@@ -355,8 +424,8 @@ fn lever_named(rows: &[Lever], name: &str) -> PsResult<Lever> {
 /// and still agree.
 ///
 /// Price carries the measurement and its conditions where one exists,
-/// and is empty where nothing has been measured, which is the honest
-/// state for the two switches that default off.
+/// and is empty where nothing has been measured yet, which is the
+/// honest state for a switch that stays off until it is.
 ///
 /// # Examples
 ///

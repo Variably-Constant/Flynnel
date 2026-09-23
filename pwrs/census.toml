@@ -808,6 +808,51 @@ reason = "internal-to-another-surface"
 note = "builds one formatted line of every switch, for the crate's own logging. Get-FlynnelLever answers the same facts as rows a script can filter and compare, which a formatted string cannot be without parsing it"
 
 [[entry]]
+item = "crate::sched::levers::latch_monitor"
+reason = "internal-to-another-surface"
+note = "the latch_monitor row of Get-FlynnelLever. Defaults off and carries no price, because nothing has measured it yet"
+
+[[entry]]
+item = "crate::sched::levers::spin_monitor"
+reason = "internal-to-another-surface"
+note = "the spin_monitor row of Get-FlynnelLever. Defaults off and carries no price for the same reason"
+
+[[entry]]
+item = "crate::sched::levers::join_park"
+reason = "internal-to-another-surface"
+note = "the join_park row of Get-FlynnelLever, whose price carries the measurement that keeps it off: the loaded stall gone on bare metal, the quiet median raised on a guest"
+
+[[entry]]
+item = "crate::sched::levers::join_park_oversubscribed"
+reason = "internal-to-another-surface"
+note = "the join_park_oversubscribed row of Get-FlynnelLever. Off and carrying no price while its quiet and loaded cost is measured"
+
+[[entry]]
+item = "crate::sched::levers::slot_park_now"
+reason = "internal-to-another-surface"
+note = "the slot_park_now row of Get-FlynnelLever, whose price says it was measured to change nothing on either host"
+
+[[entry]]
+item = "crate::sched::levers::mailbox_wake_legacy"
+reason = "internal-to-another-surface"
+note = "the mailbox_wake_legacy row of Get-FlynnelLever, whose price says on reinstates a hang and the switch exists only to price the fix"
+
+[[entry]]
+item = "crate::sched::levers::wasm_local_store"
+reason = "internal-to-another-surface"
+note = "the wasm_local_store row of Get-FlynnelLever, whose price carries the measurement that keeps it off"
+
+[[entry]]
+item = "crate::sched::oversubscription"
+reason = "internal-to-another-surface"
+note = "total_long_yields and yield_histogram are the LongYields and YieldHistogram columns of Get-FlynnelSpinWindow; LONG_YIELD, WINDOW and YIELD_BUCKETS are the line, the window and the bucket count those columns are read against"
+
+[[entry]]
+item = "crate::sched::arena::total_join_parks"
+reason = "internal-to-another-surface"
+note = "the JoinParks column of Get-FlynnelSpinWindow, beside the other counts of how a waiting worker waits"
+
+[[entry]]
 item = "crate::sched::host_width::allowed_parallelism"
 reason = "internal-to-another-surface"
 note = "the Width column of Get-FlynnelAllowedWidth, reported whether or not the allowed_width lever is on, because the lever decides whether a plan is capped by the number rather than whether the number is read"

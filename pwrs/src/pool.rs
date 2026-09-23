@@ -241,6 +241,21 @@ pub struct SpinState {
     /// which is a different state from a controller that decided and
     /// left the window where it found it.
     pub adapt_decisions: u64,
+    /// Join waits that parked in the kernel rather than yielding, under
+    /// either join-park lever, counted from process start. Zero with
+    /// both levers off.
+    pub join_parks: u64,
+    /// Timed yields that ran past the line at which a yield is taken to
+    /// have lost its core, counted from process start. Yields are timed
+    /// only while the join_park_oversubscribed lever is on, so this is
+    /// zero otherwise, and zero with it on under load says the process
+    /// was never seen oversubscribed.
+    pub long_yields: u64,
+    /// Every timed yield by length, in log2 buckets of microseconds:
+    /// element 0 is under a microsecond, element i from 2^(i-1) up to
+    /// 2^i, and the last from 2^14 up. Filled on the same terms as
+    /// LongYields.
+    pub yield_histogram: Vec<u64>,
 }
 
 pub(crate) fn spin_snapshot() -> SpinState {
@@ -249,6 +264,9 @@ pub(crate) fn spin_snapshot() -> SpinState {
         total_idle_yields: flynnel::total_idle_yields(),
         adaptive: flynnel::sched::spin_adaptive(),
         adapt_decisions: flynnel::spin_adapt_decisions(),
+        join_parks: flynnel::total_join_parks(),
+        long_yields: flynnel::total_long_yields(),
+        yield_histogram: flynnel::yield_histogram().to_vec(),
     }
 }
 
