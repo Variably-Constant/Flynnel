@@ -279,5 +279,10 @@ fn main() {
         flynnel::sched::levers::join_park_oversubscribed(),
         flynnel::total_long_yields()
     );
+    let histogram = flynnel::sched::yield_histogram();
+    println!(
+        "YIELD_US_LOG2 {}",
+        histogram.iter().map(u64::to_string).collect::<Vec<_>>().join(" ")
+    );
     std::hint::black_box(&data);
 }

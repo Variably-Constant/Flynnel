@@ -55,6 +55,20 @@ static LAST_LONG_YIELD_NS: AtomicU64 = AtomicU64::new(0);
 /// Long yields seen, process-wide.
 static LONG_YIELDS: AtomicU64 = AtomicU64::new(0);
 
+/// How many buckets [`yield_histogram`] answers.
+pub const YIELD_BUCKETS: usize = 16;
+
+/// Every timed yield, by length: bucket 0 is under a microsecond, bucket
+/// `i` from 2^(i-1) up to 2^i microseconds, and the last bucket takes
+/// everything from 2^14 microseconds up.
+static YIELD_HISTOGRAM: [AtomicU64; YIELD_BUCKETS] = [const { AtomicU64::new(0) }; YIELD_BUCKETS];
+
+fn bucket_of(took: Duration) -> usize {
+    let us = took.as_micros();
+    let bits = (u128::BITS - us.leading_zeros()) as usize;
+    bits.min(YIELD_BUCKETS - 1)
+}
+
 fn now_ns() -> u64 {
     let since = EPOCH.get_or_init(Instant::now).elapsed().as_nanos();
     // Clamped rather than converted: u64 nanoseconds last 584 years.
@@ -67,6 +81,7 @@ pub(crate) fn timed_yield() -> Duration {
     let started = Instant::now();
     std::thread::yield_now();
     let took = started.elapsed();
+    YIELD_HISTOGRAM[bucket_of(took)].fetch_add(1, Relaxed);
     if took >= LONG_YIELD {
         LONG_YIELDS.fetch_add(1, Relaxed);
         LAST_LONG_YIELD_NS.store(now_ns(), Relaxed);
@@ -98,6 +113,16 @@ pub fn total_long_yields() -> u64 {
     LONG_YIELDS.load(Relaxed)
 }
 
+/// Every timed yield since the process started, counted by length in
+/// log2 buckets of microseconds: bucket 0 is under a microsecond, bucket
+/// `i` from 2^(i-1) up to 2^i, the last from 2^14 up. Filled only while
+/// `FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED` is on. What separates a yield
+/// that lost its core from one that did not is read here rather than
+/// assumed, and [`LONG_YIELD`] is set from it.
+pub fn yield_histogram() -> [u64; YIELD_BUCKETS] {
+    std::array::from_fn(|i| YIELD_HISTOGRAM[i].load(Relaxed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +141,19 @@ mod tests {
         assert!(within_window(at, at + window - 1));
         assert!(!within_window(at, at + window));
         assert!(!within_window(at, at + 10 * window));
+    }
+
+    #[test]
+    fn a_yield_lands_in_the_bucket_of_its_length() {
+        assert_eq!(bucket_of(Duration::from_nanos(900)), 0);
+        assert_eq!(bucket_of(Duration::from_micros(1)), 1);
+        assert_eq!(bucket_of(Duration::from_micros(3)), 2);
+        assert_eq!(bucket_of(Duration::from_micros(4)), 3);
+        assert_eq!(bucket_of(Duration::from_micros(100)), 7);
+        assert_eq!(bucket_of(Duration::from_millis(8)), 13);
+        assert_eq!(bucket_of(Duration::from_millis(16)), 14);
+        assert_eq!(bucket_of(Duration::from_millis(17)), YIELD_BUCKETS - 1);
+        assert_eq!(bucket_of(Duration::from_secs(10)), YIELD_BUCKETS - 1);
     }
 
     #[test]

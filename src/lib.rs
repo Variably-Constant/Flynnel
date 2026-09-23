@@ -107,7 +107,7 @@ pub use sched::{
     reset_spin_stats, set_spin_adaptive, set_spin_window, spin_adapt_decisions, spin_window,
     total_idle_yields, total_join_parks, total_latch_monitor_arms, total_latch_monitor_waits,
     total_long_yields, total_monitor_rounds, total_park_events, total_rescue_events,
-    total_self_rescues, total_sleepless_backoffs,
+    total_self_rescues, total_sleepless_backoffs, yield_histogram,
 };
 pub use sched::hybrid::{
     SplitReport, hybrid_auto, hybrid_auto_split, hybrid_auto_split_ranges, hybrid_pipeline,

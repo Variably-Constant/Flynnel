@@ -115,7 +115,7 @@ pub use arena::{
     dispatch_trace_snapshot, dispatch_trace_wait_snapshot, join, join_context, join_default,
     total_join_parks,
 };
-pub use oversubscription::total_long_yields;
+pub use oversubscription::{total_long_yields, yield_histogram};
 pub use io_pool::{IoPool, IoTask, global_io_pool, submit_io_or_inline};
 pub use bg_calibration::spawn_calibration;
 #[cfg(feature = "verify-chain")]
