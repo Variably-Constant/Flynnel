@@ -389,6 +389,9 @@ required-features = ["gpu-peer"]
 name = "gpu_peer_generation_barrier"
 required-features = ["gpu-peer"]
 
+[[example]]
+name = "chunk_stack_headroom"
+
 [[bench]]
 name = "flynn_axes"
 harness = false
