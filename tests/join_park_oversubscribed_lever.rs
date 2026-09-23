@@ -66,7 +66,16 @@ fn an_oversubscribed_process_parks_its_join_waiters_and_the_joins_stay_correct()
 
     let parks_before = flynnel::total_join_parks();
     let long_before = flynnel::total_long_yields();
-    for _ in 0..20 {
+    // At least twenty joins, and more until three have parked or ten
+    // seconds have passed. A waiter parks only when a long yield is
+    // fresh at the moment it checks, and a host whose lost yields last a
+    // whole Windows quantum can go several joins without one, so a fixed
+    // count would pass or fail on a single park.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut joins = 0u32;
+    while joins < 20
+        || (flynnel::total_join_parks() - parks_before < 3 && Instant::now() < deadline)
+    {
         let halves = flynnel::join(
             &plan,
             || {
@@ -79,6 +88,7 @@ fn an_oversubscribed_process_parks_its_join_waiters_and_the_joins_stay_correct()
             },
         );
         assert_eq!(halves, (1, 2), "a join returned its halves out of order or wrong");
+        joins += 1;
     }
     let mut data = vec![0u64; 1 << 16];
     for round in 1..=50u64 {
@@ -96,7 +106,7 @@ fn an_oversubscribed_process_parks_its_join_waiters_and_the_joins_stay_correct()
     let parks = flynnel::total_join_parks() - parks_before;
     let long = flynnel::total_long_yields() - long_before;
     println!(
-        "JOIN_PARKS {parks} LONG_YIELDS {long} over 20 joins on {workers} workers beside {} spinners",
+        "JOIN_PARKS {parks} LONG_YIELDS {long} over {joins} joins on {workers} workers beside {} spinners",
         cores * 2
     );
 
@@ -113,6 +123,6 @@ fn an_oversubscribed_process_parks_its_join_waiters_and_the_joins_stay_correct()
     );
     assert!(
         parks > 0,
-        "the process read {long} long yields and parked no join waiter across twenty joins"
+        "the process read {long} long yields and parked no join waiter across {joins} joins"
     );
 }
