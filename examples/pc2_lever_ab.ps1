@@ -83,6 +83,7 @@ $tree = "C:\Projects\Flynnel-l1-$Sha"
 trap {
     "LEVER_ABORTED $($_.Exception.Message)" | Add-Content -Path $log
     Exit-TimingRun -Log $log
+    Exit-BoxRun -Log $log
     exit 7
 }
 
@@ -111,11 +112,16 @@ if ($LASTEXITCODE -ne 0) {
 $exe = ".\target\release\examples\throughput_under_load.exe"
 
 if ($Contend) {
-    # No wait and no deference: the run shares pc2 with whatever else is
-    # there, announced in presence as the wait would have been. The arms
-    # are paired by trial, so the box's load falls on both.
-    & C:\Temp\presence.ps1 -Claim "flynnel lever $short, $Trials trials, timing that contends with what else runs, Flynnel-Scholar" -OwnerPid $PID *>&1 |
+    # No wait, no deference and no measurement lease: the run shares pc2
+    # with whatever else is there, declared in presence as the wait would
+    # have been, and released on every path out. The arms are paired by
+    # trial, so the box's load falls on both.
+    "SOURCE_STATE head=$(git -C $tree rev-parse --short HEAD) dirty=$(@(git -C $tree status --porcelain --untracked-files=no).Count) in $tree" |
         Add-Content -Path $log
+    $box = @{ What = "flynnel lever $short, $Trials trials, TIMINGS that contend with what else runs"; Log = $log; Who = 'Flynnel-Scholar'; RequireLease = $false }
+    if (-not (Enter-BoxRun @box)) {
+        exit 3
+    }
     "CONTENDING no quiet wait; each arm's line records the box's busy cores" | Add-Content -Path $log
 } else {
     $guard = @{ What = "flynnel lever $short, $Trials trials"; Log = $log; Tree = $tree; Who = 'Flynnel-Scholar' }
@@ -183,6 +189,7 @@ $acted = Census-Rows -Lines $written -Pattern $ActedPattern
     Add-Content -Path $log
 "LEVER_DONE $(Get-Date -Format o)" | Add-Content -Path $log
 Exit-TimingRun -Log $log
+Exit-BoxRun -Log $log
 
 if ($retained -eq 0) {
     "NO_RETAINED_ROWS nothing here parses as a measurement" | Add-Content -Path $log

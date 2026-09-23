@@ -18,6 +18,27 @@
 # -Who is the agent the presence claim names, so an operator reading the
 # presence list knows whose run is holding the box.
 #
+# A run that is not timing anything - a build, a bake, a correctness gate -
+# holds the box just as long and declares itself through the other pair:
+#
+#   . C:\Temp\pc2_timing_guard.ps1
+#   if (-not (Enter-BoxRun -What "what this run is" -Log $log `
+#             -Who 'Your-Name')) { exit 3 }
+#   ... the work ...
+#   Exit-BoxRun -Log $log
+#
+# Enter-TimingRun calls Enter-BoxRun itself, so a timing run declares once and
+# a caller must not call both. Neither takes the measurement lease: that is
+# C:\Temp\pc2_lease.py, whose holder must be the parent of the work, so the
+# launch wraps the runner rather than the runner taking it -
+#
+#   schtasks /run -> python pc2_lease.py run --who '<you>' -- <the runner>
+#
+# and both entry points refuse a span that is not under it, unless the caller
+# passes -RequireLease $false. Each refusal writes its own line, so NO_LEASE,
+# NO_PROVENANCE and NOT_QUIET are told apart by a caller that only sees the
+# exit code.
+#
 # -BoundOn says what the run's wall is bound on and picks the CPU ceiling from
 # it: host, the default, waits for a box quiet enough that its cores are not
 # deciding the answer; device waits only for a box that is not saturated,
@@ -28,6 +49,104 @@
 # to call when no claim is held and safe to call twice.
 
 $script:TimingClaimHeld = $false
+$script:BoxClaimHeld = $false
+
+# Whether this process is running under C:\Temp\pc2_lease.py's measurement
+# lease: true, false, or nothing where the question could not be answered.
+#
+# Three answers rather than two. A check that reads "I could not tell" as
+# "yes" lets an undeclared span run believing it is serialized, and one that
+# reads it as "no" refuses a run that is correctly wrapped; the caller chooses
+# which of those it would rather have.
+#
+# The lease sets no environment variable on its child, so the relation is read
+# from the process tree: its own status verb names the holding pid, and this
+# process is under it when that pid is one of its ancestors. Ancestors rather
+# than the parent, because the holder is the parent of the runner and the
+# runner is the parent of whatever dot-sources this file.
+function Test-UnderMeasurementLease {
+    try {
+        $status = & python 'C:\Temp\pc2_lease.py' status 2>&1 | Out-String
+    } catch {
+        return $null
+    }
+    # Free is tested first and the holder is matched on its whole phrase,
+    # because the same output lists the queue behind the lease as "1. pid N"
+    # and a looser pattern would read the first waiter as the holder.
+    if ($status -match 'the lease is free') {
+        return $false
+    }
+    if ($status -match 'held by pid (\d+)') {
+        $held = [int]$Matches[1]
+    } else {
+        return $null
+    }
+    $walk = $PID
+    for ($hops = 0; $hops -lt 12; $hops++) {
+        if ($walk -eq $held) { return $true }
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $walk" -ErrorAction SilentlyContinue
+        if (-not $proc -or -not $proc.ParentProcessId -or $proc.ParentProcessId -eq 0) { return $false }
+        $walk = [int]$proc.ParentProcessId
+    }
+    return $null
+}
+
+# Declare a span on the box, without waiting for it to be quiet.
+#
+# A build, a bake or a correctness gate holds the box as long as a timing run
+# and has had nothing to announce itself with, so a neighbour reads occupancy
+# off CPU and cannot tell a gap between two phases from an ending. This writes
+# the span where a neighbour reads it, carrying what the run is for and whom
+# to ask about it.
+#
+# It does not take the measurement lease. pc2_lease.py holds that for exactly
+# the life of its child and requires the holder to be the child's parent,
+# which a function dot-sourced into the work can never be; its header forbids
+# hand-rolling the take and release for that reason. So this refuses unless it
+# is already under the lease, which turns the nesting that file requires -
+# the task, then the lease, then the work - into something checked rather than
+# hoped for.
+function Enter-BoxRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$What,
+        [Parameter(Mandatory = $true)][string]$Log,
+        # The agent whose span this is, so the presence line says who to ask.
+        [string]$Who = 'an agent that did not name itself',
+        [int]$OwnerPid = $PID,
+        # Whether a span that is not under the measurement lease is refused.
+        # A caller that genuinely runs outside it passes false, and the fact
+        # reaches the log either way, so an unserialized span is never silent.
+        [bool]$RequireLease = $true
+    )
+    $under = Test-UnderMeasurementLease
+    $said = if ($null -eq $under) { 'could not be read' } elseif ($under) { 'held' } else { 'not held' }
+    "BOX_LEASE $said at $(Get-Date -Format o)" | Add-Content -Path $Log
+    if ($RequireLease -and $under -ne $true) {
+        ("NO_LEASE this span is not under C:\Temp\pc2_lease.py, which is the only registry that " +
+         "serializes; wrap the launch as: python C:\Temp\pc2_lease.py run --who '<you>' -- <command>") |
+            Add-Content -Path $Log
+        return $false
+    }
+    $claim = "$What, and this line stands until it exits, $Who"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Temp\presence.ps1' `
+        -Claim $claim -OwnerPid $OwnerPid *>&1 | Add-Content -Path $Log
+    $script:BoxClaimHeld = $true
+    return $true
+}
+
+# Withdraw the declaration. Safe when none is held and safe to call twice,
+# which a harness needs because its trap and its normal path both reach here
+# on some exit orders.
+function Exit-BoxRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$Log,
+        [int]$OwnerPid = $PID
+    )
+    if (-not $script:BoxClaimHeld) { return }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Temp\presence.ps1' `
+        -Release -OwnerPid $OwnerPid *>&1 | Add-Content -Path $Log
+    $script:BoxClaimHeld = $false
+}
 
 # Busy cores over a short interval, counting every process on the box.
 #
@@ -90,7 +209,11 @@ function Enter-TimingRun {
         [double]$MaxIdleCores = -1,
         # Ceiling on the wait. awaitquiet's own default is 180, which is
         # right for a run nobody is watching and wrong for a smoke test.
-        [double]$WaitMinutes = 180
+        [double]$WaitMinutes = 180,
+        # Passed to [Enter-BoxRun]: whether a run that is not under the
+        # measurement lease is refused. A timing run has the most to lose from
+        # not being serialized, so it defaults to refusing.
+        [bool]$RequireLease = $true
     )
 
     if ($MaxIdleCores -lt 0) {
@@ -164,9 +287,13 @@ function Enter-TimingRun {
     }
     "QUIET_REACHED $(Get-Date -Format o)" | Add-Content -Path $Log
 
-    $claim = "$What, TIMINGS, needs a quiet box, and this line stands until it exits, $Who"
-    & powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Temp\presence.ps1' `
-        -Claim $claim -OwnerPid $OwnerPid *>&1 | Add-Content -Path $Log
+    # One declaration per span, made through the call a build makes, so a
+    # timing run appears in the presence record once rather than twice and a
+    # caller adding Enter-BoxRun beside this would not double it.
+    if (-not (Enter-BoxRun -What "$What, TIMINGS, needs a quiet box" -Log $Log `
+              -Who $Who -OwnerPid $OwnerPid -RequireLease $RequireLease)) {
+        return $false
+    }
     $script:TimingClaimHeld = $true
     return $true
 }
@@ -177,7 +304,6 @@ function Exit-TimingRun {
         [int]$OwnerPid = $PID
     )
     if (-not $script:TimingClaimHeld) { return }
-    & powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Temp\presence.ps1' `
-        -Release -OwnerPid $OwnerPid *>&1 | Add-Content -Path $Log
     $script:TimingClaimHeld = $false
+    Exit-BoxRun -Log $Log -OwnerPid $OwnerPid
 }
