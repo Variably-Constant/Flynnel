@@ -47,6 +47,13 @@ param(
     [int]$SmtPrior = 0,
     [double]$SettleCores = 1.4,
     [int]$SettleTries = 12,
+    # The busy-core ceiling the timing guard waits under before the first
+    # trial. Left at 0 the guard takes its own default, which clears a
+    # bare box's floor; a host carrying a process that holds a core
+    # sits above that floor, and a guard waiting on it waits out its
+    # whole timeout and then declines to measure. Every arm line records
+    # the busy cores it started against either way.
+    [double]$MaxIdleCores = 0,
     # What engagement looks like for this lever, as two separate
     # questions. Read is whether the switch reached its mechanism;
     # Acted is whether the mechanism then changed a decision. A lever
@@ -86,7 +93,7 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 # would otherwise have to take from the command line that launched it.
 # irregular and duty_ms are what put a lever in the regime it was built
 # for, and a log naming neither cannot say which regime it measured.
-"LEVER_START $(Get-Date -Format o) tree=$tree lever=$Lever trials=$Trials window=${WindowS}s load=$Load reps=$Reps entry=$Entry irregular=$Irregular duty_ms=$DutyMs smt_prior=$SmtPrior settle_cores=$SettleCores read_pattern=$ReadPattern acted_pattern=$ActedPattern" |
+"LEVER_START $(Get-Date -Format o) tree=$tree lever=$Lever trials=$Trials window=${WindowS}s load=$Load reps=$Reps entry=$Entry irregular=$Irregular duty_ms=$DutyMs smt_prior=$SmtPrior settle_cores=$SettleCores max_idle_cores=$(if ($MaxIdleCores -gt 0) { $MaxIdleCores } else { 'guard_default' }) read_pattern=$ReadPattern acted_pattern=$ActedPattern" |
     Out-File -FilePath $log
 
 Set-Location $tree
@@ -100,8 +107,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 $exe = ".\target\release\examples\throughput_under_load.exe"
 
-if (-not (Enter-TimingRun -What "flynnel lever $short, $Trials trials" -Log $log `
-          -Tree $tree -Who 'Flynnel-Scholar')) {
+$guard = @{ What = "flynnel lever $short, $Trials trials"; Log = $log; Tree = $tree; Who = 'Flynnel-Scholar' }
+if ($MaxIdleCores -gt 0) { $guard.MaxIdleCores = $MaxIdleCores }
+if (-not (Enter-TimingRun @guard)) {
     exit 3
 }
 
