@@ -12,6 +12,11 @@
 //! A test binary of its own, because the profile is measured once per
 //! process by its first query, and any other test that queried first
 //! would take the measurement from the calling thread instead.
+//!
+//! Its assertion compares two timings, so it holds only in an optimized
+//! build: in a debug build a worker's inline pass costs about what a
+//! dispatch does, and the two cannot be told apart. The gate runs it
+//! under the release-test profile.
 
 use std::time::Duration;
 

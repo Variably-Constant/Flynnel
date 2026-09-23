@@ -652,6 +652,40 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
+- **A process whose first host-profile query came from a pool worker
+  calibrated on that worker's own join, and could publish the result for
+  every process on the host.** `host_dispatch_profile` measures on the
+  thread that asks first. On a worker the draw's two-item joins go
+  through `join_in_worker`: the worker pushes the right half to its own
+  deque, runs the one-item left half and pops the right half back before
+  a parked peer can take it, so the dispatch cost timed an inline pass.
+  The module's chunk runner, `flynnel_run_chunks_v1`, starts its dispatch
+  on a worker by design, and two PowerShell processes running typed
+  blocks through it, one per edition, drew and confirmed a 100 ns record
+  in a Windows host's shared store. The store declines to displace a
+  cheaper record, so every honest draw after them was refused.
+
+  A first query on a worker now hands the draw to a helper thread
+  outside the pool and runs pool jobs until it ends, so the figure is an
+  outside caller's dispatch whichever thread asks, and a pool of one
+  worker still reaches the draw's dispatches through its own search. A
+  worker that cannot start the thread draws on itself, says so on stderr,
+  and does not store the draw. `LAYOUT_VERSION` is 9, which gives builds
+  carrying this a table of their own, so no record written by a build
+  without it is read.
+
+  `tests/calibration_first_asked_on_a_worker.rs` asks first from a worker
+  whose peers have parked, draws again from outside the pool in the same
+  process, and requires the worker's figure to reach half the outside
+  one. On a 16-vCPU Linux guest under the release-test profile it fails
+  on the previous commit in five runs of five (a worker's draw 131 to 180
+  ns against 1203 to 1303 from outside) and passes on this one in five of
+  five (1043 to 1202 against 1242 to 1372). A release-test build on the
+  24-thread Windows host drew 100 ns from a worker in four runs of five
+  on the previous commit. The gate runs the test under release-test,
+  since in a debug build the inline pass costs about what a dispatch
+  does.
+
 - **A monitor wait reported its own deadline as a wake.**
   `Parker::park_until` dispatched to the wait once and returned `true`
   whatever came back, but `UMWAIT` returns on its TSC deadline as well
