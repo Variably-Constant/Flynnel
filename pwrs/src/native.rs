@@ -57,8 +57,13 @@ pub type RunChunksV1 =
 ///
 /// Synchronous. A caller that has to stay responsive calls it once per
 /// batch and checks for cancellation between calls. The calling thread
-/// may run chunks itself while it waits, so a body runs on this
-/// module's workers and possibly on the caller's own thread.
+/// blocks for the call.
+///
+/// No body runs on the calling thread. The dispatch is started from one
+/// of this module's workers, so the probe that measures per-item cost
+/// and any job small enough to run inline both land on a worker, whose
+/// 8 MiB stack this module sets, rather than on the caller's, whose
+/// stack it neither sets nor knows.
 ///
 /// The dispatch keeps SMT siblings parked, as this crate does for any
 /// call site that is not one of its own classified kernel operations: a
@@ -89,25 +94,18 @@ pub unsafe extern "C" fn flynnel_run_chunks_v1(
         if n == 0 {
             return;
         }
-        let plan = flynnel::JobPlan::new(band_for(n), n.min(u32::MAX as usize) as u32);
-        // One zero-sized slot per index. The indexed helper splits a
-        // slice, and a slice of unit values carries the range and
-        // allocates nothing.
-        let mut slots = vec![(); n];
-        for_each_chunk_indexed_min_leaf(&plan, &mut slots, min_leaf.max(1), |start, chunk| {
-            if stop.load(Ordering::Acquire) != 0 {
-                return;
-            }
-            let code = body(ctx_addr as *const c_void, start, start + chunk.len());
-            if code != 0 {
-                match stop.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => {}
-                    // An earlier chunk stopped the run first, and the
-                    // first code is the one reported.
-                    Err(_earlier) => {}
-                }
-            }
-        });
+        // An explicit leaf shape with a batch of at least eight is the
+        // one plan pick_tier never routes Inline, so the pool always
+        // takes this join. Called from outside the pool the whole join
+        // is injected onto a worker and the caller blocks; called from a
+        // worker it runs where it already is.
+        let onto_a_worker =
+            flynnel::JobPlan::new(0, 8).with_leaf_shape(flynnel::LeafShape::PortCompute);
+        flynnel::join(
+            &onto_a_worker,
+            || dispatch_chunks(n, min_leaf, body, ctx_addr, &stop),
+            || (),
+        );
     }));
     match dispatched {
         Ok(()) => stop.load(Ordering::Acquire),
@@ -121,6 +119,32 @@ pub unsafe extern "C" fn flynnel_run_chunks_v1(
             RUN_CHUNKS_PANIC
         }
     }
+}
+
+/// The chunked dispatch itself, which [`flynnel_run_chunks_v1`] runs from
+/// a worker.
+///
+/// Records into `stop` the first nonzero code a body returns and skips
+/// every chunk that has not started by then.
+fn dispatch_chunks(n: usize, min_leaf: usize, body: ChunkBodyV1, ctx_addr: usize, stop: &AtomicI32) {
+    let plan = flynnel::JobPlan::new(band_for(n), n.min(u32::MAX as usize) as u32);
+    // One zero-sized slot per index. The indexed helper splits a slice,
+    // and a slice of unit values carries the range and allocates nothing.
+    let mut slots = vec![(); n];
+    for_each_chunk_indexed_min_leaf(&plan, &mut slots, min_leaf.max(1), |start, chunk| {
+        if stop.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let code = body(ctx_addr as *const c_void, start, start + chunk.len());
+        if code != 0 {
+            match stop.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {}
+                // An earlier chunk stopped the run first, and the first
+                // code is the one reported.
+                Err(_earlier) => {}
+            }
+        }
+    });
 }
 
 /// Where the native entry points are in the library that is loaded now,
@@ -170,7 +194,7 @@ impl Cmdlet for GetFlynnelNativeEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU8, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 
     /// Marks every index in its range once. The slice it marks is what
     /// `ctx` points at.
@@ -246,6 +270,52 @@ mod tests {
         };
         assert_eq!(code, 0);
         assert!((0..n).all(|i| seen[i].load(Ordering::Relaxed) == 1));
+    }
+
+    /// What a body needs to tell whether it ran on the thread that
+    /// called the export.
+    struct CallerCheck {
+        caller: std::thread::ThreadId,
+        ran_on_caller: AtomicBool,
+        covered: AtomicUsize,
+    }
+
+    extern "C" fn note_thread(ctx: *const c_void, start: usize, end: usize) -> i32 {
+        // SAFETY: the test passes a pointer to a live CallerCheck whose
+        // fields are atomics or read-only.
+        let check = unsafe { &*(ctx as *const CallerCheck) };
+        if std::thread::current().id() == check.caller {
+            check.ran_on_caller.store(true, Ordering::Relaxed);
+        }
+        check.covered.fetch_add(end - start, Ordering::Relaxed);
+        0
+    }
+
+    #[test]
+    fn no_body_runs_on_the_calling_thread() {
+        // The test harness's thread is not one of the pool's, so it
+        // stands where a foreign caller does. The sizes reach both ways a
+        // dispatch run from here could put a body on this thread: the
+        // probe that measures cost on a prefix, and a job small enough
+        // to run inline where it started.
+        for n in [1, 2, 7, 64, 1_000, 100_000] {
+            let check = CallerCheck {
+                caller: std::thread::current().id(),
+                ran_on_caller: AtomicBool::new(false),
+                covered: AtomicUsize::new(0),
+            };
+            // SAFETY: `check` outlives the call and note_thread reads it
+            // only through atomics.
+            let code = unsafe {
+                flynnel_run_chunks_v1(n, 1, note_thread, &check as *const CallerCheck as *const c_void)
+            };
+            assert_eq!(code, 0, "n = {n}");
+            assert_eq!(check.covered.load(Ordering::Relaxed), n, "coverage at n = {n}");
+            assert!(
+                !check.ran_on_caller.load(Ordering::Relaxed),
+                "a body ran on the calling thread at n = {n}"
+            );
+        }
     }
 
     #[test]

@@ -102,9 +102,14 @@ Describe 'Measure-FlynnelHybridJoin' {
     }
 
     It 'answers a finite checksum from each half' {
+        # Finite as neither NaN nor infinite. [double]::IsFinite exists
+        # only from .NET Core 2.1, so Windows PowerShell 5.1 on .NET
+        # Framework has no such method; the two it does have say the same.
         $r = Measure-FlynnelHybridJoin -Count 10000 -Operation Sqrt
-        [double]::IsFinite($r.CpuChecksum) | Should -BeTrue
-        [double]::IsFinite($r.BackendChecksum) | Should -BeTrue
+        foreach ($sum in $r.CpuChecksum, $r.BackendChecksum) {
+            [double]::IsNaN($sum) | Should -BeFalse
+            [double]::IsInfinity($sum) | Should -BeFalse
+        }
         $r.CpuChecksum | Should -BeGreaterThan 0
     }
 
