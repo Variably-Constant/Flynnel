@@ -291,12 +291,21 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   away. A yield with nothing else ready returns in about a microsecond,
   and one that loses the core returns a time slice later, so the pool's
   idle rounds, which yield with no latch pending, time their yields
-  while the switch is on, and one of 100 us or more marks the process
+  while the switch is on, and one of 2 ms or more marks the process
   oversubscribed for the next 10 ms. A join waiter whose spin budget is
-  spent parks while that mark is fresh and yields otherwise, so a quiet
-  process never parks one. `total_long_yields()` counts the readings.
-  Its quiet and loaded cost on bare metal and on a guest are being
-  measured, and it stays off until they are.
+  spent parks while that mark is fresh and yields otherwise.
+  `total_long_yields()` counts the readings and `yield_histogram()`
+  counts every timed yield in log2 buckets of microseconds.
+
+  The line is read from those buckets. On the 16-vCPU guest, processes
+  with no spinners saw 13 and 37 of about 7.9 million yields reach 2 ms,
+  and processes with 12 spinners saw 10,106 and 27,393 of about 7.3
+  million. A first line of 100 us did not separate them: the quiet
+  processes read about 1,970 each, because a guest's vCPU is descheduled
+  mid-yield often enough to look like a lost core, and parked 15,400 to
+  21,300 times at a quiet cost of about 6 per cent. Its quiet and loaded
+  cost at 2 ms, on bare metal and on a guest, are being measured, and it
+  stays off until they are.
 
 - Two trace events under `FLYNNEL_TRACE=1`. `LatchSet` (kind 20) comes
   just before a thief sets the latch of the stolen job it ran.

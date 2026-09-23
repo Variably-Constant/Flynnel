@@ -411,9 +411,11 @@ pub fn join_park() -> bool {
 /// and when it does, it comes back a time slice later rather than in a
 /// microsecond. So the pool's idle rounds, which yield with no latch
 /// pending, time their yields while this is on, and a long one is the
-/// reading. A quiet process never parks a join waiter, and a guest pays
-/// no hypervisor wake for a yield that would have cost nothing. What it
-/// adds while on is two clock reads around each idle yield.
+/// reading. A quiet process parks a join waiter only on the rare yield
+/// that a descheduled vCPU stretched past the line, and a guest pays no
+/// hypervisor wake for a yield that would have cost nothing. What it
+/// adds while on is two clock reads and one counter add around each idle
+/// yield.
 ///
 /// Off until measured, quiet and loaded, on bare metal and on a guest.
 pub fn join_park_oversubscribed() -> bool {

@@ -6,7 +6,9 @@
 //! thread's time slice ends, milliseconds later. So a long yield is a
 //! direct reading that another thread wanted this core, and it needs no
 //! count of threads or cores, which a process cannot see for the host
-//! it shares.
+//! it shares. How long counts as long is [`LONG_YIELD`], and it is set
+//! from measured lengths rather than from that argument alone, because
+//! on a guest a yield is also stretched by its vCPU being descheduled.
 //!
 //! The pool's idle rounds take the reading. They yield with no latch
 //! pending, so a yield that runs long there costs a worker nothing it
@@ -29,11 +31,21 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-/// A yield that took at least this long gave its core to another
-/// thread. A yield with nothing else ready is a system call of about a
-/// microsecond, and a time slice it loses to is a millisecond or more,
-/// so the line sits between them with room on either side.
-pub const LONG_YIELD: Duration = Duration::from_micros(100);
+/// A yield that took at least this long lost its core to another thread
+/// for a time slice.
+///
+/// Set from the lengths yields take, every one timed, in the
+/// oversubscribed caller on a 16-vCPU Linux guest. Two processes with no
+/// spinners saw 13 and 37 of about 7.9 million yields reach 2 ms; two
+/// with 12 spinners beside their 16 workers saw 10,106 of 7.4 million
+/// and 27,393 of 7.2 million.
+/// Lower lines do not separate the two: the quiet processes also held
+/// about 1,500 yields between 0.5 and 2 ms, and at 100 us they read about
+/// 1,970 long yields each and parked 15,400 to 21,300 times, which cost
+/// the quiet median about 6 per cent there. A guest's vCPU is descheduled
+/// mid-yield often enough to look like a lost core; a lost time slice is
+/// longer.
+pub const LONG_YIELD: Duration = Duration::from_millis(2);
 
 /// How long after a long yield the process still counts as
 /// oversubscribed.
