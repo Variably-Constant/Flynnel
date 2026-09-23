@@ -392,6 +392,9 @@ required-features = ["gpu-peer"]
 [[example]]
 name = "chunk_stack_headroom"
 
+[[example]]
+name = "oversubscribed_caller"
+
 [[bench]]
 name = "flynn_axes"
 harness = false
