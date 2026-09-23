@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use crate::sched::arena_local::{WorkerCtx, current_worker_ctx};
 use crate::sched::arena_numa::NumaArena;
 use crate::sched::job::{JobRef, NUMA_HINT_ANY, StackJob};
-use crate::sched::latch::{CoreLatch, LockLatch, SpinLatch};
+use crate::sched::latch::{JoinLatch, LockLatch, SpinLatch};
 use crate::sched::sleep::Parker;
 use crate::sched::plan::{JobPlan, SchedTier, pick_tier};
 use crate::numa_topology::numa_topology;
@@ -347,6 +347,33 @@ pub fn dispatch_trace_wait_snapshot() -> (u64, u64) {
     )
 }
 
+/// Join waits that reached the kernel park, process-wide.
+static JOIN_PARKS: AtomicU64 = AtomicU64::new(0);
+
+/// How many join waits have parked in the kernel since the process
+/// started, which is zero unless `FLYNNEL_LEVER_JOIN_PARK` is on. A run
+/// that sets the lever and reads zero here never reached the park.
+pub fn total_join_parks() -> u64 {
+    JOIN_PARKS.load(Relaxed)
+}
+
+/// Parks the calling worker until the half's latch is set or something
+/// else unparks its thread, through the latch's sleep handshake, so a set
+/// that lands before the park ends it rather than being missed. Returns
+/// with the latch set, or unset after a wake that was not its set, for
+/// the caller's loop to look for work again.
+fn park_for_half(latch: &JoinLatch) {
+    if !latch.core.get_sleepy() {
+        return;
+    }
+    if !latch.core.fall_asleep() {
+        return;
+    }
+    JOIN_PARKS.fetch_add(1, Relaxed);
+    let _unparked = latch.parker().park_until(|| latch.is_set());
+    latch.core.wake_up();
+}
+
 #[inline]
 fn join_in_worker<A, B, RA, RB>(
     ctx: &WorkerCtx,
@@ -361,20 +388,17 @@ where
     RA: Send,
     RB: Send,
 {
-    // Per-fork latch: CoreLatch, not SpinLatch. A SpinLatch here
-    // (parker.unpark on Latch::set) measures 1.5-1.8x slower on
-    // bisect-heavy real-world workloads because the same Parker
-    // is shared with worker_loop's idle-sleep path: peer-wake
-    // calls from arena_local::wake_one_peer (legitimately
-    // targeting the worker_loop idle sleeper) collide with the
-    // SpinLatch-park waiter, ~1us of spurious wake per collision,
-    // compounded across the 32-fork bisect depth typical at that
-    // shape. The wait loop below peer-helps via find_work and
-    // does not reach a park branch on those workloads. SpinLatch
-    // fits sites that own a dedicated Parker not shared with the
-    // worker pool's idle-sleep coordinator; the join_in_worker
-    // wait loop is not one of those sites.
-    let job_b = StackJob::new(b, CoreLatch::new());
+    // Per-fork latch: a JoinLatch. The thief sets it, and it unparks
+    // this worker's join parker when the worker parked on it, which
+    // only the idle round below does and only under
+    // levers::join_park. It names the parker by address, so a set pays
+    // one pointer load and no Arc clone. A SpinLatch parked on the
+    // pool's idle Parker measured 1.5-1.8x slower on bisect-heavy work:
+    // wake_one_peer's wakes for the idle sleeper landed on join waiters
+    // at about 1 us each. The join parker is a separate Parker, but both
+    // park this thread, so such a wake still ends a join park, and the
+    // waiter then looks for work, which is what the wake was for.
+    let job_b = StackJob::new(b, JoinLatch::new(&ctx.join_parker));
     // SAFETY: job_b lives on this stack frame; the latch-wait
     // below keeps it alive until the worker finishes touching it.
     let job_b_ref = unsafe {
@@ -544,11 +568,22 @@ where
             // would only deny a core to the thief running it.
             let idle_since = idle_since.get_or_insert_with(std::time::Instant::now);
             if idle_since.elapsed().as_nanos() >= u128::from(spin_budget_ns) {
-                let yield_started = crate::sched::trace::is_enabled().then(std::time::Instant::now);
-                std::thread::yield_now();
-                if let Some(started) = yield_started {
-                    let us = started.elapsed().as_micros().min(u128::from(u32::MAX));
-                    last_yield_us = Some(us as u32);
+                // Under the lever a worker parks in the kernel until the
+                // thief sets the half's latch, because a yield among more
+                // runnable threads than cores gives the core away for the
+                // rest of another thread's time slice. An external slot
+                // yields as before: its join parker belongs to the
+                // arena's thread, not the caller's.
+                if !ctx.is_external_slot && crate::sched::levers::join_park() {
+                    park_for_half(&job_b.latch);
+                } else {
+                    let yield_started =
+                        crate::sched::trace::is_enabled().then(std::time::Instant::now);
+                    std::thread::yield_now();
+                    if let Some(started) = yield_started {
+                        let us = started.elapsed().as_micros().min(u128::from(u32::MAX));
+                        last_yield_us = Some(us as u32);
+                    }
                 }
             } else {
                 std::hint::spin_loop();
@@ -659,9 +694,13 @@ where
         // caller-as-worker's eager own-pop loses the race vs
         // broadcast-wake + primary steal. Caller-parks-while-
         // primary-runs is strictly better for the cold-cache case.
-        let parker = Arc::new(Parker::new(
-            crate::sched::arena_local::LOCAL_SPIN_ROUNDS,
-        ));
+        // Under levers::slot_park_now the parker takes no yield rounds,
+        // since the loop below has already spun for the plan's budget.
+        let parker = Arc::new(Parker::new(if crate::sched::levers::slot_park_now() {
+            0
+        } else {
+            crate::sched::arena_local::LOCAL_SPIN_ROUNDS
+        }));
         let job = StackJob::new(
             move |_stolen: bool| -> (RA, RB) {
                 let primary_ctx_ptr = current_worker_ctx();

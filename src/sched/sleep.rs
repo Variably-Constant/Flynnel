@@ -995,7 +995,8 @@ impl Parker {
 
     /// Construct a Parker pinned to one wait strategy, which the
     /// controller will not move. Used by benches and tests that need
-    /// one arm held still.
+    /// one arm held still, and by each worker's join parker, whose wait
+    /// must leave the core rather than hold it.
     ///
     /// Callers must not pass a strategy this host cannot execute:
     /// [`WaitStrategy::Waitpkg`] without

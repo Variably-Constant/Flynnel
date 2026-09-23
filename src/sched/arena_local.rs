@@ -210,6 +210,13 @@ pub(crate) struct WorkerCtx {
     /// no atomic contention with peers). Only external slots
     /// re-route to the injector.
     pub(crate) is_external_slot: bool,
+    /// This worker's parker for join waits: pinned to the kernel park
+    /// with no yield rounds, and unparked by the thief that sets a
+    /// forked half's [`crate::sched::latch::JoinLatch`]. Built on the
+    /// owning thread, so it parks and wakes that thread. An external
+    /// slot's context is built on the arena's thread instead, so its
+    /// join parker is never parked on.
+    pub(crate) join_parker: Parker,
 }
 
 // NOTE: WorkerCtx deliberately carries no `PrivateLifoDeque`
@@ -1366,6 +1373,7 @@ impl LocalArena {
                 sleep: Arc::clone(&sleep_arc),
                 last_victim: Cell::new(usize::MAX),
                 is_external_slot: true,
+                join_parker: Parker::with_strategy(0, crate::sched::sleep::WaitStrategy::StdPark),
             };
             external_slots.push(Arc::new(ExternalSlot {
                 claimed: AtomicBool::new(false),
@@ -2073,6 +2081,7 @@ fn worker_loop(
         sleep,
         last_victim: Cell::new(usize::MAX),
         is_external_slot: false,
+        join_parker: Parker::with_strategy(0, crate::sched::sleep::WaitStrategy::StdPark),
     };
     // SAFETY: ctx lives on this stack frame until clear_current_worker_ctx()
     // runs at the bottom of the function. No other thread reads our

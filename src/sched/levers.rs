@@ -16,8 +16,8 @@
 //!
 //! Three have earned it: [`calibration_refusal`], [`oncore_spread`] and
 //! [`allowed_width`] default on, and the reading is on each function.
-//! The other two are off and say what would have to be measured for
-//! that to change.
+//! The rest are off and say what would have to be measured for that to
+//! change.
 //!
 //! # Why environment variables rather than features
 //!
@@ -354,6 +354,39 @@ pub fn latch_monitor() -> bool {
 pub fn mailbox_wake_legacy() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| read("FLYNNEL_LEVER_MAILBOX_WAKE_LEGACY"))
+}
+
+/// Give the outside caller's slot-wait parker no yield rounds, so a
+/// caller whose spin budget is spent goes from the sleep handshake
+/// straight to the park.
+///
+/// A yield while the process holds more runnable threads than cores
+/// hands the core to a ready thread for the rest of that thread's time
+/// slice, so a latch set during the yield rounds is seen late. On pc2 at
+/// 13be54b, with 18 spinners beside 24 workers, 97 of 104 slow calls
+/// ended their wait inside those rounds, a median 12.6 ms after their
+/// job ended, and the callers that had reached the park woke in 2 to
+/// 7 us. Off until measured on a quiet host too, where a wait that the
+/// yield rounds would have caught pays a park and a wake instead.
+pub fn slot_park_now() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| read("FLYNNEL_LEVER_SLOT_PARK_NOW"))
+}
+
+/// Park a worker whose stolen right half is still running, once its
+/// spin budget is spent and it finds nothing to steal, in a kernel wait
+/// that the thief ends by setting the half's latch, instead of yielding
+/// each round.
+///
+/// The same cause as [`slot_park_now`], inside the join: on pc2 at
+/// 13be54b every slow call whose join ran on for a millisecond or more
+/// after its last leaf had a waiter whose last yield covered most of
+/// that time after its latch was set. Off until measured: the park and
+/// its wake are system calls a quiet host did not pay, and a parked
+/// waiter steals nothing until something wakes it.
+pub fn join_park() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| read("FLYNNEL_LEVER_JOIN_PARK"))
 }
 
 /// Spend an idle pool worker's spin rounds in a bounded monitor wait on

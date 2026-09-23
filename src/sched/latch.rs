@@ -282,6 +282,73 @@ impl Latch for SpinLatch {
     }
 }
 
+/// The latch of a join's right half: a [`CoreLatch`] plus the parker of
+/// the worker that forked it, so the thief that sets it can wake that
+/// worker when it parked to wait.
+///
+/// The parker is held by address, not by `Arc`. It is the waiting
+/// worker's own and lives in that worker's context for the worker's
+/// whole life, which outlasts every join the worker is inside, so the
+/// setter reads one pointer on every set where [`SpinLatch`] pays an
+/// `Arc` clone.
+pub struct JoinLatch {
+    /// State machine underlying this wake-capable wrapper.
+    pub core: CoreLatch,
+    /// The forking worker's join parker.
+    parker: core::ptr::NonNull<crate::sched::sleep::Parker>,
+}
+
+// SAFETY: the parker pointer is dereferenced only to call
+// `Parker::unpark`, which takes `&self` on a type that is itself `Sync`,
+// and the parker outlives the latch as the type's doc states.
+unsafe impl Send for JoinLatch {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for JoinLatch {}
+
+impl JoinLatch {
+    /// A fresh latch whose set wakes `parker` when its owner parked on it.
+    /// `parker` must outlive every set of this latch.
+    #[inline]
+    pub fn new(parker: &crate::sched::sleep::Parker) -> Self {
+        Self {
+            core: CoreLatch::new(),
+            parker: core::ptr::NonNull::from(parker),
+        }
+    }
+
+    /// Forwarded test for is_set on the underlying CoreLatch.
+    #[inline]
+    pub fn is_set(&self) -> bool {
+        self.core.is_set()
+    }
+
+    /// The parker this latch wakes.
+    #[inline]
+    pub fn parker(&self) -> &crate::sched::sleep::Parker {
+        // SAFETY: the constructor's contract keeps the parker alive for
+        // as long as the latch is in use.
+        unsafe { self.parker.as_ref() }
+    }
+}
+
+impl Latch for JoinLatch {
+    #[inline]
+    unsafe fn set(this: *const Self) {
+        // SAFETY: the pointer is read before the publishing store, and
+        // the parker it names outlives the latch, so the wake below is
+        // sound after the owner has observed SET and dropped `*this`.
+        let parker = unsafe { (*this).parker };
+        // SAFETY: the trait method's `# Safety` clause forwards the
+        // validity-of-`this` precondition; the inner set honors the
+        // publish-then-invalidate contract.
+        let was_sleeping = unsafe { CoreLatch::set(&(*this).core) };
+        if was_sleeping {
+            // SAFETY: as above, the parker outlives the latch.
+            unsafe { parker.as_ref() }.unpark();
+        }
+    }
+}
+
 /// N-participant wake-capable latch. The inner `CoreLatch` only
 /// transitions to `SET` when a counter reaches zero; each
 /// `Latch::set` call decrements the counter. The publisher whose
@@ -751,6 +818,65 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn join_latch_wakes_its_parked_owner() {
+        // The owner builds its parker and the latch on its own thread
+        // and parks through the handshake; the set, from another thread,
+        // must end the park. The parker is leaked, as a worker's join
+        // parker outlives every latch that names it. A wake that is not
+        // the set parks again, so only the set's unpark can let the
+        // owner finish inside the bound.
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<Arc<JoinLatch>>();
+
+        let waiter = thread::spawn(move || {
+            let parker: &'static crate::sched::sleep::Parker =
+                Box::leak(Box::new(crate::sched::sleep::Parker::with_strategy(
+                    0,
+                    crate::sched::sleep::WaitStrategy::StdPark,
+                )));
+            let latch = Arc::new(JoinLatch::new(parker));
+            tx.send(latch.clone()).unwrap();
+            while !latch.is_set() {
+                if latch.core.get_sleepy() && latch.core.fall_asleep() {
+                    let _unparked: bool = latch.parker().park_until(|| latch.is_set());
+                }
+                latch.core.wake_up();
+            }
+        });
+
+        let latch = rx.recv().expect("waiter must send latch");
+        thread::sleep(Duration::from_millis(50));
+        unsafe { Latch::set(&*latch) };
+
+        let t0 = Instant::now();
+        loop {
+            if waiter.is_finished() {
+                waiter.join().unwrap();
+                break;
+            }
+            if t0.elapsed() > Duration::from_secs(5) {
+                panic!("owner did not wake within 5s after the JoinLatch was set");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn join_latch_set_before_any_park_refuses_the_handshake() {
+        let parker = crate::sched::sleep::Parker::with_strategy(
+            0,
+            crate::sched::sleep::WaitStrategy::StdPark,
+        );
+        let latch = JoinLatch::new(&parker);
+        unsafe { Latch::set(&latch) };
+        assert!(latch.is_set());
+        assert!(
+            !latch.core.get_sleepy(),
+            "a set latch must not let its owner park"
+        );
     }
 
     #[test]
