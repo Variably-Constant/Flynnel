@@ -155,12 +155,19 @@ if (-not $commitDescribesModule) {
     Write-Host '  against it is comparing harnesses rather than builds.'
 }
 
+# The platform, read without naming $IsWindows or $IsLinux: Windows
+# PowerShell 5.1 defines neither, and strict mode throws on reading a
+# variable that was never set.
+$onWindows = $PSVersionTable.PSEdition -eq 'Desktop' -or
+    [bool](Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue)
+$onLinux = [bool](Get-Variable -Name IsLinux -ValueOnly -ErrorAction SilentlyContinue)
+$platform = if ($onWindows) { 'Windows' } elseif ($onLinux) { 'Linux' } else { 'Other' }
+
 $hostInfo = [PSCustomObject]@{
     Machine        = [Environment]::MachineName
     Edition        = $PSVersionTable.PSEdition
     Version        = $PSVersionTable.PSVersion.ToString()
-    Platform       = if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') { 'Windows' }
-                     elseif ($IsLinux) { 'Linux' } else { 'Other' }
+    Platform       = $platform
     ProcessorCount = [Environment]::ProcessorCount
     Commit         = $commit
     Dirty          = $dirty
@@ -186,7 +193,7 @@ function Measure-Cell {
         $sw.Stop()
         $samples[$i] = $sw.Elapsed.TotalMilliseconds
     }
-    $sorted = $samples | Sort-Object
+    $sorted = @($samples | Sort-Object)
     [PSCustomObject]@{
         MedianMs = $sorted[[int]($Repeats / 2)]
         MinMs    = $sorted[0]
@@ -221,8 +228,8 @@ $script:Burners = @()
 # unconditionally ends the run before a single cell is timed. That is
 # how this arm first failed on the Linux guest: eight burners asked
 # for, none started, and the whole bench gone at the load arm.
-$script:BurnerShell = if ($IsWindows -or $null -eq $IsWindows) { 'powershell' } else { 'pwsh' }
-$script:BurnerHides = $IsWindows -or $null -eq $IsWindows
+$script:BurnerShell = if ($onWindows) { 'powershell' } else { 'pwsh' }
+$script:BurnerHides = $onWindows
 
 function Start-Burners {
     if ($LoadThreads -le 0) { return }
@@ -259,8 +266,12 @@ function Stop-Burners {
 # replaces the diagnostic with a word that names nothing. The first
 # version of this trap did exactly that and cost a whole bench run's
 # evidence.
+#
+# The trap covers the whole script, lines above Stop-Burners' definition
+# included, so it calls the function only once it exists; otherwise the
+# missing function's error would replace the one being reported.
 trap {
-    Stop-Burners
+    if (Get-Command -Name Stop-Burners -CommandType Function -ErrorAction SilentlyContinue) { Stop-Burners }
     Write-Host ("FAULT " + $_.Exception.GetType().Name + ": " + $_.Exception.Message)
     Write-Host ("FAULT_AT " + $_.InvocationInfo.PositionMessage)
     throw $_
@@ -320,7 +331,10 @@ while ($warmClock.Elapsed.TotalSeconds -lt $WarmupMaxSeconds) {
         $samples += $one.Elapsed.TotalMilliseconds
     }
     $block.Stop()
-    $sorted = $samples | Sort-Object
+    # A block that fits one call of the anchor holds one sample, and a
+    # sort of one element yields a scalar, which has no Count under
+    # strict mode.
+    $sorted = @($samples | Sort-Object)
     $warmBlocks += $sorted[[int]($sorted.Count / 2)]
     if ($warmBlocks.Count -ge 2) {
         $a = $warmBlocks[-2]
@@ -721,9 +735,13 @@ $controlDriftPct = if ($controlFirst.MedianMs -gt 0) {
 # keyed by commit and the comparison is to the most recent entry from a
 # different one. Comparing to the same commit would measure the box,
 # which the control already does.
+#
+# Windows PowerShell 5.1's ConvertFrom-Json writes a JSON array as one
+# object where PowerShell 7 enumerates it; ForEach-Object unrolls it in
+# both, so each store reads back as its records.
 $store = @()
 if (Test-Path $AnchorStore) {
-    $store = @(Get-Content -LiteralPath $AnchorStore -Raw | ConvertFrom-Json)
+    $store = @(Get-Content -LiteralPath $AnchorStore -Raw | ConvertFrom-Json | ForEach-Object { $_ })
 }
 $previous = $store |
     Where-Object { $_.Commit -ne $commit -and $_.Machine -eq $hostInfo.Machine -and
@@ -777,7 +795,7 @@ foreach ($row in $rows) {
 # their properties.
 $runRows = @()
 if (Test-Path $RunStore) {
-    $runRows = @(Get-Content -LiteralPath $RunStore -Raw | ConvertFrom-Json)
+    $runRows = @(Get-Content -LiteralPath $RunStore -Raw | ConvertFrom-Json | ForEach-Object { $_ })
 }
 $runId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
 foreach ($row in $rows) {
