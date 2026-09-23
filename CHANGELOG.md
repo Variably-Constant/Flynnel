@@ -668,11 +668,11 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   And the join waiter's round after its spin budget grew with the park
   and timed-yield paths inside every instantiation of `join_in_worker`;
   that round is now one out-of-line, cold, non-generic function. Against
-  the release before the levers the fixed tree reads 0.9934 over 40
-  paired trials, 22 below parity, so no cost is resolved; against the
-  levers' own tip the latch placement alone reads 1.0246, faster in 13
-  trials of 15. An 8-core desktop's pairs spread too widely to resolve
-  any of the three comparisons, the original cost included.
+  the release before the levers the fixed tree still reads 0.9884 over
+  40 paired trials, slower in 30, so these two changes recover about a
+  fifth of the cost and about 1.2 per cent remains. An 8-core desktop's
+  pairs spread too widely to resolve any of the three comparisons, the
+  original cost included.
 
 - **A process whose first host-profile query came from a pool worker
   calibrated on that worker's own join, and could publish the result for
