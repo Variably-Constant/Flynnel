@@ -272,10 +272,12 @@ fn main() {
         flynnel::total_sleepless_backoffs()
     );
     println!(
-        "JOIN_PARKS {} join_park={} slot_park_now={}",
+        "JOIN_PARKS {} join_park={} slot_park_now={} join_park_oversubscribed={} long_yields={}",
         flynnel::total_join_parks(),
         flynnel::sched::levers::join_park(),
-        flynnel::sched::levers::slot_park_now()
+        flynnel::sched::levers::slot_park_now(),
+        flynnel::sched::levers::join_park_oversubscribed(),
+        flynnel::total_long_yields()
     );
     std::hint::black_box(&data);
 }

@@ -785,7 +785,10 @@ impl Sleep {
 
     /// One idle round: a bounded monitor wait on the counters word where
     /// [`crate::sched::levers::spin_monitor`] is on and the host has a
-    /// monitor that holds, a `yield_now` otherwise.
+    /// monitor that holds, a `yield_now` otherwise. Under
+    /// [`crate::sched::levers::join_park_oversubscribed`] the yield is
+    /// timed, because an idle worker has no latch pending and so can take
+    /// the reading of whether the process is oversubscribed for nothing.
     ///
     /// The wait watches the line a producer stores to when it posts
     /// work, so the round ends when work arrives rather than when the
@@ -822,7 +825,11 @@ impl Sleep {
                 }
             }
         }
-        thread::yield_now();
+        if crate::sched::levers::join_park_oversubscribed() {
+            crate::sched::oversubscription::timed_yield();
+        } else {
+            thread::yield_now();
+        }
     }
 
     /// Worker-side: called when one search round produced no

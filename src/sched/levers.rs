@@ -366,8 +366,12 @@ pub fn mailbox_wake_legacy() -> bool {
 /// 13be54b, with 18 spinners beside 24 workers, 97 of 104 slow calls
 /// ended their wait inside those rounds, a median 12.6 ms after their
 /// job ended, and the callers that had reached the park woke in 2 to
-/// 7 us. Off until measured on a quiet host too, where a wait that the
-/// yield rounds would have caught pays a park and a wake instead.
+/// 7 us.
+///
+/// Off: measured to change nothing. In four arms of the oversubscribed
+/// caller, on pc2 at faa0d05 and on a 16-vCPU guest at 517dba9, this arm
+/// sat with the arm that had no switch on, quiet and loaded, and adding
+/// it to [`join_park`] moved nothing that arm had not.
 pub fn slot_park_now() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| read("FLYNNEL_LEVER_SLOT_PARK_NOW"))
@@ -381,12 +385,40 @@ pub fn slot_park_now() -> bool {
 /// The same cause as [`slot_park_now`], inside the join: on pc2 at
 /// 13be54b every slow call whose join ran on for a millisecond or more
 /// after its last leaf had a waiter whose last yield covered most of
-/// that time after its latch was set. Off until measured: the park and
-/// its wake are system calls a quiet host did not pay, and a parked
-/// waiter steals nothing until something wakes it.
+/// that time after its latch was set.
+///
+/// Off, and measured not to be never-slower. On pc2 at faa0d05, with 18
+/// spinners beside 24 workers, it took a loaded dispatch's median from
+/// 3.02 to 0.95 ms and its p99 from 31.3 to 1.8 ms, at no quiet cost.
+/// On a 16-vCPU guest at 517dba9 it raised the quiet median from about
+/// 1.3 to 3.1 ms in each of three rounds, with the serial control level
+/// across the arms: a parked thread halts its vCPU, and the wake through
+/// the hypervisor costs far more than the yield it replaced.
+/// [`join_park_oversubscribed`] parks only where a yield would lose the
+/// core.
 pub fn join_park() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| read("FLYNNEL_LEVER_JOIN_PARK"))
+}
+
+/// Park a join waiter whose spin budget is spent in the kernel, as
+/// [`join_park`] does, but only while a yield somewhere in the process
+/// has given its core away within the last
+/// [`crate::sched::oversubscription::WINDOW`]; otherwise yield as the
+/// shipped code does.
+///
+/// A yield loses the core only when another thread is ready to take it,
+/// and when it does, it comes back a time slice later rather than in a
+/// microsecond. So the pool's idle rounds, which yield with no latch
+/// pending, time their yields while this is on, and a long one is the
+/// reading. A quiet process never parks a join waiter, and a guest pays
+/// no hypervisor wake for a yield that would have cost nothing. What it
+/// adds while on is two clock reads around each idle yield.
+///
+/// Off until measured, quiet and loaded, on bare metal and on a guest.
+pub fn join_park_oversubscribed() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| read("FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED"))
 }
 
 /// Spend an idle pool worker's spin rounds in a bounded monitor wait on
@@ -488,7 +520,8 @@ pub fn describe() -> String {
     format!(
         "oncore_spread={} batch_weight={} smt_window={} allowed_width={} \
          calibration_refusal={} latch_monitor={} spin_monitor={} join_park={} \
-         slot_park_now={} spin_adaptive={} spin_window={} serve_policy={:?} occupancy_floor={}",
+         join_park_oversubscribed={} slot_park_now={} spin_adaptive={} spin_window={} \
+         serve_policy={:?} occupancy_floor={}",
         oncore_spread(),
         batch_weight(),
         smt_from_window(),
@@ -497,6 +530,7 @@ pub fn describe() -> String {
         latch_monitor(),
         spin_monitor(),
         join_park(),
+        join_park_oversubscribed(),
         slot_park_now(),
         crate::sched::spin_adaptive(),
         crate::sched::spin_window(),

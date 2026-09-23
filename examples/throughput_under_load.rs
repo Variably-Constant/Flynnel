@@ -356,7 +356,7 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
          window_ticks={} class={:?} workers={} allowed={} smt={} \
          smt_declined={} smt_allowed={} \
          spin_adaptive={} spin_window={} spin_adapts={} idle_yields={} \
-         join_park={} join_parks={} slot_park_now={}",
+         join_park={} join_parks={} slot_park_now={} join_park_oversubscribed={} long_yields={}",
         site.leaf_count(),
         site.oncore_items(),
         reading(site.per_item_ns()),
@@ -379,6 +379,8 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
         flynnel::sched::levers::join_park(),
         flynnel::total_join_parks(),
         flynnel::sched::levers::slot_park_now(),
+        flynnel::sched::levers::join_park_oversubscribed(),
+        flynnel::total_long_yields(),
     );
 }
 

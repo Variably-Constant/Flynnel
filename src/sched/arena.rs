@@ -568,14 +568,28 @@ where
             // would only deny a core to the thief running it.
             let idle_since = idle_since.get_or_insert_with(std::time::Instant::now);
             if idle_since.elapsed().as_nanos() >= u128::from(spin_budget_ns) {
-                // Under the lever a worker parks in the kernel until the
-                // thief sets the half's latch, because a yield among more
-                // runnable threads than cores gives the core away for the
-                // rest of another thread's time slice. An external slot
-                // yields as before: its join parker belongs to the
-                // arena's thread, not the caller's.
-                if !ctx.is_external_slot && crate::sched::levers::join_park() {
+                // Under either park lever a worker parks in the kernel
+                // until the thief sets the half's latch, because a yield
+                // among more runnable threads than cores gives the core
+                // away for the rest of another thread's time slice.
+                // join_park parks always; join_park_oversubscribed only
+                // while some yield in the process has lately lost its
+                // core, and otherwise times this yield, so the waiter's
+                // own reading counts as well. An external slot yields as
+                // before: its join parker belongs to the arena's thread,
+                // not the caller's.
+                let reading = crate::sched::levers::join_park_oversubscribed();
+                if !ctx.is_external_slot
+                    && (crate::sched::levers::join_park()
+                        || (reading && crate::sched::oversubscription::recently()))
+                {
                     park_for_half(&job_b.latch);
+                } else if reading {
+                    let took = crate::sched::oversubscription::timed_yield();
+                    if crate::sched::trace::is_enabled() {
+                        let us = took.as_micros().min(u128::from(u32::MAX));
+                        last_yield_us = Some(us as u32);
+                    }
                 } else {
                     let yield_started =
                         crate::sched::trace::is_enabled().then(std::time::Instant::now);

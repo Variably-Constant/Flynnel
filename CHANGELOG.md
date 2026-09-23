@@ -9,6 +9,10 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- `external_dispatch`'s documentation says what the caller does: it
+  hands the join to a worker, spins for the plan's budget, then parks
+  until the latch sets, and runs none of the join's work itself.
+
 - The parker records what it did, under `FLYNNEL_TRACE=1`. `ParkEnter`
   (kind 14) on every park, payload the strategy it chose - 0 kernel
   park, 1 WAITPKG, 2 MONITORX - plus 16 when that park is one half of a
@@ -254,6 +258,63 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   occupancy, which cannot exceed 1000.
 
 ### Added
+
+- `FLYNNEL_LEVER_JOIN_PARK` and `FLYNNEL_LEVER_SLOT_PARK_NOW`, both off.
+  A thread that waits by calling `yield_now` while its process holds
+  more runnable threads than cores gives its core to a ready thread for
+  the rest of that thread's time slice, and sees a latch already set
+  milliseconds late. On a 24-thread Windows host, with 18 spinning
+  threads in the process, an outside caller's dispatch of 1e6 items
+  finished every leaf within about 1 to 3 ms and completed as much as
+  30 ms later, at a loaded p99 of 33.9 ms against a quiet 1.44.
+  `JOIN_PARK` parks a join waiter in the kernel once its spin budget is
+  spent and it finds nothing to steal, and the thief that sets the right
+  half's latch wakes it. `SLOT_PARK_NOW` takes the yield rounds out of
+  the outside caller's slot wait, which has already spun for its budget.
+  The right half's latch is a `JoinLatch`, which names the forking
+  worker's own parker by address, so a set reads one pointer and clones
+  no `Arc`. `total_join_parks()` counts the parks, so a run can show it
+  reached them.
+
+  Both stay off, on four arms of that reproducer (neither, each, both;
+  three rounds, positions rotating). On the 24-thread host `JOIN_PARK`
+  took the loaded median from 3.02 to 0.95 ms and the p99 from 31.3 to
+  1.8 ms, with calls of 5 ms or more falling from 211 to none, at no
+  quiet cost: 0.468 ms against 0.471. On a 16-vCPU Linux guest it raised
+  the quiet median from about 1.3 to 3.1 ms in each round, with the
+  serial control level across the arms, because a parked thread halts
+  its vCPU and the wake through the hypervisor costs far more than the
+  yield it replaced. `SLOT_PARK_NOW` moved nothing on either host.
+
+- `FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED`, off: the join park, taken
+  only while a yield somewhere in the process has lately given its core
+  away. A yield with nothing else ready returns in about a microsecond,
+  and one that loses the core returns a time slice later, so the pool's
+  idle rounds, which yield with no latch pending, time their yields
+  while the switch is on, and one of 100 us or more marks the process
+  oversubscribed for the next 10 ms. A join waiter whose spin budget is
+  spent parks while that mark is fresh and yields otherwise, so a quiet
+  process never parks one. `total_long_yields()` counts the readings.
+  Its quiet and loaded cost on bare metal and on a guest are being
+  measured, and it stays off until they are.
+
+- Two trace events under `FLYNNEL_TRACE=1`. `LatchSet` (kind 20) comes
+  just before a thief sets the latch of the stolen job it ran.
+  `JoinLastYield` (21) comes before the `JoinWaitEnd` of a join wait
+  that yielded, with payload the last yield's length in microseconds.
+  A last yield that spans the awaited half's `LatchSet` is a waiter
+  that was away while its latch was set, which is how the case above
+  was told apart from a thief that set its latch late.
+
+- `total_self_rescues()`, `total_park_events()` and
+  `total_rescue_events()`: how pool workers leave the idle path, whether
+  parking, rescued inside the spin window, or rescued by the recheck
+  after publishing sleep.
+
+- `examples/oversubscribed_caller`: an outside caller's dispatch timed
+  with and without spinning threads in the same process, beside the
+  same work run serially, reporting the tail. With `FLYNNEL_TRACE=1` it
+  dumps every thread's trace so a slow call can be split.
 
 - **`MONITORX`/`MWAITX`, so AMD parts before Zen 5 stop falling back
   to the kernel.** `cpu_info::has_monitorx` reads CPUID `Fn8000_0001`
