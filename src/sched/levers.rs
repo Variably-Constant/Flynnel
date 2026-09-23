@@ -487,8 +487,8 @@ pub fn calibration_refusal() -> bool {
 pub fn describe() -> String {
     format!(
         "oncore_spread={} batch_weight={} smt_window={} allowed_width={} \
-         calibration_refusal={} latch_monitor={} spin_monitor={} spin_adaptive={} \
-         spin_window={} serve_policy={:?} occupancy_floor={}",
+         calibration_refusal={} latch_monitor={} spin_monitor={} join_park={} \
+         slot_park_now={} spin_adaptive={} spin_window={} serve_policy={:?} occupancy_floor={}",
         oncore_spread(),
         batch_weight(),
         smt_from_window(),
@@ -496,6 +496,8 @@ pub fn describe() -> String {
         calibration_refusal(),
         latch_monitor(),
         spin_monitor(),
+        join_park(),
+        slot_park_now(),
         crate::sched::spin_adaptive(),
         crate::sched::spin_window(),
         serve_policy(),

@@ -271,5 +271,11 @@ fn main() {
         flynnel::total_self_rescues(),
         flynnel::total_sleepless_backoffs()
     );
+    println!(
+        "JOIN_PARKS {} join_park={} slot_park_now={}",
+        flynnel::total_join_parks(),
+        flynnel::sched::levers::join_park(),
+        flynnel::sched::levers::slot_park_now()
+    );
     std::hint::black_box(&data);
 }
