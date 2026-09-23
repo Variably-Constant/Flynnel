@@ -552,11 +552,13 @@ where
 /// Slow-path body: dispatch a join from outside the worker pool.
 ///
 /// Builds a single wrapper [`StackJob`] whose closure runs the
-/// entire `join_in_worker(ctx, plan, a, b)` body, injects it into
-/// the NUMA arena, and waits on its latch. While waiting the
-/// caller thread participates in work-stealing via
-/// `arena.try_run_one`, which keeps the pool fed when the
-/// scheduler has no other sleepers.
+/// entire `join_in_worker(ctx, plan, a, b)` body, hands it to the
+/// pool, and waits on its latch. The caller runs none of the join's
+/// work: a worker takes the wrapper and the rest of the pool steals
+/// from it, while the caller spins for the plan's budget and then
+/// parks until the latch sets. So the call returns only once every
+/// leaf has finished, including one whose worker the OS has
+/// preempted.
 ///
 /// Every recursive `sched::join` issued from inside `a` or `b`
 /// will then be inside a worker context and use the fast path.
