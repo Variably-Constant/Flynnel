@@ -304,6 +304,86 @@ Describe 'New-FlynnelGpuPeerConfig' {
     }
 }
 
+Describe '[Flynnel.GpuPeerConfig]::new' {
+    # The constructor and the cmdlet run the same Rust function, so a
+    # config built either way must agree on every property. One case per
+    # arity, from none to all twelve, each setting only its last
+    # argument, so a positional slot bound to the wrong field shows as
+    # a difference.
+
+    It 'builds what New-FlynnelGpuPeerConfig builds from <Name>' -TestCases @(
+        @{ Name = 'no arguments'
+           Ctor = { [Flynnel.GpuPeerConfig]::new() }
+           Cmdlet = { New-FlynnelGpuPeerConfig } }
+        @{ Name = 'a region path'
+           Ctor = { [Flynnel.GpuPeerConfig]::new('peer-region.bin') }
+           Cmdlet = { New-FlynnelGpuPeerConfig -RegionPath 'peer-region.bin' } }
+        @{ Name = 'a lane count'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, 8) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -Lanes 8 } }
+        @{ Name = 'a slot size'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, $null, 8192) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -SlotBytes 8192 } }
+        @{ Name = 'slots per lane'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, $null, $null, 48) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -SlotsPerLane 48 } }
+        @{ Name = 'a quantum'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, $null, $null, $null, 333333) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -QuantumNs 333333 } }
+        @{ Name = 'a barrier deadline'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, $null, $null, $null, $null, 7777777) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -BarrierDeadlineNs 7777777 } }
+        @{ Name = 'an idle exit'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, $null, $null, $null, $null, $null, 5555555) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -IdleExitNs 5555555 } }
+        @{ Name = 'a device ordinal'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, $null, $null, $null, $null, $null, $null, 3) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -DeviceOrdinal 3 } }
+        @{ Name = 'a VRAM block size'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, $null, $null, $null, $null, $null, $null,
+                        $null, 131072) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -VramBlockBytes 131072 } }
+        @{ Name = 'a VRAM block count'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, $null, $null, $null, $null, $null, $null,
+                        $null, $null, 96) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -VramBlocks 96 } }
+        @{ Name = 'blocks per lane'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, $null, $null, $null, $null, $null, $null,
+                        $null, $null, $null, 5) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -BlocksPerLane 5 } }
+        @{ Name = 'per-lane team widths'
+           Ctor = { [Flynnel.GpuPeerConfig]::new($null, 3, $null, $null, $null, $null, $null,
+                        $null, $null, $null, $null, [uint32[]]@(1, 2, 4)) }
+           Cmdlet = { New-FlynnelGpuPeerConfig -Lanes 3 -LaneTeams @(1, 2, 4) } }
+    ) {
+        $built = & $Ctor
+        $built | Should -BeOfType [Flynnel.GpuPeerConfig]
+        Get-FlynnelPropertyDifference -Left $built -Right (& $Cmdlet) | Should -BeNullOrEmpty
+    }
+
+    It 'starts from the crate defaults rather than from zeros' {
+        # A parameterless constructor would make a config of CLR zeros,
+        # which binds as valid wherever the type is taken and has no
+        # lanes. This one is the crate's own defaults.
+        $c = [Flynnel.GpuPeerConfig]::new()
+        $c.Lanes | Should -BeGreaterThan 0
+        $c.SlotBytes | Should -BeGreaterThan 0
+        $c.SlotsPerLane | Should -BeGreaterThan 0
+        $c.QuantumNs | Should -BeGreaterThan 0
+        $c.RegionPath | Should -BeNullOrEmpty
+    }
+
+    It 'refuses no lanes at all' {
+        { [Flynnel.GpuPeerConfig]::new($null, 0) } | Should -Throw -ExpectedMessage '*above zero*'
+    }
+
+    It 'refuses a per-lane team list that does not cover every lane' {
+        { [Flynnel.GpuPeerConfig]::new($null, 4, $null, $null, $null, $null, $null, $null,
+            $null, $null, $null, [uint32[]]@(1, 2)) } |
+            Should -Throw -ExpectedMessage '*every lane*'
+    }
+}
+
 Describe 'Get-FlynnelLinalgMethod' {
     # The choice is a function of the sizes and of figures measured
     # when the kernels were written, so every assertion holds on a host

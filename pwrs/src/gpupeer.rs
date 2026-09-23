@@ -461,6 +461,88 @@ impl Default for PeerConfig {
     }
 }
 
+/// Statics of `Flynnel.GpuPeerConfig`.
+#[psmethods]
+impl PeerConfig {
+    /// Builds peer settings as New-FlynnelGpuPeerConfig does, through the
+    /// same code, starting at the crate's own defaults: so
+    /// `[Flynnel.GpuPeerConfig]::new()` is the default config and not
+    /// one of zeros.
+    ///
+    /// Every argument is optional and in the cmdlet's parameter order,
+    /// and an omitted one keeps its default, so one `new` answers every
+    /// arity. It refuses what the cmdlet refuses: no lanes, and a
+    /// LaneTeams list whose length is not the lane count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        region_path: Option<String>,
+        lanes: Option<u32>,
+        slot_bytes: Option<u32>,
+        slots_per_lane: Option<u32>,
+        quantum_ns: Option<u64>,
+        barrier_deadline_ns: Option<u64>,
+        idle_exit_ns: Option<u64>,
+        device_ordinal: Option<u32>,
+        vram_block_bytes: Option<u32>,
+        vram_blocks: Option<u32>,
+        blocks_per_lane: Option<u32>,
+        lane_teams: Option<Vec<u32>>,
+    ) -> PsResult<PeerConfig> {
+        let mut c = PeerConfig::default();
+        if let Some(v) = region_path {
+            c.region_path = v;
+        }
+        if let Some(v) = lanes {
+            c.lanes = v;
+        }
+        if let Some(v) = slot_bytes {
+            c.slot_bytes = v;
+        }
+        if let Some(v) = slots_per_lane {
+            c.slots_per_lane = v;
+        }
+        if let Some(v) = quantum_ns {
+            c.quantum_ns = v;
+        }
+        if let Some(v) = barrier_deadline_ns {
+            c.barrier_deadline_ns = v;
+        }
+        if let Some(v) = idle_exit_ns {
+            c.idle_exit_ns = v;
+        }
+        if let Some(v) = device_ordinal {
+            c.device_ordinal = v;
+        }
+        if let Some(v) = vram_block_bytes {
+            c.vram_block_bytes = v;
+        }
+        if let Some(v) = vram_blocks {
+            c.vram_blocks = v;
+        }
+        if let Some(v) = blocks_per_lane {
+            c.blocks_per_lane = v;
+        }
+        if let Some(v) = lane_teams {
+            c.lane_teams = v;
+        }
+        if c.lanes == 0 {
+            return Err(arg_err("Lanes must be above zero").terminating());
+        }
+        // Refused here rather than at init, because init's refusal
+        // arrives after a device context has been made and torn down.
+        if !c.lane_teams.is_empty() && c.lane_teams.len() != c.lanes as usize {
+            return Err(arg_err(format!(
+                "LaneTeams has {} entries and Lanes is {}; a per-lane team width needs one \
+                 entry for every lane",
+                c.lane_teams.len(),
+                c.lanes
+            ))
+            .terminating());
+        }
+        Ok(c)
+    }
+}
+
 impl PeerConfig {
     fn to_crate(&self) -> GpuPeerConfig {
         GpuPeerConfig {
@@ -560,57 +642,20 @@ pub struct NewFlynnelGpuPeerConfig {
 
 impl Cmdlet for NewFlynnelGpuPeerConfig {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let mut c = PeerConfig::default();
-        if let Some(v) = self.region_path.take() {
-            c.region_path = v;
-        }
-        if let Some(v) = self.lanes {
-            c.lanes = v;
-        }
-        if let Some(v) = self.slot_bytes {
-            c.slot_bytes = v;
-        }
-        if let Some(v) = self.slots_per_lane {
-            c.slots_per_lane = v;
-        }
-        if let Some(v) = self.quantum_ns {
-            c.quantum_ns = v;
-        }
-        if let Some(v) = self.barrier_deadline_ns {
-            c.barrier_deadline_ns = v;
-        }
-        if let Some(v) = self.idle_exit_ns {
-            c.idle_exit_ns = v;
-        }
-        if let Some(v) = self.device_ordinal {
-            c.device_ordinal = v;
-        }
-        if let Some(v) = self.vram_block_bytes {
-            c.vram_block_bytes = v;
-        }
-        if let Some(v) = self.vram_blocks {
-            c.vram_blocks = v;
-        }
-        if let Some(v) = self.blocks_per_lane {
-            c.blocks_per_lane = v;
-        }
-        if let Some(v) = self.lane_teams.take() {
-            c.lane_teams = v;
-        }
-        if c.lanes == 0 {
-            return Err(arg_err("Lanes must be above zero").terminating());
-        }
-        // Refused here rather than at init, because init's refusal
-        // arrives after a device context has been made and torn down.
-        if !c.lane_teams.is_empty() && c.lane_teams.len() != c.lanes as usize {
-            return Err(arg_err(format!(
-                "LaneTeams has {} entries and Lanes is {}; a per-lane team width needs one \
-                 entry for every lane",
-                c.lane_teams.len(),
-                c.lanes
-            ))
-            .terminating());
-        }
+        let c = PeerConfig::new(
+            self.region_path.take(),
+            self.lanes,
+            self.slot_bytes,
+            self.slots_per_lane,
+            self.quantum_ns,
+            self.barrier_deadline_ns,
+            self.idle_exit_ns,
+            self.device_ordinal,
+            self.vram_block_bytes,
+            self.vram_blocks,
+            self.blocks_per_lane,
+            self.lane_teams.take(),
+        )?;
         ps.write(c)
     }
 }
@@ -833,6 +878,11 @@ impl Cmdlet for NewFlynnelGpuPeer {
             )
             .terminating());
         }
+        #[expect(
+            clippy::manual_unwrap_or_default,
+            reason = "an absent Config is the crate's defaults by the parameter's contract, and the \
+                      match says so where a default substitution would read as a swallowed value"
+        )]
         let config = match self.config.take() {
             Some(c) => c,
             None => PeerConfig::default(),

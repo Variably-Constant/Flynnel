@@ -259,6 +259,61 @@ impl Plan {
     }
 }
 
+/// Statics of `Flynnel.JobPlan`.
+#[psmethods]
+impl Plan {
+    /// Builds a plan as New-FlynnelPlan does, through the same code:
+    /// `[Flynnel.JobPlan]::new(8, 100000)` is `New-FlynnelPlan 8 100000`.
+    ///
+    /// KOuter and BatchSize are required, as they are on the cmdlet. The
+    /// rest follow in the cmdlet's order and each is optional, so one
+    /// `new` answers every arity. It refuses what the cmdlet refuses:
+    /// Bare with a Profile, Workers 0, and anything the scheduler's own
+    /// plan refuses. Having no pipeline, it cannot warn, so a PerItemNs
+    /// without a TaskOverheadNs is built as asked; only New-FlynnelPlan
+    /// says that the leaf-width model then has nothing to solve.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        k_outer: u8,
+        batch_size: u32,
+        profile: Option<DispatchProfile>,
+        bare: Option<bool>,
+        per_item_ns: Option<u32>,
+        task_overhead_ns: Option<u32>,
+        leaf_shape: Option<LeafShape>,
+        smt: Option<bool>,
+        workers: Option<u32>,
+    ) -> PsResult<Plan> {
+        let bare = bare.unwrap_or(false);
+        if bare && profile.is_some() {
+            return Err(arg_err(
+                "Bare and Profile ask for different things: Bare takes none of the host's \
+                 adaptive state and Profile names one. Pass one or neither.",
+            )
+            .terminating());
+        }
+        if workers == Some(0) {
+            return Err(arg_err("Workers must be at least one").terminating());
+        }
+        let plan = Plan {
+            k_outer,
+            batch_size,
+            profile,
+            bare,
+            smt: smt.unwrap_or(false),
+            workers,
+            leaf_shape,
+            per_item_ns,
+            task_overhead_ns,
+            ..Plan::default()
+        };
+        // Built once here, so an argument the crate refuses is refused
+        // now rather than at whichever kernel first used the plan.
+        plan.to_job_plan()?;
+        Ok(plan)
+    }
+}
+
 /// Everything a plan resolves to on this host.
 #[psclass(name = "Flynnel.ResolvedPlan")]
 #[derive(Clone, Default)]
@@ -369,16 +424,17 @@ pub struct NewFlynnelPlan {
 
 impl Cmdlet for NewFlynnelPlan {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        if self.bare && self.profile.is_some() {
-            return Err(arg_err(
-                "Bare and Profile ask for different things: Bare takes none of the host's \
-                 adaptive state and Profile names one. Pass one or neither.",
-            )
-            .terminating());
-        }
-        if self.workers == Some(0) {
-            return Err(arg_err("Workers must be at least one").terminating());
-        }
+        let plan = Plan::new(
+            self.k_outer,
+            self.batch_size,
+            self.profile,
+            Some(self.bare),
+            self.per_item_ns,
+            self.task_overhead_ns,
+            self.leaf_shape,
+            Some(self.smt),
+            self.workers,
+        )?;
         // A per-item cost without the task overhead leaves the
         // leaf-width model unsolvable, and the plan then uses the
         // minimum leaf. Saying so costs nothing and is the difference
@@ -391,21 +447,6 @@ impl Cmdlet for NewFlynnelPlan {
                  nothing"
             )?;
         }
-        let plan = Plan {
-            k_outer: self.k_outer,
-            batch_size: self.batch_size,
-            profile: self.profile,
-            bare: self.bare,
-            smt: self.smt,
-            workers: self.workers,
-            leaf_shape: self.leaf_shape,
-            per_item_ns: self.per_item_ns,
-            task_overhead_ns: self.task_overhead_ns,
-            ..Plan::default()
-        };
-        // Built once here, so an argument the crate refuses is refused
-        // now rather than at whichever kernel first used the plan.
-        plan.to_job_plan()?;
         ps.write(plan)
     }
 }

@@ -770,8 +770,7 @@ fn read_descriptor(path: &Path) -> BTreeSet<String> {
     };
     let mut out = BTreeSet::new();
     let mut rest = text.as_str();
-    loop {
-        let Some(open) = rest.find(['"', '\'']) else { break };
+    while let Some(open) = rest.find(['"', '\'']) {
         let Some(quote) = rest[open..].chars().next() else { break };
         rest = &rest[open + 1..];
         let Some(close) = rest.find(quote) else { break };

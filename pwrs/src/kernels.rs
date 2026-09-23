@@ -199,7 +199,7 @@ fn chunking(plan: &flynnel::JobPlan, n: usize) -> (usize, usize) {
     if n == 0 {
         return (0, 0);
     }
-    let workers = plan.resolved_workers().max(1) as usize;
+    let workers = plan.resolved_workers().max(1);
     let n_chunks = (workers * 4).max(1).min(n);
     let chunk_len = n.div_ceil(n_chunks);
     (n_chunks, chunk_len)
@@ -404,18 +404,18 @@ pub(crate) struct MapOperands {
     pub addend: Option<f64>,
 }
 
-/// The per-element body of one declared operation, with its operands
-/// already read. Every family that runs a declared map goes through
-/// this, so two of them cannot answer differently for the same
-/// operation.
+/// One declared operation's per-element body.
 ///
 /// `Send` as well as `Sync` because the hybrid family moves the body
 /// to a backend thread; the kernels family only shares it across
 /// workers.
-pub(crate) fn map_each(
-    op: MapOp,
-    operands: MapOperands,
-) -> PsResult<Box<dyn Fn(&mut f64) + Send + Sync>> {
+pub(crate) type ElementBody = Box<dyn Fn(&mut f64) + Send + Sync>;
+
+/// The per-element body of one declared operation, with its operands
+/// already read. Every family that runs a declared map goes through
+/// this, so two of them cannot answer differently for the same
+/// operation.
+pub(crate) fn map_each(op: MapOp, operands: MapOperands) -> PsResult<ElementBody> {
     Ok(match op {
         MapOp::Clamp => {
             let (Some(lo), Some(hi)) = (operands.min, operands.max) else {
@@ -1313,20 +1313,19 @@ fn plan_subtrees(start: usize, len: usize, out: &mut Vec<(usize, usize)>) {
 
 /// Combine the subtree chaining values back up the tree, walking the
 /// same split that produced them so each one lands where it belongs.
-fn fold_subtrees(
-    start: usize,
-    len: usize,
-    cvs: &[ChainingValue],
-    next: &mut usize,
-) -> ChainingValue {
+///
+/// The split depends on a span's length alone, so the lengths are all
+/// the walk needs: `next` takes the chaining values in the order
+/// `plan_subtrees` produced them.
+fn fold_subtrees(len: usize, cvs: &[ChainingValue], next: &mut usize) -> ChainingValue {
     if len <= SUBTREE_LEAF || len <= blake3::CHUNK_LEN {
         let cv = cvs[*next];
         *next += 1;
         return cv;
     }
     let left = left_subtree_len(len as u64) as usize;
-    let l = fold_subtrees(start, left, cvs, next);
-    let r = fold_subtrees(start + left, len - left, cvs, next);
+    let l = fold_subtrees(left, cvs, next);
+    let r = fold_subtrees(len - left, cvs, next);
     merge_subtrees_non_root(&l, &r, Mode::Hash)
 }
 
@@ -1361,9 +1360,9 @@ fn hash_bytes_parallel(plan: &flynnel::JobPlan, bytes: &[u8]) -> String {
     });
 
     let mut from_left = 0usize;
-    let lcv = fold_subtrees(0, left, &cvs[..left_count], &mut from_left);
+    let lcv = fold_subtrees(left, &cvs[..left_count], &mut from_left);
     let mut from_right = 0usize;
-    let rcv = fold_subtrees(left, n - left, &cvs[left_count..], &mut from_right);
+    let rcv = fold_subtrees(n - left, &cvs[left_count..], &mut from_right);
     hex32(merge_subtrees_root(&lcv, &rcv, Mode::Hash).as_bytes())
 }
 
@@ -2291,6 +2290,11 @@ impl Cmdlet for UpdateFlynnelText {
                 if pattern.is_empty() {
                     return Err(arg_err("Pattern must not be empty").terminating());
                 }
+                #[expect(
+                    clippy::manual_unwrap_or_default,
+                    reason = "an absent Replacement asks for the pattern to be deleted, and the \
+                              match names that case where a default would hide it"
+                )]
                 let replacement = match self.replacement.as_deref() {
                     Some(r) => r,
                     // Deleting the pattern is what an absent

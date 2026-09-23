@@ -471,6 +471,29 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   from another thread. Work that runs on the pool is therefore work
   the module declares.
 
+  **Objects construct from script as well as from their cmdlets.**
+  `[Flynnel.JobPlan]::new(8, 100000)` builds what `New-FlynnelPlan 8
+  100000` builds, and `[Flynnel.GpuPeerConfig]::new()` builds the
+  crate's default peer settings, as `New-FlynnelGpuPeerConfig` does.
+  Each cmdlet calls its constructor, so the two routes cannot drift,
+  and the suites check them equal at every arity on both editions. The
+  five singly built proxy classes have constructors on the same terms,
+  and the ring shapes that come as several objects build from one
+  factory type. A constructor has no pipeline, so where a cmdlet warns,
+  it refuses or builds as asked: a plan with a PerItemNs and no
+  TaskOverheadNs, which New-FlynnelPlan warns leaves the leaf-width
+  model nothing to solve, is built as given.
+
+  **Sizes take a suffix on both editions.** PowerShell 7 binds the
+  string `'2MB'` to a numeric parameter by itself, and Windows
+  PowerShell 5.1 refuses it, which is the form a size takes when it
+  comes from a variable, a CSV or a settings file. So 18 byte-size and
+  large-count parameters carry a transform that reads the forms 7
+  reads, exactly as 7 reads them, and hands everything else back
+  unchanged. On the 24-thread host a bind through it costs 0.8 to
+  0.9 us more on PowerShell 7.6 and 6 to 10 us more on 5.1, whose
+  binder charges 5 to 8 us for any transform at all.
+
   **A completeness gate, `pwrs/src/bin/census.rs`, reads the crate and
   fails on any public item neither bound nor recorded in
   `census.toml` with one of six fixed reasons.** A binding missing a
@@ -481,11 +504,13 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   GPU-peer and cross-process families and in the racing arms that need
   a body able to decline or disagree.
 
-  528 tests pass on a Linux guest under PowerShell 7.6.5, and the
-  suites run on Windows PowerShell 5.1 as well; each prints the host
-  and edition before it asserts, because one pipeline record costs
-  three times more on 5.1 and a figure without its edition cannot be
-  compared with one from the other.
+  Built on PoWerRuSt 0.2.0. 631 tests pass on Windows under
+  PowerShell 7.6.6 and the same 631 under Windows PowerShell 5.1, and
+  628 on a Linux guest under 7.6.5, which skips three more; each suite
+  prints the host and edition before it
+  asserts, because one pipeline record costs three times more on 5.1
+  and a figure without its edition cannot be compared with one from
+  the other.
 
 - `benches/verify_chain_fold.rs`, which measures what ordering the
   verify chain's fold costs, per chunk and per byte, with a quiet arm

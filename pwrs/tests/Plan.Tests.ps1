@@ -103,6 +103,86 @@ Describe 'New-FlynnelPlan' {
     }
 }
 
+Describe '[Flynnel.JobPlan]::new' {
+    # The constructor and the cmdlet run the same Rust function, so a
+    # plan built either way must agree on every property. One case per
+    # arity, each one argument longer than the last.
+
+    It 'builds what New-FlynnelPlan builds from <Name>' -TestCases @(
+        @{ Name = 'the two required arguments'
+           Ctor = { [Flynnel.JobPlan]::new(8, 100000) }
+           Cmdlet = { New-FlynnelPlan -KOuter 8 -BatchSize 100000 } }
+        @{ Name = 'a profile'
+           Ctor = { [Flynnel.JobPlan]::new(8, 100000, [Flynnel.DispatchProfile]::Streaming) }
+           Cmdlet = { New-FlynnelPlan -KOuter 8 -BatchSize 100000 -Profile Streaming } }
+        @{ Name = 'Bare'
+           Ctor = { [Flynnel.JobPlan]::new(8, 100000, $null, $true) }
+           Cmdlet = { New-FlynnelPlan -KOuter 8 -BatchSize 100000 -Bare } }
+        @{ Name = 'a per-item cost alone'
+           Ctor = { [Flynnel.JobPlan]::new(8, 100000, $null, $false, 200) }
+           Cmdlet = { New-FlynnelPlan -KOuter 8 -BatchSize 100000 -PerItemNs 200 `
+                          -WarningAction SilentlyContinue } }
+        @{ Name = 'both halves of the leaf-width model'
+           Ctor = { [Flynnel.JobPlan]::new(8, 100000, $null, $false, 200, 900) }
+           Cmdlet = { New-FlynnelPlan -KOuter 8 -BatchSize 100000 -PerItemNs 200 -TaskOverheadNs 900 } }
+        @{ Name = 'a leaf shape'
+           Ctor = { [Flynnel.JobPlan]::new(8, 100000, $null, $false, $null, $null,
+                        [Flynnel.LeafShape]::Gather) }
+           Cmdlet = { New-FlynnelPlan -KOuter 8 -BatchSize 100000 -LeafShape Gather } }
+        @{ Name = 'the siblings'
+           Ctor = { [Flynnel.JobPlan]::new(8, 100000, $null, $false, $null, $null, $null, $true) }
+           Cmdlet = { New-FlynnelPlan -KOuter 8 -BatchSize 100000 -Smt } }
+        @{ Name = 'a worker count'
+           Ctor = { [Flynnel.JobPlan]::new(8, 100000, $null, $false, $null, $null, $null,
+                        $false, 3) }
+           Cmdlet = { New-FlynnelPlan -KOuter 8 -BatchSize 100000 -Workers 3 } }
+    ) {
+        $built = & $Ctor
+        $built | Should -BeOfType [Flynnel.JobPlan]
+        Get-FlynnelPropertyDifference -Left $built -Right (& $Cmdlet) | Should -BeNullOrEmpty
+    }
+
+    It 'requires the size and the batch, as the cmdlet does' {
+        # No parameterless constructor is left to make a plan of zeros.
+        { [Flynnel.JobPlan]::new() } | Should -Throw
+        { [Flynnel.JobPlan]::new(8) } | Should -Throw
+        foreach ($ctor in [Flynnel.JobPlan].GetConstructors()) {
+            @($ctor.GetParameters() | Where-Object { -not $_.IsOptional }).Count |
+                Should -Be 2 -Because 'KOuter and BatchSize are the two required arguments'
+        }
+    }
+
+    It 'refuses Bare and Profile together' {
+        { [Flynnel.JobPlan]::new(8, 1000, [Flynnel.DispatchProfile]::Streaming, $true) } |
+            Should -Throw -ExpectedMessage '*Pass one or neither*'
+    }
+
+    It 'refuses a worker count of zero' {
+        { [Flynnel.JobPlan]::new(8, 1000, $null, $false, $null, $null, $null, $false, 0) } |
+            Should -Throw -ExpectedMessage '*at least one*'
+    }
+
+    It 'builds a per-item cost alone as asked, without a warning' {
+        # A constructor has no pipeline to warn on; only the cmdlet says
+        # that the leaf-width model then has nothing to solve.
+        $out = @(& { [Flynnel.JobPlan]::new(8, 1000, $null, $false, 200) } 3>&1)
+        @($out | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count |
+            Should -Be 0
+        $plan = @($out | Where-Object { $_ -is [Flynnel.JobPlan] })
+        $plan.Count | Should -Be 1
+        $plan[0].PerItemNs | Should -Be 200
+        $plan[0].TaskOverheadNs | Should -BeNullOrEmpty
+    }
+
+    It 'governs a kernel it is handed to' {
+        $data = 1..2000 | ForEach-Object { [double]$_ }
+        $pinned = [Flynnel.JobPlan]::new(10, 2000, $null, $false, $null, $null, $null, $false, 1)
+        $got = Invoke-FlynnelMap -InputObject $data -Operation Square -Plan $pinned
+        $want = $data | ForEach-Object { $_ * $_ }
+        (Compare-Object $got $want -SyncWindow 0).Count | Should -Be 0
+    }
+}
+
 Describe 'Update-FlynnelPlan' {
     It 'answers a copy and leaves the original alone' {
         $base = New-FlynnelPlan -KOuter 8 -BatchSize 1000

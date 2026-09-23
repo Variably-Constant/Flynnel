@@ -50,6 +50,39 @@ function Test-FlynnelMultiNode {
 # unaffected; it is only a test trying to be quiet that loses the
 # thing it came to read.
 
+# The properties on which two objects of one class disagree, one
+# "Name: left <> right" line each, so an assertion that two ways of
+# building a value agree names the field that did not. An array compares
+# element by element, and a null only equals a null.
+function Get-FlynnelPropertyDifference {
+    param(
+        [Parameter(Mandatory)]$Left,
+        [Parameter(Mandatory)]$Right
+    )
+    if ($Left.GetType() -ne $Right.GetType()) {
+        return "type: $($Left.GetType().FullName) <> $($Right.GetType().FullName)"
+    }
+    foreach ($property in $Left.PSObject.Properties) {
+        $l = $property.Value
+        $r = $Right.($property.Name)
+        if ($null -eq $l -or $null -eq $r) {
+            $same = ($null -eq $l) -and ($null -eq $r)
+        } elseif ($l -is [Array] -or $r -is [Array]) {
+            $la = @($l)
+            $ra = @($r)
+            $same = $la.Count -eq $ra.Count
+            for ($i = 0; $same -and $i -lt $la.Count; $i++) {
+                $same = $la[$i] -eq $ra[$i]
+            }
+        } else {
+            $same = $l -eq $r
+        }
+        if (-not $same) {
+            "$($property.Name): $(@($l) -join ',') <> $(@($r) -join ',')"
+        }
+    }
+}
+
 # Every property of a class the module exports, for the checks that a
 # figure which can be unmeasured is nullable rather than a zero-valued
 # primitive.
