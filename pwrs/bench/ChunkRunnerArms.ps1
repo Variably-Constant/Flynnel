@@ -12,19 +12,21 @@
 #   ENGINE  Invoke-FlynnelMap with the matching declared operation
 #
 # The five bodies are the ones whose answer is the same IEEE operation on
-# both sides, per Lightfold's compiled plane and Flynnel's MapOp. Before a
-# cell is timed its three answers are compared bit for bit, and the POOL
-# and SERIAL arms are asked through -Stats which pool actually ran, so a
-# row cannot be fast because it computed something else or because the
-# pool quietly declined.
+# both sides, per Lightfold's compiled plane and Flynnel's MapOp. Before
+# anything is timed, every row's three answers are compared bit for bit,
+# and the POOL and SERIAL arms are asked through -Stats which pool ran and
+# what each phase cost, so a row cannot be fast because it computed
+# something else or because the pool quietly declined.
 #
 # Lightfold reads LIGHTFOLD_POOL on every dispatch, so the variable is set
-# between arms and never inside a timed body. The order of the three arms
-# rotates by row so that a position does not stand in for an arm. A
+# between calls and never inside a timed body. Within a row the arms
+# alternate call by call: each round runs every arm once, in an order that
+# rotates by round and by row, and every timed call follows a full
+# collection, so the heap and the box's drift land on every arm alike. A
 # PowerShell-only control is timed at both ends of every row, which gives
-# how far the box moved while the row was taken. The load pass repeats
-# every arm under burners on half the logical processors and is read
-# against a loaded control.
+# how far the process moved while the row was taken. The load pass repeats
+# every row under burners on half the logical processors, with its own
+# controls.
 #
 # The arms include what each route costs to hand its answer back.
 # Invoke-FlynnelMap returns one array; whatever Invoke-LightfoldParallel
@@ -44,7 +46,9 @@ param(
     [Parameter(Mandatory)][string]$LightfoldModule,
     [int[]]$Sizes = @(1000, 100000, 1000000),
     [int]$Repeats = 7,
-    [double]$Cooldown = 0.5,
+    # Seconds of rest after every timed call, so a pool's spinning workers
+    # have parked before the next arm starts.
+    [double]$Cooldown = 0.1,
     [string]$Tag = 'chunkrunner',
     [string]$OutDir = $PSScriptRoot,
     # The Lightfold commit the module was built from. Lightfold's tree is
@@ -125,8 +129,13 @@ if (-not $poolPossible) {
     Write-Host ($refusal -f $edition, $PSVersionTable.PSVersion)
 }
 
-$repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-$commit = (& git -C $repoRoot rev-parse --short HEAD 2>&1 | Out-String).Trim()
+# The commit of the tree the Flynnel module was built in, which is what the
+# run timed, whichever tree this script itself was read from.
+$commit = (& git -C $FlynnelModule rev-parse --short HEAD 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "FLYNNEL COMMIT UNKNOWN: $FlynnelModule is not inside a git work tree ($commit)"
+    $commit = $null
+}
 $scriptParam = (Get-Command Invoke-LightfoldParallel).Parameters['Script']
 if (-not $scriptParam) { throw 'Invoke-LightfoldParallel has no -Script parameter' }
 $scriptIsBlock = $scriptParam.ParameterType -eq [scriptblock]
@@ -149,18 +158,37 @@ if (-not $LightfoldCommit) {
 # Timing, the control and the burners
 # ----------------------------------------------------------------------
 
+# A full collection, so every timed call starts from the same heap.
+function Invoke-Collection {
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+    [System.GC]::Collect()
+}
+
+# One timed call of a body, after a full collection.
+function Measure-Once {
+    param([Parameter(Mandatory)][scriptblock]$Body)
+    Invoke-Collection
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $null = & $Body
+    $sw.Stop()
+    $sw.Elapsed.TotalMilliseconds
+}
+
+# The middle value, the lower of the two middle values for an even count.
+function Get-Median {
+    param([Parameter(Mandatory)][double[]]$Values)
+    $sorted = [double[]]($Values | Sort-Object)
+    $sorted[[int][Math]::Floor(($sorted.Length - 1) / 2)]
+}
+
 function Measure-Cell {
     param([Parameter(Mandatory)][scriptblock]$Body, [int]$Warmup = 2)
     for ($i = 0; $i -lt $Warmup; $i++) { $null = & $Body }
     $samples = New-Object double[] $Repeats
-    for ($i = 0; $i -lt $Repeats; $i++) {
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $null = & $Body
-        $sw.Stop()
-        $samples[$i] = $sw.Elapsed.TotalMilliseconds
-    }
-    $sorted = $samples | Sort-Object
-    [PSCustomObject]@{ MedianMs = $sorted[[int]($Repeats / 2)]; MinMs = $sorted[0]; MaxMs = $sorted[-1] }
+    for ($i = 0; $i -lt $Repeats; $i++) { $samples[$i] = Measure-Once -Body $Body }
+    $sorted = [double[]]($samples | Sort-Object)
+    [PSCustomObject]@{ MedianMs = (Get-Median $samples); MinMs = $sorted[0]; MaxMs = $sorted[-1] }
 }
 
 function Start-Cooldown {
@@ -226,15 +254,39 @@ function Get-Answer {
     }
 }
 
-# Which pool a Lightfold arm actually ran on, from its own report.
-function Get-PoolUsed {
+# A Lightfold arm's own report of one run: which pool evaluated the items
+# and what each phase cost. The output is collected before it is searched,
+# so the write phase is not charged for the search.
+function Get-RunReport {
     param([string]$Arm, [hashtable]$Body, [double[]]$X)
     $env:LIGHTFOLD_POOL = if ($Arm -eq 'POOL') { 'flynnel' } else { 'inline' }
-    $run = @(Invoke-LightfoldParallel -Script (Get-Script $Body.Text) -Items $X -Plane Compiled -Stats |
-        Where-Object { $_.PSObject.TypeNames -contains 'Lightfold.ParallelRun' -or
-                       $_.GetType().FullName -eq 'Lightfold.ParallelRun' })
+    Invoke-Collection
+    $written = @(Invoke-LightfoldParallel -Script (Get-Script $Body.Text) -Items $X -Plane Compiled -Stats)
+    $run = @($written.Where({ $_ -isnot [double] -and
+                              ($_.PSObject.TypeNames -contains 'Lightfold.ParallelRun' -or
+                               $_.GetType().FullName -eq 'Lightfold.ParallelRun') }))
     if ($run.Count -ne 1) { throw "$Arm $($Body.Name): -Stats gave $($run.Count) ParallelRun objects, not one" }
-    [string]$run[0].Pool
+    $run[0]
+}
+
+# A reported time rounded for the table, or $null when the report carried
+# none, so a phase that was not measured never reads as one that took no
+# time.
+function Get-Rounded {
+    param($Value)
+    if ($null -eq $Value) { $null } else { [Math]::Round([double]$Value, 3) }
+}
+
+# The phase times of one report.
+function Get-Phases {
+    param($Report)
+    [PSCustomObject]@{
+        SplitMs  = Get-Rounded $Report.SplitMs
+        DecodeMs = Get-Rounded $Report.DecodeMs
+        EvalMs   = Get-Rounded $Report.EvalMs
+        WriteMs  = Get-Rounded $Report.WriteMs
+        TotalMs  = Get-Rounded $Report.TotalMs
+    }
 }
 
 function Test-SameBits {
@@ -266,21 +318,81 @@ function Set-ArmEnvironment {
     elseif ($Arm -eq 'SERIAL') { $env:LIGHTFOLD_POOL = 'inline' }
 }
 
+# One row under the current load. Every round runs each arm once, in an
+# order that rotates by round and by row, and the control is timed at both
+# ends of the row.
+function Measure-Row {
+    param([Parameter(Mandatory)][hashtable]$Body, [Parameter(Mandatory)][double[]]$X, [int]$Rotation)
+    $armBodies = @{}
+    foreach ($arm in $arms) {
+        $armBodies[$arm] = Get-ArmBody -Arm $arm -Body $Body -X $X
+        Set-ArmEnvironment -Arm $arm
+        for ($w = 0; $w -lt 2; $w++) { $null = & $armBodies[$arm] }
+    }
+    $first = (Measure-Cell -Body $controlBody).MedianMs
+    $samples = @{}
+    foreach ($arm in $arms) { $samples[$arm] = New-Object double[] $Repeats }
+    for ($r = 0; $r -lt $Repeats; $r++) {
+        for ($k = 0; $k -lt $arms.Count; $k++) {
+            $arm = $arms[($k + $r + $Rotation) % $arms.Count]
+            Set-ArmEnvironment -Arm $arm
+            $samples[$arm][$r] = Measure-Once -Body $armBodies[$arm]
+            Start-Cooldown
+        }
+    }
+    $last = (Measure-Cell -Body $controlBody).MedianMs
+    [PSCustomObject]@{ Samples = $samples; ControlFirstMs = $first; ControlLastMs = $last }
+}
+
+# The median over rounds of one arm's time over another's in the same
+# round, so a round the process slowed moves both sides of its ratio.
+function Get-PairRatio {
+    param([Parameter(Mandatory)][double[]]$Over, [Parameter(Mandatory)][double[]]$Under)
+    $ratios = New-Object double[] $Over.Length
+    for ($i = 0; $i -lt $Over.Length; $i++) { $ratios[$i] = $Over[$i] / $Under[$i] }
+    [Math]::Round((Get-Median $ratios), 3)
+}
+
+# A pass's figures added to its row under a prefix: each arm's median,
+# the paired ratios, the control's drift across the row, and every sample.
+function Add-Pass {
+    param([Parameter(Mandatory)]$Row, [string]$Prefix, [Parameter(Mandatory)]$Measured)
+    $s = $Measured.Samples
+    $hasPool = $s.ContainsKey('POOL')
+    $drift = if ($Measured.ControlFirstMs -gt 0) {
+        [Math]::Round(100.0 * ($Measured.ControlLastMs - $Measured.ControlFirstMs) / $Measured.ControlFirstMs, 2)
+    } else { $null }
+    $kept = [ordered]@{}
+    foreach ($arm in $arms) { $kept[$arm] = @($s[$arm] | ForEach-Object { [Math]::Round($_, 4) }) }
+    $values = [ordered]@{
+        "${Prefix}PoolMs"           = if ($hasPool) { [Math]::Round((Get-Median $s['POOL']), 4) } else { $null }
+        "${Prefix}SerialMs"         = [Math]::Round((Get-Median $s['SERIAL']), 4)
+        "${Prefix}EngineMs"         = [Math]::Round((Get-Median $s['ENGINE']), 4)
+        "${Prefix}SerialOverPool"   = if ($hasPool) { Get-PairRatio $s['SERIAL'] $s['POOL'] } else { $null }
+        "${Prefix}EngineOverPool"   = if ($hasPool) { Get-PairRatio $s['ENGINE'] $s['POOL'] } else { $null }
+        "${Prefix}EngineOverSerial" = Get-PairRatio $s['ENGINE'] $s['SERIAL']
+        "${Prefix}DriftPct"         = $drift
+        "${Prefix}Samples"          = [PSCustomObject]$kept
+    }
+    foreach ($name in $values.Keys) { $Row | Add-Member -NotePropertyName $name -NotePropertyValue $values[$name] }
+}
+
 # ----------------------------------------------------------------------
 # The run
 # ----------------------------------------------------------------------
 
 $arms = if ($poolPossible) { @('POOL', 'SERIAL', 'ENGINE') } else { @('SERIAL', 'ENGINE') }
-$rows = @()
-$rowIndex = 0
-$controlFirst = Measure-Cell -Body $controlBody -Warmup 20
-Start-Cooldown
+$lightfoldArms = @($arms | Where-Object { $_ -ne 'ENGINE' })
+$inputs = @{}
+foreach ($size in $Sizes) { $inputs[$size] = New-Input -Count $size }
 
+# Every row is checked, and its phase reports read, before the first timed
+# call: the answers agree bit for bit and each Lightfold arm ran where it
+# was sent.
+$rows = @()
 foreach ($size in $Sizes) {
-    $x = New-Input -Count $size
+    $x = $inputs[$size]
     foreach ($b in $bodies) {
-        # Correctness first: the answers agree and each Lightfold arm ran
-        # where it was asked to.
         $answers = @{}
         foreach ($arm in $arms) { $answers[$arm] = Get-Answer -Arm $arm -Body $b -X $x }
         foreach ($arm in $arms) {
@@ -288,59 +400,40 @@ foreach ($size in $Sizes) {
                 throw "$($b.Name) at ${size}: the $arm answer differs from ENGINE's in its bits; nothing is timed"
             }
         }
-        $poolUsed = @{}
-        foreach ($arm in $arms | Where-Object { $_ -ne 'ENGINE' }) {
-            $poolUsed[$arm] = Get-PoolUsed -Arm $arm -Body $b -X $x
+        $reports = @{}
+        foreach ($arm in $lightfoldArms) { $reports[$arm] = Get-RunReport -Arm $arm -Body $b -X $x }
+        if ($poolPossible -and [string]$reports['POOL'].Pool -notmatch 'Flynnel') {
+            throw "$($b.Name) at ${size}: POOL reported pool '$($reports['POOL'].Pool)', so it did not run on Flynnel"
         }
-        if ($poolPossible -and $poolUsed['POOL'] -notmatch 'Flynnel') {
-            throw "$($b.Name) at ${size}: POOL reported pool '$($poolUsed['POOL'])', so it did not run on Flynnel"
-        }
-        if ($poolUsed['SERIAL'] -match 'Flynnel') {
-            throw "$($b.Name) at ${size}: SERIAL reported pool '$($poolUsed['SERIAL'])'"
-        }
-
-        # The arm order rotates by row.
-        $order = @(for ($k = 0; $k -lt $arms.Count; $k++) { $arms[($k + $rowIndex) % $arms.Count] })
-        $rowIndex++
-        Write-Host ("row {0} at {1}: order {2}" -f $b.Name, $size, ($order -join ','))
-        $rowControlFirst = Measure-Cell -Body $controlBody
-        $cells = @{}
-        foreach ($arm in $order) {
-            Set-ArmEnvironment -Arm $arm
-            $cells[$arm] = Measure-Cell -Body (Get-ArmBody -Arm $arm -Body $b -X $x)
-            Start-Cooldown
-        }
-        $rowControlLast = Measure-Cell -Body $controlBody
-        $drift = if ($rowControlFirst.MedianMs -gt 0) {
-            [Math]::Round(100.0 * ($rowControlLast.MedianMs - $rowControlFirst.MedianMs) / $rowControlFirst.MedianMs, 2)
-        } else { $null }
-        $poolMs = if ($cells.ContainsKey('POOL')) { [Math]::Round($cells['POOL'].MedianMs, 4) } else { $null }
-        $serialMs = [Math]::Round($cells['SERIAL'].MedianMs, 4)
-        $engineMs = [Math]::Round($cells['ENGINE'].MedianMs, 4)
-        $serialOverPool = $null
-        $engineOverPool = $null
-        if ($null -ne $poolMs -and $poolMs -gt 0) {
-            $serialOverPool = [Math]::Round($serialMs / $poolMs, 3)
-            $engineOverPool = [Math]::Round($engineMs / $poolMs, 3)
+        if ([string]$reports['SERIAL'].Pool -match 'Flynnel') {
+            throw "$($b.Name) at ${size}: SERIAL reported pool '$($reports['SERIAL'].Pool)'"
         }
         $rows += [PSCustomObject]@{
-            Body           = $b.Name
-            Size           = $size
-            PoolMs         = $poolMs
-            SerialMs       = $serialMs
-            EngineMs       = $engineMs
-            SerialOverPool = $serialOverPool
-            EngineOverPool = $engineOverPool
-            RowDriftPct    = $drift
-            PoolRan        = if ($poolUsed.ContainsKey('POOL')) { $poolUsed['POOL'] } else { $null }
-            SerialRan      = $poolUsed['SERIAL']
+            Body         = $b.Name
+            Size         = $size
+            PoolRan      = if ($poolPossible) { [string]$reports['POOL'].Pool } else { $null }
+            SerialRan    = [string]$reports['SERIAL'].Pool
+            PoolPhases   = if ($poolPossible) { Get-Phases $reports['POOL'] } else { $null }
+            SerialPhases = Get-Phases $reports['SERIAL']
         }
     }
 }
+$answers = $null
+$reports = $null
+Write-Host ("checked {0} row(s) before any timing: every answer matches ENGINE's bits, and each Lightfold arm ran where it was sent" -f $rows.Count)
+
+$rowIndex = 0
+$controlFirst = Measure-Cell -Body $controlBody -Warmup 20
+foreach ($row in $rows) {
+    $b = $bodies | Where-Object { $_.Name -eq $row.Body }
+    Write-Host ("quiet {0} at {1}" -f $row.Body, $row.Size)
+    Add-Pass -Row $row -Prefix '' -Measured (Measure-Row -Body $b -X $inputs[$row.Size] -Rotation $rowIndex)
+    $rowIndex++
+}
 $controlLast = Measure-Cell -Body $controlBody
 
-# The load pass: every arm again under the burners, against a loaded
-# control taken at both ends.
+# The load pass: every row again under the burners, each with a control at
+# both ends.
 $loadedControlFirst = $null
 $loadedControlLast = $null
 if ($LoadThreads -gt 0) {
@@ -348,15 +441,10 @@ if ($LoadThreads -gt 0) {
     Start-Burners
     $loadedControlFirst = Measure-Cell -Body $controlBody
     foreach ($row in $rows) {
-        $x = New-Input -Count $row.Size
         $b = $bodies | Where-Object { $_.Name -eq $row.Body }
-        foreach ($arm in $arms) {
-            Set-ArmEnvironment -Arm $arm
-            $cell = Measure-Cell -Body (Get-ArmBody -Arm $arm -Body $b -X $x)
-            $row | Add-Member -NotePropertyName ("Loaded{0}Ms" -f ($arm.Substring(0, 1) + $arm.Substring(1).ToLower())) `
-                -NotePropertyValue ([Math]::Round($cell.MedianMs, 4))
-            Start-Cooldown
-        }
+        Write-Host ("loaded {0} at {1}" -f $row.Body, $row.Size)
+        Add-Pass -Row $row -Prefix 'Loaded' -Measured (Measure-Row -Body $b -X $inputs[$row.Size] -Rotation $rowIndex)
+        $rowIndex++
     }
     $loadedControlLast = Measure-Cell -Body $controlBody
     Stop-Burners
@@ -390,9 +478,29 @@ if ($LoadThreads -gt 0) {
         $LoadThreads, $result.ControlFirstMs, $result.LoadedControlFirstMs)
 }
 Write-Host ''
+Write-Host 'quiet'
 $rows | Format-Table Body, Size, PoolMs, SerialMs, EngineMs, SerialOverPool, EngineOverPool,
-    RowDriftPct, PoolRan -AutoSize
-Write-Host 'SerialOverPool above one means the pool arm beat Lightfold on one thread; EngineOverPool'
-Write-Host 'above one means it beat the declared kernel driven through the engine. RowDriftPct is'
-Write-Host "how far the control moved across the row's arms, a floor under the row's error."
+    EngineOverSerial, DriftPct -AutoSize | Out-Host
+if ($LoadThreads -gt 0) {
+    Write-Host 'loaded'
+    $rows | Format-Table Body, Size, LoadedPoolMs, LoadedSerialMs, LoadedEngineMs, LoadedSerialOverPool,
+        LoadedEngineOverPool, LoadedEngineOverSerial, LoadedDriftPct -AutoSize | Out-Host
+}
+Write-Host 'phases of one call per Lightfold arm, from its -Stats report, taken before any timing'
+$phaseRows = foreach ($row in $rows) {
+    foreach ($pair in @(@('POOL', $row.PoolPhases), @('SERIAL', $row.SerialPhases))) {
+        if ($null -ne $pair[1]) {
+            [PSCustomObject]@{
+                Body = $row.Body; Size = $row.Size; Arm = $pair[0]
+                SplitMs = $pair[1].SplitMs; DecodeMs = $pair[1].DecodeMs; EvalMs = $pair[1].EvalMs
+                WriteMs = $pair[1].WriteMs; TotalMs = $pair[1].TotalMs
+            }
+        }
+    }
+}
+$phaseRows | Format-Table -AutoSize | Out-Host
+Write-Host 'Each ratio is the median over rounds of one arm over another in the same round. SerialOverPool'
+Write-Host 'above one means the pool arm beat Lightfold on one thread; EngineOverPool and EngineOverSerial'
+Write-Host 'below one mean the declared kernel driven through the engine beat that arm. DriftPct is how far'
+Write-Host "the control moved across the row, a floor under the row's error."
 Write-Host "RESULT $outFile"
