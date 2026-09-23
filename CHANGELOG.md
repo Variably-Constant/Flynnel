@@ -656,6 +656,24 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
+- **With every park switch off, the park-lever changes made fine-grained
+  dispatch slower.** On a 24-thread Windows host, paired by trial on one
+  harness source with the host profile pinned, the quiet window at about
+  5 ns an item read 0.9853 of the release before them, slower in 15
+  trials of 15. Two causes, each found by bisecting the commits between.
+  The right half's latch became 16 bytes and 8-aligned, and a `StackJob`
+  keeping declaration order put it first, beside the closure slot the
+  thief writes as it starts, where the 1-byte latch had sat last beside
+  the result; `StackJob` is now `#[repr(C)]` with the latch declared last.
+  And the join waiter's round after its spin budget grew with the park
+  and timed-yield paths inside every instantiation of `join_in_worker`;
+  that round is now one out-of-line, cold, non-generic function. Against
+  the release before the levers the fixed tree reads 0.9934 over 40
+  paired trials, 22 below parity, so no cost is resolved; against the
+  levers' own tip the latch placement alone reads 1.0246, faster in 13
+  trials of 15. An 8-core desktop's pairs spread too widely to resolve
+  any of the three comparisons, the original cost included.
+
 - **A process whose first host-profile query came from a pool worker
   calibrated on that worker's own join, and could publish the result for
   every process on the host.** `host_dispatch_profile` measures on the

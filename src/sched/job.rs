@@ -394,20 +394,27 @@ impl<T> JobResult<T> {
 /// machine, no wake mechanism). `F` is the closure, `R` is its
 /// return value. Both must be `Send` because the closure may run
 /// on a different worker thread.
+///
+/// Laid out in declaration order: the closure, the result, then the
+/// latch. The parent spins on the latch while the thief runs the job;
+/// the thief writes the closure's slot as it starts and the result's
+/// just before it sets the latch, so the latch shares a cache line with
+/// the result and not with the closure.
+#[repr(C)]
 pub(crate) struct StackJob<L, F, R>
 where
     L: Latch + Sync,
     F: FnOnce(bool) -> R + Send,
     R: Send,
 {
-    /// Latch that the executing worker sets after writing
-    /// [`result`]; the parent thread polls / parks on this.
-    pub(crate) latch: L,
     /// Closure to execute. Moved out exactly once via the
     /// `UnsafeCell::take()` pattern.
     func: UnsafeCell<Option<F>>,
     /// Slot for the closure's return value or captured panic.
     result: UnsafeCell<JobResult<R>>,
+    /// Latch that the executing worker sets after writing
+    /// [`result`]; the parent thread polls / parks on this.
+    pub(crate) latch: L,
 }
 
 impl<L, F, R> StackJob<L, F, R>
