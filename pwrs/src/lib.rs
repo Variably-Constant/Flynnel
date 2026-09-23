@@ -273,6 +273,26 @@ pwrs::export_module! {
         gpupeer::LinalgOpKind,
         crossproc::DequeVariantKind,
     ],
+    transforms: [
+        suffix::ring_capacity,
+        suffix::spsc_ring_capacity,
+        suffix::mpsc_ring_capacity,
+        suffix::composed_mpsc_capacity,
+        suffix::composed_mpmc_capacity,
+        suffix::injector_capacity,
+        suffix::notify_ring_capacity,
+        suffix::peer_config_slot_bytes,
+        suffix::peer_config_slots_per_lane,
+        suffix::peer_config_vram_block_bytes,
+        suffix::plan_batch_size,
+        suffix::plan_shape_batch_size,
+        suffix::hybrid_join_count,
+        suffix::hybrid_placement_count,
+        suffix::hybrid_split_count,
+        suffix::hybrid_pipeline_count,
+        suffix::race_any_count,
+        suffix::explore_select_count,
+    ],
     providers: [provider::FlynnelDrive],
 }
 
@@ -291,5 +311,6 @@ mod pool;
 mod provider;
 mod racing;
 mod rings;
+mod suffix;
 mod types;
 mod verify;
