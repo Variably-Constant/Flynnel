@@ -248,15 +248,19 @@ impl FlynnelDrive {
     /// so an empty level is a process that has run no work through
     /// Flynnel rather than a level that failed to enumerate.
     ///
-    /// The colon a location carries between file and line cannot be a
-    /// path segment on either platform, so it becomes a hyphen. The
-    /// row still holds File, Line and Column, which is what a script
-    /// reads; the name only has to be unique and typeable.
+    /// Every separator a path segment cannot carry becomes a hyphen: the
+    /// slashes of the file's own path, the colon of a Windows drive
+    /// letter, which the crate's absolute source path begins with when
+    /// it is built outside the module's directory, and the one a
+    /// location puts between file and line. A colon left in the name
+    /// would read as a drive separator. The row still holds File, Line
+    /// and Column, which is what a script reads; the name only has to
+    /// be unique and typeable.
     fn site_names() -> Vec<String> {
         flynnel::registered_sites()
             .iter()
             .map(|e| {
-                let file = e.location.file().replace(['\\', '/'], "-");
+                let file = e.location.file().replace(['\\', '/', ':'], "-");
                 format!("{file}-{}", e.location.line())
             })
             .collect()

@@ -37,6 +37,11 @@ pub const RUN_CHUNKS_PANIC: i32 = -1;
 /// other value stops the run.
 pub type ChunkBodyV1 = extern "C" fn(ctx: *const c_void, start: usize, end: usize) -> i32;
 
+/// [`flynnel_run_chunks_v1`] as a function pointer: the type a caller
+/// holding its address casts it back to.
+pub type RunChunksV1 =
+    unsafe extern "C" fn(n: usize, min_leaf: usize, body: ChunkBodyV1, ctx: *const c_void) -> i32;
+
 /// Run `body` over `[0, n)` in chunks on this module's worker pool, and
 /// return once every chunk has finished or the run has stopped.
 ///
@@ -144,14 +149,19 @@ pub struct NativeEntry {
 /// # Examples
 ///
 /// `Get-FlynnelNativeEntry`
-#[cmdlet(verb = "Get", noun = "FlynnelNativeEntry", output = ["Flynnel.NativeEntry"])]
+#[cmdlet(
+    verb = "Get",
+    noun = "FlynnelNativeEntry",
+    alias = "Get-FlyNativeEntry",
+    output = ["Flynnel.NativeEntry"]
+)]
 #[derive(Default)]
 pub struct GetFlynnelNativeEntry {}
 
 impl Cmdlet for GetFlynnelNativeEntry {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         ps.write(NativeEntry {
-            run_chunks_v1: flynnel_run_chunks_v1 as usize as u64,
+            run_chunks_v1: flynnel_run_chunks_v1 as RunChunksV1 as usize as u64,
             abi_version: NATIVE_ABI_VERSION,
         })
     }
@@ -241,6 +251,6 @@ mod tests {
     #[test]
     fn the_entry_reports_this_symbol_and_version_one() {
         assert_eq!(NATIVE_ABI_VERSION, 1);
-        assert_ne!(flynnel_run_chunks_v1 as usize, 0);
+        assert_ne!(flynnel_run_chunks_v1 as RunChunksV1 as usize, 0);
     }
 }
