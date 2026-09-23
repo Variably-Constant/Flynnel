@@ -54,6 +54,9 @@ param(
     # whole timeout and then declines to measure. Every arm line records
     # the busy cores it started against either way.
     [double]$MaxIdleCores = 0,
+    # Share pc2 with whatever else runs: no wait for quiet and no
+    # deference, only a presence claim.
+    [switch]$Contend,
     # What engagement looks like for this lever, as two separate
     # questions. Read is whether the switch reached its mechanism;
     # Acted is whether the mechanism then changed a decision. A lever
@@ -107,10 +110,19 @@ if ($LASTEXITCODE -ne 0) {
 }
 $exe = ".\target\release\examples\throughput_under_load.exe"
 
-$guard = @{ What = "flynnel lever $short, $Trials trials"; Log = $log; Tree = $tree; Who = 'Flynnel-Scholar' }
-if ($MaxIdleCores -gt 0) { $guard.MaxIdleCores = $MaxIdleCores }
-if (-not (Enter-TimingRun @guard)) {
-    exit 3
+if ($Contend) {
+    # No wait and no deference: the run shares pc2 with whatever else is
+    # there, announced in presence as the wait would have been. The arms
+    # are paired by trial, so the box's load falls on both.
+    & C:\Temp\presence.ps1 -Claim "flynnel lever $short, $Trials trials, timing that contends with what else runs, Flynnel-Scholar" -OwnerPid $PID *>&1 |
+        Add-Content -Path $log
+    "CONTENDING no quiet wait; each arm's line records the box's busy cores" | Add-Content -Path $log
+} else {
+    $guard = @{ What = "flynnel lever $short, $Trials trials"; Log = $log; Tree = $tree; Who = 'Flynnel-Scholar' }
+    if ($MaxIdleCores -gt 0) { $guard.MaxIdleCores = $MaxIdleCores }
+    if (-not (Enter-TimingRun @guard)) {
+        exit 3
+    }
 }
 
 foreach ($t in 1..$Trials) {
