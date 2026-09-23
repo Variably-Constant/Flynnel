@@ -682,8 +682,11 @@ Describe 'Send-FlynnelItem and Receive-FlynnelItem' {
     }
 
     It 'refuses a push at a pop side and says how much did not go in' {
+        # A push refused at the wrong side is a per-item error, and so
+        # non-terminating like any one failed pipeline item; the test asks
+        # for it to stop rather than borrowing the runner's preference.
         $p, $c = New-FlynnelSpscRing -Capacity 8
-        { , (New-Payload -Seed 1 -Length 8) | Send-FlynnelItem -To $c } | Should -Throw
+        { , (New-Payload -Seed 1 -Length 8) | Send-FlynnelItem -To $c -ErrorAction Stop } | Should -Throw
     }
 
     It 'answers to its Fly aliases' {

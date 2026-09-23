@@ -481,8 +481,14 @@ fn wrong_side_pop(id: u64) -> PsError {
 }
 
 /// The error for an argument a ring cannot take.
+///
+/// Terminating, as the module's other argument refusals are: a script
+/// that passed a capacity, a count or a ring object this cannot take
+/// holds nothing to carry on with, and a non-terminating error would let
+/// it carry on holding nothing. A push refused at the wrong side is the
+/// per-item error, and stays non-terminating.
 fn arg_err(message: impl Into<String>) -> PsError {
-    PsError::new(ErrorCategory::InvalidArgument, "FlynnelArgument", message.into())
+    PsError::new(ErrorCategory::InvalidArgument, "FlynnelArgument", message.into()).terminating()
 }
 
 /// Runs `f` against one entry under one acquisition of the table.

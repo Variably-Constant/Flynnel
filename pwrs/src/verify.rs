@@ -101,8 +101,11 @@ fn unknown_chain(id: u64) -> PsError {
     )
 }
 
+/// The error for an argument a chain cannot take, terminating as the
+/// module's other argument refusals are: a comparison against something
+/// that is not a chain has nothing to report.
 fn arg_err(message: impl Into<String>) -> PsError {
-    PsError::new(ErrorCategory::InvalidArgument, "FlynnelArgument", message.into())
+    PsError::new(ErrorCategory::InvalidArgument, "FlynnelArgument", message.into()).terminating()
 }
 
 fn with_chain<T>(id: u64, f: impl FnOnce(&mut ChainEntry) -> PsResult<T>) -> PsResult<T> {
@@ -393,8 +396,7 @@ impl Cmdlet for CompareFlynnelVerifyChain {
             return Err(arg_err(
                 "Reference and Difference are the same chain, which can only agree with \
                  itself and says nothing",
-            )
-            .terminating());
+            ));
         }
 
         // Finalize each before reading the digests, so the roots
