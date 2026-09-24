@@ -28,16 +28,17 @@
 #   Exit-BoxRun -Log $log
 #
 # Enter-TimingRun calls Enter-BoxRun itself, so a timing run declares once and
-# a caller must not call both. Neither takes the measurement lease: that is
-# C:\Temp\pc2_lease.py, whose holder must be the parent of the work, so the
-# launch wraps the runner rather than the runner taking it -
+# a caller must not call both. Neither takes the measurement lease, and
+# neither asks for it unless the caller passes -RequireLease $true. That lease
+# is C:\Temp\pc2_lease.py, whose holder must be the parent of the work, so a
+# launch that uses it wraps the runner rather than the runner taking it -
 #
 #   schtasks /run -> python pc2_lease.py run --who '<you>' -- <the runner>
 #
-# and both entry points refuse a span that is not under it, unless the caller
-# passes -RequireLease $false. Each refusal writes its own line, so NO_LEASE,
-# NO_PROVENANCE and NOT_QUIET are told apart by a caller that only sees the
-# exit code.
+# and with -RequireLease $true both entry points refuse a span that is not
+# under it. Each refusal writes its own line, so NO_LEASE, NO_PROVENANCE and
+# NOT_QUIET are told apart by a caller that only sees the exit code; the
+# BOX_LEASE line records the lease's state for every span either way.
 #
 # -BoundOn says what the run's wall is bound on and picks the CPU ceiling from
 # it: host, the default, waits for a box quiet enough that its cores are not
@@ -102,10 +103,10 @@ function Test-UnderMeasurementLease {
 # It does not take the measurement lease. pc2_lease.py holds that for exactly
 # the life of its child and requires the holder to be the child's parent,
 # which a function dot-sourced into the work can never be; its header forbids
-# hand-rolling the take and release for that reason. So this refuses unless it
-# is already under the lease, which turns the nesting that file requires -
-# the task, then the lease, then the work - into something checked rather than
-# hoped for.
+# hand-rolling the take and release for that reason. So with -RequireLease
+# $true this refuses unless it is already under the lease, which turns the
+# nesting that file requires - the task, then the lease, then the work - into
+# something checked rather than hoped for.
 function Enter-BoxRun {
     param(
         [Parameter(Mandatory = $true)][string]$What,
@@ -114,9 +115,10 @@ function Enter-BoxRun {
         [string]$Who = 'an agent that did not name itself',
         [int]$OwnerPid = $PID,
         # Whether a span that is not under the measurement lease is refused.
-        # A caller that genuinely runs outside it passes false, and the fact
-        # reaches the log either way, so an unserialized span is never silent.
-        [bool]$RequireLease = $true
+        # Only a caller whose launch is wrapped in the lease passes true. The
+        # lease's state reaches the log either way, so an unserialized span is
+        # never silent.
+        [bool]$RequireLease = $false
     )
     $under = Test-UnderMeasurementLease
     $said = if ($null -eq $under) { 'could not be read' } elseif ($under) { 'held' } else { 'not held' }
@@ -211,9 +213,9 @@ function Enter-TimingRun {
         # right for a run nobody is watching and wrong for a smoke test.
         [double]$WaitMinutes = 180,
         # Passed to [Enter-BoxRun]: whether a run that is not under the
-        # measurement lease is refused. A timing run has the most to lose from
-        # not being serialized, so it defaults to refusing.
-        [bool]$RequireLease = $true
+        # measurement lease is refused. Only a caller whose launch is wrapped
+        # in the lease passes true.
+        [bool]$RequireLease = $false
     )
 
     if ($MaxIdleCores -lt 0) {
