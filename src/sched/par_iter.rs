@@ -257,11 +257,37 @@ fn record_leaf_on_core<F: FnOnce() -> R, R>(
     out
 }
 
+/// A leaf's per-item squared time: its squared time over its item
+/// count. Summed across leaves it gives an unbiased estimate of the
+/// per-item variance whatever sizes the leaves came out at, because a
+/// leaf of n items averages n of them. A leaf of no items contributes
+/// time to the leaf statistics and nothing to the per-item ones, which
+/// is what it can honestly say.
+///
+/// Taken from the raw nanoseconds in 128 bits and scaled once, rather
+/// than from the scaled square: scaling first costs the low 8 bits of
+/// every leaf, which is nothing on a millisecond leaf and 40 percent on
+/// a one-item leaf of a microsecond. That error arrives as spread,
+/// which is the one thing this figure exists to measure.
+#[inline(always)]
+fn per_item_square(nanos: u64, items: u64) -> u64 {
+    (nanos as u128)
+        .saturating_mul(nanos as u128)
+        .checked_div((items as u128) << 16)
+        .unwrap_or(0) as u64
+}
+
 /// Record a pre-measured serial-span duration against `site`
 /// without bracketing a body. The heartbeat and token-bucket fillers
 /// record the serial spans between their promotions, and the
 /// whole-input serial passes record the pass, in place of closure
 /// invocations.
+///
+/// A span carries the items it covered and enters the site's
+/// statistics as a leaf of that many items does. The site's per-item
+/// mean is its summed time over its summed items, so a span's time
+/// counted without its items would be spread over items other leaves
+/// covered.
 ///
 /// Spans feed the SITE's statistics only, never the process-global
 /// counters: a span is a whole serial stretch, and mixing it into the
@@ -277,15 +303,17 @@ fn record_leaf_on_core<F: FnOnce() -> R, R>(
 pub(crate) fn record_leaf_span_ns(
     site: Option<crate::sched::call_site::SiteRef>,
     nanos: u64,
+    items: u64,
 ) {
     if let Some(site) = site {
         let scaled = nanos >> 8;
-        // No item count: a span covers whatever the promotion loop got
-        // through, so it feeds the leaf statistics and contributes
-        // nothing to the per-item ones rather than entering them as a
-        // single item of its whole duration.
-        site.get()
-            .record_batch_site_only(nanos, scaled.saturating_mul(scaled), 1, 0, 0);
+        site.get().record_batch_site_only(
+            nanos,
+            scaled.saturating_mul(scaled),
+            1,
+            items,
+            per_item_square(nanos, items),
+        );
     }
 }
 
@@ -297,10 +325,10 @@ pub(crate) fn record_leaf_span_ns(
 /// first read in a process measures the rate with three
 /// one-millisecond spins, and a span with no site is dropped anyway.
 #[inline(always)]
-fn record_leaf_span_ticks(site: Option<crate::sched::call_site::SiteRef>, ticks: u64) {
+fn record_leaf_span_ticks(site: Option<crate::sched::call_site::SiteRef>, ticks: u64, items: u64) {
     if site.is_some() {
         let (nanos, _) = LocalLeafBuffer::as_nanos(ticks, 0);
-        record_leaf_span_ns(site, nanos);
+        record_leaf_span_ns(site, nanos, items);
     }
 }
 
@@ -405,23 +433,7 @@ impl LocalLeafBuffer {
     ) {
         let scaled = nanos >> 8;
         let sq = scaled.saturating_mul(scaled);
-        // The per-item term is this leaf's squared time over its item
-        // count. Summed across leaves it gives an unbiased estimate of
-        // the per-item variance whatever sizes the leaves came out at,
-        // because a leaf of n items averages n of them. A leaf of no
-        // items contributes time to the leaf statistics and nothing to
-        // the per-item ones, which is what it can honestly say.
-        //
-        // Taken from the raw nanoseconds in 128 bits and scaled once,
-        // rather than from `sq`: scaling first costs the low 8 bits of
-        // every leaf, which is nothing on a millisecond leaf and 40
-        // percent on a one-item leaf of a microsecond. That error
-        // arrives as spread, which is the one thing this figure exists
-        // to measure.
-        let per_item_sq = (nanos as u128)
-            .saturating_mul(nanos as u128)
-            .checked_div((items as u128) << 16)
-            .unwrap_or(0) as u64;
+        let per_item_sq = per_item_square(nanos, items);
 
         self.global_sum_ns = self.global_sum_ns.saturating_add(nanos);
         self.global_sumsq_scaled = self.global_sumsq_scaled.saturating_add(sq);
@@ -2524,7 +2536,7 @@ where
         // of the process-global per-leaf counters.
         let t0 = std::time::Instant::now();
         op(items);
-        record_leaf_span_ns(plan.site, t0.elapsed().as_nanos() as u64);
+        record_leaf_span_ns(plan.site, t0.elapsed().as_nanos() as u64, n as u64);
         return;
     }
     let n_chunks = n.div_ceil(chunk);
@@ -3864,7 +3876,7 @@ where
     if n <= MIN_LEAF_ITEMS {
         let t0 = std::time::Instant::now();
         fill_serial(items, start, f);
-        record_leaf_span_ns(plan.site, t0.elapsed().as_nanos() as u64);
+        record_leaf_span_ns(plan.site, t0.elapsed().as_nanos() as u64, n as u64);
         return;
     }
     let base = items.as_mut_ptr() as *mut R;
@@ -3894,7 +3906,7 @@ where
         if (i & POLL_MASK) == 0 && (n - i) >= 2 * MIN_LEAF_ITEMS {
             let now = read_tsc();
             if now.wrapping_sub(last_tick) >= HEARTBEAT_CYCLES {
-                record_leaf_span_ticks(plan.site, now.wrapping_sub(span_t0));
+                record_leaf_span_ticks(plan.site, now.wrapping_sub(span_t0), i as u64);
                 let (_filled, tail) = items.split_at_mut(i);
                 let mid = tail.len() >> 1;
                 let (near, far) = tail.split_at_mut(mid);
@@ -3911,7 +3923,7 @@ where
     }
     // Loop completed without promoting: the whole run was one
     // serial span.
-    record_leaf_span_ticks(plan.site, read_tsc().wrapping_sub(span_t0));
+    record_leaf_span_ticks(plan.site, read_tsc().wrapping_sub(span_t0), n as u64);
 }
 
 /// Pure serial fill into a `MaybeUninit<R>` slice. Used by
@@ -4096,7 +4108,7 @@ where
         if (token_trip || tick_trip) && i + 1 < n {
             let remaining = n - i;
             if remaining >= 2 {
-                record_leaf_span_ticks(plan.site, read_tsc().wrapping_sub(span_t0));
+                record_leaf_span_ticks(plan.site, read_tsc().wrapping_sub(span_t0), i as u64);
                 let (_filled, tail) = items.split_at_mut(i);
                 collect_inner(
                     plan, tail, start + i, f, 1,
@@ -4109,7 +4121,7 @@ where
         }
     }
     // Loop completed without promoting: one serial span.
-    record_leaf_span_ticks(plan.site, read_tsc().wrapping_sub(span_t0));
+    record_leaf_span_ticks(plan.site, read_tsc().wrapping_sub(span_t0), n as u64);
 }
 
 /// Recursive bisection with a fixed `chunk_size` floor + adaptive
@@ -5754,6 +5766,91 @@ mod tests {
         let wall_ns = t0.elapsed().as_nanos() as u64;
         let inner_ns = last_ns.load(Ordering::Relaxed) - first_ns.load(Ordering::Relaxed);
         assert_span_in_nanoseconds(&SITE, rate_16, wall_ns, inner_ns);
+    }
+
+    /// Check that `site` holds `spans` spans of `items` items each and
+    /// nothing else, and that they reached it with their item counts:
+    /// the site has a per-item mean, and it is the site's summed time
+    /// over every item the spans covered. Spans recorded without their
+    /// items leave a site holding only spans with no item count, and no
+    /// per-item mean at all.
+    fn assert_spans_carry_items(
+        site: &crate::sched::call_site::CallSiteState,
+        spans: u64,
+        items: u64,
+    ) {
+        assert_eq!(
+            site.leaf_count(),
+            spans,
+            "each fill that cannot promote records one span"
+        );
+        let per_item = site
+            .per_item_ns()
+            .expect("spans that carry their items give the site a per-item mean");
+        let covered = spans * items;
+        let sum_ns = site.leaf_sum_ns();
+        assert!(
+            per_item.abs_diff(sum_ns / covered) <= 1,
+            "{per_item} ns an item from {sum_ns} ns over {covered} items: the spans' time is \
+             not divided by the items they covered"
+        );
+    }
+
+    #[test]
+    fn a_span_carries_the_items_it_covered() {
+        use crate::sched::call_site::{CallSiteState, SiteRef};
+        // Four fills or passes at each site, none able to promote or
+        // split, so each site holds four spans and nothing else.
+        const SPANS: u64 = 4;
+
+        // More than MIN_LEAF_ITEMS, so the fill polls, and fewer than
+        // twice that remain after its first poll, so it cannot promote.
+        static HEARTBEAT: CallSiteState = CallSiteState::new();
+        let plan = JobPlan::new(6, 1).with_site(SiteRef::new(&HEARTBEAT));
+        let n = 2 * MIN_LEAF_ITEMS;
+        for _ in 0..SPANS {
+            let mut buf: Vec<std::mem::MaybeUninit<u64>> = Vec::with_capacity(n);
+            buf.resize_with(n, std::mem::MaybeUninit::uninit);
+            heartbeat_fill(&plan, &mut buf[..], 0, &span_test_item);
+        }
+        assert_spans_carry_items(&HEARTBEAT, SPANS, n as u64);
+
+        // At most MIN_LEAF_ITEMS, the fill's serial branch.
+        static SERIAL: CallSiteState = CallSiteState::new();
+        let plan = JobPlan::new(6, 1).with_site(SiteRef::new(&SERIAL));
+        let n = MIN_LEAF_ITEMS;
+        for _ in 0..SPANS {
+            let mut buf: Vec<std::mem::MaybeUninit<u64>> = Vec::with_capacity(n);
+            buf.resize_with(n, std::mem::MaybeUninit::uninit);
+            heartbeat_fill(&plan, &mut buf[..], 0, &span_test_item);
+        }
+        assert_spans_carry_items(&SERIAL, SPANS, n as u64);
+
+        // Fewer items than one poll interval and no tokens, so the
+        // bucket's fill checks neither trip.
+        static BUCKET: CallSiteState = CallSiteState::new();
+        let plan = JobPlan::new(6, 1).with_site(SiteRef::new(&BUCKET));
+        let n = POLL_MASK;
+        for _ in 0..SPANS {
+            let mut buf: Vec<std::mem::MaybeUninit<u64>> = Vec::with_capacity(n);
+            buf.resize_with(n, std::mem::MaybeUninit::uninit);
+            token_bucket_fill(&plan, &mut buf[..], 0, &span_test_item, &|_: usize| 0u32);
+        }
+        assert_spans_carry_items(&BUCKET, SPANS, n as u64);
+
+        // An input no longer than the chunk, the whole-input pass.
+        static FIXED: CallSiteState = CallSiteState::new();
+        let plan = JobPlan::new(6, 1).with_site(SiteRef::new(&FIXED));
+        let n = 64;
+        for _ in 0..SPANS {
+            let mut v: Vec<u64> = (0..n as u64).collect();
+            for_each_fixed_chunk(&plan, &mut v, n, |slice| {
+                for x in slice.iter_mut() {
+                    *x = span_test_item(*x as usize);
+                }
+            });
+        }
+        assert_spans_carry_items(&FIXED, SPANS, n as u64);
     }
 
     #[test]

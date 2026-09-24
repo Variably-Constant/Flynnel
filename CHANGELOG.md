@@ -696,6 +696,27 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   records between half the items' own interval and twice the wall time
   around the fill.
 
+- **A span's time reached its call site's per-item mean without the items
+  it covered.** The heartbeat and token-bucket fillers and the whole-input
+  serial passes record each serial stretch against the site as one span,
+  and a span carried no item count, while the site's per-item mean is its
+  summed time over its summed items. So a site holding spans and leaves
+  divided the spans' time among the leaves' items: one uniform workload at
+  reps 16 read 57 ns an item and class `MemoryBound` through the heartbeat
+  collect, against 3 and 4 and `FineGrain` through the indexed and
+  token-bucket collects, in one short run on a Linux guest. The same mean
+  sets a site's smallest leaf, the pool's dispatch cost over the per-item
+  cost, so an inflated mean also split the site's leaves finer than its
+  items' cost called for. A span now carries the items it covered, those filled before a promotion or all of
+  them at completion, and enters the per-item statistics as a leaf of that
+  many items does, still at the site only. The fillers are reached through
+  `collect_indexed_heartbeat` and `collect_indexed_token_bucket`, and the
+  passes through `for_each_fixed_chunk` and the helpers built on it, where
+  a chunk size of one makes a one-item input the pass. A test gives each
+  of the four span paths a site holding four spans and nothing else, and
+  reads a per-item mean equal to the summed time over the items the spans
+  covered, where before there was none.
+
 - **With every park switch off, the park-lever changes made fine-grained
   dispatch slower.** On a 24-thread Windows host, paired by trial on one
   harness source with the host profile pinned, the quiet window at about
