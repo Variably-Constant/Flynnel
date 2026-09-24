@@ -684,6 +684,18 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
+- **Heartbeat and token-bucket spans reached a call site's classifier in
+  counter ticks.** Both fillers time the serial stretch between their
+  promotions with the timestamp counter and recorded the difference
+  against the site as nanoseconds, which on x86_64 put a heartbeat
+  site's leaf times out by the counter's rate, the factor of 4.66 the
+  leaf path's conversion corrected on one bench host. The spans now go
+  through the leaf path's conversion. The whole-input serial passes
+  time their spans in nanoseconds and are unchanged. Two tests fill
+  through a stretch each filler cannot promote and hold the one span it
+  records between half the items' own interval and twice the wall time
+  around the fill.
+
 - **With every park switch off, the park-lever changes made fine-grained
   dispatch slower.** On a 24-thread Windows host, paired by trial on one
   harness source with the host profile pinned, the quiet window at about

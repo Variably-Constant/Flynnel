@@ -258,20 +258,21 @@ fn record_leaf_on_core<F: FnOnce() -> R, R>(
 }
 
 /// Record a pre-measured serial-span duration against `site`
-/// without bracketing a body. Used by the heartbeat and
-/// token-bucket fillers, whose "leaves" are the serial spans
-/// between promotions rather than closure invocations.
+/// without bracketing a body. The heartbeat and token-bucket fillers
+/// record the serial spans between their promotions, and the
+/// whole-input serial passes record the pass, in place of closure
+/// invocations.
 ///
 /// Spans feed the SITE's statistics only, never the process-global
-/// counters: a span is a whole-stretch wall time (heartbeat quantum
-/// and up), and mixing it into the global classifier's per-item-ns
-/// boundaries would migrate the process profile off unrelated
-/// workloads. With no site attached the sample is dropped.
+/// counters: a span is a whole serial stretch, and mixing it into the
+/// global classifier's per-item-ns boundaries would migrate the
+/// process profile off unrelated workloads. With no site attached the
+/// sample is dropped.
 ///
-/// `nanos` is already nanoseconds and goes to the site unconverted:
-/// this path bypasses [`LocalLeafBuffer`], where counter ticks are
-/// turned into nanoseconds, so converting here would apply the rate
-/// twice.
+/// `nanos` is nanoseconds and goes to the site unconverted: this path
+/// bypasses [`LocalLeafBuffer`], where counter ticks are turned into
+/// nanoseconds. A span timed on the counter comes through
+/// [`record_leaf_span_ticks`].
 #[inline(always)]
 pub(crate) fn record_leaf_span_ns(
     site: Option<crate::sched::call_site::SiteRef>,
@@ -285,6 +286,21 @@ pub(crate) fn record_leaf_span_ns(
         // single item of its whole duration.
         site.get()
             .record_batch_site_only(nanos, scaled.saturating_mul(scaled), 1, 0, 0);
+    }
+}
+
+/// [`record_leaf_span_ns`] for a span timed with [`read_tsc`]: the
+/// delta is counter ticks, turned into nanoseconds by the conversion
+/// [`LocalLeafBuffer`] applies to leaves.
+///
+/// The site is checked before the rate is read, because on x86_64 the
+/// first read in a process measures the rate with three
+/// one-millisecond spins, and a span with no site is dropped anyway.
+#[inline(always)]
+fn record_leaf_span_ticks(site: Option<crate::sched::call_site::SiteRef>, ticks: u64) {
+    if site.is_some() {
+        let (nanos, _) = LocalLeafBuffer::as_nanos(ticks, 0);
+        record_leaf_span_ns(site, nanos);
     }
 }
 
@@ -3855,8 +3871,8 @@ where
     let last_tick = read_tsc();
     // Serial-span start for the site classifier: everything filled
     // between here and a promotion (or loop completion) is one
-    // leaf-equivalent span. Same TSC-as-approximate-ns convention
-    // as record_leaf.
+    // leaf-equivalent span, timed on the counter and recorded in
+    // nanoseconds.
     let span_t0 = last_tick;
 
     // Serial fill until rdtsc tick crosses HEARTBEAT_CYCLES; on tick
@@ -3878,7 +3894,7 @@ where
         if (i & POLL_MASK) == 0 && (n - i) >= 2 * MIN_LEAF_ITEMS {
             let now = read_tsc();
             if now.wrapping_sub(last_tick) >= HEARTBEAT_CYCLES {
-                record_leaf_span_ns(plan.site, now.wrapping_sub(span_t0));
+                record_leaf_span_ticks(plan.site, now.wrapping_sub(span_t0));
                 let (_filled, tail) = items.split_at_mut(i);
                 let mid = tail.len() >> 1;
                 let (near, far) = tail.split_at_mut(mid);
@@ -3895,7 +3911,7 @@ where
     }
     // Loop completed without promoting: the whole run was one
     // serial span.
-    record_leaf_span_ns(plan.site, read_tsc().wrapping_sub(span_t0));
+    record_leaf_span_ticks(plan.site, read_tsc().wrapping_sub(span_t0));
 }
 
 /// Pure serial fill into a `MaybeUninit<R>` slice. Used by
@@ -4045,8 +4061,8 @@ where
     }
     let base = items.as_mut_ptr() as *mut R;
     let mut last_tick = read_tsc();
-    // Serial-prefix span start for the site classifier (same
-    // TSC-as-approximate-ns convention as record_leaf).
+    // Serial-prefix span start for the site classifier, timed on the
+    // counter and recorded in nanoseconds.
     let span_t0 = last_tick;
     let mut tokens_since_check: u64 = 0;
 
@@ -4080,7 +4096,7 @@ where
         if (token_trip || tick_trip) && i + 1 < n {
             let remaining = n - i;
             if remaining >= 2 {
-                record_leaf_span_ns(plan.site, read_tsc().wrapping_sub(span_t0));
+                record_leaf_span_ticks(plan.site, read_tsc().wrapping_sub(span_t0));
                 let (_filled, tail) = items.split_at_mut(i);
                 collect_inner(
                     plan, tail, start + i, f, 1,
@@ -4093,7 +4109,7 @@ where
         }
     }
     // Loop completed without promoting: one serial span.
-    record_leaf_span_ns(plan.site, read_tsc().wrapping_sub(span_t0));
+    record_leaf_span_ticks(plan.site, read_tsc().wrapping_sub(span_t0));
 }
 
 /// Recursive bisection with a fixed `chunk_size` floor + adaptive
@@ -5623,6 +5639,121 @@ mod tests {
             after.sum_ns.wrapping_sub(before.sum_ns) > 0,
             "the global leaf time did not rise while the site recorded {sum_ns} ns"
         );
+    }
+
+    /// One item of the span tests' fills: heavy enough that a fill's
+    /// span is far above the resolution of a pair of counter reads, and
+    /// kept by `black_box` so the fill cannot be discarded.
+    fn span_test_item(i: usize) -> u64 {
+        let mut acc = i as u64;
+        for _ in 0..256 {
+            acc = acc.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        }
+        std::hint::black_box(acc)
+    }
+
+    /// Check that the one span a fill recorded against `site` arrived in
+    /// nanoseconds, given the wall time measured around the fill and the
+    /// interval from its first item's start to its last item's end,
+    /// which the span encloses.
+    ///
+    /// A span past twice the wall time is counter ticks, which run at
+    /// over two a nanosecond on every host this runs on. A span under
+    /// half the inner interval is the conversion applied twice. Losing
+    /// the core inside the fill lengthens all three alike, and a stall
+    /// outside it only widens the ceiling.
+    fn assert_span_in_nanoseconds(
+        site: &crate::sched::call_site::CallSiteState,
+        rate_16: u64,
+        wall_ns: u64,
+        inner_ns: u64,
+    ) {
+        assert_eq!(
+            site.leaf_count(),
+            1,
+            "a fill that cannot promote records one span"
+        );
+        let span_ns = site.leaf_sum_ns();
+        assert!(
+            span_ns <= wall_ns.saturating_mul(2),
+            "a {span_ns} ns span inside {wall_ns} ns of wall time, with the counter at \
+             {rate_16} sixteenths of a tick a nanosecond: the span is in counter ticks"
+        );
+        assert!(
+            span_ns >= inner_ns / 2,
+            "a {span_ns} ns span around {inner_ns} ns of items, with the counter at \
+             {rate_16} sixteenths of a tick a nanosecond: the span was converted twice"
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_span_reaches_its_site_in_nanoseconds() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Twice MIN_LEAF_ITEMS, so fewer than that remain after the
+        // first poll and the fill cannot promote: it records one span,
+        // the whole fill, timed on the counter.
+        static SITE: crate::sched::call_site::CallSiteState =
+            crate::sched::call_site::CallSiteState::new();
+        let site = crate::sched::call_site::SiteRef::new(&SITE);
+        let plan = JobPlan::new(6, 1).with_site(site);
+        // The first read of the rate measures it with a spin, which would
+        // otherwise land inside the wall time below.
+        let rate_16 = tsc_per_ns_16();
+        let n = 2 * MIN_LEAF_ITEMS;
+        let mut buf: Vec<std::mem::MaybeUninit<u64>> = Vec::with_capacity(n);
+        buf.resize_with(n, std::mem::MaybeUninit::uninit);
+        let base = std::time::Instant::now();
+        let first_ns = AtomicU64::new(0);
+        let last_ns = AtomicU64::new(0);
+        let item = |i: usize| {
+            if i == 0 {
+                first_ns.store(base.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            let out = span_test_item(i);
+            if i == n - 1 {
+                last_ns.store(base.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            out
+        };
+        let t0 = std::time::Instant::now();
+        heartbeat_fill(&plan, &mut buf[..], 0, &item);
+        let wall_ns = t0.elapsed().as_nanos() as u64;
+        let inner_ns = last_ns.load(Ordering::Relaxed) - first_ns.load(Ordering::Relaxed);
+        assert_span_in_nanoseconds(&SITE, rate_16, wall_ns, inner_ns);
+    }
+
+    #[test]
+    fn a_token_bucket_span_reaches_its_site_in_nanoseconds() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Fewer items than one poll interval and no tokens, so the fill
+        // checks neither trip and cannot promote: it records one span,
+        // the whole fill, timed on the counter.
+        static SITE: crate::sched::call_site::CallSiteState =
+            crate::sched::call_site::CallSiteState::new();
+        let site = crate::sched::call_site::SiteRef::new(&SITE);
+        let plan = JobPlan::new(6, 1).with_site(site);
+        let rate_16 = tsc_per_ns_16();
+        let n = POLL_MASK;
+        let mut buf: Vec<std::mem::MaybeUninit<u64>> = Vec::with_capacity(n);
+        buf.resize_with(n, std::mem::MaybeUninit::uninit);
+        let base = std::time::Instant::now();
+        let first_ns = AtomicU64::new(0);
+        let last_ns = AtomicU64::new(0);
+        let item = |i: usize| {
+            if i == 0 {
+                first_ns.store(base.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            let out = span_test_item(i);
+            if i == n - 1 {
+                last_ns.store(base.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            out
+        };
+        let t0 = std::time::Instant::now();
+        token_bucket_fill(&plan, &mut buf[..], 0, &item, &|_: usize| 0u32);
+        let wall_ns = t0.elapsed().as_nanos() as u64;
+        let inner_ns = last_ns.load(Ordering::Relaxed) - first_ns.load(Ordering::Relaxed);
+        assert_span_in_nanoseconds(&SITE, rate_16, wall_ns, inner_ns);
     }
 
     #[test]
