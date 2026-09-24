@@ -27,11 +27,12 @@
 use crate::sched::arena::{global_local_arena, join_context};
 use crate::sched::plan::JobPlan;
 
-/// Heartbeat interval in CPU cycles. ~20µs at 3 GHz, below the
-/// 67µs canonical heartbeat value: the hybrid design hands the
-/// tail off to SLAW on the first tick (no further heartbeat
-/// recursion), so faster ticks mean an earlier handover and more
-/// of the work runs in parallel.
+/// The heartbeat quantum: how long a serial fill runs before it hands
+/// its tail to the pool, and the estimated total below which an entry
+/// gate skips the pool altogether. Below the 67µs canonical heartbeat
+/// value: the hybrid design hands the tail off to SLAW on the first
+/// tick (no further heartbeat recursion), so faster ticks mean an
+/// earlier handover and more of the work runs in parallel.
 ///
 /// At 20µs:
 /// - matmul 16x16 (~25µs total serial) just barely fires one
@@ -40,7 +41,37 @@ use crate::sched::plan::JobPlan;
 ///   97% of work runs through SLAW's parallel bisect.
 /// - matmul 64x64 (~13ms serial) fans out at iter ~20 of 4096;
 ///   99% parallel.
+const HEARTBEAT_NS: u64 = 20_000;
+
+/// The quantum in timestamp-counter ticks while the counter's rate is
+/// unmeasured, which is [`HEARTBEAT_NS`] at 3 GHz. [`heartbeat_ticks`]
+/// takes the host's own rate once anything in the process has measured
+/// it.
+#[cfg(target_arch = "x86_64")]
 const HEARTBEAT_CYCLES: u64 = 60_000;
+
+/// The heartbeat quantum in [`read_tsc`] ticks on this host.
+///
+/// On x86_64 the counter's rate is read as [`tsc_per_ns_16`] stored it
+/// and never measured from here, because the first measurement in a
+/// process spins for three milliseconds and a fill must not pay that.
+/// Until a leaf flush or a span with a site has measured it, the
+/// quantum is `HEARTBEAT_CYCLES`. Off x86_64 the counter is a
+/// nanosecond clock and the quantum is [`HEARTBEAT_NS`] exactly.
+#[inline(always)]
+fn heartbeat_ticks() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match TSC_PER_NS_16.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => HEARTBEAT_CYCLES,
+            rate_16 => HEARTBEAT_NS.saturating_mul(rate_16) >> 4,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        HEARTBEAT_NS
+    }
+}
 
 /// How often to check the heartbeat timer. `iter_count & POLL_MASK
 /// == 0` triggers an rdtsc read. 0x1F = every 32 iterations,
@@ -3686,7 +3717,8 @@ const HEARTBEAT_GATE_ITEMS: usize = 100_000;
 /// Charguéraud, Guatto, Rainey, Sieczkowski, "Heartbeat Scheduling:
 /// Provable Efficiency for Nested Parallelism", PLDI 2018, §4
 /// "Native support for parallel loops"). On each rdtsc tick that
-/// crosses [`HEARTBEAT_CYCLES`], the current loop's remaining range
+/// crosses the quantum, [`HEARTBEAT_NS`] in this host's counter ticks
+/// (see [`heartbeat_ticks`]), the current loop's remaining range
 /// is split in half and the upper half is forked via
 /// [`crate::sched::join_context`]. Each forked sub-range runs its
 /// own polling counter so the promotion tree builds incrementally.
@@ -3757,8 +3789,6 @@ where
     if plan.estimated_per_item_ns_explicit
         && let Some(total_ns) = plan.estimated_total_ns()
     {
-        // HEARTBEAT_CYCLES is ~20µs at 3 GHz = ~20_000ns.
-        const HEARTBEAT_NS: u64 = 20_000;
         if total_ns < HEARTBEAT_NS {
             // Run fully serial: no scheduler involvement at all.
             return serial_collect_indexed(n, &f);
@@ -3880,6 +3910,7 @@ where
         return;
     }
     let base = items.as_mut_ptr() as *mut R;
+    let quantum = heartbeat_ticks();
     let last_tick = read_tsc();
     // Serial-span start for the site classifier: everything filled
     // between here and a promotion (or loop completion) is one
@@ -3887,7 +3918,7 @@ where
     // nanoseconds.
     let span_t0 = last_tick;
 
-    // Serial fill until rdtsc tick crosses HEARTBEAT_CYCLES; on tick
+    // Serial fill until rdtsc tick crosses the quantum; on tick
     // bisect the remaining tail in half and fork the far half via
     // sched::join_context. Both halves recurse through heartbeat_fill
     // so each forked sub-range maintains its own polling counter -
@@ -3905,7 +3936,7 @@ where
         // halves at or above the serial-only threshold.
         if (i & POLL_MASK) == 0 && (n - i) >= 2 * MIN_LEAF_ITEMS {
             let now = read_tsc();
-            if now.wrapping_sub(last_tick) >= HEARTBEAT_CYCLES {
+            if now.wrapping_sub(last_tick) >= quantum {
                 record_leaf_span_ticks(plan.site, now.wrapping_sub(span_t0), i as u64);
                 let (_filled, tail) = items.split_at_mut(i);
                 let mid = tail.len() >> 1;
@@ -3947,7 +3978,7 @@ where
 /// heartbeat that accumulates **work tokens** between checks. Each
 /// item contributes a caller-supplied token count; promote-to-SLAW
 /// fires when accumulated tokens cross [`TOKEN_BUCKET_PROMOTE`] OR
-/// when an rdtsc tick crosses [`HEARTBEAT_CYCLES`]. Use for
+/// when an rdtsc tick crosses the quantum ([`heartbeat_ticks`]). Use for
 /// heterogeneous-per-iter workloads where the rdtsc-mask-based
 /// `collect_indexed_heartbeat` polls too rarely (heavy items) or
 /// too often (light items) for the actual cost distribution.
@@ -3989,7 +4020,6 @@ where
     if plan.estimated_per_item_ns_explicit
         && let Some(total_ns) = plan.estimated_total_ns()
     {
-        const HEARTBEAT_NS: u64 = 20_000;
         if total_ns < HEARTBEAT_NS {
             return serial_collect_indexed(n, &f);
         }
@@ -4072,6 +4102,7 @@ where
         return;
     }
     let base = items.as_mut_ptr() as *mut R;
+    let quantum = heartbeat_ticks();
     let mut last_tick = read_tsc();
     // Serial-prefix span start for the site classifier, timed on the
     // counter and recorded in nanoseconds.
@@ -4099,7 +4130,7 @@ where
         // quantum has passed.
         let token_trip = tokens_since_check >= TOKEN_BUCKET_PROMOTE;
         let tick_trip = (i & POLL_MASK) == 0
-            && read_tsc().wrapping_sub(last_tick) >= HEARTBEAT_CYCLES;
+            && read_tsc().wrapping_sub(last_tick) >= quantum;
         if (token_trip || tick_trip) && i + 1 < n {
             let remaining = n - i;
             if remaining >= 2 {
@@ -5885,6 +5916,20 @@ mod tests {
             // directly and the promoted tail through collect_inner.
             assert_eq!(unsafe { slot.assume_init_read() }, item(i));
         }
+    }
+
+    #[test]
+    fn the_heartbeat_quantum_is_its_stated_nanoseconds_once_the_rate_is_known() {
+        // Measures the counter's rate unless this process already has,
+        // after which the quantum is taken from it.
+        let rate_16 = tsc_per_ns_16();
+        let ticks = heartbeat_ticks();
+        let (nanos, _) = LocalLeafBuffer::as_nanos(ticks, 0);
+        assert!(
+            nanos.abs_diff(HEARTBEAT_NS) <= HEARTBEAT_NS / 100,
+            "the quantum is {ticks} ticks, {nanos} ns through the leaf path's conversion at \
+             {rate_16} sixteenths of a tick a nanosecond, where it is stated as {HEARTBEAT_NS} ns"
+        );
     }
 
     #[test]

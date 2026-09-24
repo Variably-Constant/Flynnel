@@ -730,6 +730,18 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   which is the serial prefix's length, and requires fewer than all of
   them, with every slot holding its item.
 
+- **The heartbeat quantum was a fixed count of counter ticks while the
+  entry gates beside it assume 20 µs.** `HEARTBEAT_CYCLES` was 60,000
+  ticks, 20 µs only on a 3 GHz counter: 12.8 µs on a 4.7 GHz one, and
+  60 µs off x86_64, where the counter is a nanosecond clock. The two
+  entry gates each carried their own 20 µs constant. There is now one
+  `HEARTBEAT_NS`, and both fillers take the quantum in ticks from the
+  counter rate the process has already measured, falling back to the
+  fixed count until something has, so a fill never pays the rate probe's
+  three one-millisecond spins itself. A test converts the quantum back
+  through the leaf path's own conversion and requires it within one per
+  cent of `HEARTBEAT_NS`.
+
 - **With every park switch off, the park-lever changes made fine-grained
   dispatch slower.** On a 24-thread Windows host, paired by trial on one
   harness source with the host profile pinned, the quiet window at about
