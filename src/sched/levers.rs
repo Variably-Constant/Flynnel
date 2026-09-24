@@ -14,8 +14,9 @@
 //! A switch whose default flips on the strength of an argument rather
 //! than a reading is how the thing this campaign is fixing got in.
 //!
-//! Three have earned it: [`calibration_refusal`], [`oncore_spread`] and
-//! [`allowed_width`] default on, and the reading is on each function.
+//! Four have earned it: [`calibration_refusal`], [`oncore_spread`],
+//! [`allowed_width`] and [`join_park_oversubscribed`] default on, and the
+//! reading is on each function.
 //! The rest are off and say what would have to be measured for that to
 //! change.
 //!
@@ -423,10 +424,23 @@ pub fn join_park() -> bool {
 /// adds while on is two clock reads and one counter add around each idle
 /// yield.
 ///
-/// Off until measured, quiet and loaded, on bare metal and on a guest.
+/// On, measured in the oversubscribed caller against the same code with
+/// it off, rounds paired, quiet and loaded. On a 16-vCPU Linux guest, in
+/// two runs of 15 rounds each on fresh calibrations, the quiet median was
+/// 0.994 and 0.991 of the off arm's, slower in 6 rounds of 15 in each run
+/// (0.977 to 1.017 and 0.944 to 1.034 across the middle nine), and 1.002
+/// and 0.992 against each process's own serial calls; under load, calls
+/// of 5 ms or more fell to 0.56 and 0.60 of the off arm's, fewer in 13 and
+/// 12 rounds, while the loaded median resolved in neither. On a 24-thread
+/// Windows host with its profile pinned, the median round's loaded p99
+/// was 25.0 ms against 32.2 and its calls of 5 ms or more 104 against
+/// 128, with the quiet median at 0.469 ms against 0.452 beside a serial
+/// control at 3.710 against 3.576. On an 8-core Windows desktop the loaded
+/// median was 2.76 ms against 5.31 and the calls of 5 ms or more 120
+/// against 414. `FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED=0` turns it off.
 pub fn join_park_oversubscribed() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| read("FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED"))
+    *V.get_or_init(|| read_defaulting_on("FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED"))
 }
 
 /// Spend an idle pool worker's spin rounds in a bounded monitor wait on
@@ -493,10 +507,10 @@ pub fn allowed_width() -> bool {
 /// Decline to displace a stored calibration whose dispatch cost is
 /// cheaper than the one being offered.
 ///
-/// One of the three switches here that default on, with `oncore_spread`
-/// and `allowed_width`. The rest default off because off is the behavior
-/// that shipped and a measurement has to earn the flip; this one has the
-/// measurement.
+/// One of the four switches here that default on, with `oncore_spread`,
+/// `allowed_width` and `join_park_oversubscribed`. The rest default off
+/// because off is the behavior that shipped and a measurement has to
+/// earn the flip; this one has the measurement.
 /// Across 16 draws at each of three
 /// load levels on a 12-core host, the dispatch cost read 1300 to 1500 ns
 /// idle and 3.2 to 7.0 million saturated, with no overlap, so the
@@ -574,9 +588,9 @@ mod tests {
         // test in this binary.
         //
         // Named by reader rather than by lever because the levers do not
-        // share a default. oncore_spread, calibration_refusal and
-        // allowed_width take read_defaulting_on; batch_weight and
-        // smt_from_window take read.
+        // share a default. oncore_spread, calibration_refusal,
+        // allowed_width and join_park_oversubscribed take
+        // read_defaulting_on; batch_weight and smt_from_window take read.
         unsafe { std::env::remove_var("FLYNNEL_LEVER_DEFAULT_TEST") };
         assert!(
             !read("FLYNNEL_LEVER_DEFAULT_TEST"),

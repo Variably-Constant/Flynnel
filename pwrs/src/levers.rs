@@ -213,6 +213,15 @@ const JOIN_PARK_PRICE: &str = "Off, and measured not to be never-slower. Four ar
     about 1.3 to 3.1 ms, because a parked thread halts its vCPU and the wake goes through the \
     hypervisor.";
 
+const JOIN_PARK_OVERSUBSCRIBED_PRICE: &str = "On a 16-vCPU Linux guest, two runs of 15 rounds \
+    of the oversubscribed caller against the same code with it off: the quiet median 0.994 and \
+    0.991 of the off arm's, slower in 6 rounds of 15 in each (0.977 to 1.017 and 0.944 to 1.034 \
+    across the middle nine), and calls of 5 ms or more under load 0.56 and 0.60 of the off \
+    arm's, fewer in 13 and 12. On a 24-thread Windows bare-metal box the \
+    median round's loaded p99 was 25.0 against 32.2 ms and its calls of 5 ms or more 104 against \
+    128, with the quiet median at 0.469 against 0.452 ms beside a serial control at 3.710 against \
+    3.576. Each idle yield pays two clock reads and a counter add while it is on.";
+
 const SLOT_PARK_PRICE: &str = "Off, and measured to change nothing: in four arms of the \
     oversubscribed caller on a 24-thread Windows bare-metal box and on a 16-vCPU Linux guest it \
     sat with the arm that had no switch on, quiet and loaded.";
@@ -316,8 +325,8 @@ fn all_levers() -> Vec<Lever> {
             "join_park_oversubscribed",
             "FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED",
             levers::join_park_oversubscribed(),
-            false,
-            NO_PRICE,
+            true,
+            JOIN_PARK_OVERSUBSCRIBED_PRICE,
         ),
         switch_row(
             "slot_park_now",

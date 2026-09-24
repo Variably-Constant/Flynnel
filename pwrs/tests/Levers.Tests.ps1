@@ -91,14 +91,14 @@ Describe 'Get-FlynnelLever' {
         # A switch that ships on has to say what it costs. A switch that
         # nothing has measured yet carries no price, and that is honest
         # rather than an omission.
-        foreach ($name in 'oncore_spread', 'allowed_width', 'calibration_refusal') {
+        foreach ($name in 'oncore_spread', 'allowed_width', 'calibration_refusal',
+                          'join_park_oversubscribed') {
             $row = $script:Levers | Where-Object Name -eq $name
             $row.Default | Should -Be 'true'
             $row.Price | Should -Not -BeNullOrEmpty -Because "$name ships on and must say what it costs"
         }
         foreach ($name in 'batch_weight', 'smt_window', 'latch_monitor', 'spin_monitor',
-                          'join_park', 'join_park_oversubscribed', 'slot_park_now',
-                          'mailbox_wake_legacy', 'wasm_local_store') {
+                          'join_park', 'slot_park_now', 'mailbox_wake_legacy', 'wasm_local_store') {
             $row = $script:Levers | Where-Object Name -eq $name
             $row.Default | Should -Be 'false'
         }

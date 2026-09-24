@@ -290,7 +290,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   three rounds, positions rotating), on a 24-thread run that routed on
   a profile drawn on a pool worker (see Fixed).
 
-- `FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED`, off: the join park, taken
+- `FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED`, on: the join park, taken
   only while a yield somewhere in the process has lately given its core
   away. A yield with nothing else ready returns in about a microsecond,
   and one that loses the core returns a time slice later, so the pool's
@@ -307,9 +307,22 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   million. A first line of 100 us did not separate them: the quiet
   processes read about 1,970 each, because a guest's vCPU is descheduled
   mid-yield often enough to look like a lost core, and parked 15,400 to
-  21,300 times at a quiet cost of about 6 per cent. Its quiet and loaded
-  cost at 2 ms, on bare metal and on a guest, are being measured, and it
-  stays off until they are.
+  21,300 times at a quiet cost of about 6 per cent.
+
+  At 2 ms it ships on. On the guest, in two runs of 15 rounds of the
+  reproducer against the same code with it off, each on a fresh
+  calibration, the quiet median read 0.994 and 0.991 of the off arm's,
+  slower in 6 rounds of 15 in each run (0.977 to 1.017 and 0.944 to
+  1.034 across the middle nine), and the calls of 5 ms or more under load
+  fell to 0.56 and 0.60 of the off arm's, fewer in 13 and 12 rounds,
+  while the loaded median resolved in neither. `JOIN_PARK` in the same
+  runs cost the quiet median 23 per cent in all 30 rounds. On the
+  24-thread host the median round's loaded p99 was 25.0 ms against 32.2
+  and its calls of 5 ms or more 104 against 128, with the quiet median at
+  0.469 ms against 0.452 beside a serial control at 3.710 against 3.576;
+  on the 16-thread host the loaded median was 2.76 ms against 5.31 and
+  the calls of 5 ms or more 120 against 414.
+  `FLYNNEL_LEVER_JOIN_PARK_OVERSUBSCRIBED=0` turns it off.
 
 - Two trace events under `FLYNNEL_TRACE=1`. `LatchSet` (kind 20) comes
   just before a thief sets the latch of the stolen job it ran.
