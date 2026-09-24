@@ -4093,18 +4093,13 @@ where
         // Token threshold OR rdtsc tick: either signal triggers a
         // promote-to-SLAW. Token check is cheap (one branch); rdtsc
         // check fires only every POLL_MASK+1 items to keep cost
-        // amortized even when each token is small.
+        // amortized even when each token is small. The tick counts from
+        // the span's start, as the heartbeat filler's does, so a fill
+        // whose tokens under-count its items still promotes once a
+        // quantum has passed.
         let token_trip = tokens_since_check >= TOKEN_BUCKET_PROMOTE;
-        let tick_trip = (i & POLL_MASK) == 0 && {
-            let now = read_tsc();
-            let elapsed = now.wrapping_sub(last_tick);
-            if elapsed >= HEARTBEAT_CYCLES {
-                true
-            } else {
-                last_tick = now;
-                false
-            }
-        };
+        let tick_trip = (i & POLL_MASK) == 0
+            && read_tsc().wrapping_sub(last_tick) >= HEARTBEAT_CYCLES;
         if (token_trip || tick_trip) && i + 1 < n {
             let remaining = n - i;
             if remaining >= 2 {
@@ -5851,6 +5846,45 @@ mod tests {
             });
         }
         assert_spans_carry_items(&FIXED, SPANS, n as u64);
+    }
+
+    #[test]
+    fn a_token_bucket_fill_with_no_tokens_promotes_once_a_quantum_has_passed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Items light enough that one poll window of POLL_MASK + 1 of
+        // them takes a small part of a quantum, and enough of them that
+        // the whole fill takes many quanta. With no tokens the time
+        // trip is the only way out of the serial prefix.
+        let item = |i: usize| {
+            let mut acc = i as u64;
+            for _ in 0..32 {
+                acc = acc.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            }
+            std::hint::black_box(acc)
+        };
+        let n = 1usize << 16;
+        // The filler asks for an item's tokens only while it fills
+        // serially, so the count of asks is the serial prefix's length.
+        let asked = AtomicUsize::new(0);
+        let tokens = |_: usize| {
+            asked.fetch_add(1, Ordering::Relaxed);
+            0u32
+        };
+        let plan = JobPlan::new(6, 1);
+        let mut buf: Vec<std::mem::MaybeUninit<u64>> = Vec::with_capacity(n);
+        buf.resize_with(n, std::mem::MaybeUninit::uninit);
+        token_bucket_fill(&plan, &mut buf[..], 0, &item, &tokens);
+        let serial = asked.load(Ordering::Relaxed);
+        assert!(
+            serial < n,
+            "a fill of {n} items with no tokens stayed serial throughout: the time trip never \
+             fired, so it is not counting from the span's start"
+        );
+        for (i, slot) in buf.iter().enumerate() {
+            // SAFETY: the fill writes every slot, the serial prefix
+            // directly and the promoted tail through collect_inner.
+            assert_eq!(unsafe { slot.assume_init_read() }, item(i));
+        }
     }
 
     #[test]

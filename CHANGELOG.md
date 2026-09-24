@@ -717,6 +717,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   reads a per-item mean equal to the summed time over the items the spans
   covered, where before there was none.
 
+- **A token-bucket fill whose tokens under-counted its items never
+  reached the time trip its documentation promises.**
+  `collect_indexed_token_bucket` promotes its serial prefix when the
+  accumulated tokens cross the threshold or when a heartbeat quantum has
+  passed, and the filler restarted the quantum at every poll that did not
+  trip, so the time trip fired only when one poll window of 32 items took
+  a whole quantum. Light items with few or no tokens therefore filled
+  serially however long the input. The quantum now counts from the
+  span's start, as the heartbeat filler's does. A test fills 65,536 light
+  items with no tokens, reads how many items the filler asked tokens for,
+  which is the serial prefix's length, and requires fewer than all of
+  them, with every slot holding its item.
+
 - **With every park switch off, the park-lever changes made fine-grained
   dispatch slower.** On a 24-thread Windows host, paired by trial on one
   harness source with the host profile pinned, the quiet window at about
