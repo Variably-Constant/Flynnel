@@ -259,6 +259,21 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- A classified window's spread on each clock apart. `window_cv2_per_mille`
+  is the spread the class was decided from: the on-core clock's where
+  the window carried on-core samples, wall time's otherwise, so under
+  `FLYNNEL_LEVER_ONCORE_SPREAD` a reader could not set the classifier's
+  input beside the wall spread it would have used without the lever.
+  `CallSiteState` now also answers `window_wall_cv2_per_mille` and
+  `window_wall_cv2_range_per_mille` for every classified window,
+  `window_oncore_cv2_per_mille` and `window_oncore_cv2_range_per_mille`
+  for the windows classified on the on-core clock (`None` until there is
+  one, so a run that took no on-core timing reads as nothing), and
+  `window_oncore_ticks`. Written once per classifier tick, never per
+  leaf. The module's `Get-FlynnelCallSite` rows carry them as
+  `WindowWallCv2PerMille`, `WindowOncoreCv2PerMille`, their minima and
+  maxima, and `WindowOncoreTicks`.
+
 - `FLYNNEL_LEVER_JOIN_PARK` and `FLYNNEL_LEVER_SLOT_PARK_NOW`, both off.
   A thread that waits by calling `yield_now` while its process holds
   more runnable threads than cores gives its core to a ready thread for

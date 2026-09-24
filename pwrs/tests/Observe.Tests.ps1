@@ -314,7 +314,15 @@ Describe 'Get-FlynnelCallSite' {
                 $s.WindowMeanNs | Should -BeNullOrEmpty
                 $s.WindowCv2MinPerMille | Should -BeNullOrEmpty
                 $s.WindowCv2MaxPerMille | Should -BeNullOrEmpty
+                $s.WindowWallCv2PerMille | Should -BeNullOrEmpty
+                $s.WindowWallCv2MinPerMille | Should -BeNullOrEmpty
             }
+            if ($s.WindowOncoreTicks -eq 0) {
+                $s.WindowOncoreCv2PerMille | Should -BeNullOrEmpty
+                $s.WindowOncoreCv2MinPerMille | Should -BeNullOrEmpty
+                $s.WindowOncoreCv2MaxPerMille | Should -BeNullOrEmpty
+            }
+            $s.WindowOncoreTicks | Should -BeLessOrEqual $s.WindowTicks
         }
     }
 
@@ -327,6 +335,12 @@ Describe 'Get-FlynnelCallSite' {
             if ($null -ne $s.WindowCv2MinPerMille) {
                 $s.WindowCv2MaxPerMille | Should -Not -BeNullOrEmpty
                 $s.WindowCv2MaxPerMille | Should -BeGreaterOrEqual $s.WindowCv2MinPerMille
+            }
+            if ($null -ne $s.WindowWallCv2MinPerMille) {
+                $s.WindowWallCv2MaxPerMille | Should -BeGreaterOrEqual $s.WindowWallCv2MinPerMille
+            }
+            if ($null -ne $s.WindowOncoreCv2MinPerMille) {
+                $s.WindowOncoreCv2MaxPerMille | Should -BeGreaterOrEqual $s.WindowOncoreCv2MinPerMille
             }
         }
     }

@@ -277,6 +277,19 @@ pub struct CallSiteState {
     // regime a run was in.
     window_cv2_min: AtomicU64,
     window_cv2_max: AtomicU64,
+    // The same window's spread on each clock apart, with the extremes of
+    // each. `window_cv2` is whichever of the two the classifier used;
+    // these let a reader set the one it used beside the one it did not.
+    // The on-core figures are written only for a window whose spread the
+    // classifier took from the on-core clock, which `window_oncore_ticks`
+    // counts.
+    window_wall_cv2: AtomicU64,
+    window_wall_cv2_min: AtomicU64,
+    window_wall_cv2_max: AtomicU64,
+    window_oncore_cv2: AtomicU64,
+    window_oncore_cv2_min: AtomicU64,
+    window_oncore_cv2_max: AtomicU64,
+    window_oncore_ticks: AtomicU64,
     // Execution-policy A/B arms: per-arm EWMA wall time + sample
     // counts + a call counter driving the trial cadence.
     arm_ewma_ns: [AtomicU64; 2],
@@ -404,6 +417,13 @@ impl CallSiteState {
             window_ticks: AtomicU64::new(0),
             window_cv2_min: AtomicU64::new(u64::MAX),
             window_cv2_max: AtomicU64::new(0),
+            window_wall_cv2: AtomicU64::new(0),
+            window_wall_cv2_min: AtomicU64::new(u64::MAX),
+            window_wall_cv2_max: AtomicU64::new(0),
+            window_oncore_cv2: AtomicU64::new(0),
+            window_oncore_cv2_min: AtomicU64::new(u64::MAX),
+            window_oncore_cv2_max: AtomicU64::new(0),
+            window_oncore_ticks: AtomicU64::new(0),
             arm_ewma_ns: [const { AtomicU64::new(0) }; 2],
             arm_samples: [const { AtomicU32::new(0) }; 2],
             arm_calls: AtomicU32::new(0),
@@ -479,6 +499,13 @@ impl CallSiteState {
             window_ticks,
             window_cv2_min,
             window_cv2_max,
+            window_wall_cv2,
+            window_wall_cv2_min,
+            window_wall_cv2_max,
+            window_oncore_cv2,
+            window_oncore_cv2_min,
+            window_oncore_cv2_max,
+            window_oncore_ticks,
             arm_ewma_ns,
             arm_samples,
             arm_calls,
@@ -531,6 +558,11 @@ impl CallSiteState {
             window_cv2,
             window_ticks,
             window_cv2_max,
+            window_wall_cv2,
+            window_wall_cv2_max,
+            window_oncore_cv2,
+            window_oncore_cv2_max,
+            window_oncore_ticks,
             split_cpu_ns_per_item,
             split_backend_ns_per_item,
             reduce_cost_sum_cycles,
@@ -572,7 +604,9 @@ impl CallSiteState {
         // The extremes start at the identity for a min, so the first
         // window after a reset sets both rather than being weighed
         // against a range the previous arm established.
-        window_cv2_min.store(u64::MAX, Ordering::Relaxed);
+        for min in [window_cv2_min, window_wall_cv2_min, window_oncore_cv2_min] {
+            min.store(u64::MAX, Ordering::Relaxed);
+        }
         recent_occupancy_pct.store(OCCUPANCY_UNREPORTED, Ordering::Relaxed);
         collapse_overran.store(false, Ordering::Relaxed);
     }
@@ -992,7 +1026,10 @@ impl CallSiteState {
     /// cv^2 per mille of per-item cost over the delta window the latest
     /// classifier tick classified, the variance [`Self::learned_class`]
     /// was decided from, as opposed to [`Self::cv2_per_mille`] over the
-    /// site's whole life and over leaf times rather than items. A window
+    /// site's whole life and over leaf times rather than items. It is the
+    /// on-core clock's spread where the window carried one and wall
+    /// time's otherwise; [`Self::window_wall_cv2_per_mille`] and
+    /// [`Self::window_oncore_cv2_per_mille`] give the two apart. A window
     /// whose samples carried no item count reports the spread of its
     /// leaf times instead. `None` until a tick has classified a window.
     pub fn window_cv2_per_mille(&self) -> Option<u64> {
@@ -1027,6 +1064,67 @@ impl CallSiteState {
                 self.window_cv2_max.load(Ordering::Relaxed),
             ))
         }
+    }
+
+    /// cv^2 per mille of per-item cost on wall time over the delta window
+    /// the latest tick classified, whichever clock the classifier took its
+    /// spread from; a window whose samples carried no item count reports
+    /// its leaf times' spread. Where [`Self::window_oncore_cv2_per_mille`]
+    /// answers for the same tick, the two are one window on two clocks.
+    /// `None` until a tick has classified a window.
+    pub fn window_wall_cv2_per_mille(&self) -> Option<u64> {
+        if self.window_ticks.load(Ordering::Relaxed) == 0 {
+            None
+        } else {
+            Some(self.window_wall_cv2.load(Ordering::Relaxed))
+        }
+    }
+
+    /// Smallest and largest per-window wall cv^2 over every tick. `None`
+    /// until a tick has classified a window.
+    pub fn window_wall_cv2_range_per_mille(&self) -> Option<(u64, u64)> {
+        if self.window_ticks.load(Ordering::Relaxed) == 0 {
+            None
+        } else {
+            Some((
+                self.window_wall_cv2_min.load(Ordering::Relaxed),
+                self.window_wall_cv2_max.load(Ordering::Relaxed),
+            ))
+        }
+    }
+
+    /// cv^2 per mille of per-item cost on the thread's own clock over the
+    /// latest delta window whose spread the classifier took from that
+    /// clock: [`crate::sched::levers::oncore_spread`] on, and the window's
+    /// leaves timed on the sampled path. `None` until such a window has
+    /// been classified, so a run that took no on-core timing reads as
+    /// nothing rather than as a spread of zero.
+    pub fn window_oncore_cv2_per_mille(&self) -> Option<u64> {
+        if self.window_oncore_ticks.load(Ordering::Relaxed) == 0 {
+            None
+        } else {
+            Some(self.window_oncore_cv2.load(Ordering::Relaxed))
+        }
+    }
+
+    /// Smallest and largest on-core cv^2 over the windows whose spread the
+    /// classifier took from the on-core clock. `None` until such a window
+    /// has been classified.
+    pub fn window_oncore_cv2_range_per_mille(&self) -> Option<(u64, u64)> {
+        if self.window_oncore_ticks.load(Ordering::Relaxed) == 0 {
+            None
+        } else {
+            Some((
+                self.window_oncore_cv2_min.load(Ordering::Relaxed),
+                self.window_oncore_cv2_max.load(Ordering::Relaxed),
+            ))
+        }
+    }
+
+    /// Delta windows whose spread the classifier took from the on-core
+    /// clock, out of [`Self::window_ticks`].
+    pub fn window_oncore_ticks(&self) -> u64 {
+        self.window_oncore_ticks.load(Ordering::Relaxed)
     }
 
     /// One classifier tick over the delta window since the previous
@@ -1099,15 +1197,14 @@ impl CallSiteState {
             .map(|mean| per_item_cv2(d_oncore_sumsq, mean, d_oncore_items));
 
         let per_item = dsum.checked_div(ditems);
-        let (mean_ns, cv2) = if let Some(mean) = per_item {
-            // The mean stays on wall time, where the classifier's
-            // nanosecond boundaries are stated. The spread comes from
-            // the on-core clock where the window carried one, and falls
-            // back to wall time where it did not, which is what a
-            // platform with no thread clock has always had.
-            let spread = oncore_cv2
-                .unwrap_or_else(|| per_item_cv2(dsumsq_per_item, mean, ditems));
-            (mean, spread)
+        // The mean stays on wall time, where the classifier's nanosecond
+        // boundaries are stated, and so does the first spread here. The
+        // classifier then takes its spread from the on-core clock where
+        // the window carried one, and keeps the wall spread where it did
+        // not, which is what a platform with no thread clock has always
+        // had.
+        let (mean_ns, wall_cv2) = if let Some(mean) = per_item {
+            (mean, per_item_cv2(dsumsq_per_item, mean, ditems))
         } else {
             // Divided by the window's summed weight rather than its leaf
             // count, because the sums carry each batch's weight as a
@@ -1124,11 +1221,22 @@ impl CallSiteState {
             };
             (mean, spread)
         };
+        let oncore_used = oncore_cv2.filter(|_| per_item.is_some());
+        let cv2 = oncore_used.unwrap_or(wall_cv2);
         self.window_mean_ns.store(mean_ns, Ordering::Relaxed);
         self.window_cv2.store(cv2, Ordering::Relaxed);
         self.window_ticks.fetch_add(1, Ordering::Relaxed);
         self.window_cv2_min.fetch_min(cv2, Ordering::Relaxed);
         self.window_cv2_max.fetch_max(cv2, Ordering::Relaxed);
+        self.window_wall_cv2.store(wall_cv2, Ordering::Relaxed);
+        self.window_wall_cv2_min.fetch_min(wall_cv2, Ordering::Relaxed);
+        self.window_wall_cv2_max.fetch_max(wall_cv2, Ordering::Relaxed);
+        if let Some(oncore) = oncore_used {
+            self.window_oncore_cv2.store(oncore, Ordering::Relaxed);
+            self.window_oncore_cv2_min.fetch_min(oncore, Ordering::Relaxed);
+            self.window_oncore_cv2_max.fetch_max(oncore, Ordering::Relaxed);
+            self.window_oncore_ticks.fetch_add(1, Ordering::Relaxed);
+        }
         let observed = classify_observed(mean_ns, cv2);
         let observed_tag = class_tag_encode(observed);
 
@@ -1869,6 +1977,68 @@ mod tests {
         if 40 < low {
             assert_eq!(S.learned_class(), Some(WorkloadClass::Streaming));
         }
+    }
+
+    #[test]
+    fn a_window_reports_its_spread_on_each_clock() {
+        // The leaves of the test above on wall time, cv^2 40 per mille,
+        // and the same leaves flat on the thread's own clock. The
+        // classifier takes the on-core spread and the wall one stays
+        // readable beside it.
+        static S: CallSiteState = CallSiteState::new();
+        const ITEMS: u64 = 1024;
+        let (fast, slow) = (1280u64 * ITEMS, 1920u64 * ITEMS);
+        let flat = 1600u64 * ITEMS;
+        let sq = |ns: u64| (ns >> 8).saturating_mul(ns >> 8);
+        let per_item_sq = |ns: u64| {
+            ((ns as u128).saturating_mul(ns as u128) / ((ITEMS as u128) << 16)) as u64
+        };
+        S.record_oncore_batch(16 * flat, 16 * per_item_sq(flat), 16 * ITEMS);
+        S.record_batch_site_only(
+            8 * fast + 8 * slow,
+            8 * sq(fast) + 8 * sq(slow),
+            16,
+            16 * ITEMS,
+            8 * per_item_sq(fast) + 8 * per_item_sq(slow),
+        );
+        assert_eq!(S.window_wall_cv2_per_mille(), Some(40));
+        assert_eq!(S.window_oncore_cv2_per_mille(), Some(0));
+        assert_eq!(S.window_cv2_per_mille(), Some(0), "the classifier used the on-core spread");
+        assert_eq!(S.window_oncore_ticks(), 1);
+        assert_eq!(S.window_wall_cv2_range_per_mille(), Some((40, 40)));
+        assert_eq!(S.window_oncore_cv2_range_per_mille(), Some((0, 0)));
+
+        S.reset();
+        assert_eq!(S.window_wall_cv2_per_mille(), None);
+        assert_eq!(S.window_oncore_cv2_per_mille(), None);
+        assert_eq!(S.window_oncore_ticks(), 0);
+        // A flat window after the reset sets both ends of the wall range
+        // rather than being weighed against the 40 before it.
+        S.record_batch_site_only(16 * flat, 16 * sq(flat), 16, 16 * ITEMS, 16 * per_item_sq(flat));
+        assert_eq!(S.window_wall_cv2_range_per_mille(), Some((0, 0)));
+    }
+
+    #[test]
+    fn a_window_with_no_oncore_timing_reads_none_on_that_clock() {
+        static S: CallSiteState = CallSiteState::new();
+        const ITEMS: u64 = 1024;
+        let (fast, slow) = (1280u64 * ITEMS, 1920u64 * ITEMS);
+        let sq = |ns: u64| (ns >> 8).saturating_mul(ns >> 8);
+        let per_item_sq = |ns: u64| {
+            ((ns as u128).saturating_mul(ns as u128) / ((ITEMS as u128) << 16)) as u64
+        };
+        S.record_batch_site_only(
+            8 * fast + 8 * slow,
+            8 * sq(fast) + 8 * sq(slow),
+            16,
+            16 * ITEMS,
+            8 * per_item_sq(fast) + 8 * per_item_sq(slow),
+        );
+        assert_eq!(S.window_wall_cv2_per_mille(), Some(40));
+        assert_eq!(S.window_cv2_per_mille(), Some(40), "wall time is all the window had");
+        assert_eq!(S.window_oncore_cv2_per_mille(), None);
+        assert_eq!(S.window_oncore_cv2_range_per_mille(), None);
+        assert_eq!(S.window_oncore_ticks(), 0);
     }
 
     #[test]

@@ -759,11 +759,8 @@ pub struct CallSite {
     pub cv2_per_mille: Option<u64>,
     /// The same spread measured on the threads' own clocks rather than
     /// the wall, which advance only while a thread is on a core. Also
-    /// lifetime.
-    ///
-    /// There is no window-scoped form of this figure, so the spread the
-    /// lever acted on at the window it acted cannot be read. That is a
-    /// hole in the crate's surface rather than in this row.
+    /// lifetime; WindowOncoreCv2PerMille and its extremes are the same
+    /// clock at the scope of the windows the classifier acted on.
     pub per_item_oncore_cv2_per_mille: Option<u64>,
     /// Items the on-core figures were measured over. Zero says the
     /// strided path never sampled here, which is why the spread beside
@@ -771,7 +768,9 @@ pub struct CallSite {
     pub oncore_items: u64,
     /// Mean leaf time of the delta window the latest tick classified.
     pub window_mean_ns: Option<u64>,
-    /// Spread of that one window.
+    /// Spread of that one window, on the on-core clock where the window
+    /// carried one and on the wall otherwise: the spread the class was
+    /// decided from.
     ///
     /// One classifier tick out of thousands. It spans the whole range
     /// within a single run, so a reading of it says almost nothing on
@@ -786,6 +785,28 @@ pub struct CallSite {
     pub window_cv2_max_per_mille: Option<u64>,
     /// Windows the site has classified.
     pub window_ticks: u64,
+    /// The latest window's spread on wall time, whichever clock the
+    /// classifier used for it, so it can be set beside the on-core
+    /// figure of the same window.
+    pub window_wall_cv2_per_mille: Option<u64>,
+    /// The lowest wall spread across every tick this site has
+    /// classified.
+    pub window_wall_cv2_min_per_mille: Option<u64>,
+    /// The highest wall spread across those ticks.
+    pub window_wall_cv2_max_per_mille: Option<u64>,
+    /// The latest spread the classifier took from the on-core clock.
+    /// Null until a window has been classified on that clock, which is
+    /// how a run that took no on-core timing reads, rather than as a
+    /// spread of zero.
+    pub window_oncore_cv2_per_mille: Option<u64>,
+    /// The lowest on-core spread across the windows classified on that
+    /// clock.
+    pub window_oncore_cv2_min_per_mille: Option<u64>,
+    /// The highest on-core spread across those windows.
+    pub window_oncore_cv2_max_per_mille: Option<u64>,
+    /// Windows the classifier took its spread from the on-core clock
+    /// for, out of WindowTicks.
+    pub window_oncore_ticks: u64,
     /// What fraction of its interval the most recent dispatch here
     /// spent on a core, in hundredths. Null before any dispatch has
     /// reported, which is a different state from a pool that held none
@@ -833,6 +854,14 @@ pub(crate) fn call_site_row(entry: &flynnel::RegisteredSite) -> CallSite {
         Some((lo, hi)) => (Some(lo), Some(hi)),
         None => (None, None),
     };
+    let (wall_min, wall_max) = match s.window_wall_cv2_range_per_mille() {
+        Some((lo, hi)) => (Some(lo), Some(hi)),
+        None => (None, None),
+    };
+    let (oncore_min, oncore_max) = match s.window_oncore_cv2_range_per_mille() {
+        Some((lo, hi)) => (Some(lo), Some(hi)),
+        None => (None, None),
+    };
     CallSite {
         file: entry.location.file().to_string(),
         line: entry.location.line(),
@@ -848,6 +877,13 @@ pub(crate) fn call_site_row(entry: &flynnel::RegisteredSite) -> CallSite {
         window_cv2_min_per_mille: cv2_min,
         window_cv2_max_per_mille: cv2_max,
         window_ticks: s.window_ticks(),
+        window_wall_cv2_per_mille: s.window_wall_cv2_per_mille(),
+        window_wall_cv2_min_per_mille: wall_min,
+        window_wall_cv2_max_per_mille: wall_max,
+        window_oncore_cv2_per_mille: s.window_oncore_cv2_per_mille(),
+        window_oncore_cv2_min_per_mille: oncore_min,
+        window_oncore_cv2_max_per_mille: oncore_max,
+        window_oncore_ticks: s.window_oncore_ticks(),
         recent_occupancy_pct: s.recent_occupancy(),
         seeded_depth: s.seeded_depth(),
         seed_depth_flips: s.seed_depth_flips(),
