@@ -67,12 +67,15 @@
 //! and the machine's state at that moment are common to both arms
 //! instead of dividing one process by another.
 //!
-//! The last argument picks the dispatch entry: `plain` (the default),
-//! `indexed` or `triple`. They do not share a leaf recorder, so a figure
-//! taken through one says nothing about the others. `plain` reaches
-//! `record_leaf_sampled`; the other two reach
-//! `record_leaf_bracket_sampled`, which is the only path where the
-//! on-core bracket's cost can be weighed.
+//! The eighth argument picks the dispatch entry: `plain` (the default),
+//! `indexed`, `triple`, `heartbeat` or `bucket`. They do not share a
+//! leaf recorder, so a figure taken through one says nothing about the
+//! others. `plain` reaches `record_leaf_sampled`; `indexed` and `triple`
+//! reach `record_leaf_bracket_sampled`, which is the only path where the
+//! on-core bracket's cost can be weighed. `heartbeat` and `bucket`
+//! collect through `collect_indexed_heartbeat` and
+//! `collect_indexed_token_bucket`, whose fillers record serial spans
+//! against the site rather than leaves.
 //!
 //! ```sh
 //! throughput_under_load <window_s> <load_threads> <trials> [smt_prior] \
@@ -86,7 +89,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use flynnel::sched::par_iter::{
-    for_each_chunk_indexed_min_leaf, for_each_chunk_min_leaf, for_each_chunk_triple_min_leaf,
+    collect_indexed_heartbeat, collect_indexed_token_bucket, for_each_chunk_indexed_min_leaf,
+    for_each_chunk_min_leaf, for_each_chunk_triple_min_leaf,
 };
 use flynnel::{CallSiteState, JobPlan, SiteRef};
 
@@ -94,6 +98,16 @@ static SITE: CallSiteState = CallSiteState::new();
 
 const ITEMS: usize = 1 << 16;
 const MIN_LEAF: usize = 256;
+
+/// Items a dispatch covers through the two collect entries.
+///
+/// Both collects hand the work to their filler only at an item count the
+/// library keeps private, 100,000 in every tree this harness has been
+/// run against, and send a smaller batch to the plain indexed collect.
+/// This sits above it. The engagement line's arm figures report whether
+/// the heartbeat filler then ran, since its routing also reads the
+/// site's spread.
+const COLLECT_ITEMS: usize = 1 << 17;
 
 fn arg<T>(n: usize, default: T) -> T
 where
@@ -193,11 +207,19 @@ const BLOCK_ITEMS: usize = 512;
 /// `record_leaf_bracket_sampled`, which times every leaf and brackets
 /// one in the stride. A run that means to weigh the bracket has to ask
 /// for an entry that can reach it.
+///
+/// `Heartbeat` and `Bucket` collect into a new vector and copy it back,
+/// so a dispatch does the in-place entries' per-item work over
+/// [`COLLECT_ITEMS`] items, plus the allocation and the copy. Their
+/// fillers record serial spans, the heartbeat's between promotions and
+/// the bucket's before its one promotion, and neither brackets a leaf.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Entry {
     Plain,
     Indexed,
     Triple,
+    Heartbeat,
+    Bucket,
 }
 
 impl Entry {
@@ -206,7 +228,25 @@ impl Entry {
             "plain" => Some(Self::Plain),
             "indexed" => Some(Self::Indexed),
             "triple" => Some(Self::Triple),
+            "heartbeat" => Some(Self::Heartbeat),
+            "bucket" => Some(Self::Bucket),
             _ => None,
+        }
+    }
+
+    /// Items one dispatch covers.
+    fn items(self) -> usize {
+        match self {
+            Self::Plain | Self::Indexed | Self::Triple => ITEMS,
+            Self::Heartbeat | Self::Bucket => COLLECT_ITEMS,
+        }
+    }
+
+    /// Whether any leaf this entry records can carry an on-core reading.
+    fn brackets(self) -> bool {
+        match self {
+            Self::Plain | Self::Indexed | Self::Triple => true,
+            Self::Heartbeat | Self::Bucket => false,
         }
     }
 }
@@ -269,6 +309,31 @@ fn window(
                         }
                     },
                 );
+            }
+            Entry::Heartbeat => {
+                let src: &[Item] = buf;
+                let out = collect_indexed_heartbeat(&plan, src.len(), |i| {
+                    let mut slot = src[i];
+                    grind(&mut slot);
+                    slot
+                });
+                buf.copy_from_slice(&out);
+            }
+            Entry::Bucket => {
+                // One token a round, the item's own cost in the unit the
+                // body spends it in.
+                let src: &[Item] = buf;
+                let out = collect_indexed_token_bucket(
+                    &plan,
+                    src.len(),
+                    |i| src[i].reps,
+                    |i| {
+                        let mut slot = src[i];
+                        grind(&mut slot);
+                        slot
+                    },
+                );
+                buf.copy_from_slice(&out);
             }
         }
         dispatches += 1;
@@ -356,7 +421,8 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
          window_ticks={} class={:?} workers={} allowed={} smt={} \
          smt_declined={} smt_allowed={} \
          spin_adaptive={} spin_window={} spin_adapts={} idle_yields={} \
-         join_park={} join_parks={} slot_park_now={} join_park_oversubscribed={} long_yields={}",
+         join_park={} join_parks={} slot_park_now={} join_park_oversubscribed={} long_yields={} \
+         arm_ewma_default_ns={} arm_ewma_alternative_ns={}",
         site.leaf_count(),
         site.oncore_items(),
         reading(site.per_item_ns()),
@@ -381,6 +447,8 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
         flynnel::sched::levers::slot_park_now(),
         flynnel::sched::levers::join_park_oversubscribed(),
         flynnel::total_long_yields(),
+        reading(Some(site.arm_ewmas().0).filter(|ns| *ns > 0)),
+        reading(Some(site.arm_ewmas().1).filter(|ns| *ns > 0)),
     );
 }
 
@@ -395,7 +463,9 @@ fn main() {
     let entry_name: String = arg(8, "plain".to_string());
     let block_items: usize = arg(9, BLOCK_ITEMS);
     let Some(entry) = Entry::parse(&entry_name) else {
-        eprintln!("entry must be plain, indexed or triple, and was {entry_name:?}");
+        eprintln!(
+            "entry must be plain, indexed, triple, heartbeat or bucket, and was {entry_name:?}"
+        );
         std::process::exit(2);
     };
 
@@ -433,13 +503,14 @@ fn main() {
     let measured = Duration::from_secs(window_s);
     // The per-item cost is fixed here, once, so every dispatch of every
     // arm runs the same work whatever order the buffer reaches.
-    let mut buf: Vec<Item> = (0..ITEMS)
+    let mut buf: Vec<Item> = (0..entry.items())
         .map(|i| Item { reps: reps_at(i, reps, irregular, block_items), acc: i as u64 })
         .collect();
     // The triple entry needs somewhere to write. Allocated for every
-    // entry so the process's memory is the same whichever one runs, and
-    // a comparison between entries is not also a comparison between
-    // allocations.
+    // entry, so the three in-place entries hold the same memory whichever
+    // one runs and a comparison among them is not also a comparison
+    // between allocations. The collect entries hold a larger buffer and
+    // allocate on every dispatch, so they compare only with themselves.
     let mut aux: Vec<Item> = vec![Item { reps: 1, acc: 0 }; ITEMS];
 
     // One warm window, discarded: the first dispatches of a process pay
@@ -527,8 +598,10 @@ fn main() {
     // records every leaf through record_leaf takes no bracket, so the
     // switch is on and nothing happens - and the rows look exactly like
     // a mechanism that did not help. An arm that asked for it and took
-    // no reading says so rather than being read as a result.
-    if flynnel::sched::levers::oncore_spread() && SITE.oncore_items() == 0 {
+    // no reading says so rather than being read as a result. The collect
+    // entries record spans and unbracketed leaves by design, so for them
+    // the absence is the expected reading.
+    if entry.brackets() && flynnel::sched::levers::oncore_spread() && SITE.oncore_items() == 0 {
         eprintln!(
             "the on-core switch is on and no leaf carried an on-core reading, so the \
              {entry_name} entry never reached a recorder that brackets and the switch \
