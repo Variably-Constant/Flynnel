@@ -31,7 +31,7 @@
 //! `LockLatch` follow the same discipline.
 //!
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// Latch not set; owning thread is awake.
 const UNSET: u8 = 0;
@@ -282,69 +282,112 @@ impl Latch for SpinLatch {
     }
 }
 
-/// The latch of a join's right half: a [`CoreLatch`] plus the parker of
-/// the worker that forked it, so the thief that sets it can wake that
-/// worker when it parked to wait.
+/// The latch of a join's right half: the [`CoreLatch`] states and the
+/// address of the forking worker's join parker in one word, so the thief
+/// that sets it can wake that worker when it parked to wait.
+///
+/// A [`crate::sched::sleep::Parker`] is 64-byte aligned, so its address
+/// leaves the low two bits free for the state. The latch is one pointer
+/// wide, and a set is one swap, as a [`CoreLatch`]'s is.
 ///
 /// The parker is held by address, not by `Arc`. It is the waiting
 /// worker's own and lives in that worker's context for the worker's
-/// whole life, which outlasts every join the worker is inside, so the
-/// setter reads one pointer on every set where [`SpinLatch`] pays an
-/// `Arc` clone.
+/// whole life, which outlasts every join the worker is inside.
 pub struct JoinLatch {
-    /// State machine underlying this wake-capable wrapper.
-    pub core: CoreLatch,
-    /// The forking worker's join parker.
-    parker: core::ptr::NonNull<crate::sched::sleep::Parker>,
+    /// The parker's address with the latch state in the low two bits.
+    word: AtomicUsize,
 }
 
-// SAFETY: the parker pointer is dereferenced only to call
-// `Parker::unpark`, which takes `&self` on a type that is itself `Sync`,
-// and the parker outlives the latch as the type's doc states.
-unsafe impl Send for JoinLatch {}
-// SAFETY: as for `Send`.
-unsafe impl Sync for JoinLatch {}
+/// The bits of [`JoinLatch`]'s word that hold the state.
+const STATE_BITS: usize = 0b11;
 
 impl JoinLatch {
     /// A fresh latch whose set wakes `parker` when its owner parked on it.
     /// `parker` must outlive every set of this latch.
     #[inline]
     pub fn new(parker: &crate::sched::sleep::Parker) -> Self {
+        let address = core::ptr::from_ref(parker) as usize;
+        debug_assert_eq!(address & STATE_BITS, 0, "a Parker is 64-byte aligned");
         Self {
-            core: CoreLatch::new(),
-            parker: core::ptr::NonNull::from(parker),
+            word: AtomicUsize::new(address | usize::from(UNSET)),
         }
     }
 
-    /// Forwarded test for is_set on the underlying CoreLatch.
+    /// The parker's address, which no transition changes.
+    #[inline]
+    fn address(&self) -> usize {
+        self.word.load(Ordering::Relaxed) & !STATE_BITS
+    }
+
+    /// Moves the state from `from` to `to`, as [`CoreLatch`]'s handshake
+    /// transitions do.
+    #[inline]
+    fn transition(&self, from: u8, to: u8) -> bool {
+        let address = self.address();
+        self.word
+            .compare_exchange(
+                address | usize::from(from),
+                address | usize::from(to),
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// Whether the latch has been set, Acquire-ordered as
+    /// [`CoreLatch::is_set`] is.
     #[inline]
     pub fn is_set(&self) -> bool {
-        self.core.is_set()
+        self.word.load(Ordering::Acquire) & STATE_BITS == usize::from(SET)
+    }
+
+    /// First phase of the sleep handshake, as [`CoreLatch::get_sleepy`].
+    #[inline]
+    pub fn get_sleepy(&self) -> bool {
+        self.transition(UNSET, SLEEPY)
+    }
+
+    /// Second phase of the sleep handshake, as [`CoreLatch::fall_asleep`].
+    #[inline]
+    pub fn fall_asleep(&self) -> bool {
+        self.transition(SLEEPY, SLEEPING)
+    }
+
+    /// Reverts a wake that did not observe the set, as
+    /// [`CoreLatch::wake_up`].
+    #[inline]
+    pub fn wake_up(&self) {
+        if !self.is_set() {
+            self.transition(SLEEPING, UNSET);
+        }
     }
 
     /// The parker this latch wakes.
     #[inline]
     pub fn parker(&self) -> &crate::sched::sleep::Parker {
         // SAFETY: the constructor's contract keeps the parker alive for
-        // as long as the latch is in use.
-        unsafe { self.parker.as_ref() }
+        // as long as the latch is in use, and no transition changes the
+        // address bits.
+        unsafe { &*(self.address() as *const crate::sched::sleep::Parker) }
     }
 }
 
 impl Latch for JoinLatch {
     #[inline]
     unsafe fn set(this: *const Self) {
-        // SAFETY: the pointer is read before the publishing store, and
-        // the parker it names outlives the latch, so the wake below is
-        // sound after the owner has observed SET and dropped `*this`.
-        let parker = unsafe { (*this).parker };
         // SAFETY: the trait method's `# Safety` clause forwards the
-        // validity-of-`this` precondition; the inner set honors the
-        // publish-then-invalidate contract.
-        let was_sleeping = unsafe { CoreLatch::set(&(*this).core) };
-        if was_sleeping {
-            // SAFETY: as above, the parker outlives the latch.
-            unsafe { parker.as_ref() }.unpark();
+        // validity-of-`this` precondition. The address is read before the
+        // publishing swap and nothing of `*this` is touched after it.
+        let address = unsafe { (*this).address() };
+        // SAFETY: as above.
+        let old = unsafe {
+            (*this)
+                .word
+                .swap(address | usize::from(SET), Ordering::AcqRel)
+        };
+        if old & STATE_BITS == usize::from(SLEEPING) {
+            // SAFETY: the parker outlives the latch.
+            unsafe { &*(address as *const crate::sched::sleep::Parker) }.unpark();
         }
     }
 }
@@ -840,10 +883,10 @@ mod tests {
             let latch = Arc::new(JoinLatch::new(parker));
             tx.send(latch.clone()).unwrap();
             while !latch.is_set() {
-                if latch.core.get_sleepy() && latch.core.fall_asleep() {
+                if latch.get_sleepy() && latch.fall_asleep() {
                     let _unparked: bool = latch.parker().park_until(|| latch.is_set());
                 }
-                latch.core.wake_up();
+                latch.wake_up();
             }
         });
 
@@ -874,7 +917,7 @@ mod tests {
         unsafe { Latch::set(&latch) };
         assert!(latch.is_set());
         assert!(
-            !latch.core.get_sleepy(),
+            !latch.get_sleepy(),
             "a set latch must not let its owner park"
         );
     }

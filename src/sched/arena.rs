@@ -363,15 +363,15 @@ pub fn total_join_parks() -> u64 {
 /// with the latch set, or unset after a wake that was not its set, for
 /// the caller's loop to look for work again.
 fn park_for_half(latch: &JoinLatch) {
-    if !latch.core.get_sleepy() {
+    if !latch.get_sleepy() {
         return;
     }
-    if !latch.core.fall_asleep() {
+    if !latch.fall_asleep() {
         return;
     }
     JOIN_PARKS.fetch_add(1, Relaxed);
     let _unparked = latch.parker().park_until(|| latch.is_set());
-    latch.core.wake_up();
+    latch.wake_up();
 }
 
 /// One round of a join waiter whose spin budget is spent: a park in the

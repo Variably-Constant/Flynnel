@@ -714,6 +714,20 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   pairs spread too widely to resolve any of the three comparisons, the
   original cost included.
 
+  Three more changes close the rest. The join latch is one word, the
+  forking worker's join parker's address with the latch state in its two
+  low bits, which the parker's 64-byte alignment leaves free, so a set is
+  one swap and `StackJob` carries a pointer-wide latch. The join parker
+  is boxed, so a worker's context no longer inherits the parker's
+  alignment. And `StackJob` is 64-byte aligned. Timed on the tree before
+  the levers plus the earlier two fixes, 40 paired trials against the
+  release before the levers, read so a neighbor's load cannot move it
+  (per arm, windows more than four robust scales below the arm's upper
+  half dropped, then the 75th-percentile ratio with an interval from
+  resampling trials): 0.9973 [0.9920, 1.0035], where the earlier two
+  fixes alone read 0.9906 [0.9855, 0.9938] the same way. The latch and
+  box without the alignment read 0.9945 [0.9877, 1.0003].
+
 - **A process whose first host-profile query came from a pool worker
   calibrated on that worker's own join, and could publish the result for
   every process on the host.** `host_dispatch_profile` measures on the

@@ -400,7 +400,7 @@ impl<T> JobResult<T> {
 /// the thief writes the closure's slot as it starts and the result's
 /// just before it sets the latch, so the latch shares a cache line with
 /// the result and not with the closure.
-#[repr(C)]
+#[repr(C, align(64))]
 pub(crate) struct StackJob<L, F, R>
 where
     L: Latch + Sync,
