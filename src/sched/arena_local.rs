@@ -1373,7 +1373,10 @@ impl LocalArena {
                 sleep: Arc::clone(&sleep_arc),
                 last_victim: Cell::new(usize::MAX),
                 is_external_slot: true,
-                join_parker: Box::new(Parker::with_strategy(0, crate::sched::sleep::WaitStrategy::StdPark)),
+                join_parker: Box::new(Parker::with_strategy(
+                    0,
+                    crate::sched::sleep::WaitStrategy::StdPark,
+                )),
             };
             external_slots.push(Arc::new(ExternalSlot {
                 claimed: AtomicBool::new(false),
@@ -2081,7 +2084,10 @@ fn worker_loop(
         sleep,
         last_victim: Cell::new(usize::MAX),
         is_external_slot: false,
-        join_parker: Box::new(Parker::with_strategy(0, crate::sched::sleep::WaitStrategy::StdPark)),
+        join_parker: Box::new(Parker::with_strategy(
+            0,
+            crate::sched::sleep::WaitStrategy::StdPark,
+        )),
     };
     // SAFETY: ctx lives on this stack frame until clear_current_worker_ctx()
     // runs at the bottom of the function. No other thread reads our
