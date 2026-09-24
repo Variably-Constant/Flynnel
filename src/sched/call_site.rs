@@ -1229,12 +1229,16 @@ impl CallSiteState {
         self.window_cv2_min.fetch_min(cv2, Ordering::Relaxed);
         self.window_cv2_max.fetch_max(cv2, Ordering::Relaxed);
         self.window_wall_cv2.store(wall_cv2, Ordering::Relaxed);
-        self.window_wall_cv2_min.fetch_min(wall_cv2, Ordering::Relaxed);
-        self.window_wall_cv2_max.fetch_max(wall_cv2, Ordering::Relaxed);
+        self.window_wall_cv2_min
+            .fetch_min(wall_cv2, Ordering::Relaxed);
+        self.window_wall_cv2_max
+            .fetch_max(wall_cv2, Ordering::Relaxed);
         if let Some(oncore) = oncore_used {
             self.window_oncore_cv2.store(oncore, Ordering::Relaxed);
-            self.window_oncore_cv2_min.fetch_min(oncore, Ordering::Relaxed);
-            self.window_oncore_cv2_max.fetch_max(oncore, Ordering::Relaxed);
+            self.window_oncore_cv2_min
+                .fetch_min(oncore, Ordering::Relaxed);
+            self.window_oncore_cv2_max
+                .fetch_max(oncore, Ordering::Relaxed);
             self.window_oncore_ticks.fetch_add(1, Ordering::Relaxed);
         }
         let observed = classify_observed(mean_ns, cv2);
@@ -1990,9 +1994,8 @@ mod tests {
         let (fast, slow) = (1280u64 * ITEMS, 1920u64 * ITEMS);
         let flat = 1600u64 * ITEMS;
         let sq = |ns: u64| (ns >> 8).saturating_mul(ns >> 8);
-        let per_item_sq = |ns: u64| {
-            ((ns as u128).saturating_mul(ns as u128) / ((ITEMS as u128) << 16)) as u64
-        };
+        let per_item_sq =
+            |ns: u64| ((ns as u128).saturating_mul(ns as u128) / ((ITEMS as u128) << 16)) as u64;
         S.record_oncore_batch(16 * flat, 16 * per_item_sq(flat), 16 * ITEMS);
         S.record_batch_site_only(
             8 * fast + 8 * slow,
@@ -2003,7 +2006,11 @@ mod tests {
         );
         assert_eq!(S.window_wall_cv2_per_mille(), Some(40));
         assert_eq!(S.window_oncore_cv2_per_mille(), Some(0));
-        assert_eq!(S.window_cv2_per_mille(), Some(0), "the classifier used the on-core spread");
+        assert_eq!(
+            S.window_cv2_per_mille(),
+            Some(0),
+            "the classifier used the on-core spread"
+        );
         assert_eq!(S.window_oncore_ticks(), 1);
         assert_eq!(S.window_wall_cv2_range_per_mille(), Some((40, 40)));
         assert_eq!(S.window_oncore_cv2_range_per_mille(), Some((0, 0)));
@@ -2014,7 +2021,13 @@ mod tests {
         assert_eq!(S.window_oncore_ticks(), 0);
         // A flat window after the reset sets both ends of the wall range
         // rather than being weighed against the 40 before it.
-        S.record_batch_site_only(16 * flat, 16 * sq(flat), 16, 16 * ITEMS, 16 * per_item_sq(flat));
+        S.record_batch_site_only(
+            16 * flat,
+            16 * sq(flat),
+            16,
+            16 * ITEMS,
+            16 * per_item_sq(flat),
+        );
         assert_eq!(S.window_wall_cv2_range_per_mille(), Some((0, 0)));
     }
 
@@ -2024,9 +2037,8 @@ mod tests {
         const ITEMS: u64 = 1024;
         let (fast, slow) = (1280u64 * ITEMS, 1920u64 * ITEMS);
         let sq = |ns: u64| (ns >> 8).saturating_mul(ns >> 8);
-        let per_item_sq = |ns: u64| {
-            ((ns as u128).saturating_mul(ns as u128) / ((ITEMS as u128) << 16)) as u64
-        };
+        let per_item_sq =
+            |ns: u64| ((ns as u128).saturating_mul(ns as u128) / ((ITEMS as u128) << 16)) as u64;
         S.record_batch_site_only(
             8 * fast + 8 * slow,
             8 * sq(fast) + 8 * sq(slow),
@@ -2035,7 +2047,11 @@ mod tests {
             8 * per_item_sq(fast) + 8 * per_item_sq(slow),
         );
         assert_eq!(S.window_wall_cv2_per_mille(), Some(40));
-        assert_eq!(S.window_cv2_per_mille(), Some(40), "wall time is all the window had");
+        assert_eq!(
+            S.window_cv2_per_mille(),
+            Some(40),
+            "wall time is all the window had"
+        );
         assert_eq!(S.window_oncore_cv2_per_mille(), None);
         assert_eq!(S.window_oncore_cv2_range_per_mille(), None);
         assert_eq!(S.window_oncore_ticks(), 0);
