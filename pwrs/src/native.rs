@@ -9,8 +9,11 @@
 //! name; `Get-FlynnelNativeEntry` hands out its address from the copy
 //! that is loaded.
 //!
-//! Every symbol carries its ABI version in its name. A change is a new
-//! symbol beside the old one, never an edit under a caller.
+//! Every symbol carries its ABI version in its name. Once a released
+//! library calls an entry, a change to it is a new symbol beside the old
+//! one, never an edit under that caller. Before then an entry changes in
+//! place, and [`NativeEntry`] says which form of it the loaded module
+//! has, so a caller built for the other form refuses rather than calls.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -39,8 +42,13 @@ pub type ChunkBodyV1 = extern "C" fn(ctx: *const c_void, start: usize, end: usiz
 
 /// [`flynnel_run_chunks_v1`] as a function pointer: the type a caller
 /// holding its address casts it back to.
-pub type RunChunksV1 =
-    unsafe extern "C" fn(n: usize, min_leaf: usize, body: ChunkBodyV1, ctx: *const c_void) -> i32;
+pub type RunChunksV1 = unsafe extern "C" fn(
+    n: usize,
+    min_leaf: usize,
+    site: u64,
+    body: ChunkBodyV1,
+    ctx: *const c_void,
+) -> i32;
 
 /// Run `body` over `[0, n)` in chunks on this module's worker pool, and
 /// return once every chunk has finished or the run has stopped.
@@ -54,6 +62,15 @@ pub type RunChunksV1 =
 /// as one. Light per-item work wants a large floor so dispatch cost
 /// does not dominate it; heavy per-item work wants one, so a short job
 /// is still split across workers rather than run on one.
+///
+/// `site` names the kind of work this job is. The pool learns how to
+/// dispatch per site - the class of the work, what an item costs, how
+/// deep to seed the split - so jobs passed the same key learn together
+/// and jobs passed different keys learn apart. A caller running several
+/// kernels passes one key per kernel; a key shared by work of different
+/// costs trains one classifier on a mixture that describes none of it.
+/// Any value is a key, and no key names a site of this module's own
+/// cmdlets, whose sites are source locations.
 ///
 /// Synchronous. A caller that has to stay responsive calls it once per
 /// batch and checks for cancellation between calls. The calling thread
@@ -82,6 +99,7 @@ pub type RunChunksV1 =
 pub unsafe extern "C" fn flynnel_run_chunks_v1(
     n: usize,
     min_leaf: usize,
+    site: u64,
     body: ChunkBodyV1,
     ctx: *const c_void,
 ) -> i32 {
@@ -103,7 +121,7 @@ pub unsafe extern "C" fn flynnel_run_chunks_v1(
             flynnel::JobPlan::new(0, 8).with_leaf_shape(flynnel::LeafShape::PortCompute);
         flynnel::join(
             &onto_a_worker,
-            || dispatch_chunks(n, min_leaf, body, ctx_addr, &stop),
+            || dispatch_chunks(n, min_leaf, site, body, ctx_addr, &stop),
             || (),
         );
     }));
@@ -125,9 +143,18 @@ pub unsafe extern "C" fn flynnel_run_chunks_v1(
 /// a worker.
 ///
 /// Records into `stop` the first nonzero code a body returns and skips
-/// every chunk that has not started by then.
-fn dispatch_chunks(n: usize, min_leaf: usize, body: ChunkBodyV1, ctx_addr: usize, stop: &AtomicI32) {
-    let plan = flynnel::JobPlan::new(band_for(n), n.min(u32::MAX as usize) as u32);
+/// every chunk that has not started by then. The dispatch learns at the
+/// site `site` keys, not at this function's own source location.
+fn dispatch_chunks(
+    n: usize,
+    min_leaf: usize,
+    site: u64,
+    body: ChunkBodyV1,
+    ctx_addr: usize,
+    stop: &AtomicI32,
+) {
+    let plan = flynnel::JobPlan::new(band_for(n), n.min(u32::MAX as usize) as u32)
+        .with_site(flynnel::site_for_key(site));
     // One zero-sized slot per index. The indexed helper splits a slice,
     // and a slice of unit values carries the range and allocates nothing.
     let mut slots = vec![(); n];
@@ -156,6 +183,12 @@ pub struct NativeEntry {
     pub run_chunks_v1: u64,
     /// The ABI version of the entries in this object.
     pub abi_version: u32,
+    /// Whether `flynnel_run_chunks_v1` takes a site key, its third
+    /// argument: `(n, min_leaf, site, body, ctx)`. A module without this
+    /// property, or with it false, has the form without one,
+    /// `(n, min_leaf, body, ctx)`, under the same name and ABI version,
+    /// so a caller checks this before calling rather than the version.
+    pub site_key: bool,
     /// The revision of the declared kernels this module's cmdlets run,
     /// `flynnel::kernels::REVISION` in the build that made it. A library
     /// driving the same kernels from the crate it links answers what
@@ -203,6 +236,7 @@ impl Cmdlet for GetFlynnelNativeEntry {
         ps.write(NativeEntry {
             run_chunks_v1: flynnel_run_chunks_v1 as RunChunksV1 as usize as u64,
             abi_version: NATIVE_ABI_VERSION,
+            site_key: true,
             kernels_revision: flynnel::kernels::REVISION,
             pool_started: flynnel::sched::arena::global_local_arena_started(),
         })
@@ -213,6 +247,9 @@ impl Cmdlet for GetFlynnelNativeEntry {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
+
+    /// The site key the tests that are not about keys pass.
+    const TEST_SITE: u64 = 0x7E57;
 
     /// Marks every index in its range once. The slice it marks is what
     /// `ctx` points at.
@@ -251,7 +288,13 @@ mod tests {
         // SAFETY: `seen` outlives the call and `mark` only reads it
         // through atomics.
         let code = unsafe {
-            flynnel_run_chunks_v1(n, 1, mark, &seen as *const Vec<AtomicU8> as *const c_void)
+            flynnel_run_chunks_v1(
+                n,
+                1,
+                TEST_SITE,
+                mark,
+                &seen as *const Vec<AtomicU8> as *const c_void,
+            )
         };
         assert_eq!(code, 0);
         let wrong: Vec<usize> = (0..n)
@@ -263,7 +306,8 @@ mod tests {
     #[test]
     fn a_nonzero_return_is_the_code_reported() {
         // SAFETY: `stop_at_zero` does not read its context.
-        let code = unsafe { flynnel_run_chunks_v1(10_000, 1, stop_at_zero, std::ptr::null()) };
+        let code =
+            unsafe { flynnel_run_chunks_v1(10_000, 1, TEST_SITE, stop_at_zero, std::ptr::null()) };
         assert_eq!(code, 7);
     }
 
@@ -272,7 +316,13 @@ mod tests {
         let calls = AtomicUsize::new(0);
         // SAFETY: `calls` outlives the call.
         let code = unsafe {
-            flynnel_run_chunks_v1(0, 1, count, &calls as *const AtomicUsize as *const c_void)
+            flynnel_run_chunks_v1(
+                0,
+                1,
+                TEST_SITE,
+                count,
+                &calls as *const AtomicUsize as *const c_void,
+            )
         };
         assert_eq!(code, 0);
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -284,7 +334,13 @@ mod tests {
         let seen = marks(n);
         // SAFETY: as in every_index_runs_exactly_once.
         let code = unsafe {
-            flynnel_run_chunks_v1(n, 0, mark, &seen as *const Vec<AtomicU8> as *const c_void)
+            flynnel_run_chunks_v1(
+                n,
+                0,
+                TEST_SITE,
+                mark,
+                &seen as *const Vec<AtomicU8> as *const c_void,
+            )
         };
         assert_eq!(code, 0);
         assert!((0..n).all(|i| seen[i].load(Ordering::Relaxed) == 1));
@@ -325,7 +381,13 @@ mod tests {
             // SAFETY: `check` outlives the call and note_thread reads it
             // only through atomics.
             let code = unsafe {
-                flynnel_run_chunks_v1(n, 1, note_thread, &check as *const CallerCheck as *const c_void)
+                flynnel_run_chunks_v1(
+                    n,
+                    1,
+                    TEST_SITE,
+                    note_thread,
+                    &check as *const CallerCheck as *const c_void,
+                )
             };
             assert_eq!(code, 0, "n = {n}");
             assert_eq!(check.covered.load(Ordering::Relaxed), n, "coverage at n = {n}");
@@ -334,6 +396,32 @@ mod tests {
                 "a body ran on the calling thread at n = {n}"
             );
         }
+    }
+
+    #[test]
+    fn two_keys_learn_at_two_sites() {
+        let n = 100_000;
+        let first = 0x7E57_0A11_u64;
+        let second = 0x7E57_0B22_u64;
+        for key in [first, second] {
+            let seen = marks(n);
+            // SAFETY: as in every_index_runs_exactly_once.
+            let code = unsafe {
+                flynnel_run_chunks_v1(
+                    n,
+                    1,
+                    key,
+                    mark,
+                    &seen as *const Vec<AtomicU8> as *const c_void,
+                )
+            };
+            assert_eq!(code, 0, "key {key:#x}");
+        }
+        let a = flynnel::site_for_key(first);
+        let b = flynnel::site_for_key(second);
+        assert_ne!(a, b, "two keys learn apart");
+        assert!(a.get().leaf_count() > 0, "the job passed the first key learned at its site");
+        assert!(b.get().leaf_count() > 0, "the job passed the second key learned at its site");
     }
 
     #[test]

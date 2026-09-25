@@ -738,16 +738,22 @@ impl Cmdlet for SetFlynnelTraceState {
 ///
 /// The scheduler keeps this per source location, so two callers of the
 /// same kernel with different workloads each get their own classifier
-/// rather than averaging into one.
+/// rather than averaging into one. Work another native library runs
+/// through the chunk runner has no source location here, and learns at
+/// a site named by the key that library passed.
 #[psclass(name = "Flynnel.CallSite")]
 #[derive(Clone, Default)]
 pub struct CallSite {
-    /// The source file the site is in.
-    pub file: String,
-    /// Its line.
-    pub line: u32,
-    /// Its column, which is what tells two sites on one line apart.
-    pub column: u32,
+    /// The source file the site is in, null for a keyed site.
+    pub file: Option<String>,
+    /// Its line, null for a keyed site.
+    pub line: Option<u32>,
+    /// Its column, which is what tells two sites on one line apart; null
+    /// for a keyed site.
+    pub column: Option<u32>,
+    /// The key another native library passed the chunk runner for this
+    /// site's jobs, null for a site at a source location.
+    pub key: Option<u64>,
     /// The class the site settled on, null before it has classified a
     /// window.
     pub learned_class: Option<crate::types::WorkloadClass>,
@@ -870,7 +876,27 @@ pub struct CallSite {
 }
 
 pub(crate) fn call_site_row(entry: &flynnel::RegisteredSite) -> CallSite {
-    let s = entry.site.get();
+    site_row(
+        Some(entry.location.file().to_string()),
+        Some(entry.location.line()),
+        Some(entry.location.column()),
+        None,
+        entry.site,
+    )
+}
+
+pub(crate) fn keyed_site_row(entry: &flynnel::RegisteredKeyedSite) -> CallSite {
+    site_row(None, None, None, Some(entry.key), entry.site)
+}
+
+fn site_row(
+    file: Option<String>,
+    line: Option<u32>,
+    column: Option<u32>,
+    key: Option<u64>,
+    site: flynnel::SiteRef,
+) -> CallSite {
+    let s = site.get();
     let (arm_default, arm_alternative) = s.arm_ewmas();
     let (route_default, route_alternative) = s.routing_ewmas();
     let (cv2_min, cv2_max) = match s.window_cv2_range_per_mille() {
@@ -886,9 +912,10 @@ pub(crate) fn call_site_row(entry: &flynnel::RegisteredSite) -> CallSite {
         None => (None, None),
     };
     CallSite {
-        file: entry.location.file().to_string(),
-        line: entry.location.line(),
-        column: entry.location.column(),
+        file,
+        line,
+        column,
+        key,
         learned_class: s.learned_class().map(|c| c.into()),
         leaf_count: s.leaf_count(),
         per_item_ns: s.per_item_ns(),
@@ -928,7 +955,10 @@ pub(crate) fn call_site_row(entry: &flynnel::RegisteredSite) -> CallSite {
 /// A site appears once a dispatch has reached that source location, so
 /// a process that has run no work through Flynnel answers nothing. The
 /// locations are inside the scheduler and inside this module, because
-/// those are the callers: a cmdlet's own line is not a call site.
+/// those are the callers: a cmdlet's own line is not a call site. Work
+/// another native library ran through the chunk runner follows them,
+/// one row per key that library passed, with a Key and no File, Line or
+/// Column.
 ///
 /// Every site in one call. The registry sits behind the lock a dispatch
 /// meeting a new location has to take to write, so reading it a site at
@@ -951,7 +981,8 @@ pub struct GetFlynnelCallSite {}
 impl Cmdlet for GetFlynnelCallSite {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let sites = flynnel::registered_sites();
-        if sites.is_empty() {
+        let keyed = flynnel::registered_keyed_sites();
+        if sites.is_empty() && keyed.is_empty() {
             pwrs::warning!(
                 ps,
                 "no dispatch has reached a call site in this process yet, so there is nothing \
@@ -961,6 +992,20 @@ impl Cmdlet for GetFlynnelCallSite {
         }
         for entry in &sites {
             ps.write(call_site_row(entry))?;
+        }
+        for entry in &keyed {
+            ps.write(keyed_site_row(entry))?;
+        }
+        // A site past a table's capacity has no row, so the rows alone
+        // would read as every site there is.
+        let located_over = flynnel::sched::call_site::site_table_overflow();
+        let keyed_over = flynnel::sched::call_site::keyed_site_table_overflow();
+        if located_over > 0 || keyed_over > 0 {
+            pwrs::warning!(
+                ps,
+                "{located_over} source location(s) and {keyed_over} key(s) arrived after their \
+                 site table was full, so they learned at sites no row above describes"
+            )?;
         }
         Ok(())
     }
@@ -997,7 +1042,7 @@ pub struct ResetFlynnelCallSite {}
 
 impl Cmdlet for ResetFlynnelCallSite {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let held = flynnel::registered_sites().len();
+        let held = flynnel::registered_sites().len() + flynnel::registered_keyed_sites().len();
         if !ps.should_process(
             &format!("{held} call site(s) in this process"),
             "discard everything they have learned",

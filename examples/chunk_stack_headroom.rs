@@ -4,11 +4,12 @@
 //! flynnel-pwrs's `flynnel_run_chunks_v1` runs a caller's body inside a
 //! `join` on a plan that is never routed inline, which puts the whole
 //! call on a pool worker, and then through
-//! `for_each_chunk_indexed_min_leaf`. This runs that same dispatch with
-//! a body that asks the operating system where its own thread's stack
-//! ends and records the least room any body was left with. A caller
-//! whose body needs more than that can overflow, and an overflow ends
-//! the process with nothing able to catch it.
+//! `for_each_chunk_indexed_min_leaf` on a plan carrying the site the
+//! caller's key names. This runs that same dispatch with a body that
+//! asks the operating system where its own thread's stack ends and
+//! records the least room any body was left with. A caller whose body
+//! needs more than that can overflow, and an overflow ends the process
+//! with nothing able to catch it.
 //!
 //! The dispatch nests: a bisect recurses once per halving, and a worker
 //! waiting on a join runs whatever it steals on the same stack. So one
@@ -77,6 +78,10 @@ fn stack_left() -> usize {
     (&marker as *const u8 as usize).saturating_sub(stack_low())
 }
 
+/// The key this run's dispatches pass, as a caller of the chunk runner
+/// passes one per kind of work.
+const SITE_KEY: u64 = 0x57AC_4EAD;
+
 /// Run the chunk runner's dispatch over `n` items and return the least
 /// stack any body was left with.
 fn one_dispatch(n: usize, min_leaf: usize) -> usize {
@@ -85,7 +90,8 @@ fn one_dispatch(n: usize, min_leaf: usize) -> usize {
     join(
         &onto_a_worker,
         || {
-            let plan = JobPlan::new(band_for(n), n.min(u32::MAX as usize) as u32);
+            let plan = JobPlan::new(band_for(n), n.min(u32::MAX as usize) as u32)
+                .with_site(flynnel::site_for_key(SITE_KEY));
             let mut slots = vec![(); n];
             for_each_chunk_indexed_min_leaf(&plan, &mut slots, min_leaf, |_start, _chunk| {
                 least.fetch_min(stack_left(), Ordering::Relaxed);

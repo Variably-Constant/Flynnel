@@ -295,13 +295,23 @@ Describe 'Get-FlynnelCallSite' {
         $null = Invoke-FlynnelMap -InputObject $script:Work -Operation Square
     }
 
-    It 'answers a row per site, each saying where it is' {
+    It 'answers a row per site, each saying where it is or which key named it' {
+        # A site at a source location carries its file and line and no
+        # key; one another native library keyed through the chunk runner
+        # carries its key and no location. Never both, never neither.
         $sites = @(Get-FlynnelCallSite -WarningVariable ignored)
         $sites.Count | Should -BeGreaterThan 0
         foreach ($s in $sites) {
-            $s.File | Should -Not -BeNullOrEmpty
-            $s.Line | Should -BeGreaterThan 0
+            if ($null -eq $s.Key) {
+                $s.File | Should -Not -BeNullOrEmpty
+                $s.Line | Should -BeGreaterThan 0
+            } else {
+                $s.File | Should -BeNullOrEmpty
+                $s.Line | Should -BeNullOrEmpty
+                $s.Column | Should -BeNullOrEmpty
+            }
         }
+        @($sites | Where-Object { $null -eq $_.Key }).Count | Should -BeGreaterThan 0
     }
 
     It 'reports an unmeasured figure as nothing rather than zero' {

@@ -109,13 +109,22 @@ impl FlynnelDrive {
             };
         }
         if let Some(name) = path.strip_prefix("sites/") {
-            let sites = flynnel::registered_sites();
-            let names = Self::site_names();
-            let found = names.iter().position(|n| n == name);
-            return match found {
-                Some(i) => Ok(Some(crate::observe::call_site_row(&sites[i]).into_ps()?)),
-                None => Ok(None),
-            };
+            // Matched by name within each reading of the registry, so a
+            // site registered between two readings cannot pair one site's
+            // name with another's row.
+            if let Some(e) = flynnel::registered_sites()
+                .iter()
+                .find(|e| Self::located_site_name(e) == name)
+            {
+                return Ok(Some(crate::observe::call_site_row(e).into_ps()?));
+            }
+            if let Some(e) = flynnel::registered_keyed_sites()
+                .iter()
+                .find(|e| Self::keyed_site_name(e) == name)
+            {
+                return Ok(Some(crate::observe::keyed_site_row(e).into_ps()?));
+            }
+            return Ok(None);
         }
         if let Some(name) = path.strip_prefix("backends/") {
             let detected = flynnel::backend::detect::detect_all();
@@ -241,12 +250,23 @@ impl FlynnelDrive {
         out
     }
 
-    /// Every call site the scheduler has materialised, named by the
-    /// source location that made it.
+    /// Every call site the scheduler has materialised: those at a source
+    /// location, named by it, then those another native library keyed,
+    /// named by the key.
     ///
-    /// A site appears only once a dispatch has reached that location,
-    /// so an empty level is a process that has run no work through
-    /// Flynnel rather than a level that failed to enumerate.
+    /// A site appears only once a dispatch has reached it, so an empty
+    /// level is a process that has run no work through Flynnel rather
+    /// than a level that failed to enumerate.
+    fn site_names() -> Vec<String> {
+        let mut names: Vec<String> = flynnel::registered_sites()
+            .iter()
+            .map(Self::located_site_name)
+            .collect();
+        names.extend(flynnel::registered_keyed_sites().iter().map(Self::keyed_site_name));
+        names
+    }
+
+    /// A located site's name: its file and line.
     ///
     /// Every separator a path segment cannot carry becomes a hyphen: the
     /// slashes of the file's own path, the colon of a Windows drive
@@ -256,14 +276,15 @@ impl FlynnelDrive {
     /// would read as a drive separator. The row still holds File, Line
     /// and Column, which is what a script reads; the name only has to
     /// be unique and typeable.
-    fn site_names() -> Vec<String> {
-        flynnel::registered_sites()
-            .iter()
-            .map(|e| {
-                let file = e.location.file().replace(['\\', '/', ':'], "-");
-                format!("{file}-{}", e.location.line())
-            })
-            .collect()
+    fn located_site_name(e: &flynnel::RegisteredSite) -> String {
+        let file = e.location.file().replace(['\\', '/', ':'], "-");
+        format!("{file}-{}", e.location.line())
+    }
+
+    /// A keyed site's name: `key-` and the key as sixteen hex digits,
+    /// which no located name can be, since those begin with a file path.
+    fn keyed_site_name(e: &flynnel::RegisteredKeyedSite) -> String {
+        format!("key-{:016x}", e.key)
     }
 
     /// Every backend kind the taxonomy names, whether or not this host

@@ -95,8 +95,8 @@ pub mod dual_deque;
 
 pub use plan::{BisectVariant, HwClass, JobPlan, SchedTier, kband_for, pick_tier};
 pub use call_site::{
-    CallSiteState, Placement, PolicyArm, RegisteredSite, SiteRef, caller_site, registered_sites,
-    reset_all_sites, site_for_location,
+    CallSiteState, Placement, PolicyArm, RegisteredKeyedSite, RegisteredSite, SiteRef, caller_site,
+    registered_keyed_sites, registered_sites, reset_all_sites, site_for_key, site_for_location,
 };
 pub use adaptive_profile::{
     ClassThresholds, ThresholdCalibration, calibrate_class_thresholds,

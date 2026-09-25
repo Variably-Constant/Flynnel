@@ -393,6 +393,32 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 - Get-FlynnelNativeEntry's `KernelsRevision`, the `flynnel::kernels`
   revision the module's cmdlets run, beside `AbiVersion`.
 
+- The module's native chunk runner,
+  `flynnel_run_chunks_v1(n, min_leaf, site, body, ctx)`, with
+  Get-FlynnelNativeEntry answering its address as `RunChunksV1`. Another
+  native library in the process runs a body over `[0, n)` in chunks on
+  the module's worker pool instead of starting a pool of its own. The
+  call blocks until every chunk has finished or a body's nonzero return
+  has stopped the run, answers that code, or -1 for a panic caught in the
+  dispatch, and runs no body on the calling thread. `site` is the
+  caller's key for the kind of work: jobs passed one key learn how to
+  dispatch at one site and jobs passed different keys learn apart, as the
+  module's own cmdlets each learn at their own. `SiteKey` on
+  Get-FlynnelNativeEntry is true on an entry that takes the key, and a
+  caller checks it before calling: an entry without the key has the same
+  name and ABI version, and calling one form as the other jumps through
+  the wrong argument.
+
+  `sched::call_site::site_for_key` resolves a caller-chosen `u64` to a
+  site in a table apart from the source locations', 4096 keys and then
+  one shared overflow site that `keyed_site_table_overflow` counts;
+  `registered_keyed_sites` lists them. Get-FlynnelCallSite writes a keyed
+  site's row with its `Key` and no file, line or column, the Flynnel:
+  drive names it `sites/key-` and the key in hex, and both cmdlets and
+  Reset-FlynnelCallSite cover keyed sites with the located ones.
+  Get-FlynnelCallSite warns with both tables' overflow counts when either
+  has filled, since a site past a table's capacity has no row.
+
 - `FromColumns` on Flynnel.TextMatch, FileMatch, FileMeasure, FileHash,
   HashCheck and HistogramBin: one typed array per property, all one
   length, and the class's array back, built by the module. Another

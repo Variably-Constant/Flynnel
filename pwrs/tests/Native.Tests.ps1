@@ -43,6 +43,16 @@ Describe 'Get-FlynnelNativeEntry' {
         $script:Entry.RunChunksV1.GetType().FullName | Should -Be 'System.UInt64'
     }
 
+    It 'says the run-chunks entry takes a site key, as a Boolean' {
+        # The entry's signature changed under the same name and ABI
+        # version, so this flag is what a caller checks before calling:
+        # a module without it, or with it false, has the entry that takes
+        # no key, and calling one form as the other jumps through the
+        # wrong argument.
+        $script:Entry.SiteKey | Should -BeTrue
+        $script:Entry.SiteKey.GetType().FullName | Should -Be 'System.Boolean'
+    }
+
     It 'answers the same address twice in one session' {
         # One loaded copy of the library, one address. A caller that asks
         # per dispatch sees a change only when a reload loads a new copy.

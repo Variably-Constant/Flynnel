@@ -1098,7 +1098,7 @@ note = "join_hybrid, hybrid_auto, hybrid_auto_split_ranges and hybrid_pipeline a
 [[entry]]
 item = "crate::sched::call_site"
 reason = "internal-to-another-surface"
-note = "the per-site learned state: Get-FlynnelCallSite writes a row per site and Reset-FlynnelCallSite clears them. Placement is exported as Flynnel.Placement now that the hybrid cmdlets produce one. site_for_location takes a source location a script does not have, and the two constants are the model's own shape rather than a setting"
+note = "the per-site learned state: Get-FlynnelCallSite writes a row per site, located and keyed, and warns with both overflow counts when either table has filled, and Reset-FlynnelCallSite clears them. Placement is exported as Flynnel.Placement now that the hybrid cmdlets produce one. site_for_location takes a source location a script does not have, site_for_key is reached through flynnel_run_chunks_v1's site argument, and the two constants are the model's own shape rather than a setting"
 
 [[entry]]
 item = "crate::sched::occupancy"

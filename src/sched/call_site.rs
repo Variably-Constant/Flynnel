@@ -11,7 +11,10 @@
 //! delegating helpers resolve to the outermost user call site.
 //! Driver loops that funnel many workloads through one textual site
 //! share one state; callers can pin their own via
-//! [`crate::sched::JobPlan::with_site`].
+//! [`crate::sched::JobPlan::with_site`]. A caller outside this binary
+//! has no source location here, so it names its work by a key instead:
+//! [`site_for_key`] resolves a caller-chosen u64 to a site of its own,
+//! in a table apart from the locations'.
 //!
 //! A site holds: a learned
 //! [`crate::sched::adaptive_profile::WorkloadClass`] (delta-window
@@ -1732,7 +1735,6 @@ struct SiteNode {
 /// Linear probing wants the headroom: a table near capacity walks a
 /// long run of occupied slots on every miss.
 const SITE_SLOTS: usize = 2048;
-const SITE_MASK: usize = SITE_SLOTS - 1;
 
 /// Open-addressed, insert-once, never-removed table of leaked nodes.
 ///
@@ -1750,74 +1752,202 @@ static SITE_TABLE: [AtomicPtr<SiteNode>; SITE_SLOTS] =
 /// call. Silence here would make that look like ordinary behavior.
 static SITE_TABLE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
-/// The node for `key`, or `None` with the probe stopping at the first
-/// empty slot, which is where an insert for this key would go.
-fn site_lookup(key: u64) -> Option<&'static SiteNode> {
-    let mut idx = (key as usize) & SITE_MASK;
-    for _ in 0..SITE_SLOTS {
-        let p = SITE_TABLE[idx].load(Ordering::Acquire);
+/// A node in one of the site tables: the key it was inserted under and
+/// the state it holds.
+trait TableNode: 'static {
+    fn key(&self) -> u64;
+    fn state(&self) -> &'static CallSiteState;
+}
+
+impl TableNode for SiteNode {
+    fn key(&self) -> u64 {
+        self.key
+    }
+
+    fn state(&self) -> &'static CallSiteState {
+        self.state
+    }
+}
+
+/// The node for `key` in `table`, probing from `start`, or `None` with
+/// the probe stopping at the first empty slot, which is where an insert
+/// for this key would go. `table`'s length is a power of two.
+fn table_lookup<N: TableNode>(
+    table: &'static [AtomicPtr<N>],
+    start: usize,
+    key: u64,
+) -> Option<&'static N> {
+    let mask = table.len() - 1;
+    let mut idx = start & mask;
+    for _ in 0..table.len() {
+        let p = table[idx].load(Ordering::Acquire);
         if p.is_null() {
             return None;
         }
-        // SAFETY: a non-null slot holds a leaked SiteNode that is
-        // never freed, moved or rehashed.
+        // SAFETY: a non-null slot holds a leaked node that is never
+        // freed, moved or rehashed.
         let node = unsafe { &*p };
-        if node.key == key {
+        if node.key() == key {
             return Some(node);
         }
-        idx = (idx + 1) & SITE_MASK;
+        idx = (idx + 1) & mask;
     }
     None
 }
 
-/// The state for `key`, inserting one that records `loc` if the key
-/// is not yet present. Racing inserters of the same key all return
-/// the one node that won its slot.
-fn site_insert(key: u64, loc: &'static std::panic::Location<'static>) -> &'static CallSiteState {
+/// The state for `key` in `table`, probing from `start` and inserting
+/// the node `build` makes if the key is not yet present, or `None` when
+/// every slot is taken by another key. Racing inserters of the same key
+/// all return the one node that won its slot.
+fn table_insert<N: TableNode>(
+    table: &'static [AtomicPtr<N>],
+    start: usize,
+    key: u64,
+    build: impl Fn() -> N,
+) -> Option<&'static CallSiteState> {
     // Built at most once and only on reaching an empty slot, so a
     // caller that finds the key already present allocates nothing. A
     // racer that loses its CAS and then finds its key further along
     // abandons the node it prepared; that is bounded by the number of
-    // threads meeting one new location at the same moment.
-    let mut prepared: Option<&'static SiteNode> = None;
-    let mut idx = (key as usize) & SITE_MASK;
-    for _ in 0..SITE_SLOTS {
-        let p = SITE_TABLE[idx].load(Ordering::Acquire);
+    // threads meeting one new key at the same moment.
+    let mut prepared: Option<&'static N> = None;
+    let mask = table.len() - 1;
+    let mut idx = start & mask;
+    for _ in 0..table.len() {
+        let p = table[idx].load(Ordering::Acquire);
         if p.is_null() {
-            let node = *prepared.get_or_insert_with(|| {
-                &*Box::leak(Box::new(SiteNode {
-                    key,
-                    location: loc,
-                    state: Box::leak(Box::new(CallSiteState::new())),
-                }))
-            });
-            let fresh = node as *const SiteNode as *mut SiteNode;
-            match SITE_TABLE[idx].compare_exchange(
+            let node = *prepared.get_or_insert_with(|| &*Box::leak(Box::new(build())));
+            let fresh = node as *const N as *mut N;
+            match table[idx].compare_exchange(
                 core::ptr::null_mut(),
                 fresh,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return node.state,
+                Ok(_) => return Some(node.state()),
                 Err(taken) => {
-                    // SAFETY: as in site_lookup.
+                    // SAFETY: as in table_lookup.
                     let other = unsafe { &*taken };
-                    if other.key == key {
-                        return other.state;
+                    if other.key() == key {
+                        return Some(other.state());
                     }
                 }
             }
         } else {
-            // SAFETY: as in site_lookup.
+            // SAFETY: as in table_lookup.
             let node = unsafe { &*p };
-            if node.key == key {
-                return node.state;
+            if node.key() == key {
+                return Some(node.state());
             }
         }
-        idx = (idx + 1) & SITE_MASK;
+        idx = (idx + 1) & mask;
     }
-    SITE_TABLE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-    Box::leak(Box::new(CallSiteState::new()))
+    None
+}
+
+/// The node for a location's `key`, or `None` with the probe stopping
+/// at the first empty slot.
+fn site_lookup(key: u64) -> Option<&'static SiteNode> {
+    table_lookup(&SITE_TABLE, key as usize, key)
+}
+
+/// The state for a location's `key`, inserting one that records `loc`
+/// if the key is not yet present.
+fn site_insert(key: u64, loc: &'static std::panic::Location<'static>) -> &'static CallSiteState {
+    let inserted = table_insert(&SITE_TABLE, key as usize, key, || SiteNode {
+        key,
+        location: loc,
+        state: Box::leak(Box::new(CallSiteState::new())),
+    });
+    match inserted {
+        Some(state) => state,
+        None => {
+            SITE_TABLE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+            Box::leak(Box::new(CallSiteState::new()))
+        }
+    }
+}
+
+/// A site that a caller outside this binary named by a key of its own.
+struct KeyNode {
+    key: u64,
+    state: &'static CallSiteState,
+}
+
+impl TableNode for KeyNode {
+    fn key(&self) -> u64 {
+        self.key
+    }
+
+    fn state(&self) -> &'static CallSiteState {
+        self.state
+    }
+}
+
+/// Slot count of the key table: 32 KiB of zeroed bss, room for a
+/// caller that keys by kernel, phase and size class at once.
+const KEY_SLOTS: usize = 4096;
+
+/// Caller-keyed sites, in a table of their own rather than the
+/// location table. The locations are fixed when the binary is built,
+/// so the code bounds that table's population; a caller's keys are
+/// bounded by nothing here, and a caller that mints many must not be
+/// able to fill the table the scheduler's own call sites live in.
+static KEY_TABLE: [AtomicPtr<KeyNode>; KEY_SLOTS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; KEY_SLOTS];
+
+/// The number of keys the key table failed to hold.
+static KEY_TABLE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// The one site every key past the key table's capacity shares.
+///
+/// Shared rather than one per key, because a caller's keys are
+/// unbounded and a state per key past capacity would leak without
+/// limit. Those keys then learn together, as jobs with no key would,
+/// and the overflow count says so.
+static KEY_OVERFLOW_SITE: CallSiteState = CallSiteState::new();
+
+/// Where a key's probe starts. A caller packs whatever it likes into
+/// 64 bits, often small counters or fields in the high bits, so the
+/// key is spread by a multiplicative hash; a location's key is a hash
+/// already and is used as it is.
+fn key_slot(key: u64) -> usize {
+    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize
+}
+
+/// The site for a key chosen by a caller outside this binary,
+/// allocating the state on first sight of the key.
+///
+/// For work whose dispatch has no source location of its own: every job
+/// another native library hands to a chunk runner reaches the pool
+/// through that runner's one dispatch call, so without a key they would
+/// all learn at that call. Jobs passed the same key learn together and
+/// jobs passed different keys learn apart. A key never names a
+/// location's site, whatever its value, since the two live in separate
+/// tables.
+pub fn site_for_key(key: u64) -> SiteRef {
+    let slot = key_slot(key);
+    if let Some(node) = table_lookup(&KEY_TABLE, slot, key) {
+        return SiteRef::new(node.state);
+    }
+    let inserted = table_insert(&KEY_TABLE, slot, key, || KeyNode {
+        key,
+        state: Box::leak(Box::new(CallSiteState::new())),
+    });
+    match inserted {
+        Some(state) => SiteRef::new(state),
+        None => {
+            KEY_TABLE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+            SiteRef::new(&KEY_OVERFLOW_SITE)
+        }
+    }
+}
+
+/// How many keys the key table could not hold, each of which learned at
+/// the one shared overflow site. Zero until [`KEY_SLOTS`] distinct keys
+/// have been seen.
+pub fn keyed_site_table_overflow() -> u64 {
+    KEY_TABLE_OVERFLOW.load(Ordering::Relaxed)
 }
 
 /// How many sites the table could not hold. Zero on every table that
@@ -1891,12 +2021,18 @@ pub(crate) fn registry_len() -> usize {
 /// than an instant's snapshot. Nothing is ever removed, so a site the
 /// scan does report was really there.
 fn site_nodes() -> impl Iterator<Item = &'static SiteNode> {
-    SITE_TABLE.iter().filter_map(|slot| {
+    table_nodes(&SITE_TABLE)
+}
+
+/// Every node `table` holds, in slot order, on the terms of
+/// [`site_nodes`].
+fn table_nodes<N: TableNode>(table: &'static [AtomicPtr<N>]) -> impl Iterator<Item = &'static N> {
+    table.iter().filter_map(|slot| {
         let p = slot.load(Ordering::Acquire);
         if p.is_null() {
             None
         } else {
-            // SAFETY: as in site_lookup.
+            // SAFETY: as in table_lookup.
             Some(unsafe { &*p })
         }
     })
@@ -1929,7 +2065,32 @@ pub fn registered_sites() -> Vec<RegisteredSite> {
         .collect()
 }
 
-/// Resets every site in the registry, answering how many.
+/// One site a caller outside this binary named by a key, and the key.
+#[derive(Copy, Clone, Debug)]
+pub struct RegisteredKeyedSite {
+    /// The key its caller passed.
+    pub key: u64,
+    /// What that site has learned.
+    pub site: SiteRef,
+}
+
+/// Every keyed site the registry holds, each with its key.
+///
+/// Order is the table's and carries no meaning; sort on the key. Keys
+/// past the table's capacity share one site that has no key and is not
+/// listed here; [`keyed_site_table_overflow`] counts them.
+pub fn registered_keyed_sites() -> Vec<RegisteredKeyedSite> {
+    table_nodes(&KEY_TABLE)
+        .map(|node| RegisteredKeyedSite {
+            key: node.key,
+            site: SiteRef::new(node.state),
+        })
+        .collect()
+}
+
+/// Resets every site in the registry, the located and the keyed, and
+/// the keyed overflow site once a key has reached it, answering how
+/// many.
 ///
 /// For measuring two arms in one process: see [`CallSiteState::reset`]
 /// for why the alternative, a process each, measures something else.
@@ -1942,6 +2103,14 @@ pub fn reset_all_sites() -> usize {
     let mut swept = 0;
     for node in site_nodes() {
         node.state.reset();
+        swept += 1;
+    }
+    for node in table_nodes(&KEY_TABLE) {
+        node.state.reset();
+        swept += 1;
+    }
+    if keyed_site_table_overflow() > 0 {
+        KEY_OVERFLOW_SITE.reset();
         swept += 1;
     }
     swept
@@ -2282,21 +2451,63 @@ mod tests {
     }
 
     #[test]
-    fn resetting_every_site_covers_the_one_just_made() {
+    fn resetting_every_site_covers_the_ones_just_made() {
         // Safe to run beside the other tests in this module even though
         // the sweep is process-wide: every one of them that asserts on
         // counters owns its state as a `static CallSiteState`, which is
-        // never in the registry, and the one that does use caller_site
-        // asserts identity and registry size, neither of which a reset
-        // changes.
+        // never in the registry, and the ones that use caller_site or
+        // site_for_key assert identity and listing, neither of which a
+        // reset changes. This is the one test that resets, so the keyed
+        // site's counters are checked here rather than in a test of
+        // their own that this sweep could land inside.
         let mine = caller_site();
         mine.get().record_seed_depth(2);
         mine.get().record_seed_depth(7);
         assert_eq!(mine.get().seed_depth_flips(), 1);
+        let keyed = site_for_key(0x5EED_0004);
+        keyed.get().record_seed_depth(2);
+        keyed.get().record_seed_depth(7);
+        assert_eq!(keyed.get().seed_depth_flips(), 1);
 
         let swept = reset_all_sites();
-        assert!(swept >= 1, "the sweep counts the sites it reset");
+        assert!(swept >= 2, "the sweep counts the located and keyed sites it reset");
         assert_eq!(mine.get().seed_depth_flips(), 0);
+        assert_eq!(keyed.get().seed_depth_flips(), 0);
+    }
+
+    #[test]
+    fn one_key_is_one_site_and_two_keys_are_two() {
+        let a = site_for_key(0x5EED_0001);
+        assert_eq!(site_for_key(0x5EED_0001), a, "a key resolves to the site it made");
+        assert_ne!(site_for_key(0x5EED_0002), a, "two keys learn apart");
+    }
+
+    #[test]
+    fn a_key_never_names_a_location_site() {
+        let here = caller_site();
+        let found = registered_sites()
+            .into_iter()
+            .find(|r| r.site == here)
+            .expect("a site resolved through caller_site is in the registry");
+        // The location table's own key for that site, passed as a
+        // caller's key, still names a keyed site.
+        let keyed = site_for_key(location_key(found.location));
+        assert_ne!(keyed, here, "a key equal to a location's hash is a site of its own");
+    }
+
+    #[test]
+    fn the_registry_lists_each_keyed_site_by_its_key() {
+        let key = 0x5EED_0003;
+        let site = site_for_key(key);
+        let listed = registered_keyed_sites()
+            .into_iter()
+            .find(|r| r.key == key)
+            .expect("a keyed site is listed with its key");
+        assert_eq!(listed.site, site);
+        assert!(
+            registered_sites().iter().all(|r| r.site != site),
+            "a keyed site is not listed among the located ones"
+        );
     }
 
     #[test]

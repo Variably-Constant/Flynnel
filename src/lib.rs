@@ -100,8 +100,8 @@ pub use sched::{BisectVariant, JobPlan};
 pub use sched::arena::{join, join_context, join_default};
 pub use sched::cooperative::cooperative_join_n;
 pub use sched::call_site::{
-    CallSiteState, Placement, RegisteredSite, SiteRef, caller_site, registered_sites,
-    reset_all_sites, site_for_location,
+    CallSiteState, Placement, RegisteredKeyedSite, RegisteredSite, SiteRef, caller_site,
+    registered_keyed_sites, registered_sites, reset_all_sites, site_for_key, site_for_location,
 };
 pub use sched::cat::{CatCapability, CatError, L3Reservation};
 pub use sched::{
