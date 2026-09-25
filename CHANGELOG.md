@@ -74,6 +74,14 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   Get-FlynnelReducePath reads the path of Measure-FlynnelPrimitive's
   `reduce_chunks` fold. No declared kernel reaches `reduce_chunks` now.
 
+- Sort-FlynnelArray is Invoke-FlynnelSort, alias Invoke-FlySort. Sort is
+  not one of PowerShell's approved verbs, so every plain
+  `Import-Module Flynnel` warned twice about it; Invoke is the verb
+  Invoke-FlynnelMap and Invoke-FlynnelZip already take. Sort-FlynnelArray
+  and Sort-FlyArray remain aliases, so a script that calls either runs
+  unchanged. `kernels::DESCRIPTORS` names the new cmdlet; the kernel and
+  its answers are unchanged, so `kernels::REVISION` is not raised.
+
 - `external_dispatch`'s documentation says what the caller does: it
   hands the join to a worker, spins for the plan's budget, then parks
   until the latch sets, and runs none of the join's work itself.

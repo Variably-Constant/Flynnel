@@ -23,6 +23,16 @@ BeforeAll {
     $script:Cmdlets = @($script:Module.ExportedCmdlets.Values)
     $script:Aliases = @($script:Module.ExportedAliases.Values)
 
+    # The aliases that are not a cmdlet's Fly alias, each with the
+    # cmdlet it resolves to. Invoke-FlynnelSort answers to the Sort- names
+    # because Sort is not an approved verb and scripts call it by them.
+    # Named here rather than filtered out of the alias checks, so a
+    # second name nobody documents still fails them.
+    $script:Extra = @{
+        'Sort-FlynnelArray' = 'Invoke-FlynnelSort'
+        'Sort-FlyArray'     = 'Invoke-FlynnelSort'
+    }
+
     # Every other suite's text, for the check that each command is
     # reached by one. Read once rather than per command.
     $script:SuiteText = (Get-ChildItem -Path $PSScriptRoot -Filter '*.Tests.ps1' |
@@ -76,33 +86,12 @@ Describe 'naming' {
             (($wrong | ForEach-Object Name) -join ', '))
     }
 
-    It 'uses an approved verb everywhere, bar one named exception' {
-        # Sort is not on PowerShell's approved list. Sort-Object is
-        # grandfathered, so every user reads Sort- as ordering, and the
-        # approved alternatives each say something this cmdlet does not
-        # do. The name stands and the analyzer warning is accepted.
-        #
-        # Named here rather than filtered out of the check, so the
-        # exception is one line a reader can see and argue with, and so
-        # a second unapproved verb still fails.
-        $allowed = @('Sort-FlynnelArray')
+    It 'uses an approved verb everywhere' {
+        # An unapproved verb makes every plain Import-Module warn, twice.
         $approved = @(Get-Verb | ForEach-Object Verb)
-        $wrong = @($script:Cmdlets | Where-Object {
-            $_.Verb -notin $approved -and $_.Name -notin $allowed
-        })
+        $wrong = @($script:Cmdlets | Where-Object { $_.Verb -notin $approved })
         $wrong.Count | Should -Be 0 -Because ("these use an unapproved verb: " +
             (($wrong | ForEach-Object Name) -join ', '))
-    }
-
-    It 'still needs the one exception it carries' {
-        # An allow-list that has stopped matching anything is a line
-        # nobody removes, and the next reader takes it for a rule. This
-        # fails when Sort-FlynnelArray goes away, and when Sort joins
-        # the approved list and the exception becomes dead.
-        $approved = @(Get-Verb | ForEach-Object Verb)
-        Get-Command 'Sort-FlynnelArray' -ErrorAction SilentlyContinue |
-            Should -Not -BeNullOrEmpty
-        $approved | Should -Not -Contain 'Sort'
     }
 
     It 'gives every cmdlet exactly one Fly alias' {
@@ -121,6 +110,7 @@ Describe 'naming' {
             $target = $alias.ResolvedCommand
             if (-not $target) { $wrong += "$($alias.Name) resolves to nothing"; continue }
             $expected = $alias.Name -replace '^(\w+)-Fly', '$1-Flynnel'
+            if ($script:Extra.ContainsKey($alias.Name)) { $expected = $script:Extra[$alias.Name] }
             if ($target.Name -ne $expected) {
                 $wrong += "$($alias.Name) resolves to $($target.Name), not $expected"
             }
@@ -128,10 +118,19 @@ Describe 'naming' {
         $wrong.Count | Should -Be 0 -Because ($wrong -join '; ')
     }
 
-    It 'has as many aliases as cmdlets' {
-        # One each, no more: a stray alias is a name a script can come
-        # to depend on that nothing documents.
-        $script:Aliases.Count | Should -Be $script:Cmdlets.Count
+    It 'has as many aliases as cmdlets, and the named extras' {
+        # One Fly alias each and the extras named above, no more: a stray
+        # alias is a name a script can come to depend on that nothing
+        # documents.
+        $script:Aliases.Count | Should -Be ($script:Cmdlets.Count + $script:Extra.Count)
+    }
+
+    It 'still exports every extra alias it names' {
+        # A list that has stopped matching anything is a line nobody
+        # removes, and the next reader takes it for a rule.
+        foreach ($name in $script:Extra.Keys) {
+            $script:Aliases.Name | Should -Contain $name
+        }
     }
 }
 
@@ -395,7 +394,7 @@ Describe 'anything over many items crosses in one call' {
             'Get-FlynnelPrefixSum'       = 'InputObject'
             'Get-FlynnelHistogram'       = 'InputObject'
             'Get-FlynnelDotProduct'      = 'Left'
-            'Sort-FlynnelArray'          = 'InputObject'
+            'Invoke-FlynnelSort'         = 'InputObject'
             'Measure-FlynnelFileHash'    = 'Path'
             'Test-FlynnelFileHash'       = 'Path'
             'Search-FlynnelFile'         = 'Path'
@@ -422,7 +421,7 @@ Describe 'anything over many items crosses in one call' {
         # cmdlet is called per item, which is the cost the rule exists
         # to avoid.
         $fromPipeline = @('Invoke-FlynnelMap', 'Measure-FlynnelReduce',
-                          'Get-FlynnelPrefixSum', 'Sort-FlynnelArray',
+                          'Get-FlynnelPrefixSum', 'Invoke-FlynnelSort',
                           'Measure-FlynnelFileHash')
         $wrong = @()
         foreach ($name in $fromPipeline) {

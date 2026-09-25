@@ -110,7 +110,7 @@ Describe 'the types this family exports' {
             { Invoke-FlynnelMap -InputObject $x -Operation Square },
             { Invoke-FlynnelZip -Left $x -Right $x -Operation Add },
             { Get-FlynnelPrefixSum -InputObject $x },
-            { Sort-FlynnelArray -InputObject $x }) {
+            { Invoke-FlynnelSort -InputObject $x }) {
             $out = @(& $call)
             $out.Count | Should -Be 1 -Because 'the pipeline carries one array, not four doubles'
             $out[0].Count | Should -Be 4
@@ -431,21 +431,21 @@ Describe 'Get-FlynnelDotProduct' {
     }
 }
 
-Describe 'Sort-FlynnelArray' {
+Describe 'Invoke-FlynnelSort' {
     It 'orders exactly as Sort-Object does' {
-        $got = Sort-FlynnelArray -InputObject $script:Data
+        $got = Invoke-FlynnelSort -InputObject $script:Data
         $want = $script:Data | Sort-Object
         (Compare-Object $got $want -SyncWindow 0).Count | Should -Be 0
     }
 
     It 'reverses for Descending' {
-        $got = Sort-FlynnelArray -InputObject $script:Data -Descending
+        $got = Invoke-FlynnelSort -InputObject $script:Data -Descending
         $want = $script:Data | Sort-Object -Descending
         (Compare-Object $got $want -SyncWindow 0).Count | Should -Be 0
     }
 
     It 'keeps every element, including the repeats' {
-        $got = Sort-FlynnelArray -InputObject $script:Data
+        $got = Invoke-FlynnelSort -InputObject $script:Data
         $got.Count | Should -Be $script:N
         ($got | Measure-Object -Sum).Sum |
             Should -Be ($script:Data | Measure-Object -Sum).Sum
@@ -455,9 +455,17 @@ Describe 'Sort-FlynnelArray' {
         # A sort cuts runs of at least 4,096 elements, so 13,000 is three
         # runs and the third waits a round for a partner.
         $odd = 1..13000 | ForEach-Object { [double]((7919 * $_) % 9973) }
-        $got = Sort-FlynnelArray -InputObject $odd
+        $got = Invoke-FlynnelSort -InputObject $odd
         $want = $odd | Sort-Object
         (Compare-Object $got $want -SyncWindow 0).Count | Should -Be 0
+    }
+
+    It 'answers the same under Sort-FlynnelArray and Sort-FlyArray' {
+        $want = Invoke-FlynnelSort -InputObject $script:Data -Descending
+        foreach ($name in 'Sort-FlynnelArray', 'Sort-FlyArray') {
+            $got = & $name -InputObject $script:Data -Descending
+            (Compare-Object $got $want -SyncWindow 0).Count | Should -Be 0 -Because "$name is an alias"
+        }
     }
 }
 

@@ -70,7 +70,7 @@
 [[entry]]
 item = "crate::kernels"
 reason = "internal-to-another-surface"
-note = "the declared kernels as jobs, bound through the kernel cmdlets family: each of Invoke-FlynnelMap, Update-FlynnelArray, Invoke-FlynnelZip, Measure-FlynnelReduce, Get-FlynnelPrefixSum, Get-FlynnelHistogram, Get-FlynnelDotProduct, Sort-FlynnelArray, Measure-FlynnelFileHash, Test-FlynnelFileHash, Search-FlynnelFile, Measure-FlynnelFileLine, Measure-FlynnelFileByte, Search-FlynnelText, Measure-FlynnelTextCount, Split-FlynnelText and Update-FlynnelText builds its kernel's job and drives it on the pool. The job protocol and the answer types are what that driving reads, DESCRIPTORS is held to those cmdlets' metadata by the module's own test, and REVISION is Get-FlynnelNativeEntry's KernelsRevision"
+note = "the declared kernels as jobs, bound through the kernel cmdlets family: each of Invoke-FlynnelMap, Update-FlynnelArray, Invoke-FlynnelZip, Measure-FlynnelReduce, Get-FlynnelPrefixSum, Get-FlynnelHistogram, Get-FlynnelDotProduct, Invoke-FlynnelSort, Measure-FlynnelFileHash, Test-FlynnelFileHash, Search-FlynnelFile, Measure-FlynnelFileLine, Measure-FlynnelFileByte, Search-FlynnelText, Measure-FlynnelTextCount, Split-FlynnelText and Update-FlynnelText builds its kernel's job and drives it on the pool. The job protocol and the answer types are what that driving reads, DESCRIPTORS is held to those cmdlets' metadata by the module's own test, and REVISION is Get-FlynnelNativeEntry's KernelsRevision"
 
 [[entry]]
 item = "crate::sched::par_iter::for_each_chunk_indexed_min_leaf"

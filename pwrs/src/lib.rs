@@ -74,7 +74,7 @@ pwrs::export_module! {
         kernels::GetFlynnelPrefixSum,
         kernels::GetFlynnelHistogram,
         kernels::GetFlynnelDotProduct,
-        kernels::SortFlynnelArray,
+        kernels::InvokeFlynnelSort,
         kernels::MeasureFlynnelFileHash,
         kernels::TestFlynnelFileHash,
         kernels::SearchFlynnelFile,

@@ -97,7 +97,7 @@ Arrays and numbers:
 | `Get-FlynnelPrefixSum` | `Get-FlyPrefixSum` |
 | `Get-FlynnelHistogram` | `Get-FlyHistogram` |
 | `Get-FlynnelDotProduct` | `Get-FlyDotProduct` |
-| `Sort-FlynnelArray` | `Sort-FlyArray` |
+| `Invoke-FlynnelSort` | `Invoke-FlySort`, `Sort-FlynnelArray`, `Sort-FlyArray` |
 
 Files:
 

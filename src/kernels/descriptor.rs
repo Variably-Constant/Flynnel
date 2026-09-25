@@ -282,7 +282,7 @@ const DOT_PRODUCT: KernelDescriptor = KernelDescriptor {
 
 const SORT: KernelDescriptor = KernelDescriptor {
     kernel: "Sort",
-    cmdlet: "Sort-FlynnelArray",
+    cmdlet: "Invoke-FlynnelSort",
     input: InputKind::Doubles,
     answer: AnswerKind::Doubles,
     params: &[

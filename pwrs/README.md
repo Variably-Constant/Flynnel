@@ -171,7 +171,8 @@ and split pairs, `Start-FlynnelSplitObserver`, `New-FlynnelIoPool`,
 Arrays and numbers: `Invoke-FlynnelMap` over fourteen element-wise
 operations, `Invoke-FlynnelZip` over six pairwise ones,
 `Measure-FlynnelReduce` over seven reductions, `Get-FlynnelPrefixSum`,
-`Get-FlynnelHistogram`, `Get-FlynnelDotProduct`, `Sort-FlynnelArray`.
+`Get-FlynnelHistogram`, `Get-FlynnelDotProduct`, `Invoke-FlynnelSort`
+(which also answers to `Sort-FlynnelArray` and `Sort-FlyArray`).
 
 Files: `Measure-FlynnelFileHash` and `Test-FlynnelFileHash` in BLAKE3,
 `Search-FlynnelFile`, `Measure-FlynnelFileLine`,

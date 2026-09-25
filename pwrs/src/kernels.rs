@@ -905,19 +905,23 @@ impl Cmdlet for GetFlynnelDotProduct {
 /// NaN sorts above every number, which is the total order
 /// `f64::total_cmp` gives and the only one a comparison sort can use.
 ///
+/// Sort is not one of PowerShell's approved verbs, so the cmdlet takes
+/// Invoke, as Invoke-FlynnelMap and Invoke-FlynnelZip do, and answers
+/// to Sort-FlynnelArray and Sort-FlyArray as aliases as well.
+///
 /// # Examples
 ///
-/// `Sort-FlynnelArray -InputObject $x`
+/// `Invoke-FlynnelSort -InputObject $x`
 ///
-/// `Sort-FlynnelArray -InputObject $x -Descending`
+/// `Invoke-FlynnelSort -InputObject $x -Descending`
 #[cmdlet(
-    verb = "Sort",
-    noun = "FlynnelArray",
-    alias = "Sort-FlyArray",
+    verb = "Invoke",
+    noun = "FlynnelSort",
+    alias = ["Invoke-FlySort", "Sort-FlynnelArray", "Sort-FlyArray"],
     output = ["System.Double[]"]
 )]
 #[derive(Default)]
-pub struct SortFlynnelArray {
+pub struct InvokeFlynnelSort {
     /// The numbers to sort.
     #[param(mandatory, position = 0, value_from_pipeline)]
     pub input_object: Vec<f64>,
@@ -929,12 +933,12 @@ pub struct SortFlynnelArray {
     pub plan: Option<Plan>,
 }
 
-impl Cmdlet for SortFlynnelArray {
+impl Cmdlet for InvokeFlynnelSort {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let items = std::mem::take(&mut self.input_object);
         let n = items.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
-        say_plan(ps, &plan, n, "Sort-FlynnelArray")?;
+        say_plan(ps, &plan, n, "Invoke-FlynnelSort")?;
         let sorted = run_on_pool(&plan, kernels::sort(&items, self.descending))?;
         ps.write(PsArray(sorted))
     }
@@ -1968,7 +1972,7 @@ mod tests {
         check::<GetFlynnelPrefixSum>("PrefixSum");
         check::<GetFlynnelHistogram>("Histogram");
         check::<GetFlynnelDotProduct>("DotProduct");
-        check::<SortFlynnelArray>("Sort");
+        check::<InvokeFlynnelSort>("Sort");
         check::<MeasureFlynnelFileHash>("FileHash");
         check::<TestFlynnelFileHash>("FileHashCheck");
         check::<SearchFlynnelFile>("SearchFile");
