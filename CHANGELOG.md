@@ -21,6 +21,24 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   count can miss a window and an extreme can miss the window that set
   it. No scheduling decision reads any of them.
 
+  Measured by `examples/throughput_under_load`, each trial running the
+  change, the build before it, and that earlier build again from a
+  second file, the three taking the six orders in turn, so the earlier
+  build over its own copy is each cell's floor. Against the build before
+  the change, 18 trials at 16 and 512 reps, quiet and under load, on a
+  24-thread Ryzen 9 7900X (beside other builds in most trials), a Zen 3
+  Linux guest and a 16-thread Ryzen 7 2700: every cell's median ratio
+  lies inside the 95 per cent interval of its copy's, the ratios running
+  0.970 to 1.052 on the 7900X, 0.923 to 1.097 on the guest and 0.938 to
+  1.062 on the 2700, against copies of 0.971 to 1.051, 0.901 to 1.143
+  and 0.946 to 1.071. Against the build without the window readers, 36
+  trials at 16 reps, quiet: 1.0044 [0.9856, 1.0160] on the 7900X (copy
+  0.9954); on the guest, whose processes land at one of two levels,
+  1.002 within the lower and 0.990 within the upper (copy 0.988 and
+  0.976); on the 2700, 0.9665 [0.9343, 1.0289] (copy 0.9753 [0.9316,
+  1.0307]), where with the locked read-modify-writes the readers had
+  leaned 1.5 to 2.7 per cent slower over five runs.
+
 - The module's kernel cmdlets run the crate's own jobs from
   `flynnel::kernels` (see Added). Each resolves its managed input, builds
   its kernel's job, dispatches the job's blocks on the pool through
