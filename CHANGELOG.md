@@ -819,6 +819,38 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
+- **A wide cooperative fan-out stranded work in parked workers'
+  mailboxes.** A mailbox is drained only by the worker that owns it,
+  and a mailbox push was served by the deque's wake, which claims
+  whichever parked worker it reaches first and, under the cooperative
+  fan-out's wake scope, issued nothing at all, so the fan-out's one wake
+  was the broadcast after its push loop. On a 16-vCPU Linux guest, 11
+  of 12 runs of `simc_cooperative` at a width of 1024 stopped, usually
+  with all fifteen peer mailboxes still holding jobs.
+
+  A push now wakes its target worker by index whatever the wake scope
+  says, reading the target's state plainly and attempting the claim
+  only when that read says it is parked. A worker that has published
+  itself as sleeping checks its own mailbox, beside the injector, before
+  it parks, which covers a push that lands while it is on its way down
+  and no wake can claim it yet. Each half alone leaves the hang: the
+  recheck alone stalled 8 runs of 12, the two together none of 12.
+
+  What it costs, on the 24-thread host with the two behaviors switched
+  inside one binary: per park transition one injector check, one flag
+  load and one `SeqCst` fence, and per mailbox push one load. Neither
+  bench resolves a time cost. `simc_cooperative` at widths 12 to 512,
+  eight rounds a side under comparable load, left 0 of 20 cells outside
+  their own run-to-run spread, the cells the change reaches no more
+  often than the rayon cells it cannot. `cold_workloads` read the old
+  behavior's time over the new at 1.000 and 1.006 on a quiet box and
+  0.990 and 0.951 beside twelve spinning threads, where the two
+  in-process controls, the same code in both, read 0.995 and 0.988; no
+  figure sat outside its resolvable spread. The pool wakes more often:
+  one traced run after an idle gap woke it 2,541 times against 1,983
+  and parked it 4,926 times against 4,873, medians of five runs, each
+  higher with the fix in 23 of 25 pairs of runs.
+
 - **A spread the statistics could not resolve read as perfectly
   uniform.** The leaf-spread statistics square each leaf in units of
   256 ns, and answered zero for a window whose mean leaf was under one

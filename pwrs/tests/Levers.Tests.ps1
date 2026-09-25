@@ -47,14 +47,14 @@ Describe 'the types and enums this family exports' {
 Describe 'Get-FlynnelLever' {
     It 'writes a row for every switch the crate reports' {
         # The list the crate's own describe prints, which is what a
-        # reader of its logs will have seen, and the two switches it
-        # leaves out, which a script can still set.
+        # reader of its logs will have seen, and the switch it leaves
+        # out, which a script can still set.
         $names = @($script:Levers | ForEach-Object Name)
         foreach ($lever in 'oncore_spread', 'batch_weight', 'smt_window', 'allowed_width',
                            'calibration_refusal', 'latch_monitor', 'spin_monitor', 'join_park',
                            'join_park_oversubscribed', 'slot_park_now', 'spin_adaptive',
                            'spin_window', 'serve_policy', 'occupancy_floor',
-                           'mailbox_wake_legacy', 'wasm_local_store') {
+                           'wasm_local_store') {
             $names | Should -Contain $lever
         }
     }
@@ -98,7 +98,7 @@ Describe 'Get-FlynnelLever' {
             $row.Price | Should -Not -BeNullOrEmpty -Because "$name ships on and must say what it costs"
         }
         foreach ($name in 'batch_weight', 'smt_window', 'latch_monitor', 'spin_monitor',
-                          'join_park', 'slot_park_now', 'mailbox_wake_legacy', 'wasm_local_store') {
+                          'join_park', 'slot_park_now', 'wasm_local_store') {
             $row = $script:Levers | Where-Object Name -eq $name
             $row.Default | Should -Be 'false'
         }
@@ -107,7 +107,7 @@ Describe 'Get-FlynnelLever' {
     It 'says why each switch that was measured and kept off stays off' {
         # The row is where a script reads why a switch it might reach for
         # is off, so a switch a measurement turned down carries it.
-        foreach ($name in 'join_park', 'slot_park_now', 'mailbox_wake_legacy', 'wasm_local_store') {
+        foreach ($name in 'join_park', 'slot_park_now', 'wasm_local_store') {
             $row = $script:Levers | Where-Object Name -eq $name
             $row.Price | Should -Not -BeNullOrEmpty -Because "$name was measured and is off"
         }

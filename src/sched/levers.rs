@@ -335,28 +335,6 @@ pub fn latch_monitor() -> bool {
     *V.get_or_init(|| read("FLYNNEL_LEVER_LATCH_MONITOR"))
 }
 
-/// Serve a mailbox push with the generic wake and leave a worker's own
-/// mailbox out of the predicate it checks before parking, as the
-/// scheduler did before the single-consumer wake was added.
-///
-/// On reinstates a hang. A mailbox is drained only by its owner, and
-/// the generic wake walks from worker zero and claims whoever is
-/// parked, so a wide cooperative fan-out strands work in the mailboxes
-/// of workers nothing woke: 11 of 12 runs of simc_cooperative_n1024
-/// stop with fifteen of sixteen mailboxes still holding jobs. This is
-/// not a fallback and nothing should run with it set.
-///
-/// It exists so the fix can be priced in one binary. The two
-/// behaviours differ by a few instructions on the park and mailbox-push
-/// paths, and comparing two builds instead would confound that
-/// difference with code layout, which on this codebase has moved a
-/// branchy cell by half. Off is the shipped behaviour, as for every
-/// other lever here.
-pub fn mailbox_wake_legacy() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| read("FLYNNEL_LEVER_MAILBOX_WAKE_LEGACY"))
-}
-
 /// Give the outside caller's slot-wait parker no yield rounds, so a
 /// caller whose spin budget is spent goes from the sleep handshake
 /// straight to the park.

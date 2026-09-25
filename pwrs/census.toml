@@ -859,11 +859,6 @@ reason = "internal-to-another-surface"
 note = "the slot_park_now row of Get-FlynnelLever, whose price says it was measured to change nothing on either host"
 
 [[entry]]
-item = "crate::sched::levers::mailbox_wake_legacy"
-reason = "internal-to-another-surface"
-note = "the mailbox_wake_legacy row of Get-FlynnelLever, whose price says on reinstates a hang and the switch exists only to price the fix"
-
-[[entry]]
 item = "crate::sched::levers::wasm_local_store"
 reason = "internal-to-another-surface"
 note = "the wasm_local_store row of Get-FlynnelLever, whose price carries the measurement that keeps it off"

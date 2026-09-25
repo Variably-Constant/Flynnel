@@ -340,9 +340,7 @@ pub fn total_sleepless_backoffs() -> u64 {
 ///
 /// Neither park nor rescue evidence counts these: the worker never
 /// parks, and it clears its idle rounds before it next finds work, so
-/// `work_found` does not see a spin that paid off. With
-/// [`crate::sched::levers::mailbox_wake_legacy`] on, the recheck reads
-/// only shutdown, so the count stays at zero until the pool shuts down.
+/// `work_found` does not see a spin that paid off.
 static SELF_RESCUES: AtomicU64 = AtomicU64::new(0);
 
 /// Times a worker was rescued by its own recheck after publishing
@@ -972,8 +970,7 @@ impl Sleep {
             // queue reads inside `has_reachable_work` carry it too
             // whatever ordering they use internally.
             std::sync::atomic::fence(Ordering::SeqCst);
-            let recheck_work = !crate::sched::levers::mailbox_wake_legacy();
-            if (self.shutdown.load(Ordering::SeqCst) || (recheck_work && has_reachable_work()))
+            if (self.shutdown.load(Ordering::SeqCst) || has_reachable_work())
                 && state
                     .state
                     .compare_exchange(SLEEPING, AWAKE, Ordering::SeqCst, Ordering::SeqCst)

@@ -226,10 +226,6 @@ const SLOT_PARK_PRICE: &str = "Off, and measured to change nothing: in four arms
     oversubscribed caller on a 24-thread Windows bare-metal box and on a 16-vCPU Linux guest it \
     sat with the arm that had no switch on, quiet and loaded.";
 
-const MAILBOX_LEGACY_PRICE: &str = "Not a mode to run: on reinstates a hang. 11 of 12 runs of \
-    simc_cooperative_n1024 stop with fifteen of sixteen mailboxes still holding jobs. It exists \
-    so the fix can be priced in one binary.";
-
 const WASM_STORE_PRICE: &str = "Off, and measured to lose. On a 24-thread Windows host a store \
     per thread is 4.4x faster with every worker settled on an idle box and 5x slower in the same \
     shape under load, 1222 against 6316 us, and every first-dispatch cell is 5 to 7 per cent \
@@ -334,13 +330,6 @@ fn all_levers() -> Vec<Lever> {
             levers::slot_park_now(),
             false,
             SLOT_PARK_PRICE,
-        ),
-        switch_row(
-            "mailbox_wake_legacy",
-            "FLYNNEL_LEVER_MAILBOX_WAKE_LEGACY",
-            levers::mailbox_wake_legacy(),
-            false,
-            MAILBOX_LEGACY_PRICE,
         ),
         switch_row(
             "wasm_local_store",
