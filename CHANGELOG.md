@@ -880,6 +880,17 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   the pool, and no longer latches its site against the inline-collapse
   estimate, which a body the cap put on the caller says nothing about.
 
+  What it costs on an uncapped plan, one compare of the plan's worker
+  cap at each entry: the build before it against the build with it,
+  through one load harness on the heartbeat entry, with a copy of the
+  earlier build as every cell's floor, six trials a cell on the
+  24-thread 7900X and the 2700 and eighteen on the Linux guest. No
+  cell's interval lies below its copy's. Of 36 cells one median sits
+  under its copy's 95 per cent interval (the 7900X at 16 reps with no
+  load, 0.953 against a copy interval from 0.957) and none over it. The
+  medians ran 0.853 to 1.096 on the 7900X, 0.940 to 1.159 on the 2700
+  and 0.920 to 1.138 on the guest.
+
 - **A wide cooperative fan-out stranded work in parked workers'
   mailboxes.** A mailbox is drained only by the worker that owns it,
   and a mailbox push was served by the deque's wake, which claims
