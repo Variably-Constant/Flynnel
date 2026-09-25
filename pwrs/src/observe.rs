@@ -342,9 +342,12 @@ pub struct LeafStatRow {
     pub per_item_ns: Option<u64>,
     /// The leaves' squared coefficient of variation in parts per
     /// thousand, which is the spread statistic the classifier reads.
-    /// Null below the sample floor.
+    /// Null below the sample floor, and when the mean leaf is under the
+    /// 256 ns unit the statistic squares in, since no spread among
+    /// leaves that short can be read.
     pub leaf_cv2_per_mille: Option<u64>,
-    /// The same statistic per item. Null below the sample floor.
+    /// The same statistic per item. Null below the sample floor, and
+    /// when the mean item costs under 256 ns, on the same grounds.
     pub per_item_cv2_per_mille: Option<u64>,
 }
 
@@ -757,6 +760,10 @@ pub struct CallSite {
     /// changed regime once carries both regimes in this figure forever,
     /// so read WindowCv2MinPerMille and WindowCv2MaxPerMille to see
     /// what the classifier actually acted on.
+    ///
+    /// Null below the sample floor, and where an item cost under a
+    /// nanosecond, since no spread about a mean that rounded to nothing
+    /// can be read.
     pub cv2_per_mille: Option<u64>,
     /// The same spread measured on the threads' own clocks rather than
     /// the wall, which advance only while a thread is on a core. Also
@@ -777,24 +784,35 @@ pub struct CallSite {
     /// within a single run, so a reading of it says almost nothing on
     /// its own; the two extremes below are the figure to judge a run
     /// by.
+    ///
+    /// The latest window whose spread could be read. A window of leaves
+    /// under the 256 ns unit the spread is kept in has a mean and no
+    /// spread, and leaves this and its extremes as they were; null until
+    /// a window with a spread has been classified.
     pub window_cv2_per_mille: Option<u64>,
-    /// The lowest per-window spread across every tick this site has
-    /// classified.
+    /// The lowest per-window spread across every window this site has
+    /// classified with a spread.
     pub window_cv2_min_per_mille: Option<u64>,
     /// The highest, which with the lowest gives the range the
     /// classifier acted over.
     pub window_cv2_max_per_mille: Option<u64>,
     /// Windows the site has classified.
     pub window_ticks: u64,
+    /// Windows whose spread could be read, out of WindowTicks: the ones
+    /// WindowCv2PerMille and its extremes are taken over.
+    pub window_spread_ticks: u64,
     /// The latest window's spread on wall time, whichever clock the
     /// classifier used for it, so it can be set beside the on-core
-    /// figure of the same window.
+    /// figure of the same window. Null until a window's wall spread
+    /// could be read.
     pub window_wall_cv2_per_mille: Option<u64>,
-    /// The lowest wall spread across every tick this site has
-    /// classified.
+    /// The lowest wall spread across every window this site has
+    /// classified with one.
     pub window_wall_cv2_min_per_mille: Option<u64>,
-    /// The highest wall spread across those ticks.
+    /// The highest wall spread across those windows.
     pub window_wall_cv2_max_per_mille: Option<u64>,
+    /// Windows whose wall spread could be read, out of WindowTicks.
+    pub window_wall_ticks: u64,
     /// The latest spread the classifier took from the on-core clock.
     /// Null until a window has been classified on that clock, which is
     /// how a run that took no on-core timing reads, rather than as a
@@ -878,9 +896,11 @@ pub(crate) fn call_site_row(entry: &flynnel::RegisteredSite) -> CallSite {
         window_cv2_min_per_mille: cv2_min,
         window_cv2_max_per_mille: cv2_max,
         window_ticks: s.window_ticks(),
+        window_spread_ticks: s.window_spread_ticks(),
         window_wall_cv2_per_mille: s.window_wall_cv2_per_mille(),
         window_wall_cv2_min_per_mille: wall_min,
         window_wall_cv2_max_per_mille: wall_max,
+        window_wall_ticks: s.window_wall_ticks(),
         window_oncore_cv2_per_mille: s.window_oncore_cv2_per_mille(),
         window_oncore_cv2_min_per_mille: oncore_min,
         window_oncore_cv2_max_per_mille: oncore_max,

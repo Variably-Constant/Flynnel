@@ -3743,6 +3743,9 @@ const HEARTBEAT_GATE_ITEMS: usize = 100_000;
 ///   policy arms A/B heartbeat against SLAW from
 ///   `n >= HEARTBEAT_MIN_ITEMS` (`4_096`), adopt whichever EWMA
 ///   wins, and re-trial on a fixed cadence.
+/// - Site cv^2 unreadable because its mean leaf is under the 256 ns
+///   unit the spread is kept in: SLAW at any `n`, decided from that
+///   mean.
 /// - Site cv^2 unknown (fresh site): legacy item-count gate -
 ///   SLAW below [`HEARTBEAT_GATE_ITEMS`] (`100_000`), heartbeat
 ///   at or above it.
@@ -3798,34 +3801,9 @@ where
         return collect_indexed(plan, n, 1, f);
     }
 
-    // Heartbeat wins on irregular per-item cost (the Acar model's
-    // target shape) and loses 3-4x on uniform cost (matmul-shaped
-    // work), so the site's observed cv^2 is the routing signal:
-    //
-    // - cv^2 known and low (uniform leaves): force SLAW at any n.
-    // - cv^2 known and high (irregular leaves): let the site's
-    //   policy arms A/B heartbeat (arm 1) against SLAW (arm 0) from
-    //   n >= HEARTBEAT_MIN_ITEMS, adopting whichever EWMA wins and
-    //   re-trialling on a fixed cadence.
-    // - cv^2 unknown (fresh site): the legacy item-count gate.
     let site = plan.site.expect("attached above");
     let cv2 = site.get().cv2_per_mille();
-    let cv2_high = crate::sched::adaptive_profile::class_thresholds()
-        .cv2_high_per_mille
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let arm = match cv2 {
-        Some(c) if c < cv2_high => crate::sched::call_site::PolicyArm::Default,
-        Some(_) => site
-            .get()
-            .choose_arm(n >= HEARTBEAT_MIN_ITEMS),
-        None => {
-            if n < HEARTBEAT_GATE_ITEMS {
-                crate::sched::call_site::PolicyArm::Default
-            } else {
-                crate::sched::call_site::PolicyArm::Alternative
-            }
-        }
-    };
+    let arm = heartbeat_arm(site.get(), cv2, n);
 
     if arm == crate::sched::call_site::PolicyArm::Default {
         let t0 = std::time::Instant::now();
@@ -3852,6 +3830,40 @@ where
     // `MaybeUninit<R>` and `R` share layout, so reconstructing
     // the Vec from the raw parts is sound.
     unsafe { Vec::from_raw_parts(buf.as_mut_ptr() as *mut R, n, buf.capacity()) }
+}
+
+/// The arm [`collect_indexed_heartbeat`] runs `n` items on at `site`,
+/// whose lifetime leaf spread is `cv2`.
+///
+/// Heartbeat wins on irregular per-item cost (the Acar model's target
+/// shape) and loses 3-4x on uniform cost (matmul-shaped work), so the
+/// site's observed cv^2 is the routing signal:
+///
+/// - cv^2 known and low (uniform leaves): SLAW at any n.
+/// - cv^2 known and high (irregular leaves): the site's policy arms
+///   A/B heartbeat (arm 1) against SLAW (arm 0) from
+///   n >= HEARTBEAT_MIN_ITEMS, adopting whichever EWMA wins and
+///   re-trialling on a fixed cadence.
+/// - cv^2 unreadable because the site's leaves are shorter than the
+///   256 ns unit it is kept in: SLAW, the route a low reading takes,
+///   decided from the mean leaf the site did measure.
+/// - cv^2 unknown (fresh site): the legacy item-count gate.
+fn heartbeat_arm(
+    site: &crate::sched::call_site::CallSiteState,
+    cv2: Option<u64>,
+    n: usize,
+) -> crate::sched::call_site::PolicyArm {
+    use crate::sched::call_site::PolicyArm;
+    let cv2_high = crate::sched::adaptive_profile::class_thresholds()
+        .cv2_high_per_mille
+        .load(std::sync::atomic::Ordering::Relaxed);
+    match cv2 {
+        Some(c) if c < cv2_high => PolicyArm::Default,
+        Some(_) => site.choose_arm(n >= HEARTBEAT_MIN_ITEMS),
+        None if site.leaves_under_spread_unit() => PolicyArm::Default,
+        None if n < HEARTBEAT_GATE_ITEMS => PolicyArm::Default,
+        None => PolicyArm::Alternative,
+    }
 }
 
 /// Floor for the heartbeat policy arm once a site's cv^2 evidence
@@ -5758,6 +5770,28 @@ mod tests {
         let wall_ns = t0.elapsed().as_nanos() as u64;
         let inner_ns = last_ns.load(Ordering::Relaxed) - first_ns.load(Ordering::Relaxed);
         assert_span_in_nanoseconds(&SITE, rate_16, wall_ns, inner_ns);
+    }
+
+    #[test]
+    fn a_heartbeat_site_of_unreadably_short_leaves_takes_slaw_at_any_size() {
+        use crate::sched::call_site::{CallSiteState, PolicyArm};
+        // Sixteen leaves of 200 ns: timed, and too short for a spread.
+        static SHORT: CallSiteState = CallSiteState::new();
+        SHORT.record_batch_site_only(16 * 200, 0, 16, 0, 0);
+        assert_eq!(SHORT.cv2_per_mille(), None);
+        let big = 4 * HEARTBEAT_GATE_ITEMS;
+        assert_eq!(
+            heartbeat_arm(&SHORT, SHORT.cv2_per_mille(), big),
+            PolicyArm::Default
+        );
+
+        // A site with no leaves yet still takes the item-count gate.
+        static FRESH: CallSiteState = CallSiteState::new();
+        assert_eq!(heartbeat_arm(&FRESH, None, big), PolicyArm::Alternative);
+        assert_eq!(
+            heartbeat_arm(&FRESH, None, HEARTBEAT_GATE_ITEMS - 1),
+            PolicyArm::Default
+        );
     }
 
     #[test]

@@ -522,20 +522,51 @@ pub fn spawn_class_threshold_calibration() {
 #[inline]
 pub fn classify_observed(mean_ns: u64, cv2_per_mille: u64) -> WorkloadClass {
     let t = class_thresholds();
+    match class_from_mean(t, mean_ns) {
+        Some(class) => class,
+        None => class_from_spread(t, cv2_per_mille),
+    }
+}
+
+/// The class a window's mean decides by itself: FineGrain and PortBound
+/// below [`ClassThresholds::port_heavy_ns`], where no spread is read, and
+/// `None` at or above it, where the spread picks the class.
+#[inline]
+fn class_from_mean(t: &ClassThresholds, mean_ns: u64) -> Option<WorkloadClass> {
     if mean_ns < t.fine_grain_ns.load(Ordering::Relaxed) {
-        return WorkloadClass::FineGrain;
+        Some(WorkloadClass::FineGrain)
+    } else if mean_ns < t.port_heavy_ns.load(Ordering::Relaxed) {
+        Some(WorkloadClass::PortBound)
+    } else {
+        None
     }
-    if mean_ns < t.port_heavy_ns.load(Ordering::Relaxed) {
-        return WorkloadClass::PortBound;
-    }
-    // Heavy per-leaf work: variance picks between streaming /
-    // memory-gather / latency.
+}
+
+/// Heavy per-leaf work: the spread picks between streaming,
+/// memory-gather and latency.
+#[inline]
+fn class_from_spread(t: &ClassThresholds, cv2_per_mille: u64) -> WorkloadClass {
     if cv2_per_mille < t.cv2_low_per_mille.load(Ordering::Relaxed) {
         WorkloadClass::Streaming
     } else if cv2_per_mille < t.cv2_high_per_mille.load(Ordering::Relaxed) {
         WorkloadClass::MemoryBound
     } else {
         WorkloadClass::LatencyBound
+    }
+}
+
+/// The class a classified window decides: from its mean, and from its
+/// spread where the mean leaves the choice to it. `None` when the spread
+/// is needed and could not be read, because the window's leaves were
+/// shorter than the unit it is kept in; a window the classifier cannot
+/// see makes no decision, and the active class stands.
+#[inline]
+pub(crate) fn classify_window(mean_ns: u64, cv2_per_mille: Option<u64>) -> Option<WorkloadClass> {
+    let t = class_thresholds();
+    match (class_from_mean(t, mean_ns), cv2_per_mille) {
+        (Some(class), _) => Some(class),
+        (None, Some(cv2)) => Some(class_from_spread(t, cv2)),
+        (None, None) => None,
     }
 }
 
@@ -854,10 +885,12 @@ static AUTO_LAST_SUMSQ_PER_ITEM: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// One tick of the closing-loop observer. Reads the global leaf
-/// stats, computes the delta since the last tick, runs
-/// [`classify_observed`] on the delta window, and migrates the
+/// stats, computes the delta since the last tick, classifies the
+/// delta window as [`classify_observed`] does, and migrates the
 /// active workload class once the same observation has been
-/// confirmed [`AUTO_MIGRATION_HYSTERESIS`] times in a row.
+/// confirmed [`AUTO_MIGRATION_HYSTERESIS`] times in a row. A window
+/// whose class turns on a spread its leaves were too short to show
+/// decides nothing and leaves the pending run where it was.
 ///
 /// Does not reset the global stats -- tests and cv^2 readers see
 /// the full cumulative counters. The "fresh window per tick"
@@ -893,7 +926,9 @@ pub fn tick_auto_classify() {
     AUTO_LAST_SUMSQ_PER_ITEM.store(stats.sumsq_per_item, Ordering::Relaxed);
 
     let (mean_ns, cv2) = window_reading(dcount, dsum, dsumsq, ditems, dsumsq_per_item);
-    let observed = classify_observed(mean_ns, cv2);
+    let Some(observed) = classify_window(mean_ns, cv2) else {
+        return;
+    };
     let active = active_workload_class();
 
     let mut word = AUTO_PENDING.load(Ordering::Relaxed);
@@ -922,34 +957,31 @@ pub fn tick_auto_classify() {
 /// items in a leaf, and the split follows from the class this decides.
 /// A window whose samples carried no item count is read per leaf,
 /// which is all such a sample can say. The spread is cv^2 in parts per
-/// mille.
+/// mille, and `None` when the mean is under the 256 ns unit its squares
+/// are kept in, since no spread about a mean that small can be read.
 fn window_reading(
     dcount: u64,
     dsum: u64,
     dsumsq: u64,
     ditems: u64,
     dsumsq_per_item: u64,
-) -> (u64, u64) {
+) -> (u64, Option<u64>) {
     if let Some(mean) = dsum.checked_div(ditems) {
         let mean_sq = ((mean as u128).saturating_mul(mean as u128) >> 16) as u64;
-        let spread = if mean_sq == 0 {
-            0
-        } else {
+        let spread = (mean_sq > 0).then(|| {
             let var = dsumsq_per_item.saturating_sub(mean_sq.saturating_mul(ditems)) / ditems;
             var.saturating_mul(1000) / mean_sq
-        };
+        });
         (mean, spread)
     } else {
         let mean = dsum / dcount;
         let scaled_mean = (dsum >> 8) / dcount;
-        let spread = if scaled_mean == 0 {
-            0
-        } else {
+        let spread = (scaled_mean > 0).then(|| {
             let sumsq_per_n = dsumsq / dcount;
             let mean_sq = scaled_mean.saturating_mul(scaled_mean);
             let var = sumsq_per_n.saturating_sub(mean_sq);
-            var.saturating_mul(1000) / mean_sq.max(1)
-        };
+            var.saturating_mul(1000) / mean_sq
+        });
         (mean, spread)
     }
 }
@@ -1238,7 +1270,10 @@ mod tests {
         let dsumsq = scaled * scaled * leaves;
 
         // No items: read per leaf, a flat window.
-        assert_eq!(window_reading(leaves, dsum, dsumsq, 0, 0), (leaf_ns, 0));
+        assert_eq!(
+            window_reading(leaves, dsum, dsumsq, 0, 0),
+            (leaf_ns, Some(0))
+        );
 
         // Sixteen items a leaf: read per item, still flat.
         let items = 16u64;
@@ -1246,9 +1281,56 @@ mod tests {
         let (mean, cv2) =
             window_reading(leaves, dsum, dsumsq, leaves * items, per_item_sq * leaves);
         assert_eq!(mean, leaf_ns / items);
+        let cv2 = cv2.expect("a 62,500 ns item is well above the unit");
         assert!(
             cv2 < 50,
             "identical leaves read as a flat window; got {cv2}"
+        );
+    }
+
+    #[test]
+    fn a_window_under_the_unit_reads_its_mean_and_no_spread() {
+        // Sixty-four leaves of 200 ns with no items, and the same leaves
+        // as four items each: both means are measured, and neither has a
+        // spread, because 200 ns and 50 ns both scale to nothing.
+        let leaves = 64u64;
+        let leaf_ns = 200u64;
+        let dsum = leaf_ns * leaves;
+        assert_eq!(window_reading(leaves, dsum, 0, 0, 0), (leaf_ns, None));
+        assert_eq!(
+            window_reading(leaves, dsum, 0, leaves * 4, 0),
+            (leaf_ns / 4, None)
+        );
+    }
+
+    #[test]
+    fn a_window_decides_by_its_mean_where_the_mean_decides() {
+        // Below the heavy boundary the mean alone places the window, so
+        // a spread that could not be read changes nothing.
+        let port_heavy = class_thresholds().port_heavy_ns.load(Ordering::Relaxed);
+        assert!(port_heavy > 1, "the heavy boundary is above one nanosecond");
+        let light = port_heavy - 1;
+        assert_eq!(
+            classify_window(light, None),
+            Some(classify_observed(light, 0))
+        );
+        assert_eq!(
+            classify_window(light, Some(900)),
+            Some(classify_observed(light, 900))
+        );
+    }
+
+    #[test]
+    fn a_heavy_window_with_no_readable_spread_decides_nothing() {
+        let heavy = class_thresholds().port_heavy_ns.load(Ordering::Relaxed) + 1_000;
+        assert_eq!(classify_window(heavy, None), None);
+        assert_eq!(
+            classify_window(heavy, Some(0)),
+            Some(WorkloadClass::Streaming)
+        );
+        assert_eq!(
+            classify_window(heavy, Some(10_000)),
+            Some(WorkloadClass::LatencyBound)
         );
     }
 

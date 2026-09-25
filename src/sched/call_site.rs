@@ -33,7 +33,7 @@
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::sched::adaptive_profile::{
-    WorkloadClass, class_tag_decode, class_tag_encode, classify_observed,
+    WorkloadClass, class_tag_decode, class_tag_encode, classify_window,
 };
 
 /// Sentinel tag meaning "this site has not been classified yet".
@@ -58,15 +58,19 @@ const SITE_MIGRATION_HYSTERESIS: u32 = 2;
 /// 500. The integer mean is the one rounding left, and it biases the
 /// result by at most `2 / mean` per mille: under 4 at 500 ns per item,
 /// the lowest cost the cv^2 edges apply to.
-fn per_item_cv2(sumsq_per_item: u64, mean: u64, items: u64) -> u64 {
+///
+/// `None` when the integer mean is zero, an item costing under one unit
+/// of whatever clock the sums are in: there is no spread about a mean
+/// that rounded away, and zero would read as uniform items.
+fn per_item_cv2(sumsq_per_item: u64, mean: u64, items: u64) -> Option<u64> {
     let mean_sq = (mean as u128).saturating_mul(mean as u128);
     let expected = mean_sq.saturating_mul(items as u128);
     if expected == 0 {
-        return 0;
+        return None;
     }
     let total = (sumsq_per_item as u128) << 16;
     let spread = total.saturating_sub(expected);
-    (spread.saturating_mul(1000) / expected) as u64
+    Some((spread.saturating_mul(1000) / expected) as u64)
 }
 
 /// Lowers `slot` to `value` where `value` is below it, from a plain load
@@ -288,9 +292,12 @@ pub struct CallSiteState {
     last_oncore_items: AtomicU64,
     last_oncore_sum: AtomicU64,
     last_oncore_sumsq_per_item: AtomicU64,
-    // Mean leaf time in nanoseconds and cv^2 per mille of the delta
-    // window the latest tick classified, and how many windows have been
-    // classified.
+    // Mean leaf time in nanoseconds of the delta window the latest tick
+    // classified, and how many windows have been classified; cv^2 per
+    // mille of the latest window whose spread could be read, and how
+    // many could. A window whose mean is under the unit its spread is
+    // kept in has a mean and no spread, and leaves `window_cv2` and its
+    // extremes where they were.
     //
     // The tick writes these and the fields below with plain loads and
     // stores, as it keeps the snapshot above, and takes no locked
@@ -300,6 +307,7 @@ pub struct CallSiteState {
     window_mean_ns: AtomicU64,
     window_cv2: AtomicU64,
     window_ticks: AtomicU64,
+    window_spread_ticks: AtomicU64,
     // Extremes of the per-window cv^2 across every tick, so a reader
     // gets the range the classifier acted over rather than whichever
     // tick happened to be last. A single tick's figure spans 0 to 527
@@ -310,12 +318,14 @@ pub struct CallSiteState {
     // The same window's spread on each clock apart, with the extremes of
     // each. `window_cv2` is whichever of the two the classifier used;
     // these let a reader set the one it used beside the one it did not.
-    // The on-core figures are written only for a window whose spread the
-    // classifier took from the on-core clock, which `window_oncore_ticks`
-    // counts.
+    // The wall figures are written only for a window whose wall spread
+    // could be read, which `window_wall_ticks` counts, and the on-core
+    // figures only for a window whose spread the classifier took from
+    // the on-core clock, which `window_oncore_ticks` counts.
     window_wall_cv2: AtomicU64,
     window_wall_cv2_min: AtomicU64,
     window_wall_cv2_max: AtomicU64,
+    window_wall_ticks: AtomicU64,
     window_oncore_cv2: AtomicU64,
     window_oncore_cv2_min: AtomicU64,
     window_oncore_cv2_max: AtomicU64,
@@ -445,11 +455,13 @@ impl CallSiteState {
             window_mean_ns: AtomicU64::new(0),
             window_cv2: AtomicU64::new(0),
             window_ticks: AtomicU64::new(0),
+            window_spread_ticks: AtomicU64::new(0),
             window_cv2_min: AtomicU64::new(u64::MAX),
             window_cv2_max: AtomicU64::new(0),
             window_wall_cv2: AtomicU64::new(0),
             window_wall_cv2_min: AtomicU64::new(u64::MAX),
             window_wall_cv2_max: AtomicU64::new(0),
+            window_wall_ticks: AtomicU64::new(0),
             window_oncore_cv2: AtomicU64::new(0),
             window_oncore_cv2_min: AtomicU64::new(u64::MAX),
             window_oncore_cv2_max: AtomicU64::new(0),
@@ -527,11 +539,13 @@ impl CallSiteState {
             window_mean_ns,
             window_cv2,
             window_ticks,
+            window_spread_ticks,
             window_cv2_min,
             window_cv2_max,
             window_wall_cv2,
             window_wall_cv2_min,
             window_wall_cv2_max,
+            window_wall_ticks,
             window_oncore_cv2,
             window_oncore_cv2_min,
             window_oncore_cv2_max,
@@ -587,9 +601,11 @@ impl CallSiteState {
             window_mean_ns,
             window_cv2,
             window_ticks,
+            window_spread_ticks,
             window_cv2_max,
             window_wall_cv2,
             window_wall_cv2_max,
+            window_wall_ticks,
             window_oncore_cv2,
             window_oncore_cv2_max,
             window_oncore_ticks,
@@ -922,18 +938,16 @@ impl CallSiteState {
     ///
     /// `None` rather than zero: zero is the spread of perfectly uniform
     /// work, which is a reading, and a site whose leaves never reached
-    /// the sampled path has no reading at all.
+    /// the sampled path has no reading at all. `None` too where an item
+    /// cost under one counter tick, as [`per_item_cv2`] says.
     pub fn per_item_oncore_cv2_per_mille(&self) -> Option<u64> {
         let items = self.leaf_oncore_items.load(Ordering::Relaxed);
         if items == 0 {
             return None;
         }
         let mean = self.leaf_oncore_sum.load(Ordering::Relaxed) / items;
-        if mean == 0 {
-            return None;
-        }
         let sumsq = self.leaf_oncore_sumsq_per_item.load(Ordering::Relaxed);
-        Some(per_item_cv2(sumsq, mean, items))
+        per_item_cv2(sumsq, mean, items)
     }
 
     /// Leaves' worth of items that carried an on-core reading.
@@ -949,7 +963,9 @@ impl CallSiteState {
     /// Coefficient-of-variation squared (parts-per-1000) over this
     /// site's cumulative leaf history, or `None` below 4 samples.
     /// Same fixed-point convention as the global
-    /// [`crate::sched::split_observer::leaf_cv_squared_per_mille`].
+    /// [`crate::sched::split_observer::leaf_cv_squared_per_mille`], and
+    /// `None` on the same further terms: a mean leaf under the 256 ns
+    /// unit the squares are kept in has no spread that can be read.
     pub fn cv2_per_mille(&self) -> Option<u64> {
         let n = self.leaf_count.load(Ordering::Relaxed);
         if n < 4 {
@@ -963,12 +979,24 @@ impl CallSiteState {
         let n = self.leaf_weight_sum.load(Ordering::Relaxed).max(1);
         let mean_scaled = (sum >> 8) / n;
         if mean_scaled == 0 {
-            return Some(0);
+            return None;
         }
         let sumsq_per_n = sumsq / n;
         let mean_sq = mean_scaled.saturating_mul(mean_scaled);
         let var = sumsq_per_n.saturating_sub(mean_sq);
-        Some(var.saturating_mul(1000) / mean_sq.max(1))
+        Some(var.saturating_mul(1000) / mean_sq)
+    }
+
+    /// Whether the site has timed its 4 leaves and their mean is under
+    /// the 256 ns unit [`Self::cv2_per_mille`] squares in, so that it has
+    /// no spread to give for a measured reason rather than for want of
+    /// leaves. A router can then decide from the mean it did measure.
+    pub(crate) fn leaves_under_spread_unit(&self) -> bool {
+        if self.leaf_count.load(Ordering::Relaxed) < 4 {
+            return false;
+        }
+        let n = self.leaf_weight_sum.load(Ordering::Relaxed).max(1);
+        (self.leaf_sum_ns.load(Ordering::Relaxed) >> 8) / n == 0
     }
 
     /// Total leaves recorded against this site.
@@ -1012,7 +1040,8 @@ impl CallSiteState {
 
     /// cv^2 per mille of per-item cost at this site, weighted by the
     /// items each leaf covered. `None` on the same terms as
-    /// [`Self::per_item_ns`].
+    /// [`Self::per_item_ns`], and where the mean item cost under a
+    /// nanosecond, which leaves no spread to read.
     ///
     /// The recorder keeps each leaf's squared time over its item count,
     /// so the sum of those less the mean squared times the items is the
@@ -1035,7 +1064,7 @@ impl CallSiteState {
         // difference as spread.
         let mean_ns = self.leaf_sum_ns.load(Ordering::Relaxed) / items;
         let sumsq_per_item = self.leaf_sumsq_per_item.load(Ordering::Relaxed);
-        Some(per_item_cv2(sumsq_per_item, mean_ns, items))
+        per_item_cv2(sumsq_per_item, mean_ns, items)
     }
 
     /// Mean cost of one item, in nanoseconds, over the delta window the
@@ -1061,9 +1090,15 @@ impl CallSiteState {
     /// time's otherwise; [`Self::window_wall_cv2_per_mille`] and
     /// [`Self::window_oncore_cv2_per_mille`] give the two apart. A window
     /// whose samples carried no item count reports the spread of its
-    /// leaf times instead. `None` until a tick has classified a window.
+    /// leaf times instead.
+    ///
+    /// It is the latest window whose spread could be read. A window whose
+    /// mean is under the unit its spread is kept in has none and does not
+    /// replace it, so this can be older than [`Self::window_mean_ns`].
+    /// `None` until a window with a readable spread has been classified;
+    /// [`Self::window_spread_ticks`] counts them.
     pub fn window_cv2_per_mille(&self) -> Option<u64> {
-        if self.window_ticks.load(Ordering::Relaxed) == 0 {
+        if self.window_spread_ticks.load(Ordering::Relaxed) == 0 {
             None
         } else {
             Some(self.window_cv2.load(Ordering::Relaxed))
@@ -1075,6 +1110,13 @@ impl CallSiteState {
         self.window_ticks.load(Ordering::Relaxed)
     }
 
+    /// Delta windows whose spread could be read, out of
+    /// [`Self::window_ticks`]: the ones [`Self::window_cv2_per_mille`] and
+    /// its range are taken over.
+    pub fn window_spread_ticks(&self) -> u64 {
+        self.window_spread_ticks.load(Ordering::Relaxed)
+    }
+
     /// Smallest and largest per-window cv^2 the classifier has seen,
     /// over every tick rather than the latest one.
     ///
@@ -1083,10 +1125,10 @@ impl CallSiteState {
     /// so it cannot say which regimes a run passed through. The range
     /// can: a maximum below the uniform edge says a spread-driven
     /// mechanism was never consulted in its own regime, whatever the
-    /// last tick happened to hold. `None` until a tick has classified a
-    /// window.
+    /// last tick happened to hold. `None` until a window with a readable
+    /// spread has been classified.
     pub fn window_cv2_range_per_mille(&self) -> Option<(u64, u64)> {
-        if self.window_ticks.load(Ordering::Relaxed) == 0 {
+        if self.window_spread_ticks.load(Ordering::Relaxed) == 0 {
             None
         } else {
             Some((
@@ -1101,19 +1143,21 @@ impl CallSiteState {
     /// spread from; a window whose samples carried no item count reports
     /// its leaf times' spread. Where [`Self::window_oncore_cv2_per_mille`]
     /// answers for the same tick, the two are one window on two clocks.
-    /// `None` until a tick has classified a window.
+    /// The latest window whose wall spread could be read, and `None`
+    /// until one has been classified; [`Self::window_wall_ticks`] counts
+    /// them.
     pub fn window_wall_cv2_per_mille(&self) -> Option<u64> {
-        if self.window_ticks.load(Ordering::Relaxed) == 0 {
+        if self.window_wall_ticks.load(Ordering::Relaxed) == 0 {
             None
         } else {
             Some(self.window_wall_cv2.load(Ordering::Relaxed))
         }
     }
 
-    /// Smallest and largest per-window wall cv^2 over every tick. `None`
-    /// until a tick has classified a window.
+    /// Smallest and largest per-window wall cv^2 over every window whose
+    /// wall spread could be read. `None` until one has been classified.
     pub fn window_wall_cv2_range_per_mille(&self) -> Option<(u64, u64)> {
-        if self.window_ticks.load(Ordering::Relaxed) == 0 {
+        if self.window_wall_ticks.load(Ordering::Relaxed) == 0 {
             None
         } else {
             Some((
@@ -1121,6 +1165,12 @@ impl CallSiteState {
                 self.window_wall_cv2_max.load(Ordering::Relaxed),
             ))
         }
+    }
+
+    /// Delta windows whose wall spread could be read, out of
+    /// [`Self::window_ticks`].
+    pub fn window_wall_ticks(&self) -> u64 {
+        self.window_wall_ticks.load(Ordering::Relaxed)
     }
 
     /// cv^2 per mille of per-item cost on the thread's own clock over the
@@ -1223,8 +1273,7 @@ impl CallSiteState {
         // them, so the clock's unit never reaches a threshold.
         let oncore_cv2 = d_oncore_sum
             .checked_div(d_oncore_items)
-            .filter(|mean| *mean > 0)
-            .map(|mean| per_item_cv2(d_oncore_sumsq, mean, d_oncore_items));
+            .and_then(|mean| per_item_cv2(d_oncore_sumsq, mean, d_oncore_items));
 
         let per_item = dsum.checked_div(ditems);
         // The mean stays on wall time, where the classifier's nanosecond
@@ -1241,33 +1290,43 @@ impl CallSiteState {
             // factor and a leaf count does not.
             let mean = dsum / dweight;
             let scaled_mean = (dsum >> 8) / dweight;
-            let spread = if scaled_mean == 0 {
-                0
-            } else {
+            // A mean leaf under the 256 ns unit the squares are kept in
+            // leaves no spread to read.
+            let spread = (scaled_mean > 0).then(|| {
                 let sumsq_per_n = dsumsq / dweight;
                 let mean_sq = scaled_mean.saturating_mul(scaled_mean);
                 let var = sumsq_per_n.saturating_sub(mean_sq);
-                var.saturating_mul(1000) / mean_sq.max(1)
-            };
+                var.saturating_mul(1000) / mean_sq
+            });
             (mean, spread)
         };
         let oncore_used = oncore_cv2.filter(|_| per_item.is_some());
-        let cv2 = oncore_used.unwrap_or(wall_cv2);
+        let cv2 = oncore_used.or(wall_cv2);
         self.window_mean_ns.store(mean_ns, Ordering::Relaxed);
-        self.window_cv2.store(cv2, Ordering::Relaxed);
         publish_count(&self.window_ticks);
-        publish_min(&self.window_cv2_min, cv2);
-        publish_max(&self.window_cv2_max, cv2);
-        self.window_wall_cv2.store(wall_cv2, Ordering::Relaxed);
-        publish_min(&self.window_wall_cv2_min, wall_cv2);
-        publish_max(&self.window_wall_cv2_max, wall_cv2);
+        if let Some(cv2) = cv2 {
+            self.window_cv2.store(cv2, Ordering::Relaxed);
+            publish_min(&self.window_cv2_min, cv2);
+            publish_max(&self.window_cv2_max, cv2);
+            publish_count(&self.window_spread_ticks);
+        }
+        if let Some(wall) = wall_cv2 {
+            self.window_wall_cv2.store(wall, Ordering::Relaxed);
+            publish_min(&self.window_wall_cv2_min, wall);
+            publish_max(&self.window_wall_cv2_max, wall);
+            publish_count(&self.window_wall_ticks);
+        }
         if let Some(oncore) = oncore_used {
             self.window_oncore_cv2.store(oncore, Ordering::Relaxed);
             publish_min(&self.window_oncore_cv2_min, oncore);
             publish_max(&self.window_oncore_cv2_max, oncore);
             publish_count(&self.window_oncore_ticks);
         }
-        let observed = classify_observed(mean_ns, cv2);
+        // A window whose class turns on a spread it could not show makes
+        // no decision, and the active class and any pending run stand.
+        let Some(observed) = classify_window(mean_ns, cv2) else {
+            return;
+        };
         let observed_tag = class_tag_encode(observed);
 
         let active = class_tag_decode(self.active_tag.load(Ordering::Relaxed));
@@ -2081,6 +2140,76 @@ mod tests {
         assert_eq!(S.window_oncore_cv2_per_mille(), None);
         assert_eq!(S.window_oncore_cv2_range_per_mille(), None);
         assert_eq!(S.window_oncore_ticks(), 0);
+    }
+
+    #[test]
+    fn a_window_of_leaves_under_the_unit_has_a_mean_and_no_spread() {
+        // Sixteen leaves of 200 ns with no item count, the heartbeat's
+        // kind of sample. Each scales to nothing in 256 ns units, so the
+        // window has a measured mean and no spread, and zero is not
+        // reported for it.
+        static S: CallSiteState = CallSiteState::new();
+        let leaf = 200u64;
+        S.record_batch_site_only(16 * leaf, 0, 16, 0, 0);
+        assert_eq!(S.window_ticks(), 1);
+        assert_eq!(S.window_mean_ns(), Some(leaf));
+        assert_eq!(S.window_spread_ticks(), 0);
+        assert_eq!(S.window_cv2_per_mille(), None);
+        assert_eq!(S.window_cv2_range_per_mille(), None);
+        assert_eq!(S.window_wall_ticks(), 0);
+        assert_eq!(S.window_wall_cv2_per_mille(), None);
+        assert_eq!(S.window_wall_cv2_range_per_mille(), None);
+        assert_eq!(S.cv2_per_mille(), None);
+        assert!(S.leaves_under_spread_unit());
+        // A mean this light places the window by itself.
+        assert!(S.learned_class().is_some());
+    }
+
+    #[test]
+    fn items_under_a_nanosecond_have_no_per_item_spread_while_their_leaves_do() {
+        // Sixteen leaves of 1024 items at half a nanosecond each: the
+        // integer mean per item is zero, while the 512 ns leaves are
+        // long enough to read, and flat.
+        static S: CallSiteState = CallSiteState::new();
+        const ITEMS: u64 = 1024;
+        let leaf = 512u64;
+        let sq = |ns: u64| (ns >> 8).saturating_mul(ns >> 8);
+        S.record_batch_site_only(16 * leaf, 16 * sq(leaf), 16, 16 * ITEMS, 0);
+        assert_eq!(S.per_item_ns(), Some(0));
+        assert_eq!(S.per_item_cv2_per_mille(), None);
+        assert_eq!(S.window_cv2_per_mille(), None);
+        assert_eq!(S.window_spread_ticks(), 0);
+        assert_eq!(S.cv2_per_mille(), Some(0));
+        assert!(!S.leaves_under_spread_unit());
+    }
+
+    #[test]
+    fn a_window_with_no_spread_keeps_the_last_one_that_had_one() {
+        // The flat-and-spread window of the tests above, cv^2 40, then a
+        // window of 200 ns leaves with no items. The second classifies
+        // and has no spread, so the reading and its range stay on the
+        // first, while the mean moves to the second.
+        static S: CallSiteState = CallSiteState::new();
+        const ITEMS: u64 = 1024;
+        let (fast, slow) = (1280u64 * ITEMS, 1920u64 * ITEMS);
+        let sq = |ns: u64| (ns >> 8).saturating_mul(ns >> 8);
+        let per_item_sq =
+            |ns: u64| ((ns as u128).saturating_mul(ns as u128) / ((ITEMS as u128) << 16)) as u64;
+        S.record_batch_site_only(
+            8 * fast + 8 * slow,
+            8 * sq(fast) + 8 * sq(slow),
+            16,
+            16 * ITEMS,
+            8 * per_item_sq(fast) + 8 * per_item_sq(slow),
+        );
+        S.record_batch_site_only(16 * 200, 0, 16, 0, 0);
+        assert_eq!(S.window_ticks(), 2);
+        assert_eq!(S.window_spread_ticks(), 1);
+        assert_eq!(S.window_wall_ticks(), 1);
+        assert_eq!(S.window_mean_ns(), Some(200));
+        assert_eq!(S.window_cv2_per_mille(), Some(40));
+        assert_eq!(S.window_cv2_range_per_mille(), Some((40, 40)));
+        assert_eq!(S.window_wall_cv2_per_mille(), Some(40));
     }
 
     #[test]

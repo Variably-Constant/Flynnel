@@ -266,6 +266,11 @@ pub fn observed_per_item_ns(stats: LeafStats) -> Option<u64> {
 /// cv^2 per mille of per-item cost, weighted by the items each leaf
 /// covered, or `None` on the same terms as [`observed_per_item_ns`].
 ///
+/// Also `None` when the mean item costs under 256 ns. The squares are
+/// kept in units of 2^16 square nanoseconds, so a smaller mean squares
+/// to zero and no spread about it can be read; zero would say the items
+/// were uniform, which nothing measured.
+///
 /// Unlike [`leaf_cv_squared_per_mille`] this does not move when the
 /// scheduler splits the same work into leaves of different sizes, which
 /// is what lets a class describe the workload rather than the split.
@@ -279,7 +284,7 @@ pub fn per_item_cv_squared_per_mille(stats: LeafStats) -> Option<u64> {
     let mean_ns = stats.sum_ns / stats.items;
     let mean_sq = ((mean_ns as u128).saturating_mul(mean_ns as u128) >> 16) as u64;
     if mean_sq == 0 {
-        return Some(0);
+        return None;
     }
     let spread = stats
         .sumsq_per_item
@@ -293,7 +298,12 @@ pub fn per_item_cv_squared_per_mille(stats: LeafStats) -> Option<u64> {
 
 /// Coefficient of variation squared (cv^2 = var/mean^2) of leaf times
 /// in fixed-point parts-per-1000. Returns `None` when fewer than 4
-/// leaves have been recorded (statistically insignificant).
+/// leaves have been recorded (statistically insignificant), and when
+/// the mean leaf is under 256 ns: each leaf's time is squared after a
+/// shift by 8, so leaves that short all scale to the same few units and
+/// their spread cannot be read. Zero would say they were uniform, and a
+/// reader acting on that, such as the SMT decision of a plan with no
+/// call site, would act on a measurement nobody took.
 ///
 /// It is the spread of whole leaves, so it moves when the same work is
 /// split into leaves of different sizes. That is what the split
@@ -315,7 +325,7 @@ pub fn leaf_cv_squared_per_mille(stats: LeafStats) -> Option<u64> {
     let n = stats.count;
     let mean_scaled = (stats.sum_ns >> 8) / n;
     if mean_scaled == 0 {
-        return Some(0);
+        return None;
     }
     let sumsq_per_n = stats.sumsq_scaled / n;
     let mean_sq = mean_scaled.saturating_mul(mean_scaled);
@@ -386,8 +396,9 @@ const MIN_WINDOW_EVENTS: u64 = 100;
 /// The multiplier a sampled window implies.
 ///
 /// `cv2` is the leaf spread in parts per mille, absent when fewer than
-/// four leaves were timed. A window carrying fewer than
-/// `MIN_WINDOW_EVENTS` events returns `current` unchanged.
+/// four leaves were timed or when they were too short for their spread
+/// to be read. A window carrying fewer than `MIN_WINDOW_EVENTS` events
+/// returns `current` unchanged.
 fn multiplier_for_window(
     total_pops: u64,
     total_steals: u64,
@@ -574,6 +585,33 @@ mod tests {
             cv2 >= 500,
             "spread leaves should have cv^2 >= 500; got {cv2}"
         );
+    }
+
+    #[test]
+    fn leaves_shorter_than_the_unit_have_no_spread_rather_than_none_of_one() {
+        // 100 and 200 ns both scale to zero units, so a zero here would
+        // read as uniform leaves that were never told apart.
+        let s = stats_of_leaf_times(&[100, 200, 100, 200, 100, 200, 100, 200]);
+        assert_eq!(leaf_cv_squared_per_mille(s), None);
+    }
+
+    #[test]
+    fn items_cheaper_than_the_unit_have_no_per_item_spread() {
+        // Eight leaves of 1024 items at 100 ns an item. Every counter
+        // is filled, and the mean still squares to nothing in units of
+        // 2^16, while the leaves themselves are long enough to read.
+        let leaf = 100u64 * 1024;
+        let per_item_sq = ((leaf as u128 * leaf as u128) / (1024u128 << 16)) as u64;
+        let s = LeafStats {
+            count: 8,
+            sum_ns: 8 * leaf,
+            sumsq_scaled: 8 * (leaf >> 8) * (leaf >> 8),
+            items: 8 * 1024,
+            sumsq_per_item: 8 * per_item_sq,
+        };
+        assert_eq!(observed_per_item_ns(s), Some(100));
+        assert_eq!(per_item_cv_squared_per_mille(s), None);
+        assert!(leaf_cv_squared_per_mille(s).is_some());
     }
 
     #[test]

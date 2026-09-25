@@ -419,10 +419,11 @@ pub struct SplitState {
     /// Nanoseconds an item took, null on the same condition.
     pub per_item_ns: Option<u64>,
     /// Spread of the per-item cost, in parts per thousand of the mean
-    /// squared. Null until the window has enough leaves.
+    /// squared. Null until the window has enough leaves, and while the
+    /// mean item costs under the 256 ns unit it is squared in.
     pub per_item_cv2_per_mille: Option<u64>,
-    /// Spread of the whole-leaf cost, on the same scale and the same
-    /// condition.
+    /// Spread of the whole-leaf cost, on the same scale, and null on the
+    /// same conditions with the mean leaf in place of the mean item.
     pub leaf_cv2_per_mille: Option<u64>,
 }
 

@@ -53,11 +53,18 @@ fn print_row(iter: u32, prev_count: u64) -> u64 {
     } else {
         0
     };
-    let cv2 = leaf_cv_squared_per_mille(s).unwrap_or(0);
-    let classified = classify_observed(delta_mean, cv2);
+    // Fewer than four leaves, or leaves too short for a spread, give no
+    // reading, which prints as a dash rather than as a spread of zero.
+    let (cv2, classified) = match leaf_cv_squared_per_mille(s) {
+        Some(cv2) => (
+            cv2.to_string(),
+            format!("{:?}", classify_observed(delta_mean, cv2)),
+        ),
+        None => ("-".to_string(), "no spread".to_string()),
+    };
     let active = active_workload_class();
     println!("{:>4} | {:>10} | {:>8} | {:>16} | {:>16}",
-        iter, s.count, cv2, format!("{classified:?}"), format!("{active:?}"));
+        iter, s.count, cv2, classified, format!("{active:?}"));
     s.count
 }
 

@@ -314,8 +314,15 @@ Describe 'Get-FlynnelCallSite' {
             }
             if ($s.WindowTicks -eq 0) {
                 $s.WindowMeanNs | Should -BeNullOrEmpty
+            }
+            # A window of leaves too short to show a spread is classified
+            # and has none, so each spread is judged by its own count.
+            if ($s.WindowSpreadTicks -eq 0) {
+                $s.WindowCv2PerMille | Should -BeNullOrEmpty
                 $s.WindowCv2MinPerMille | Should -BeNullOrEmpty
                 $s.WindowCv2MaxPerMille | Should -BeNullOrEmpty
+            }
+            if ($s.WindowWallTicks -eq 0) {
                 $s.WindowWallCv2PerMille | Should -BeNullOrEmpty
                 $s.WindowWallCv2MinPerMille | Should -BeNullOrEmpty
             }
@@ -325,6 +332,8 @@ Describe 'Get-FlynnelCallSite' {
                 $s.WindowOncoreCv2MaxPerMille | Should -BeNullOrEmpty
             }
             $s.WindowOncoreTicks | Should -BeLessOrEqual $s.WindowTicks
+            $s.WindowSpreadTicks | Should -BeLessOrEqual $s.WindowTicks
+            $s.WindowWallTicks | Should -BeLessOrEqual $s.WindowTicks
         }
     }
 

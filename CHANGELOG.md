@@ -791,6 +791,38 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
+- **A spread the statistics could not resolve read as perfectly
+  uniform.** The leaf-spread statistics square each leaf in units of
+  256 ns, and answered zero for a window whose mean leaf was under one
+  unit: `split_observer::leaf_cv_squared_per_mille`,
+  `per_item_cv_squared_per_mille` for a mean item under 256 ns,
+  `CallSiteState::cv2_per_mille` and the classifier tick's window
+  spread. A plan with no call site read that zero as uniform leaves and
+  turned SMT off. On the 24-thread host, with the module as it was
+  before its kernels moved into the crate, three maps over 4,000
+  doubles in a fresh process left eight leaves at a spread of 0 and a
+  LatencyBound plan's `EffectiveUseSmt` false, in both PowerShell
+  editions.
+
+  Each now answers `None` below its resolution, as does the tick's
+  per-item spread for an item under a nanosecond. SMT then keeps the
+  plan's prior, and the split multiplier reads the steal rate alone, as
+  it already did for a window with too few leaves; for the multiplier a
+  low reading and no reading always gave the same answer. The
+  classifier reads a spread only for a mean at or above
+  `port_heavy_ns` (500 ns by default), where each of these resolves, so
+  no class decision moves, and a window whose class would turn on a
+  spread it could not show decides nothing. `collect_indexed_heartbeat`
+  sends a site whose leaves are too short for a spread to SLAW at any
+  size, where the zero sent it, decided now from the mean it measured.
+
+  `CallSiteState::window_spread_ticks` and `window_wall_ticks` count the
+  windows whose spread could be read, and `window_cv2_per_mille`,
+  `window_wall_cv2_per_mille` and their ranges cover those windows
+  alone, so a window with a mean and no spread leaves them as they
+  were. Get-FlynnelCallSite rows carry the counts as `WindowSpreadTicks`
+  and `WindowWallTicks`.
+
 - **Heartbeat and token-bucket spans reached a call site's classifier in
   counter ticks.** Both fillers time the serial stretch between their
   promotions with the timestamp counter and recorded the difference

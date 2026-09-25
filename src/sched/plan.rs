@@ -1117,10 +1117,14 @@ impl JobPlan {
     ///   `false` (no observer signal re-enables SMT).
     /// - If the plan sets `use_smt = true` and the observer has
     ///   recorded measured per-leaf time variance with low cv^2
-    ///   (per-mille < 50, i.e. nearly uniform leaves), returns
+    ///   (below the class thresholds' `cv2_low_per_mille`, 50 per
+    ///   mille by default, i.e. nearly uniform leaves), returns
     ///   `false`. SMT siblings contest the same execution unit
     ///   on uniform-cost work and produce no gain.
-    /// - Otherwise returns `true`, trusting the plan's prior.
+    /// - Otherwise returns `true`, trusting the plan's prior. That
+    ///   includes leaves too short for their spread to be read, a mean
+    ///   under the 256 ns unit it is kept in: no reading is not a low
+    ///   one.
     ///
     /// The variance signal prefers this plan's per-call-site
     /// history when a site is attached and has recorded at least 4
