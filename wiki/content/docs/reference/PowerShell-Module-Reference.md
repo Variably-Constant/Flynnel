@@ -5,7 +5,7 @@ weight: 10
 
 Every command the Flynnel PowerShell module exports, by family, with the objects and enumerations each one deals in. For the task-oriented introduction see [How To Use The PowerShell Module](../how-to/How-To-Use-The-PowerShell-Module/).
 
-Eighty commands, fifty-four object types, twenty-six enumerations. Every command answers to a shorter name with the `Fly` prefix; the alias is listed beside each.
+111 commands, 82 object types, 37 enumerations. Every command answers to a shorter name with the `Fly` prefix; the alias is listed beside each.
 
 `Get-Help <command> -Full` carries the parameters, the examples and what each parameter means. This page is the map, not a substitute for it.
 
@@ -44,9 +44,9 @@ A plan is the unit every other family takes. Each `With` method answers a fresh 
 | `Get-FlynnelKBand` | `Get-FlyKBand` |
 | `Get-FlynnelDispatchProfile` | `Get-FlyDispatchProfile` |
 
-Objects: `Flynnel.Plan`, `Flynnel.ResolvedPlan`, `Flynnel.ProfileRow`.
+Objects: `Flynnel.JobPlan`, `Flynnel.ResolvedPlan`, `Flynnel.ProfileRow`.
 
-Enumerations: `Flynnel.DispatchProfile`, `Flynnel.SchedTier`, `Flynnel.BisectVariant`, `Flynnel.DequeTier`, `Flynnel.LeafShape`, `Flynnel.CooperativeRouting`, `Flynnel.VariantRouting`, `Flynnel.WorkloadShapeKind`.
+Enumerations: `Flynnel.DispatchProfile`, `Flynnel.SchedTier`, `Flynnel.Variant`, `Flynnel.BisectVariant`, `Flynnel.DequeTier`, `Flynnel.LeafShape`, `Flynnel.CooperativeRouting`, `Flynnel.VariantRouting`, `Flynnel.WorkloadShape`.
 
 ## The pool - 13 commands
 
@@ -82,7 +82,7 @@ Objects: `Flynnel.Pool`, `Flynnel.WorkerStat`, `Flynnel.SpinState`, `Flynnel.Spl
 
 **No command in this module submits to an IO pool.** Every declared kernel dispatches on the main arena, the file ones that block included, so a pool made with `New-FlynnelIoPool` starts threads that sit idle. It is said here because the alternative is a script that creates a pool, sees the worker count it asked for, and concludes its file work is routed. The one thing that does use a pool is `Start-FlynnelSplitObserver`, and that is the process-wide pool rather than one this command makes.
 
-## Kernels - 17 commands
+## Kernels - 18 commands
 
 The work that actually runs on the pool. Each takes an optional `-Plan`, and `-Verbose` reports the plan that ran the work, the workers it resolved to and the leaves it asked for.
 
@@ -118,9 +118,17 @@ Text:
 | `Split-FlynnelText` | `Split-FlyText` |
 | `Update-FlynnelText` | `Update-FlyText` |
 
-Objects: `Flynnel.Reduction`, `Flynnel.HistogramBin`, `Flynnel.Histogram`, `Flynnel.FileHash`, `Flynnel.HashCheck`, `Flynnel.FileMatch`, `Flynnel.FileMeasure`, `Flynnel.TextMatch`, `Flynnel.TextMeasure`.
+The pool's own primitives:
 
-Enumerations: `Flynnel.MapOp` (fourteen element-wise operations), `Flynnel.ZipOp` (six pairwise), `Flynnel.ReduceOp` (seven reductions), `Flynnel.TextTransform`.
+| command | alias |
+|---|---|
+| `Measure-FlynnelPrimitive` | `Measure-FlyPrimitive` |
+
+Objects: `Flynnel.Reduction`, `Flynnel.HistogramBin`, `Flynnel.Histogram`, `Flynnel.FileHash`, `Flynnel.HashCheck`, `Flynnel.FileMatch`, `Flynnel.FileMeasure`, `Flynnel.TextMatch`, `Flynnel.TextMeasure`, `Flynnel.PrimitiveRun`.
+
+Enumerations: `Flynnel.MapOp` (fourteen element-wise operations), `Flynnel.ZipOp` (six pairwise), `Flynnel.ReduceOp` (seven reductions), `Flynnel.TextTransform`, `Flynnel.Primitive`.
+
+The declared kernels cut their own blocks and run them through one chunk runner, so none of them reaches the pool's other primitives. `Measure-FlynnelPrimitive` runs one declared element operation through `reduce_chunks`, `for_each_chunk`, `for_each_chunk_indexed` or `collect_indexed` and answers the sum of the results, which is how a script measures the primitives against each other on one body.
 
 `Invoke-FlynnelMap` needs a typed array and refuses anything else rather than quietly boxing: the measured penalty for an untyped array is 185 times on one host and 296 on the other.
 
@@ -146,9 +154,11 @@ The dispatch counters, the pool's leaf statistics, occupancy, call sites, and wh
 | `Get-FlynnelCallSite` | `Get-FlyCallSite` |
 | `Reset-FlynnelCallSite` | `Reset-FlyCallSite` |
 
-Objects: `Flynnel.TraceState`, `Flynnel.TraceCounters`, `Flynnel.LeafStatRow`, `Flynnel.Occupancy`, `Flynnel.Spread`, `Flynnel.CallSite`.
+Objects: `Flynnel.TraceState`, `Flynnel.TraceCounters`, `Flynnel.LeafStats`, `Flynnel.Occupancy`, `Flynnel.Spread`, `Flynnel.CallSite`.
 
-Enumerations: `Flynnel.NoReadingReason`, `Flynnel.ReducePath`.
+Enumerations: `Flynnel.NoReading`, `Flynnel.ReducePath`.
+
+`Get-FlynnelReducePath` answers `Flat` or `Bisect` for a fold the pool ran, and `Caller` for one a plan capped at one worker kept on the calling thread.
 
 `Set-FlynnelTraceState` could not exist until the crate stopped latching its flag: the ring was armed by an environment variable read once, and a module cannot set the environment of a process it is already inside. `Get-FlynnelTraceState` reports `EnabledBy` as real provenance: the variable until a setter has decided, and the command after.
 
@@ -178,7 +188,7 @@ What the scheduler measured about this host, what it decided from it, and how to
 | `Get-FlynnelAccelCalibration` | `Get-FlyAccelCalibration` |
 | `Clear-FlynnelCalibrationStore` | `Clear-FlyCalibrationStore` |
 
-Objects: `Flynnel.Calibration`, `Flynnel.ClassThresholds`, `Flynnel.ThresholdCalibration`, `Flynnel.HostDispatch`, `Flynnel.KGatingResult`, `Flynnel.Stamp`, `Flynnel.StoreInfo`, `Flynnel.CpuRecord`, `Flynnel.AccelRecord`.
+Objects: `Flynnel.Calibration`, `Flynnel.ClassThresholds`, `Flynnel.ThresholdCalibration`, `Flynnel.HostDispatch`, `Flynnel.KGatingResult`, `Flynnel.HostStamp`, `Flynnel.CalibrationStore`, `Flynnel.CpuCalibration`, `Flynnel.AccelCalibration`.
 
 Enumerations: `Flynnel.Source`, `Flynnel.KGating`, `Flynnel.AccelKind`, `Flynnel.WorkloadClass`.
 
@@ -204,7 +214,7 @@ The scheduler's own in-process queues, each bound over a byte payload because a 
 | `Send-FlynnelItem` | `Send-FlyItem` | pipeline push |
 | `Receive-FlynnelItem` | `Receive-FlyItem` | pipeline pop |
 
-Objects: `Flynnel.Ring`, `Flynnel.SpscProducer`, `Flynnel.SpscConsumer`, `Flynnel.MpscProducer`, `Flynnel.MpscConsumer`, `Flynnel.ComposedConsumer`, `Flynnel.GridProducer`, `Flynnel.GridConsumer`, `Flynnel.Injector`, `Flynnel.NotifySender`, `Flynnel.NotifyReceiver`, plus `Flynnel.PushOutcome`, `Flynnel.PopOutcome` and `Flynnel.RingStat`.
+Objects: `Flynnel.Ring`, `Flynnel.SpscProducer`, `Flynnel.SpscConsumer`, `Flynnel.MpscProducer`, `Flynnel.MpscConsumer`, `Flynnel.ComposedConsumer`, `Flynnel.GridProducer`, `Flynnel.GridConsumer`, `Flynnel.Injector`, `Flynnel.NotifySender`, `Flynnel.NotifyReceiver`, plus `Flynnel.PushOutcome`, `Flynnel.PopOutcome` and `Flynnel.RingStat`, and `Flynnel.Rings`, whose statics build the shapes that come as several objects in the order their `New-` command writes them, so `$p, $c = [Flynnel.Rings]::Spsc(1024)` unpacks as `New-FlynnelSpscRing -Capacity 1024` does.
 
 Enumerations: `Flynnel.PushKind`, `Flynnel.PopKind`, `Flynnel.RingRole`.
 
@@ -280,7 +290,7 @@ The GPU joins the scheduler as a shared-memory peer over a driver-registered map
 | `Get-FlynnelGpuPeer` | `Get-FlyGpuPeer` | the live peer, or a row saying there is none |
 | `Remove-FlynnelGpuPeer` | `Remove-FlyGpuPeer` | tears it down now |
 
-Objects: `Flynnel.PeerWatchdog`, `Flynnel.WavePlan`, `Flynnel.LinalgChoice`, `Flynnel.GpuPeerConfig`, `Flynnel.GpuPeer`. Enumerations: `Flynnel.DriverModel`, `Flynnel.Frontier`, `Flynnel.LinalgOp`.
+Objects: `Flynnel.PeerWatchdog`, `Flynnel.WavePlan`, `Flynnel.LinalgChoice`, `Flynnel.GpuPeerConfig`, `Flynnel.GpuPeer`. Enumerations: `Flynnel.DriverModel`, `Flynnel.Frontier`, `Flynnel.LinalgOp`, `Flynnel.LinalgMethod`, `Flynnel.JacobiShape`.
 
 **Three of these need no device.** The watchdog reading is the driver model and the registry, the wave planner is a cost model over numbers the caller supplies, and the linalg method is a choice made from the size and the batch. All three answer the same on a machine with no card, which is what makes them the ones a script can rely on before a peer exists.
 
@@ -327,7 +337,7 @@ The runtime switches, the width this process is allowed, and which stored calibr
 | `Get-FlynnelOccupancyFloor` | `Get-FlyOccupancyFloor` | the floor as a lever row |
 | `Get-FlynnelServePolicy` | `Get-FlyServePolicy` | which stored calibration is served to peers |
 
-Objects: `Flynnel.Lever`, `Flynnel.AllowedWidth`, `Flynnel.ServePolicyState`.
+Objects: `Flynnel.Lever`, `Flynnel.AllowedWidth`, `Flynnel.ServePolicyState`. Enumeration: `Flynnel.ServePolicy`.
 
 **A lever resolves once, on first read, and stays resolved for the life of the process.** Each one is held in a `OnceLock`. Setting the environment variable after something has read it changes the variable and not the behavior.
 
@@ -347,7 +357,7 @@ Work that crosses a process boundary, and how it is routed there.
 | `Get-FlynnelCrossProcessRoute` | `Get-FlyCrossProcessRoute` | the routing table behind that answer |
 | `Get-FlynnelPassRegistry` | `Get-FlyPassRegistry` | the passes this process has registered |
 
-Objects: `Flynnel.DequeVariantInfo`, `Flynnel.CrossProcessRoute`, `Flynnel.PassRegistry`.
+Objects: `Flynnel.DequeVariantInfo`, `Flynnel.CrossProcessRoute`, `Flynnel.PassRegistry`. Enumeration: `Flynnel.DequeVariant`.
 
 **The wire carries an id, never code.** A cross-process job cannot carry a closure, because the peer cannot dereference a pointer into this process's heap. It carries `(closure_id, args)` and the peer looks the id up in its own pass registry. That is the same shape the accelerator ops use at the device boundary, and it is what makes the family reachable from a script at all: a script names a pass the peer already holds.
 
@@ -373,6 +383,18 @@ Objects: `Flynnel.RaceOutcome`, `Flynnel.RaceArm`.
 **`CancelledEarly` zero means different things in the two shapes.** On a race it means every loser finished before the winner's signal reached it, which is a fact about how even this host is. On an exploration it is the shape: nothing is canceled. Raise `-Count` or `-Repetitions` to give a signal time to arrive.
 
 **Only two of the crate's nine racing entry points are bound.** The other seven need an arm that can decline a contract it failed, refute a peer, or disagree with one. Every body this module can offer is a declared deterministic kernel, so a cmdlet over `race_agree` would always answer unanimous - a property of the binding rather than of the work.
+
+## The native entry - 1 command
+
+For a native library in this process that runs work on this module's worker pool rather than starting a pool of its own.
+
+| command | alias |
+|---|---|
+| `Get-FlynnelNativeEntry` | `Get-FlyNativeEntry` |
+
+Object: `Flynnel.NativeEntry`: the addresses of the module's native entry points, `AbiVersion`, `KernelsRevision`, which a library linking the crate compares with its own `kernels::REVISION` to know the cmdlets answer as its kernels do, and `PoolStarted`, read without starting the pool.
+
+**An address can go stale.** It stays callable for the life of the process, because the library PWRS loaded is never freed, but a reload after a rebuild loads a new copy at a new address with a pool of its own. A caller asks again whenever the process has loaded a native library since its answer was taken, and one serving several runspaces keeps an answer per runspace.
 
 ## The Flynnel drive
 

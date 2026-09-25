@@ -439,3 +439,84 @@ Describe 'anything over many items crosses in one call' {
         $wrong.Count | Should -Be 0 -Because ($wrong -join '; ')
     }
 }
+
+Describe 'the wiki reference page' {
+    # The reference page is a map a reader trusts because it looks
+    # complete. It is written by hand, so a command or a type added to the
+    # module is missing from it until someone remembers, and the totals
+    # in its first lines go stale with nothing failing. Read against the
+    # loaded module, in both directions.
+    BeforeAll {
+        $script:Docs = Join-Path $PSScriptRoot '..\..\wiki\content\docs'
+        $script:PagePath = Join-Path $script:Docs 'reference\PowerShell-Module-Reference.md'
+        $script:Page = ''
+        if (Test-Path -LiteralPath $script:PagePath) {
+            $script:Page = Get-Content -LiteralPath $script:PagePath -Raw
+        }
+        # The binding's own classes and enumerations: the shell also
+        # exports its cmdlets, its provider and its argument transforms,
+        # which a script never holds as objects.
+        $script:Types = @($script:Exported | Where-Object {
+            ($_.IsClass -or $_.IsEnum) -and $_.FullName -like 'Flynnel.*' -and
+            -not [System.Attribute].IsAssignableFrom($_) -and
+            -not [System.Management.Automation.Cmdlet].IsAssignableFrom($_) -and
+            -not [System.Management.Automation.Provider.CmdletProvider].IsAssignableFrom($_)
+        })
+    }
+
+    It 'is where the tree keeps it' {
+        Test-Path -LiteralPath $script:PagePath | Should -BeTrue -Because $script:PagePath
+    }
+
+    It 'lists every exported command in a table, and no other' {
+        $listed = @([regex]::Matches($script:Page, '(?m)^\| `([A-Z][a-z]+-Flynnel[A-Za-z]*)`') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        $exported = @($script:Cmdlets | ForEach-Object Name | Sort-Object -Unique)
+        $missing = @($exported | Where-Object { $listed -notcontains $_ })
+        $extra = @($listed | Where-Object { $exported -notcontains $_ })
+        $missing.Count | Should -Be 0 -Because ('the page has no row for ' + ($missing -join ', '))
+        $extra.Count | Should -Be 0 -Because ('the page has a row the module does not export: ' +
+            ($extra -join ', '))
+    }
+
+    It 'names every exported class and enumeration, and no other' {
+        $named = @([regex]::Matches($script:Page, '`(Flynnel\.[A-Z][A-Za-z0-9]*)`') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        $exported = @($script:Types | ForEach-Object FullName | Sort-Object -Unique)
+        $missing = @($exported | Where-Object { $named -notcontains $_ })
+        $extra = @($named | Where-Object { $exported -notcontains $_ })
+        $missing.Count | Should -Be 0 -Because ('the page never names ' + ($missing -join ', '))
+        $extra.Count | Should -Be 0 -Because ('the page names a type the module does not export: ' +
+            ($extra -join ', '))
+    }
+
+    It 'states the totals the module exports, on every page that states them' {
+        $classes = @($script:Types | Where-Object IsClass).Count
+        $enums = @($script:Types | Where-Object IsEnum).Count
+        $pages = @('reference\PowerShell-Module-Reference.md', 'reference\_index.md',
+                   'how-to\How-To-Use-The-PowerShell-Module.md')
+        foreach ($relative in $pages) {
+            $text = Get-Content -LiteralPath (Join-Path $script:Docs $relative) -Raw
+            $m = [regex]::Match($text, '(\d+) commands, (\d+) object types,? (?:and )?(\d+) enumerations')
+            $m.Success | Should -BeTrue -Because "$relative states the module's totals"
+            [int]$m.Groups[1].Value | Should -Be $script:Cmdlets.Count -Because "$relative counts the commands"
+            [int]$m.Groups[2].Value | Should -Be $classes -Because "$relative counts the object types"
+            [int]$m.Groups[3].Value | Should -Be $enums -Because "$relative counts the enumerations"
+        }
+    }
+
+    It 'gives each family heading the number of rows its tables hold, summing to the total' {
+        $wrong = @()
+        $sum = 0
+        foreach ($section in ($script:Page -split '(?m)^(?=## )')) {
+            $h = [regex]::Match($section, '^## (.*) - (\d+) commands?\r?\n')
+            if (-not $h.Success) { continue }
+            $stated = [int]$h.Groups[2].Value
+            $rows = [regex]::Matches($section, '(?m)^\| `[A-Z][a-z]+-Flynnel[A-Za-z]*`').Count
+            if ($rows -ne $stated) { $wrong += "$($h.Groups[1].Value) states $stated and lists $rows" }
+            $sum += $stated
+        }
+        $wrong.Count | Should -Be 0 -Because ($wrong -join '; ')
+        $sum | Should -Be $script:Cmdlets.Count
+    }
+}

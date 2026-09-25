@@ -15,5 +15,5 @@ Information-oriented technical descriptions. Look up a type, a primitive, an env
   {{< card link="Environment-Variables/" title="Environment Variables" subtitle="Every env var Flynnel honors at startup. All optional; defaults are tuned for general-purpose CPU compute." >}}
   {{< card link="Glossary/" title="Glossary" subtitle="Terms specific to Flynnel and the broader extended-Flynn-taxonomy vocabulary." >}}
   {{< card link="Benchmarks/" title="Benchmarks" subtitle="The internal bench harness organized by category (dispatch overhead / data-parallel / deque backing / cross-mode dispatch), with per-host transparency about which `JobPlan` shape generated each cell." >}}
-  {{< card link="PowerShell-Module-Reference/" title="PowerShell Module Reference" subtitle="Eighty commands, fifty-four object types and twenty-six enumerations, by family. The host, plans, the pool, kernels, observation, calibration and the rings, with what each family's objects carry." >}}
+  {{< card link="PowerShell-Module-Reference/" title="PowerShell Module Reference" subtitle="111 commands, 82 object types and 37 enumerations, by family. The host, plans, the pool, kernels, observation, calibration and the rings, with what each family's objects carry." >}}
 {{< /cards >}}
