@@ -54,6 +54,13 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   every host and under every `-Plan`. A plan now governs only how the
   blocks are dispatched.
 
+  Measure-FlynnelReduce, and Get-FlynnelHistogram when it finds its own
+  bounds, ran on `reduce_chunks`, which times no leaves. The entry every
+  kernel now runs on times them, as the other kernels' entries did, so
+  their leaves reach the process-wide leaf statistics: Get-FlynnelLeafStat
+  counts them, and a plan with no call site reads them when it decides
+  whether to use the SMT siblings.
+
   ToLower splits text only right after an ASCII whitespace byte. The
   standard library lowercases a capital sigma to a final or a medial
   sigma by the letters on both sides of it within the string it is

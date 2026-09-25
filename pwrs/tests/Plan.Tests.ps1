@@ -286,7 +286,12 @@ Describe 'Resolve-FlynnelPlan' {
 
     It 'gives a caller who asks for the siblings the siblings' {
         # The profile decides SMT for a plan that does not say. A plan
-        # that does say is the caller's statement and wins.
+        # that does say is the caller's statement and wins over the
+        # profile. Neither wins over the leaves: once the timed leaves
+        # read uniform, a plan with no call site gives the siblings up,
+        # and this process has timed whatever the suites before this one
+        # dispatched. So the reading starts from no leaves.
+        Reset-FlynnelLeafStat
         (Resolve-FlynnelPlan -Plan (New-FlynnelPlan -KOuter 8 -BatchSize 100000 `
             -Profile LatencyBound)).EffectiveUseSmt | Should -BeTrue
         (Resolve-FlynnelPlan -Plan (New-FlynnelPlan -KOuter 8 -BatchSize 100000 `
