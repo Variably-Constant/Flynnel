@@ -334,6 +334,7 @@ dependencies = [
  "PoWerRuSt",
  "blake3",
  "flynnel",
+ "serde_json",
  "syn 2.0.119",
 ]
 

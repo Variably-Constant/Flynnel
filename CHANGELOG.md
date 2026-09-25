@@ -21,6 +21,34 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   count can miss a window and an extreme can miss the window that set
   it. No scheduling decision reads any of them.
 
+- The module's kernel cmdlets run the crate's own jobs from
+  `flynnel::kernels` (see Added). Each resolves its managed input, builds
+  its kernel's job, dispatches the job's blocks on the pool through
+  `for_each_chunk_indexed_min_leaf`, the entry `flynnel_run_chunks_v1`
+  runs a native caller's chunks on, and writes the answer as the
+  module's own classes. Every class, cmdlet and parameter keeps its name
+  and shape.
+
+  An answer now depends on the input alone. The kernels cut their input
+  from its length rather than into four chunks a worker, and fold in
+  block order, so Sum, Product, Mean, Variance, DotProduct and PrefixSum
+  move once in their last bits and from then on answer the same bits on
+  every host and under every `-Plan`. A plan now governs only how the
+  blocks are dispatched.
+
+  ToLower splits text only right after an ASCII whitespace byte. The
+  standard library lowercases a capital sigma to a final or a medial
+  sigma by the letters on both sides of it within the string it is
+  given, and the cut on any character boundary put pieces beside sigmas,
+  so Greek text lowercased differently with the worker count. It now
+  lowercases as the whole string does.
+
+  Clamp refuses a NaN bound with `FlynnelArgument`, "Min and Max must be
+  numbers, not NaN". `f64::clamp` panics on one, on a worker.
+
+  Get-FlynnelReducePath reads the path of Measure-FlynnelPrimitive's
+  `reduce_chunks` fold. No declared kernel reaches `reduce_chunks` now.
+
 - `external_dispatch`'s documentation says what the caller does: it
   hands the join to a worker, spins for the plan's budget, then parks
   until the latch sets, and runs none of the join's work itself.
@@ -270,6 +298,40 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   occupancy, which cannot exceed 1000.
 
 ### Added
+
+- `flynnel::kernels`: every declared kernel as plain Rust, its
+  partition, per-block work and combine, with no pool, plan or arena
+  behind any of it. A kernel is a `Job` from a validating constructor
+  (`map`, `zip`, `reduce`, `prefix_sum`, `histogram`, `dot_product`,
+  `sort`, `file_hash`, `file_hash_check`, `search_file`, `file_line`,
+  `file_byte`, `search_text`, `text_count`, `split_text`,
+  `update_text`): phases of blocks cut from the input alone, a block
+  claimed before its work so it runs at most once a phase, a serial
+  combine between phases that refuses, naming the block, when one did
+  not finish, and an answer folded in block order. A caller runs the
+  blocks on any runner, so a library that links the crate and drives
+  them through `flynnel_run_chunks_v1` on the module's pool answers what
+  the module's cmdlets answer, to the bit. Refusals are values carrying
+  the cmdlets' identifiers and words, and an unreadable file is a row of
+  the answer. `REVISION` numbers the kernels' answers, `DESCRIPTORS`
+  gives each kernel's cmdlet, parameters, input and answer, and the
+  module's tests hold the descriptors to the cmdlets.
+
+- Get-FlynnelNativeEntry's `KernelsRevision`, the `flynnel::kernels`
+  revision the module's cmdlets run, beside `AbiVersion`.
+
+- `FromColumns` on Flynnel.TextMatch, FileMatch, FileMeasure, FileHash,
+  HashCheck and HistogramBin: one typed array per property, all one
+  length, and the class's array back, built by the module. Another
+  library hands over a whole answer in one call instead of building the
+  rows by type name. An empty `Actual` column entry is an unreadable
+  file and becomes null.
+
+- Measure-FlynnelPrimitive (Flynnel.PrimitiveRun, Flynnel.Primitive):
+  one declared element operation run through `reduce_chunks`,
+  `for_each_chunk`, `for_each_chunk_indexed` or `collect_indexed`,
+  answering the sum and the call's time, so the pool's primitives can be
+  measured against each other on one body.
 
 - A classified window's spread on each clock apart. `window_cv2_per_mille`
   is the spread the class was decided from: the on-core clock's where

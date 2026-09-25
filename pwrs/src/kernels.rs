@@ -3,10 +3,21 @@
 //!
 //! Flynnel's parallel primitives take Rust closures. A script has none
 //! to give, and this module never runs a script block on a worker, so
-//! the way a shell reaches `par_map_in_place`, `par_zip_apply`,
-//! `reduce_chunks` and `collect_indexed` is to name a body the module
-//! already owns. Each cmdlet here is one such body over one substrate:
-//! arrays and numbers, files, or text.
+//! the way a shell reaches the scheduler's workers is to name a body the
+//! module already owns. Each cmdlet here is one such body over one
+//! substrate: arrays and numbers, files, or text.
+//!
+//! # One implementation, in the crate
+//!
+//! Every kernel's partition, per-block work and combine is
+//! `flynnel::kernels`, plain Rust with no pool behind it. A cmdlet here
+//! resolves its managed input, builds the crate's job for it, runs the
+//! job's blocks on this module's pool, and writes the answer as this
+//! module's own classes. A library that links the crate runs the same
+//! jobs through `flynnel_run_chunks_v1` on this module's pool, so the two
+//! answer alike to the bit: a job cuts its input from the input alone and
+//! folds its blocks in block order, so neither the worker count nor the
+//! plan reaches an answer.
 //!
 //! # A kernel body calls nothing managed, and the compiler only
 //! catches half of that
@@ -29,16 +40,15 @@
 //! capture one and call either, and that compiles.
 //!
 //! So the rule is a rule rather than a guarantee: **resolve every
-//! managed value before the parallel section and hand the closure
-//! plain Rust data.** Pinning is where this is easy to get wrong,
-//! because `pin` is exactly what a kernel wants when its input is a
-//! shell `double[]`, and calling it inside `collect_indexed` instead
-//! of before it reads naturally and attaches every worker that runs
-//! the chunk.
+//! managed value before the parallel section and hand the job plain Rust
+//! data.** Pinning is where this is easy to get wrong, because `pin` is
+//! exactly what a kernel wants when its input is a shell `double[]`, and
+//! calling it inside a block instead of before the job reads naturally
+//! and attaches every worker that runs the block.
 //!
-//! Every body below keeps to it: the closures see `&mut [f64]`,
-//! `&[u8]` and indices, and every `ps.write` sits outside the
-//! parallel section.
+//! Every body below keeps to it: the jobs see `&mut [f64]`, `&[u8]`,
+//! strings and indices, and every `ps.write` sits outside the parallel
+//! section.
 //!
 //! # The shape every kernel shares
 //!
@@ -77,7 +87,8 @@
 //! whose band comes from the item count, capped at the Hierarchical
 //! band so a single-NUMA host collapses it to Local rather than
 //! federating work it has one node for. With one, the caller's plan
-//! governs and nothing here overrides it.
+//! governs how the job's blocks are dispatched. It does not change the
+//! blocks, so it does not change the answer.
 //!
 //! `-Verbose` reports the plan that ran the work, the workers it
 //! resolved to and the leaves it asked for.
@@ -87,15 +98,12 @@
 //! a run over a thousand files reports the nine it could not open
 //! rather than stopping at the first or silently returning 991 rows.
 
+use std::sync::Mutex;
+
 use pwrs::prelude::*;
 
-use blake3::hazmat::{
-    ChainingValue, HasherExt, Mode, left_subtree_len, merge_subtrees_non_root,
-    merge_subtrees_root,
-};
-use flynnel::sched::par_iter::{
-    collect_indexed, for_each_chunk, for_each_chunk_indexed, reduce_chunks,
-};
+use flynnel::kernels::{self, BlockError, Job, Refusal, RefusalId};
+use flynnel::sched::par_iter::for_each_chunk_indexed_min_leaf;
 
 use crate::plan::Plan;
 
@@ -108,25 +116,19 @@ fn arg_err(message: impl Into<String>) -> PsError {
     )
 }
 
-/// The error for an input the kernel could not read, carrying the path
-/// so a caller collecting error records can tell which one it was.
-fn read_err(path: &str, detail: impl std::fmt::Display) -> PsError {
-    PsError::new(
-        ErrorCategory::ReadError,
-        "FlynnelUnreadable",
-        format!("{path} could not be read: {detail}"),
-    )
-}
-
-/// The error for a state the kernel's own arithmetic says cannot
-/// happen. It is an error rather than a fallback value because a
-/// fallback would read as an answer.
-fn internal_err(what: &str) -> PsError {
-    PsError::new(
-        ErrorCategory::InvalidResult,
-        "FlynnelInternal",
-        format!("{what}; this is a defect in the module, not in the input"),
-    )
+/// A kernel's refusal as the error record the module writes: an argument
+/// or an internal refusal stops the cmdlet, an unreadable input is a
+/// record beside the rows that did read.
+fn refusal_err(r: Refusal) -> PsError {
+    match r.id {
+        RefusalId::Argument => {
+            PsError::new(ErrorCategory::InvalidArgument, r.id.as_str(), r.message).terminating()
+        }
+        RefusalId::Unreadable => PsError::new(ErrorCategory::ReadError, r.id.as_str(), r.message),
+        RefusalId::Internal => {
+            PsError::new(ErrorCategory::InvalidResult, r.id.as_str(), r.message).terminating()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -181,35 +183,64 @@ fn say_plan(ps: &Pipeline<'_>, plan: &flynnel::JobPlan, n: usize, what: &str) ->
 
 /// Write the refusal tally after a run that produced error records.
 fn say_refusals(ps: &Pipeline<'_>, refused: usize, total: usize) -> PsResult<()> {
-    if refused == 0 {
-        return Ok(());
+    match kernels::refusal_tally(refused, total) {
+        Some(tally) => pwrs::warning!(ps, "{tally}"),
+        None => Ok(()),
     }
-    pwrs::warning!(
-        ps,
-        "{refused} of {total} input(s) could not be read; each one has an error record above"
-    )
 }
 
-/// How many chunks to cut an input of `n` into for a plan.
+/// Run a job's blocks on this module's pool, phase by phase, and answer
+/// what it answers.
 ///
-/// Four leaves per worker rather than one: a chunk that finishes early
-/// leaves its worker something to steal, and the per-chunk cost here is
-/// a closure call over a slice rather than a dispatch.
-fn chunking(plan: &flynnel::JobPlan, n: usize) -> (usize, usize) {
-    if n == 0 {
-        return (0, 0);
-    }
-    let workers = plan.resolved_workers().max(1);
-    let n_chunks = (workers * 4).max(1).min(n);
-    let chunk_len = n.div_ceil(n_chunks);
-    (n_chunks, chunk_len)
+/// The job fixes its own blocks, so the plan decides only how they are
+/// dispatched: one leaf holds one or more whole blocks, and which worker
+/// ran which block cannot reach the answer.
+fn run_on_pool<J: Job>(plan: &flynnel::JobPlan, job: J) -> PsResult<J::Answer> {
+    kernels::drive(job, |n, body| {
+        let first: Mutex<Option<BlockError>> = Mutex::new(None);
+        let mut blocks = vec![(); n];
+        for_each_chunk_indexed_min_leaf(plan, &mut blocks, 1, |start, chunk| {
+            for b in start..start + chunk.len() {
+                if let Err(e) = body(b) {
+                    // Nothing can panic while this lock is held, so a
+                    // poisoned one still holds a whole value.
+                    let mut held = match first.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if held.is_none() {
+                        *held = Some(e);
+                    }
+                }
+            }
+        });
+        let held = match first.into_inner() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match held {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })
+    .map_err(refusal_err)
 }
 
-/// The half-open range of chunk `c`.
-fn span(c: usize, chunk_len: usize, n: usize) -> (usize, usize) {
-    let lo = (c * chunk_len).min(n);
-    let hi = (lo + chunk_len).min(n);
-    (lo, hi)
+/// Refuse unless every column has the first one's length.
+fn same_length(columns: &[(&str, usize)]) -> PsResult<()> {
+    let Some(&(first, n)) = columns.first() else {
+        return Ok(());
+    };
+    for &(name, len) in &columns[1..] {
+        if len != n {
+            return Err(arg_err(format!(
+                "{first} has {n} element(s) and {name} has {len}; every column needs the same \
+                 length"
+            ))
+            .terminating());
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -218,7 +249,7 @@ fn span(c: usize, chunk_len: usize, n: usize) -> (usize, usize) {
 
 /// An element-wise operation over one array.
 #[psenum(name = "Flynnel.MapOp")]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum MapOp {
     /// `x * x`.
     #[default]
@@ -252,9 +283,31 @@ pub enum MapOp {
     Offset,
 }
 
+impl MapOp {
+    /// The crate's operation of the same name.
+    pub(crate) fn to_kernel(self) -> kernels::MapOp {
+        match self {
+            Self::Square => kernels::MapOp::Square,
+            Self::Abs => kernels::MapOp::Abs,
+            Self::Negate => kernels::MapOp::Negate,
+            Self::Reciprocal => kernels::MapOp::Reciprocal,
+            Self::Sqrt => kernels::MapOp::Sqrt,
+            Self::Log => kernels::MapOp::Log,
+            Self::Log2 => kernels::MapOp::Log2,
+            Self::Exp => kernels::MapOp::Exp,
+            Self::Round => kernels::MapOp::Round,
+            Self::Floor => kernels::MapOp::Floor,
+            Self::Ceiling => kernels::MapOp::Ceiling,
+            Self::Clamp => kernels::MapOp::Clamp,
+            Self::Scale => kernels::MapOp::Scale,
+            Self::Offset => kernels::MapOp::Offset,
+        }
+    }
+}
+
 /// A pairwise operation over two arrays of the same length.
 #[psenum(name = "Flynnel.ZipOp")]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum ZipOp {
     /// `left + right`.
     #[default]
@@ -271,9 +324,23 @@ pub enum ZipOp {
     Max,
 }
 
+impl ZipOp {
+    /// The crate's operation of the same name.
+    fn to_kernel(self) -> kernels::ZipOp {
+        match self {
+            Self::Add => kernels::ZipOp::Add,
+            Self::Subtract => kernels::ZipOp::Subtract,
+            Self::Multiply => kernels::ZipOp::Multiply,
+            Self::Divide => kernels::ZipOp::Divide,
+            Self::Min => kernels::ZipOp::Min,
+            Self::Max => kernels::ZipOp::Max,
+        }
+    }
+}
+
 /// A reduction over one array to a single number.
 #[psenum(name = "Flynnel.ReduceOp")]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum ReduceOp {
     /// The total.
     #[default]
@@ -292,6 +359,21 @@ pub enum ReduceOp {
     Product,
     /// How many elements sit within Min and Max inclusive.
     CountMatching,
+}
+
+impl ReduceOp {
+    /// The crate's reduction of the same name.
+    fn to_kernel(self) -> kernels::ReduceOp {
+        match self {
+            Self::Sum => kernels::ReduceOp::Sum,
+            Self::Min => kernels::ReduceOp::Min,
+            Self::Max => kernels::ReduceOp::Max,
+            Self::Mean => kernels::ReduceOp::Mean,
+            Self::Variance => kernels::ReduceOp::Variance,
+            Self::Product => kernels::ReduceOp::Product,
+            Self::CountMatching => kernels::ReduceOp::CountMatching,
+        }
+    }
 }
 
 /// What a reduction answered.
@@ -321,6 +403,49 @@ pub struct HistogramBin {
     pub high: f64,
     /// How many elements landed here.
     pub count: u64,
+}
+
+impl From<kernels::HistogramBin> for HistogramBin {
+    fn from(b: kernels::HistogramBin) -> Self {
+        Self {
+            index: b.index,
+            low: b.low,
+            high: b.high,
+            count: b.count,
+        }
+    }
+}
+
+#[psmethods]
+impl HistogramBin {
+    /// One HistogramBin per position of the columns, which must all have
+    /// the same length: a whole histogram handed over in one call and
+    /// built by this module.
+    pub fn from_columns(
+        index: Vec<u32>,
+        low: Vec<f64>,
+        high: Vec<f64>,
+        count: Vec<u64>,
+    ) -> PsResult<Vec<HistogramBin>> {
+        same_length(&[
+            ("Index", index.len()),
+            ("Low", low.len()),
+            ("High", high.len()),
+            ("Count", count.len()),
+        ])?;
+        Ok(index
+            .into_iter()
+            .zip(low)
+            .zip(high)
+            .zip(count)
+            .map(|(((index, low), high), count)| HistogramBin {
+                index,
+                low,
+                high,
+                count,
+            })
+            .collect())
+    }
 }
 
 /// A whole histogram as one object, with the counts as an array.
@@ -394,15 +519,10 @@ pub struct InvokeFlynnelMap {
 }
 
 /// The operands a map operation needs, read once rather than per
-/// element, so the closure carries plain numbers and a missing operand
-/// is refused before any work is dispatched.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct MapOperands {
-    pub min: Option<f64>,
-    pub max: Option<f64>,
-    pub factor: Option<f64>,
-    pub addend: Option<f64>,
-}
+/// element, so a closure carries plain numbers and a missing operand is
+/// refused before any work is dispatched. The crate's own type, so the
+/// hybrid and racing families and the kernels read operands alike.
+pub(crate) type MapOperands = kernels::MapOperands;
 
 /// One declared operation's per-element body.
 ///
@@ -413,70 +533,11 @@ pub(crate) type ElementBody = Box<dyn Fn(&mut f64) + Send + Sync>;
 
 /// The per-element body of one declared operation, with its operands
 /// already read. Every family that runs a declared map goes through
-/// this, so two of them cannot answer differently for the same
-/// operation.
+/// this, and it applies the crate's own element operation, so no two of
+/// them can answer differently for the same operation.
 pub(crate) fn map_each(op: MapOp, operands: MapOperands) -> PsResult<ElementBody> {
-    Ok(match op {
-        MapOp::Clamp => {
-            let (Some(lo), Some(hi)) = (operands.min, operands.max) else {
-                return Err(arg_err("Clamp needs both Min and Max").terminating());
-            };
-            if lo > hi {
-                return Err(arg_err("Min must not be above Max").terminating());
-            }
-            Box::new(move |x: &mut f64| *x = x.clamp(lo, hi))
-        }
-        MapOp::Scale => {
-            let Some(k) = operands.factor else {
-                return Err(arg_err("Scale needs Factor").terminating());
-            };
-            Box::new(move |x: &mut f64| *x *= k)
-        }
-        MapOp::Offset => {
-            let Some(k) = operands.addend else {
-                return Err(arg_err("Offset needs Addend").terminating());
-            };
-            Box::new(move |x: &mut f64| *x += k)
-        }
-        MapOp::Square => Box::new(|x: &mut f64| *x *= *x),
-        MapOp::Abs => Box::new(|x: &mut f64| *x = x.abs()),
-        MapOp::Negate => Box::new(|x: &mut f64| *x = -*x),
-        MapOp::Reciprocal => Box::new(|x: &mut f64| *x = 1.0 / *x),
-        MapOp::Sqrt => Box::new(|x: &mut f64| *x = x.sqrt()),
-        MapOp::Log => Box::new(|x: &mut f64| *x = x.ln()),
-        MapOp::Log2 => Box::new(|x: &mut f64| *x = x.log2()),
-        MapOp::Exp => Box::new(|x: &mut f64| *x = x.exp()),
-        MapOp::Round => Box::new(|x: &mut f64| *x = x.round()),
-        MapOp::Floor => Box::new(|x: &mut f64| *x = x.floor()),
-        MapOp::Ceiling => Box::new(|x: &mut f64| *x = x.ceil()),
-    })
-}
-
-/// Apply one element-wise operation across a slice on Flynnel's
-/// workers. Shared by the copying and the in-place cmdlets so the two
-/// cannot answer differently.
-///
-/// Dispatched with `for_each_chunk`, whose recursion floor is 256
-/// items, and not with `par_map_in_place`, which is one task per
-/// element. The crate says so plainly: par_map_in_place is for "few
-/// large units", the shape of per-row matrix work, and these
-/// operations are a multiply. Measured at 200,000 elements on pc2,
-/// one task an element cost 5.21 ms against a 0.16 ms input crossing,
-/// so the scheduling was 25 ns an element and the arithmetic was
-/// nothing.
-fn apply_map(
-    plan: &flynnel::JobPlan,
-    items: &mut [f64],
-    op: MapOp,
-    operands: MapOperands,
-) -> PsResult<()> {
-    let each = map_each(op, operands)?;
-    for_each_chunk(plan, items, |slice| {
-        for x in slice {
-            each(x);
-        }
-    });
-    Ok(())
+    let element = kernels::Element::new(op.to_kernel(), operands).map_err(refusal_err)?;
+    Ok(Box::new(move |x: &mut f64| *x = element.apply(*x)))
 }
 
 impl Cmdlet for InvokeFlynnelMap {
@@ -485,20 +546,15 @@ impl Cmdlet for InvokeFlynnelMap {
         let n = items.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Invoke-FlynnelMap")?;
-        if n == 0 {
-            return ps.write(PsArray(Vec::<f64>::new()));
-        }
-        apply_map(
-            &plan,
-            &mut items,
-            self.operation,
-            MapOperands {
-                min: self.min,
-                max: self.max,
-                factor: self.factor,
-                addend: self.addend,
-            },
-        )?;
+        let operands = MapOperands {
+            min: self.min,
+            max: self.max,
+            factor: self.factor,
+            addend: self.addend,
+        };
+        let job =
+            kernels::map(&mut items, self.operation.to_kernel(), operands).map_err(refusal_err)?;
+        run_on_pool(&plan, job)?;
         // PsArray and not a PsMemory view. The view hands the buffer
         // over without a managed copy and measured the same: 5.19 ms
         // against 5.18 over 200,000 elements, inside a control that
@@ -588,20 +644,15 @@ impl Cmdlet for UpdateFlynnelArray {
         let n = pinned.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Update-FlynnelArray")?;
-        if n == 0 {
-            return Ok(());
-        }
-        apply_map(
-            &plan,
-            &mut pinned,
-            self.operation,
-            MapOperands {
-                min: self.min,
-                max: self.max,
-                factor: self.factor,
-                addend: self.addend,
-            },
-        )
+        let operands = MapOperands {
+            min: self.min,
+            max: self.max,
+            factor: self.factor,
+            addend: self.addend,
+        };
+        let job =
+            kernels::map(&mut pinned, self.operation.to_kernel(), operands).map_err(refusal_err)?;
+        run_on_pool(&plan, job)
     }
 }
 
@@ -637,81 +688,16 @@ impl Cmdlet for InvokeFlynnelZip {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let mut lhs = std::mem::take(&mut self.left);
         let rhs = std::mem::take(&mut self.right);
-        if lhs.len() != rhs.len() {
-            return Err(arg_err(format!(
-                "Left has {} element(s) and Right has {}; a pairwise operation needs the same \
-                 length on both",
-                lhs.len(),
-                rhs.len()
-            ))
-            .terminating());
-        }
         let n = lhs.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
+        let job = kernels::zip(&mut lhs, &rhs, self.operation.to_kernel()).map_err(refusal_err)?;
         say_plan(ps, &plan, n, "Invoke-FlynnelZip")?;
-        if n == 0 {
-            return ps.write(PsArray(Vec::<f64>::new()));
-        }
-        // Chunked, for the same reason as the map: par_zip_apply is
-        // one task per index, and these are a single instruction.
-        // The index the chunk starts at is what reaches the right
-        // operand, which no chunked helper pairs for us.
-        let each: fn(&mut f64, f64) = match self.operation {
-            ZipOp::Add => |a, b| *a += b,
-            ZipOp::Subtract => |a, b| *a -= b,
-            ZipOp::Multiply => |a, b| *a *= b,
-            ZipOp::Divide => |a, b| *a /= b,
-            ZipOp::Min => |a, b| *a = a.min(b),
-            ZipOp::Max => |a, b| *a = a.max(b),
-        };
-        for_each_chunk_indexed(&plan, &mut lhs, |start, slice| {
-            for (offset, a) in slice.iter_mut().enumerate() {
-                each(a, rhs[start + offset]);
-            }
-        });
+        run_on_pool(&plan, job)?;
         ps.write(PsArray(lhs))
     }
 }
 
-/// The running state of a pairwise-combining mean and variance.
-///
-/// Carried rather than a sum of squares because the sum-of-squares
-/// form subtracts two large nearly equal numbers, and over a long
-/// array with a large mean that cancellation is the whole answer.
-#[derive(Clone, Copy, Default)]
-struct Moments {
-    n: u64,
-    mean: f64,
-    m2: f64,
-}
-
-impl Moments {
-    fn push(mut self, x: f64) -> Self {
-        self.n += 1;
-        let delta = x - self.mean;
-        self.mean += delta / self.n as f64;
-        self.m2 += delta * (x - self.mean);
-        self
-    }
-
-    fn merge(self, other: Self) -> Self {
-        if self.n == 0 {
-            return other;
-        }
-        if other.n == 0 {
-            return self;
-        }
-        let n = self.n + other.n;
-        let delta = other.mean - self.mean;
-        let mean = self.mean + delta * (other.n as f64 / n as f64);
-        let m2 =
-            self.m2 + other.m2 + delta * delta * (self.n as f64 * other.n as f64 / n as f64);
-        Self { n, mean, m2 }
-    }
-}
-
-/// Reduces an array to one number on Flynnel's workers, through
-/// `reduce_chunks`.
+/// Reduces an array to one number on Flynnel's workers.
 ///
 /// # Examples
 ///
@@ -749,83 +735,13 @@ impl Cmdlet for MeasureFlynnelReduce {
         let n = items.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelReduce")?;
-
-        let op = self.operation;
-        let value: Option<f64> = match op {
-            ReduceOp::Sum => Some(reduce_chunks(
-                &plan,
-                &items,
-                || 0.0f64,
-                |acc, s| acc + s.iter().sum::<f64>(),
-                |a, b| a + b,
-            )),
-            ReduceOp::Product => Some(reduce_chunks(
-                &plan,
-                &items,
-                || 1.0f64,
-                |acc, s| acc * s.iter().product::<f64>(),
-                |a, b| a * b,
-            )),
-            ReduceOp::CountMatching => {
-                let (Some(lo), Some(hi)) = (self.min, self.max) else {
-                    return Err(arg_err("CountMatching needs both Min and Max").terminating());
-                };
-                if lo > hi {
-                    return Err(arg_err("Min must not be above Max").terminating());
-                }
-                let c = reduce_chunks(
-                    &plan,
-                    &items,
-                    || 0u64,
-                    |acc, s| acc + s.iter().filter(|&&x| x >= lo && x <= hi).count() as u64,
-                    |a, b| a + b,
-                );
-                Some(c as f64)
-            }
-            // The four below have no value over an empty input. A zero
-            // would read as a measured answer, so the column is null
-            // and Count says why.
-            ReduceOp::Min | ReduceOp::Max | ReduceOp::Mean | ReduceOp::Variance if n == 0 => None,
-            ReduceOp::Min => Some(reduce_chunks(
-                &plan,
-                &items,
-                || f64::INFINITY,
-                |acc, s| s.iter().fold(acc, |a, &x| a.min(x)),
-                |a, b| a.min(b),
-            )),
-            ReduceOp::Max => Some(reduce_chunks(
-                &plan,
-                &items,
-                || f64::NEG_INFINITY,
-                |acc, s| s.iter().fold(acc, |a, &x| a.max(x)),
-                |a, b| a.max(b),
-            )),
-            ReduceOp::Mean => {
-                let m = reduce_chunks(
-                    &plan,
-                    &items,
-                    Moments::default,
-                    |acc, s| s.iter().fold(acc, |a, &x| a.push(x)),
-                    Moments::merge,
-                );
-                Some(m.mean)
-            }
-            ReduceOp::Variance => {
-                let m = reduce_chunks(
-                    &plan,
-                    &items,
-                    Moments::default,
-                    |acc, s| s.iter().fold(acc, |a, &x| a.push(x)),
-                    Moments::merge,
-                );
-                Some(m.m2 / m.n as f64)
-            }
-        };
-
+        let job = kernels::reduce(&items, self.operation.to_kernel(), self.min, self.max)
+            .map_err(refusal_err)?;
+        let answer = run_on_pool(&plan, job)?;
         ps.write(Reduction {
-            operation: op,
-            count: n as u64,
-            value,
+            operation: self.operation,
+            count: answer.count,
+            value: answer.value,
         })
     }
 }
@@ -833,9 +749,9 @@ impl Cmdlet for MeasureFlynnelReduce {
 /// The inclusive running total of an array, computed as a two-phase
 /// parallel scan on Flynnel's workers.
 ///
-/// Phase one sums each chunk, phase two scans each chunk from its
-/// chunk's offset. Both phases run through `collect_indexed`; the
-/// offsets between them are a scan over one value per chunk.
+/// Phase one sums each block, phase two scans each block from its
+/// block's offset. The offsets between them are a scan over one value
+/// per block.
 ///
 /// # Examples
 ///
@@ -858,49 +774,18 @@ pub struct GetFlynnelPrefixSum {
 
 impl Cmdlet for GetFlynnelPrefixSum {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let items = std::mem::take(&mut self.input_object);
+        let mut items = std::mem::take(&mut self.input_object);
         let n = items.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Get-FlynnelPrefixSum")?;
-        if n == 0 {
-            return ps.write(PsArray(Vec::<f64>::new()));
-        }
-        let (n_chunks, chunk_len) = chunking(&plan, n);
-
-        let sums: Vec<f64> = collect_indexed(&plan, n_chunks, 1, |c| {
-            let (lo, hi) = span(c, chunk_len, n);
-            items[lo..hi].iter().sum()
-        });
-
-        let mut offsets = Vec::with_capacity(n_chunks);
-        let mut running = 0.0f64;
-        for s in &sums {
-            offsets.push(running);
-            running += *s;
-        }
-
-        let parts: Vec<Vec<f64>> = collect_indexed(&plan, n_chunks, 1, |c| {
-            let (lo, hi) = span(c, chunk_len, n);
-            let mut acc = offsets[c];
-            let mut out = Vec::with_capacity(hi - lo);
-            for &x in &items[lo..hi] {
-                acc += x;
-                out.push(acc);
-            }
-            out
-        });
-
-        let mut out = Vec::with_capacity(n);
-        for part in parts {
-            out.extend_from_slice(&part);
-        }
-        ps.write(PsArray(out))
+        run_on_pool(&plan, kernels::prefix_sum(&mut items))?;
+        ps.write(PsArray(items))
     }
 }
 
 /// Bins an array into equal-width buckets on Flynnel's workers.
 ///
-/// Each chunk fills its own bin vector and the vectors are added, so
+/// Each block fills its own bin vector and the vectors are added, so
 /// no two workers touch the same counter.
 ///
 /// Without Min and Max the range comes from the data, in one parallel
@@ -956,103 +841,28 @@ impl Cmdlet for GetFlynnelHistogram {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let items = std::mem::take(&mut self.input_object);
         let n = items.len();
-        if self.bins == 0 {
-            return Err(arg_err("Bins must be at least one").terminating());
-        }
-        let bins = self.bins as usize;
+        let job = kernels::histogram(&items, self.bins, self.min, self.max).map_err(refusal_err)?;
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Get-FlynnelHistogram")?;
-        if n == 0 {
+        let Some(histogram) = run_on_pool(&plan, job)? else {
             return Ok(());
-        }
-        let (n_chunks, chunk_len) = chunking(&plan, n);
-
-        let lo = match self.min {
-            Some(v) => v,
-            None => reduce_chunks(
-                &plan,
-                &items,
-                || f64::INFINITY,
-                |acc, s| s.iter().fold(acc, |a, &x| a.min(x)),
-                |a, b| a.min(b),
-            ),
         };
-        let hi = match self.max {
-            Some(v) => v,
-            None => reduce_chunks(
-                &plan,
-                &items,
-                || f64::NEG_INFINITY,
-                |acc, s| s.iter().fold(acc, |a, &x| a.max(x)),
-                |a, b| a.max(b),
-            ),
-        };
-        if !(lo.is_finite() && hi.is_finite()) {
-            return Err(arg_err(
-                "the range is not finite; pass Min and Max when the data holds an infinity or \
-                 a NaN",
-            )
-            .terminating());
-        }
-        if lo > hi {
-            return Err(arg_err("Min must not be above Max").terminating());
-        }
-        // A range of zero width would divide by zero. One bin holding
-        // everything is what the data says.
-        let width = if hi > lo {
-            (hi - lo) / bins as f64
-        } else {
-            0.0
-        };
-
-        let parts: Vec<Vec<u64>> = collect_indexed(&plan, n_chunks, 1, |c| {
-            let (a, b) = span(c, chunk_len, n);
-            let mut local = vec![0u64; bins];
-            for &x in &items[a..b] {
-                if x.is_nan() || x < lo || x > hi {
-                    continue;
-                }
-                let slot = if width > 0.0 {
-                    // The top of the range belongs to the last bin
-                    // rather than to a bin past the end.
-                    (((x - lo) / width) as usize).min(bins - 1)
-                } else {
-                    0
-                };
-                local[slot] += 1;
-            }
-            local
-        });
-
-        let mut total = vec![0u64; bins];
-        for part in &parts {
-            for (slot, count) in part.iter().enumerate() {
-                total[slot] += *count;
-            }
-        }
-
         if self.as_array {
             return ps.write(Histogram {
-                low: lo,
-                high: hi,
-                width,
-                counts: total,
+                low: histogram.low,
+                high: histogram.high,
+                width: histogram.width,
+                counts: histogram.counts,
             });
         }
-
-        for (index, count) in total.iter().enumerate() {
-            ps.write(HistogramBin {
-                index: index as u32,
-                low: lo + width * index as f64,
-                high: lo + width * (index + 1) as f64,
-                count: *count,
-            })?;
+        for bin in histogram.bins() {
+            ps.write(HistogramBin::from(bin))?;
         }
         Ok(())
     }
 }
 
-/// The dot product of two arrays, summed per chunk on Flynnel's
+/// The dot product of two arrays, summed per block on Flynnel's
 /// workers and combined once.
 ///
 /// # Examples
@@ -1081,35 +891,15 @@ impl Cmdlet for GetFlynnelDotProduct {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let lhs = std::mem::take(&mut self.left);
         let rhs = std::mem::take(&mut self.right);
-        if lhs.len() != rhs.len() {
-            return Err(arg_err(format!(
-                "Left has {} element(s) and Right has {}; a dot product needs the same length \
-                 on both",
-                lhs.len(),
-                rhs.len()
-            ))
-            .terminating());
-        }
+        let job = kernels::dot_product(&lhs, &rhs).map_err(refusal_err)?;
         let n = lhs.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Get-FlynnelDotProduct")?;
-        if n == 0 {
-            return ps.write(0.0f64);
-        }
-        let (n_chunks, chunk_len) = chunking(&plan, n);
-        let parts: Vec<f64> = collect_indexed(&plan, n_chunks, 1, |c| {
-            let (a, b) = span(c, chunk_len, n);
-            lhs[a..b]
-                .iter()
-                .zip(&rhs[a..b])
-                .map(|(x, y)| x * y)
-                .sum::<f64>()
-        });
-        ps.write(parts.iter().sum::<f64>())
+        ps.write(run_on_pool(&plan, job)?)
     }
 }
 
-/// Sorts an array on Flynnel's workers: each chunk is sorted in
+/// Sorts an array on Flynnel's workers: each run is sorted in
 /// parallel, then the runs are merged in parallel rounds.
 ///
 /// NaN sorts above every number, which is the total order
@@ -1145,70 +935,14 @@ impl Cmdlet for SortFlynnelArray {
         let n = items.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Sort-FlynnelArray")?;
-        if n <= 1 {
-            return ps.write(PsArray(items));
-        }
-        let (n_chunks, chunk_len) = chunking(&plan, n);
-
-        let mut runs: Vec<Vec<f64>> = collect_indexed(&plan, n_chunks, 1, |c| {
-            let (a, b) = span(c, chunk_len, n);
-            let mut part = items[a..b].to_vec();
-            part.sort_by(f64::total_cmp);
-            part
-        });
-
-        // Each round halves the run count, and every pair in a round
-        // merges independently, so the round is one dispatch.
-        while runs.len() > 1 {
-            let pairs = runs.len().div_ceil(2);
-            let taken = std::mem::take(&mut runs);
-            runs = collect_indexed(&plan, pairs, 1, |p| {
-                let left = &taken[p * 2];
-                // An odd run count leaves the last run unpaired, which
-                // carries forward to the next round unchanged.
-                match taken.get(p * 2 + 1) {
-                    None => left.clone(),
-                    Some(right) => merge_runs(left, right),
-                }
-            });
-        }
-
-        let Some(mut out) = runs.into_iter().next() else {
-            return Err(internal_err("the merge rounds consumed every run").terminating());
-        };
-        if self.descending {
-            out.reverse();
-        }
-        ps.write(PsArray(out))
+        let sorted = run_on_pool(&plan, kernels::sort(&items, self.descending))?;
+        ps.write(PsArray(sorted))
     }
-}
-
-/// One merge of two ascending runs.
-fn merge_runs(left: &[f64], right: &[f64]) -> Vec<f64> {
-    let mut out = Vec::with_capacity(left.len() + right.len());
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < left.len() && j < right.len() {
-        if left[i].total_cmp(&right[j]).is_le() {
-            out.push(left[i]);
-            i += 1;
-        } else {
-            out.push(right[j]);
-            j += 1;
-        }
-    }
-    out.extend_from_slice(&left[i..]);
-    out.extend_from_slice(&right[j..]);
-    out
 }
 
 // ---------------------------------------------------------------------
 // Files
 // ---------------------------------------------------------------------
-
-/// How much of a file one read takes. Large enough that the syscall is
-/// amortized over real work, small enough that a thousand files in
-/// flight do not each hold a large buffer.
-const FILE_CHUNK: usize = 1 << 20;
 
 /// A file's BLAKE3 root.
 #[psclass(name = "Flynnel.FileHash")]
@@ -1220,6 +954,40 @@ pub struct FileHash {
     pub hash: String,
     /// How many bytes were read.
     pub bytes: u64,
+}
+
+impl From<kernels::FileHash> for FileHash {
+    fn from(h: kernels::FileHash) -> Self {
+        Self {
+            path: h.path,
+            hash: h.hash,
+            bytes: h.bytes,
+        }
+    }
+}
+
+#[psmethods]
+impl FileHash {
+    /// One FileHash per position of the columns, which must all have the
+    /// same length: a whole answer handed over in one call and built by
+    /// this module.
+    pub fn from_columns(
+        path: Vec<String>,
+        hash: Vec<String>,
+        bytes: Vec<u64>,
+    ) -> PsResult<Vec<FileHash>> {
+        same_length(&[
+            ("Path", path.len()),
+            ("Hash", hash.len()),
+            ("Bytes", bytes.len()),
+        ])?;
+        Ok(path
+            .into_iter()
+            .zip(hash)
+            .zip(bytes)
+            .map(|((path, hash), bytes)| FileHash { path, hash, bytes })
+            .collect())
+    }
 }
 
 /// One file checked against a manifest.
@@ -1239,6 +1007,49 @@ pub struct HashCheck {
     pub is_match: bool,
 }
 
+impl From<kernels::HashCheck> for HashCheck {
+    fn from(c: kernels::HashCheck) -> Self {
+        Self {
+            path: c.path,
+            expected: c.expected,
+            actual: c.actual,
+            is_match: c.is_match,
+        }
+    }
+}
+
+#[psmethods]
+impl HashCheck {
+    /// One HashCheck per position of the columns, which must all have the
+    /// same length. An empty Actual stands for a file that could not be
+    /// read and becomes null: a real root is never empty.
+    pub fn from_columns(
+        path: Vec<String>,
+        expected: Vec<String>,
+        actual: Vec<String>,
+        is_match: Vec<bool>,
+    ) -> PsResult<Vec<HashCheck>> {
+        same_length(&[
+            ("Path", path.len()),
+            ("Expected", expected.len()),
+            ("Actual", actual.len()),
+            ("IsMatch", is_match.len()),
+        ])?;
+        Ok(path
+            .into_iter()
+            .zip(expected)
+            .zip(actual)
+            .zip(is_match)
+            .map(|(((path, expected), actual), is_match)| HashCheck {
+                path,
+                expected,
+                actual: (!actual.is_empty()).then_some(actual),
+                is_match,
+            })
+            .collect())
+    }
+}
+
 /// A line of a file that matched.
 #[psclass(name = "Flynnel.FileMatch")]
 #[derive(Clone, Default)]
@@ -1249,6 +1060,44 @@ pub struct FileMatch {
     pub line_number: u64,
     /// The line, without its terminator.
     pub line: String,
+}
+
+impl From<kernels::FileMatch> for FileMatch {
+    fn from(m: kernels::FileMatch) -> Self {
+        Self {
+            path: m.path,
+            line_number: m.line_number,
+            line: m.line,
+        }
+    }
+}
+
+#[psmethods]
+impl FileMatch {
+    /// One FileMatch per position of the columns, which must all have the
+    /// same length: a whole answer handed over in one call and built by
+    /// this module.
+    pub fn from_columns(
+        path: Vec<String>,
+        line_number: Vec<u64>,
+        line: Vec<String>,
+    ) -> PsResult<Vec<FileMatch>> {
+        same_length(&[
+            ("Path", path.len()),
+            ("LineNumber", line_number.len()),
+            ("Line", line.len()),
+        ])?;
+        Ok(path
+            .into_iter()
+            .zip(line_number)
+            .zip(line)
+            .map(|((path, line_number), line)| FileMatch {
+                path,
+                line_number,
+                line,
+            })
+            .collect())
+    }
 }
 
 /// What one file measured.
@@ -1263,150 +1112,63 @@ pub struct FileMeasure {
     pub bytes: u64,
 }
 
-/// Read a file whole, answering the failure text when it cannot be
-/// read so the caller can put it in an error record.
-fn slurp(path: &str) -> Result<Vec<u8>, String> {
-    std::fs::read(path).map_err(|e| e.to_string())
-}
-
-/// Lower-case hex for a 32-byte root.
-fn hex32(bytes: &[u8; 32]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        s.push(DIGITS[(b >> 4) as usize] as char);
-        s.push(DIGITS[(b & 0x0F) as usize] as char);
-    }
-    s
-}
-
-/// The largest file this module reads whole in order to hash its
-/// subtrees in parallel. Above it the file is streamed and hashed on
-/// one thread.
-///
-/// Both paths produce the same BLAKE3 root, so this bounds memory and
-/// speed and never what the answer is.
-const MAX_IN_MEMORY: u64 = 1 << 30;
-
-/// The largest span one worker hashes as a single subtree. Below this
-/// the split stops and one hasher runs the span, which is where
-/// BLAKE3's own SIMD parallelism does the work; above it the span is
-/// divided and the halves go to different workers.
-const SUBTREE_LEAF: usize = 1 << 20;
-
-/// The subtree spans of a buffer, left to right, by BLAKE3's own split
-/// rule.
-///
-/// `left_subtree_len` is the only split that produces valid subtrees;
-/// any other either panics or yields a root that is not BLAKE3's. The
-/// recursion stops at a span small enough to be worth one worker, and
-/// a span at or below one chunk cannot be split at all.
-fn plan_subtrees(start: usize, len: usize, out: &mut Vec<(usize, usize)>) {
-    if len <= SUBTREE_LEAF || len <= blake3::CHUNK_LEN {
-        out.push((start, len));
-        return;
-    }
-    let left = left_subtree_len(len as u64) as usize;
-    plan_subtrees(start, left, out);
-    plan_subtrees(start + left, len - left, out);
-}
-
-/// Combine the subtree chaining values back up the tree, walking the
-/// same split that produced them so each one lands where it belongs.
-///
-/// The split depends on a span's length alone, so the lengths are all
-/// the walk needs: `next` takes the chaining values in the order
-/// `plan_subtrees` produced them.
-fn fold_subtrees(len: usize, cvs: &[ChainingValue], next: &mut usize) -> ChainingValue {
-    if len <= SUBTREE_LEAF || len <= blake3::CHUNK_LEN {
-        let cv = cvs[*next];
-        *next += 1;
-        return cv;
-    }
-    let left = left_subtree_len(len as u64) as usize;
-    let l = fold_subtrees(left, cvs, next);
-    let r = fold_subtrees(len - left, cvs, next);
-    merge_subtrees_non_root(&l, &r, Mode::Hash)
-}
-
-/// The BLAKE3 root of a buffer, its subtrees hashed on Flynnel's
-/// workers and merged into the standard root.
-///
-/// This is BLAKE3's own tree, not a scheme of this module's: each
-/// worker hashes a span at its true input offset and answers the
-/// chaining value the specification defines for it, and the merges are
-/// the specification's. The answer equals `blake3::hash` over the same
-/// bytes, which Kernels.Tests.ps1 checks against a published vector
-/// and against the sequential path.
-fn hash_bytes_parallel(plan: &flynnel::JobPlan, bytes: &[u8]) -> String {
-    let n = bytes.len();
-    if n <= SUBTREE_LEAF {
-        return hex32(blake3::hash(bytes).as_bytes());
-    }
-    // The root split is the one merge that is root-flagged, so it is
-    // taken here and the two halves are folded as ordinary subtrees.
-    let left = left_subtree_len(n as u64) as usize;
-    let mut spans = Vec::new();
-    plan_subtrees(0, left, &mut spans);
-    let left_count = spans.len();
-    plan_subtrees(left, n - left, &mut spans);
-
-    let cvs: Vec<ChainingValue> = collect_indexed(plan, spans.len(), 1, |i| {
-        let (start, len) = spans[i];
-        blake3::Hasher::new()
-            .set_input_offset(start as u64)
-            .update(&bytes[start..start + len])
-            .finalize_non_root()
-    });
-
-    let mut from_left = 0usize;
-    let lcv = fold_subtrees(left, &cvs[..left_count], &mut from_left);
-    let mut from_right = 0usize;
-    let rcv = fold_subtrees(n - left, &cvs[left_count..], &mut from_right);
-    hex32(merge_subtrees_root(&lcv, &rcv, Mode::Hash).as_bytes())
-}
-
-/// The BLAKE3 root of a file read a chunk at a time, for a file too
-/// large to hold.
-fn hash_file_streaming(path: &str) -> Result<(String, u64), String> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; FILE_CHUNK];
-    let mut total = 0u64;
-    loop {
-        let got = reader.read(&mut buf).map_err(|e| e.to_string())?;
-        if got == 0 {
-            break;
+impl From<kernels::FileMeasure> for FileMeasure {
+    fn from(m: kernels::FileMeasure) -> Self {
+        Self {
+            path: m.path,
+            lines: m.lines,
+            bytes: m.bytes,
         }
-        hasher.update(&buf[..got]);
-        total += got as u64;
     }
-    Ok((hex32(hasher.finalize().as_bytes()), total))
 }
 
-/// The BLAKE3 root of one file, hashed across workers when it fits in
-/// memory and streamed on one thread when it does not.
-fn hash_file_parallel(plan: &flynnel::JobPlan, path: &str) -> Result<(String, u64), String> {
-    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
-    if size > MAX_IN_MEMORY {
-        return hash_file_streaming(path);
+#[psmethods]
+impl FileMeasure {
+    /// One FileMeasure per position of the columns, which must all have
+    /// the same length: a whole answer handed over in one call and built
+    /// by this module.
+    pub fn from_columns(
+        path: Vec<String>,
+        lines: Vec<u64>,
+        bytes: Vec<u64>,
+    ) -> PsResult<Vec<FileMeasure>> {
+        same_length(&[
+            ("Path", path.len()),
+            ("Lines", lines.len()),
+            ("Bytes", bytes.len()),
+        ])?;
+        Ok(path
+            .into_iter()
+            .zip(lines)
+            .zip(bytes)
+            .map(|((path, lines), bytes)| FileMeasure { path, lines, bytes })
+            .collect())
     }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    Ok((hash_bytes_parallel(plan, &bytes), bytes.len() as u64))
 }
 
-/// The BLAKE3 root of each of several files, one file per worker.
-///
-/// Splitting within a file as well would nest a dispatch inside a
-/// worker for no gain: with more files than workers every worker is
-/// already busy, and the subtree split would only add merges.
-fn hash_files(plan: &flynnel::JobPlan, paths: &[String]) -> Vec<Result<(String, u64), String>> {
-    if paths.len() == 1 {
-        return vec![hash_file_parallel(plan, &paths[0])];
+/// Write each row that read and an error record for each that did not,
+/// then the tally of the refusals.
+fn write_rows<R, W: IntoPs>(
+    ps: &Pipeline<'_>,
+    rows: Vec<Result<R, Refusal>>,
+    mut each: impl FnMut(R) -> Vec<W>,
+) -> PsResult<()> {
+    let total = rows.len();
+    let mut refused = 0usize;
+    for row in rows {
+        match row {
+            Ok(r) => {
+                for w in each(r) {
+                    ps.write(w)?;
+                }
+            }
+            Err(refusal) => {
+                refused += 1;
+                ps.write_error(&refusal_err(refusal))?;
+            }
+        }
     }
-    collect_indexed(plan, paths.len(), 1, |i| hash_file_streaming(&paths[i]))
+    say_refusals(ps, refused, total)
 }
 
 /// Hashes each file on the process-wide IO pool instead of the arena,
@@ -1420,15 +1182,17 @@ fn hash_files(plan: &flynnel::JobPlan, paths: &[String]) -> Vec<Result<(String, 
 ///
 /// The paths are cloned because `IoPool::submit` takes a `'static`
 /// closure. That is one allocation per file, on top of the read, and
-/// it is the cost this route has to earn back.
-fn hash_files_on_io_pool(paths: &[String]) -> Option<Vec<Result<(String, u64), String>>> {
+/// it is the cost this route has to earn back. Each file streams
+/// through the crate's one-file hash, so this route answers the root
+/// the kernel does.
+fn hash_files_on_io_pool(paths: &[String]) -> Option<Vec<Result<kernels::FileHash, Refusal>>> {
     let pool = flynnel::sched::io_pool::global_io_pool()?;
     let (tx, rx) = std::sync::mpsc::channel();
     for (i, path) in paths.iter().enumerate() {
         let tx = tx.clone();
         let path = path.clone();
         pool.submit(move || {
-            let row = hash_file_streaming(&path);
+            let row = kernels::file_hash_streamed(&path);
             if tx.send((i, row)).is_err() {
                 eprintln!(
                     "flynnel: the result channel for {path} closed before its hash was reported"
@@ -1438,8 +1202,8 @@ fn hash_files_on_io_pool(paths: &[String]) -> Option<Vec<Result<(String, u64), S
     }
     drop(tx);
 
-    let mut out: Vec<Option<Result<(String, u64), String>>> =
-        (0..paths.len()).map(|_| None).collect();
+    let mut out: Vec<Option<Result<kernels::FileHash, Refusal>>> =
+        (0..paths.len()).map(|_unfilled| None).collect();
     for (i, row) in rx {
         out[i] = Some(row);
     }
@@ -1449,13 +1213,15 @@ fn hash_files_on_io_pool(paths: &[String]) -> Option<Vec<Result<(String, u64), S
     Some(
         out.into_iter()
             .enumerate()
-            .map(|(i, slot)| {
-                slot.unwrap_or_else(|| {
-                    Err(format!(
-                        "the IO pool task for {} did not return a result",
+            .map(|(i, slot)| match slot {
+                Some(row) => row,
+                None => Err(Refusal {
+                    id: RefusalId::Unreadable,
+                    message: format!(
+                        "{} could not be read: the IO pool task for it did not return a result",
                         paths[i]
-                    ))
-                })
+                    ),
+                }),
             })
             .collect(),
     )
@@ -1512,15 +1278,13 @@ impl Cmdlet for MeasureFlynnelFileHash {
         let n = paths.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelFileHash")?;
-        if n == 0 {
-            return Ok(());
-        }
         // Asked for and available, asked for and absent, or not asked
         // for. The middle one warns rather than falling through
         // quietly, because a pool that does not exist and a pool that
         // was never wanted produce identical output otherwise.
-        let rows = if self.use_io_pool {
-            match hash_files_on_io_pool(&paths) {
+        let rows = match (self.use_io_pool, n) {
+            (_, 0) => Vec::new(),
+            (true, _) => match hash_files_on_io_pool(&paths) {
                 Some(rows) => rows,
                 None => {
                     pwrs::warning!(
@@ -1529,28 +1293,12 @@ impl Cmdlet for MeasureFlynnelFileHash {
                          workers. Set FLYNNEL_SCHED_SMT_AS_IO before the first dispatch to \
                          create one"
                     )?;
-                    hash_files(&plan, &paths)
+                    run_on_pool(&plan, kernels::file_hash(&paths))?
                 }
-            }
-        } else {
-            hash_files(&plan, &paths)
+            },
+            (false, _) => run_on_pool(&plan, kernels::file_hash(&paths))?,
         };
-
-        let mut refused = 0usize;
-        for (i, row) in rows.into_iter().enumerate() {
-            match row {
-                Ok((hash, bytes)) => ps.write(FileHash {
-                    path: paths[i].clone(),
-                    hash,
-                    bytes,
-                })?,
-                Err(why) => {
-                    refused += 1;
-                    ps.write_error(&read_err(&paths[i], why))?;
-                }
-            }
-        }
-        say_refusals(ps, refused, n)
+        write_rows(ps, rows, |h| vec![FileHash::from(h)])
     }
 }
 
@@ -1589,96 +1337,20 @@ impl Cmdlet for TestFlynnelFileHash {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let paths = std::mem::take(&mut self.path);
         let manifest = std::mem::take(&mut self.manifest);
-        if paths.len() != manifest.len() {
-            return Err(arg_err(format!(
-                "Path has {} entr(ies) and Manifest has {}; each file needs exactly one \
-                 expected root",
-                paths.len(),
-                manifest.len()
-            ))
-            .terminating());
-        }
+        let job = kernels::file_hash_check(&paths, &manifest).map_err(refusal_err)?;
         let n = paths.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Test-FlynnelFileHash")?;
-        if n == 0 {
-            return Ok(());
-        }
-        let rows = hash_files(&plan, &paths);
-
         let mut refused = 0usize;
-        for (i, row) in rows.into_iter().enumerate() {
-            let expected = manifest[i].to_ascii_lowercase();
-            match row {
-                Ok((hash, _)) => {
-                    let is_match = hash == expected;
-                    ps.write(HashCheck {
-                        path: paths[i].clone(),
-                        expected,
-                        actual: Some(hash),
-                        is_match,
-                    })?;
-                }
-                Err(why) => {
-                    refused += 1;
-                    ps.write_error(&read_err(&paths[i], why))?;
-                    ps.write(HashCheck {
-                        path: paths[i].clone(),
-                        expected,
-                        actual: None,
-                        is_match: false,
-                    })?;
-                }
+        for checked in run_on_pool(&plan, job)? {
+            if let Some(refusal) = checked.refusal {
+                refused += 1;
+                ps.write_error(&refusal_err(refusal))?;
             }
+            ps.write(HashCheck::from(checked.check))?;
         }
         say_refusals(ps, refused, n)
     }
-}
-
-/// A line with its terminating carriage return removed, when it has
-/// one. A line with none is already the whole line.
-fn without_cr(line: &[u8]) -> &[u8] {
-    match line.strip_suffix(b"\r") {
-        Some(trimmed) => trimmed,
-        None => line,
-    }
-}
-
-/// Whether `hay` holds `needle`.
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    if needle.len() > hay.len() {
-        return false;
-    }
-    hay.windows(needle.len()).any(|w| w == needle)
-}
-
-/// Every line of a byte buffer holding `needle`, with its one-based
-/// line number.
-fn matching_lines(hay: &[u8], needle: &[u8], ignore_case: bool) -> Vec<(u64, String)> {
-    let mut out = Vec::new();
-    if needle.is_empty() {
-        return out;
-    }
-    let folded_needle = if ignore_case {
-        needle.to_ascii_lowercase()
-    } else {
-        needle.to_vec()
-    };
-    for (idx, raw) in hay.split(|&b| b == b'\n').enumerate() {
-        let line = without_cr(raw);
-        let hit = if ignore_case {
-            contains(&line.to_ascii_lowercase(), &folded_needle)
-        } else {
-            contains(line, &folded_needle)
-        };
-        if hit {
-            out.push((idx as u64 + 1, String::from_utf8_lossy(line).into_owned()));
-        }
-    }
-    out
 }
 
 /// Searches files for a literal string on Flynnel's workers, one task
@@ -1728,50 +1400,14 @@ impl Cmdlet for SearchFlynnelFile {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let paths = std::mem::take(&mut self.path);
         let pattern = std::mem::take(&mut self.pattern);
-        if pattern.is_empty() {
-            return Err(arg_err("Pattern must not be empty").terminating());
-        }
+        let job = kernels::search_file(&pattern, &paths, self.ignore_case).map_err(refusal_err)?;
         let n = paths.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Search-FlynnelFile")?;
-        if n == 0 {
-            return Ok(());
-        }
-        let needle = pattern.as_bytes();
-        let fold = self.ignore_case;
-        let rows: Vec<Result<Vec<(u64, String)>, String>> = collect_indexed(&plan, n, 1, |i| {
-            slurp(&paths[i]).map(|bytes| matching_lines(&bytes, needle, fold))
-        });
-
-        let mut refused = 0usize;
-        for (i, row) in rows.into_iter().enumerate() {
-            match row {
-                Ok(hits) => {
-                    for (line_number, line) in hits {
-                        ps.write(FileMatch {
-                            path: paths[i].clone(),
-                            line_number,
-                            line,
-                        })?;
-                    }
-                }
-                Err(why) => {
-                    refused += 1;
-                    ps.write_error(&read_err(&paths[i], why))?;
-                }
-            }
-        }
-        say_refusals(ps, refused, n)
-    }
-}
-
-/// Whether a buffer's last byte leaves a line open, which makes that
-/// final unterminated line one more line.
-fn unterminated_tail(bytes: &[u8]) -> u64 {
-    match bytes.last() {
-        None => 0,
-        Some(&b'\n') => 0,
-        Some(_) => 1,
+        let rows = run_on_pool(&plan, job)?;
+        write_rows(ps, rows, |matches| {
+            matches.into_iter().map(FileMatch::from).collect()
+        })
     }
 }
 
@@ -1805,31 +1441,8 @@ impl Cmdlet for MeasureFlynnelFileLine {
         let n = paths.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelFileLine")?;
-        if n == 0 {
-            return Ok(());
-        }
-        let rows: Vec<Result<(u64, u64), String>> = collect_indexed(&plan, n, 1, |i| {
-            slurp(&paths[i]).map(|bytes| {
-                let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
-                (newlines + unterminated_tail(&bytes), bytes.len() as u64)
-            })
-        });
-
-        let mut refused = 0usize;
-        for (i, row) in rows.into_iter().enumerate() {
-            match row {
-                Ok((lines, bytes)) => ps.write(FileMeasure {
-                    path: paths[i].clone(),
-                    lines,
-                    bytes,
-                })?,
-                Err(why) => {
-                    refused += 1;
-                    ps.write_error(&read_err(&paths[i], why))?;
-                }
-            }
-        }
-        say_refusals(ps, refused, n)
+        let rows = run_on_pool(&plan, kernels::file_line(&paths))?;
+        write_rows(ps, rows, |m| vec![FileMeasure::from(m)])
     }
 }
 
@@ -1866,30 +1479,8 @@ impl Cmdlet for MeasureFlynnelFileByte {
         let n = paths.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelFileByte")?;
-        if n == 0 {
-            return Ok(());
-        }
-        let rows: Vec<Result<u64, String>> = collect_indexed(&plan, n, 1, |i| {
-            std::fs::metadata(&paths[i])
-                .map(|m| m.len())
-                .map_err(|e| e.to_string())
-        });
-
-        let mut refused = 0usize;
-        for (i, row) in rows.into_iter().enumerate() {
-            match row {
-                Ok(bytes) => ps.write(FileMeasure {
-                    path: paths[i].clone(),
-                    lines: 0,
-                    bytes,
-                })?,
-                Err(why) => {
-                    refused += 1;
-                    ps.write_error(&read_err(&paths[i], why))?;
-                }
-            }
-        }
-        say_refusals(ps, refused, n)
+        let rows = run_on_pool(&plan, kernels::file_byte(&paths))?;
+        write_rows(ps, rows, |m| vec![FileMeasure::from(m)])
     }
 }
 
@@ -1909,6 +1500,44 @@ pub struct TextMatch {
     pub line: String,
 }
 
+impl From<kernels::TextMatch> for TextMatch {
+    fn from(m: kernels::TextMatch) -> Self {
+        Self {
+            index: m.index,
+            line_number: m.line_number,
+            line: m.line,
+        }
+    }
+}
+
+#[psmethods]
+impl TextMatch {
+    /// One TextMatch per position of the columns, which must all have the
+    /// same length: a whole answer handed over in one call and built by
+    /// this module.
+    pub fn from_columns(
+        index: Vec<u64>,
+        line_number: Vec<u64>,
+        line: Vec<String>,
+    ) -> PsResult<Vec<TextMatch>> {
+        same_length(&[
+            ("Index", index.len()),
+            ("LineNumber", line_number.len()),
+            ("Line", line.len()),
+        ])?;
+        Ok(index
+            .into_iter()
+            .zip(line_number)
+            .zip(line)
+            .map(|((index, line_number), line)| TextMatch {
+                index,
+                line_number,
+                line,
+            })
+            .collect())
+    }
+}
+
 /// What a text measurement answered.
 #[psclass(name = "Flynnel.TextMeasure")]
 #[derive(Clone, Default)]
@@ -1924,81 +1553,12 @@ pub struct TextMeasure {
     pub matches: Option<u64>,
 }
 
-/// Every byte offset at which `needle` occurs in `hay`, found in
-/// parallel and answered in ascending order.
-///
-/// A chunk searches its own span extended by the pattern's length less
-/// one, so a match straddling a boundary is found by the chunk to its
-/// left. A match belongs to the chunk its first byte falls in, which
-/// is what keeps the overlap from reporting one twice.
-fn find_all(plan: &flynnel::JobPlan, hay: &[u8], needle: &[u8]) -> Vec<usize> {
-    let n = hay.len();
-    if needle.is_empty() || needle.len() > n {
-        return Vec::new();
-    }
-    let (n_chunks, chunk_len) = chunking(plan, n);
-    if n_chunks == 0 {
-        return Vec::new();
-    }
-    let reach = needle.len() - 1;
-    let parts: Vec<Vec<usize>> = collect_indexed(plan, n_chunks, 1, |c| {
-        let (lo, hi) = span(c, chunk_len, n);
-        let stop = (hi + reach).min(n);
-        if lo >= stop || stop - lo < needle.len() {
-            return Vec::new();
-        }
-        let mut hits = Vec::new();
-        for (offset, w) in hay[lo..stop].windows(needle.len()).enumerate() {
-            if w == needle && lo + offset < hi {
-                hits.push(lo + offset);
-            }
-        }
-        hits
-    });
-    let mut all: Vec<usize> = parts.into_iter().flatten().collect();
-    all.sort_unstable();
-    all
-}
-
-/// The one-based line number of a byte offset, given the newline
-/// positions in ascending order.
-fn line_of(newlines: &[usize], at: usize) -> u64 {
-    newlines.partition_point(|&p| p < at) as u64 + 1
-}
-
-/// The whole line containing a byte offset, without its terminator.
-fn line_at(hay: &[u8], newlines: &[usize], at: usize) -> String {
-    let idx = newlines.partition_point(|&p| p < at);
-    let start = if idx == 0 { 0 } else { newlines[idx - 1] + 1 };
-    // No newline at or after the offset means the line runs to the end
-    // of the text.
-    let end = match newlines.get(idx) {
-        Some(&p) => p,
-        None => hay.len(),
-    };
-    String::from_utf8_lossy(without_cr(&hay[start..end])).into_owned()
-}
-
-/// How many of the found offsets survive a left-to-right
-/// non-overlapping walk.
-fn non_overlapping(hits: &[usize], width: usize) -> usize {
-    let mut kept = 0usize;
-    let mut next_free = 0usize;
-    for &at in hits {
-        if at >= next_free {
-            kept += 1;
-            next_free = at + width;
-        }
-    }
-    kept
-}
-
 /// Finds every occurrence of a literal in one large string, searched
 /// in parallel on Flynnel's workers.
 ///
-/// The whole string crosses once. Chunks overlap by the pattern's
+/// The whole string crosses once. Blocks overlap by the pattern's
 /// length less one so a match on a boundary is still found, and each
-/// match is owned by the chunk its first byte falls in so none is
+/// match is owned by the block its first byte falls in so none is
 /// reported twice.
 ///
 /// # Examples
@@ -2027,23 +1587,11 @@ impl Cmdlet for SearchFlynnelText {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let text = std::mem::take(&mut self.text);
         let pattern = std::mem::take(&mut self.pattern);
-        if pattern.is_empty() {
-            return Err(arg_err("Pattern must not be empty").terminating());
-        }
-        let hay = text.as_bytes();
-        let plan = kernel_plan(self.plan.as_ref(), hay.len())?;
-        say_plan(ps, &plan, hay.len(), "Search-FlynnelText")?;
-        if hay.is_empty() {
-            return Ok(());
-        }
-        let hits = find_all(&plan, hay, pattern.as_bytes());
-        let newlines = find_all(&plan, hay, b"\n");
-        for at in hits {
-            ps.write(TextMatch {
-                index: at as u64,
-                line_number: line_of(&newlines, at),
-                line: line_at(hay, &newlines, at),
-            })?;
+        let job = kernels::search_text(&text, &pattern).map_err(refusal_err)?;
+        let plan = kernel_plan(self.plan.as_ref(), text.len())?;
+        say_plan(ps, &plan, text.len(), "Search-FlynnelText")?;
+        for m in run_on_pool(&plan, job)? {
+            ps.write(TextMatch::from(m))?;
         }
         Ok(())
     }
@@ -2080,57 +1628,15 @@ pub struct MeasureFlynnelTextCount {
 impl Cmdlet for MeasureFlynnelTextCount {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let text = std::mem::take(&mut self.text);
-        let hay = text.as_bytes();
-        let n = hay.len();
-        let plan = kernel_plan(self.plan.as_ref(), n)?;
-        say_plan(ps, &plan, n, "Measure-FlynnelTextCount")?;
-
-        let matches = match self.pattern.as_deref() {
-            None => None,
-            Some("") => return Err(arg_err("Pattern must not be empty").terminating()),
-            Some(p) => {
-                let hits = find_all(&plan, hay, p.as_bytes());
-                Some(non_overlapping(&hits, p.len()) as u64)
-            }
-        };
-
-        if n == 0 {
-            return ps.write(TextMeasure {
-                bytes: 0,
-                lines: 0,
-                words: 0,
-                matches,
-            });
-        }
-        let (n_chunks, chunk_len) = chunking(&plan, n);
-
-        // A word is counted where it starts, so a chunk needs to know
-        // whether the byte before its span was whitespace. Reading one
-        // byte to the left is what makes the per-chunk counts add up to
-        // the serial answer.
-        let counts: Vec<(u64, u64)> = collect_indexed(&plan, n_chunks, 1, |c| {
-            let (lo, hi) = span(c, chunk_len, n);
-            let mut lines = 0u64;
-            let mut words = 0u64;
-            let mut prev_space = lo == 0 || hay[lo - 1].is_ascii_whitespace();
-            for &b in &hay[lo..hi] {
-                if b == b'\n' {
-                    lines += 1;
-                }
-                let space = b.is_ascii_whitespace();
-                if prev_space && !space {
-                    words += 1;
-                }
-                prev_space = space;
-            }
-            (lines, words)
-        });
-
+        let job = kernels::text_count(&text, self.pattern.as_deref()).map_err(refusal_err)?;
+        let plan = kernel_plan(self.plan.as_ref(), text.len())?;
+        say_plan(ps, &plan, text.len(), "Measure-FlynnelTextCount")?;
+        let m = run_on_pool(&plan, job)?;
         ps.write(TextMeasure {
-            bytes: n as u64,
-            lines: counts.iter().map(|(l, _)| l).sum::<u64>() + unterminated_tail(hay),
-            words: counts.iter().map(|(_, w)| w).sum(),
-            matches,
+            bytes: m.bytes,
+            lines: m.lines,
+            words: m.words,
+            matches: m.matches,
         })
     }
 }
@@ -2169,35 +1675,16 @@ impl Cmdlet for SplitFlynnelText {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let text = std::mem::take(&mut self.text);
         let separator = std::mem::take(&mut self.separator);
-        if separator.is_empty() {
-            return Err(arg_err("Separator must not be empty").terminating());
-        }
-        let hay = text.as_bytes();
-        let plan = kernel_plan(self.plan.as_ref(), hay.len())?;
-        say_plan(ps, &plan, hay.len(), "Split-FlynnelText")?;
-
-        let hits = find_all(&plan, hay, separator.as_bytes());
-        let width = separator.len();
-        let mut out: Vec<String> = Vec::with_capacity(hits.len() + 1);
-        let mut cursor = 0usize;
-        for &at in &hits {
-            if at < cursor {
-                continue;
-            }
-            out.push(String::from_utf8_lossy(&hay[cursor..at]).into_owned());
-            cursor = at + width;
-        }
-        out.push(String::from_utf8_lossy(&hay[cursor..]).into_owned());
-        if self.no_empty {
-            out.retain(|s| !s.is_empty());
-        }
-        ps.write(PsArray(out))
+        let job = kernels::split_text(&text, &separator, self.no_empty).map_err(refusal_err)?;
+        let plan = kernel_plan(self.plan.as_ref(), text.len())?;
+        say_plan(ps, &plan, text.len(), "Split-FlynnelText")?;
+        ps.write(PsArray(run_on_pool(&plan, job)?))
     }
 }
 
 /// What Update-FlynnelText does to the text.
 #[psenum(name = "Flynnel.TextTransform")]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum TextTransform {
     /// Replace every non-overlapping occurrence of Pattern with
     /// Replacement.
@@ -2209,31 +1696,15 @@ pub enum TextTransform {
     ToLower,
 }
 
-/// Split points for a string, every one of them on a character
-/// boundary.
-///
-/// A byte-count chunking can land inside a multi-byte character, and
-/// slicing there panics. Each nominal split walks forward until the
-/// string agrees a boundary is there.
-fn char_bounds(text: &str, plan: &flynnel::JobPlan) -> Vec<usize> {
-    let n = text.len();
-    let (n_chunks, chunk_len) = chunking(plan, n);
-    let mut bounds = vec![0usize];
-    let mut last = 0usize;
-    for c in 1..n_chunks {
-        let mut at = (c * chunk_len).min(n);
-        while at < n && !text.is_char_boundary(at) {
-            at += 1;
-        }
-        if at > last {
-            bounds.push(at);
-            last = at;
+impl TextTransform {
+    /// The crate's transform of the same name.
+    fn to_kernel(self) -> kernels::TextTransform {
+        match self {
+            Self::Replace => kernels::TextTransform::Replace,
+            Self::ToUpper => kernels::TextTransform::ToUpper,
+            Self::ToLower => kernels::TextTransform::ToLower,
         }
     }
-    if n > last {
-        bounds.push(n);
-    }
-    bounds
 }
 
 /// Rewrites one large string on Flynnel's workers and answers the
@@ -2241,8 +1712,11 @@ fn char_bounds(text: &str, plan: &flynnel::JobPlan) -> Vec<usize> {
 ///
 /// Replace finds every occurrence in parallel and then builds the
 /// answer once, so the search scales and the copy is a single pass.
-/// The case transforms run per chunk, split on character boundaries so
-/// no multi-byte character is cut.
+/// The case transforms run per piece. ToUpper splits on character
+/// boundaries; ToLower splits only after an ASCII whitespace
+/// character, because lower-casing a capital sigma depends on the
+/// letters either side of it, and no piece boundary may stand between
+/// them.
 ///
 /// # Examples
 ///
@@ -2278,62 +1752,319 @@ pub struct UpdateFlynnelText {
 impl Cmdlet for UpdateFlynnelText {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
         let text = std::mem::take(&mut self.text);
-        let n = text.len();
-        let plan = kernel_plan(self.plan.as_ref(), n)?;
-        say_plan(ps, &plan, n, "Update-FlynnelText")?;
+        let job = kernels::update_text(
+            &text,
+            self.operation.to_kernel(),
+            self.pattern.as_deref(),
+            self.replacement.as_deref(),
+        )
+        .map_err(refusal_err)?;
+        let plan = kernel_plan(self.plan.as_ref(), text.len())?;
+        say_plan(ps, &plan, text.len(), "Update-FlynnelText")?;
+        ps.write(run_on_pool(&plan, job)?)
+    }
+}
 
-        match self.operation {
-            TextTransform::Replace => {
-                let Some(pattern) = self.pattern.clone() else {
-                    return Err(arg_err("Replace needs Pattern").terminating());
-                };
-                if pattern.is_empty() {
-                    return Err(arg_err("Pattern must not be empty").terminating());
-                }
-                #[expect(
-                    clippy::manual_unwrap_or_default,
-                    reason = "an absent Replacement asks for the pattern to be deleted, and the \
-                              match names that case where a default would hide it"
-                )]
-                let replacement = match self.replacement.as_deref() {
-                    Some(r) => r,
-                    // Deleting the pattern is what an absent
-                    // Replacement asks for.
-                    None => "",
-                };
-                let hay = text.as_bytes();
-                let hits = find_all(&plan, hay, pattern.as_bytes());
-                let width = pattern.len();
-                let mut out = String::with_capacity(n);
-                let mut cursor = 0usize;
-                for &at in &hits {
-                    if at < cursor {
-                        continue;
-                    }
-                    out.push_str(&String::from_utf8_lossy(&hay[cursor..at]));
-                    out.push_str(replacement);
-                    cursor = at + width;
-                }
-                out.push_str(&String::from_utf8_lossy(&hay[cursor..]));
-                ps.write(out)
+// ---------------------------------------------------------------------
+// The pool's own primitives, run over a declared body
+// ---------------------------------------------------------------------
+
+/// A pool primitive Measure-FlynnelPrimitive runs a declared operation
+/// through.
+#[psenum(name = "Flynnel.Primitive")]
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Primitive {
+    /// `reduce_chunks`: per-chunk sums folded into one, split as the
+    /// pool chooses. It records the path it took on the calling thread,
+    /// which Get-FlynnelReducePath reads.
+    #[default]
+    ReduceChunks,
+    /// `for_each_chunk`: the operation applied in place, chunk by chunk.
+    ForEachChunk,
+    /// `for_each_chunk_indexed`: the same, each chunk given its start
+    /// index.
+    ForEachChunkIndexed,
+    /// `collect_indexed`: one sum per chunk, four chunks a worker,
+    /// collected in order.
+    CollectIndexed,
+}
+
+/// What one run of a pool primitive answered.
+#[psclass(name = "Flynnel.PrimitiveRun")]
+#[derive(Clone, Default)]
+pub struct PrimitiveRun {
+    /// The primitive that ran.
+    pub primitive: Primitive,
+    /// The operation applied to each element.
+    pub operation: MapOp,
+    /// How many elements it read.
+    pub count: u64,
+    /// The operation's results added together. The primitive chooses its
+    /// own split, so the last bits of this sum can differ between
+    /// primitives and between hosts, which the declared kernels' answers
+    /// do not.
+    pub sum: f64,
+    /// Nanoseconds the primitive's own call took, the serial sum after an
+    /// in-place run not included.
+    pub elapsed_ns: u64,
+}
+
+/// Runs one declared element operation through one of the pool's own
+/// primitives and answers the sum of the results, for measuring the
+/// primitives against each other on the same body.
+///
+/// The declared kernels run on blocks they cut themselves, dispatched
+/// through the entry `flynnel_run_chunks_v1` uses, so none of them
+/// reaches these primitives; this cmdlet is how a script does. After a
+/// ReduceChunks run, Get-FlynnelReducePath reports the path the fold
+/// took.
+///
+/// An operation that needs an operand (Clamp, Scale, Offset) is refused,
+/// because the cmdlet takes none.
+///
+/// # Examples
+///
+/// `Measure-FlynnelPrimitive -InputObject $x -Primitive ReduceChunks; Get-FlynnelReducePath`
+///
+/// `Measure-FlynnelPrimitive -InputObject $x -Primitive ForEachChunk -Operation Sqrt`
+#[cmdlet(
+    verb = "Measure",
+    noun = "FlynnelPrimitive",
+    alias = "Measure-FlyPrimitive",
+    output = ["Flynnel.PrimitiveRun"]
+)]
+#[derive(Default)]
+pub struct MeasureFlynnelPrimitive {
+    /// The numbers to run the operation over.
+    #[param(mandatory, position = 0, value_from_pipeline)]
+    pub input_object: Vec<f64>,
+    /// Which primitive to run it through.
+    #[param(mandatory, position = 1)]
+    pub primitive: Primitive,
+    /// The operation applied to each element. Square when not given.
+    #[param]
+    pub operation: MapOp,
+    /// The plan to run under.
+    #[param]
+    pub plan: Option<Plan>,
+}
+
+impl Cmdlet for MeasureFlynnelPrimitive {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        use flynnel::sched::par_iter::{
+            collect_indexed, for_each_chunk, for_each_chunk_indexed, reduce_chunks,
+        };
+
+        let mut items = std::mem::take(&mut self.input_object);
+        let n = items.len();
+        let plan = kernel_plan(self.plan.as_ref(), n)?;
+        say_plan(ps, &plan, n, "Measure-FlynnelPrimitive")?;
+        let element = kernels::Element::new(self.operation.to_kernel(), MapOperands::default())
+            .map_err(refusal_err)?;
+        let started = std::time::Instant::now();
+        let folded = match self.primitive {
+            Primitive::ReduceChunks => Some(reduce_chunks(
+                &plan,
+                &items,
+                || 0.0f64,
+                |acc, s| acc + s.iter().map(|&x| element.apply(x)).sum::<f64>(),
+                |a, b| a + b,
+            )),
+            Primitive::ForEachChunk => {
+                for_each_chunk(&plan, &mut items, |s| element.apply_slice(s));
+                None
             }
-            TextTransform::ToUpper | TextTransform::ToLower => {
-                if n == 0 {
-                    return ps.write(String::new());
-                }
-                let upper = matches!(self.operation, TextTransform::ToUpper);
-                let bounds = char_bounds(&text, &plan);
-                let n_parts = bounds.len() - 1;
-                let parts: Vec<String> = collect_indexed(&plan, n_parts, 1, |c| {
-                    let piece = &text[bounds[c]..bounds[c + 1]];
-                    if upper {
-                        piece.to_uppercase()
-                    } else {
-                        piece.to_lowercase()
-                    }
+            Primitive::ForEachChunkIndexed => {
+                for_each_chunk_indexed(&plan, &mut items, |_start, s| element.apply_slice(s));
+                None
+            }
+            Primitive::CollectIndexed => {
+                // Four chunks a worker, so a chunk that finishes early
+                // leaves its worker something to steal.
+                let chunks = (plan.resolved_workers().max(1) * 4).min(n).max(1);
+                let len = n.div_ceil(chunks).max(1);
+                let sums: Vec<f64> = collect_indexed(&plan, chunks, 1, |c| {
+                    let lo = (c * len).min(n);
+                    let hi = (lo + len).min(n);
+                    items[lo..hi].iter().map(|&x| element.apply(x)).sum::<f64>()
                 });
-                ps.write(parts.concat())
+                Some(sums.iter().sum::<f64>())
             }
+        };
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let sum = match folded {
+            Some(sum) => sum,
+            None => items.iter().sum::<f64>(),
+        };
+        ps.write(PrimitiveRun {
+            primitive: self.primitive,
+            operation: self.operation,
+            count: n as u64,
+            sum,
+            elapsed_ns,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parameters a cmdlet's own metadata declares, in its order:
+    /// name, CLR type, mandatory, position, pipeline.
+    fn declared(descriptor_json: &str) -> Vec<(String, String, bool, Option<u64>, bool)> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(descriptor_json).expect("the cmdlet descriptor is JSON");
+        let params = parsed["params"]
+            .as_array()
+            .expect("the descriptor lists its params");
+        params
+            .iter()
+            .map(|p| {
+                (
+                    p["name"].as_str().expect("a name").to_string(),
+                    p["clr"].as_str().expect("a CLR type").to_string(),
+                    p["mandatory"].as_bool().expect("mandatory is a bool"),
+                    p["position"].as_u64(),
+                    p["pipeline"].as_bool().expect("pipeline is a bool"),
+                )
+            })
+            .collect()
+    }
+
+    /// Fail naming every difference between a cmdlet and its kernel's
+    /// descriptor.
+    fn check<C: CmdletMeta>(kernel: &str) {
+        let d = kernels::descriptor_for(kernel).expect("the crate describes this kernel");
+        assert_eq!(d.cmdlet, C::NAME, "{kernel} names its cmdlet");
+        let have = declared(&C::descriptor());
+        let want: Vec<(String, String, bool, Option<u64>, bool)> = d
+            .params
+            .iter()
+            .map(|p| {
+                (
+                    p.name.to_string(),
+                    p.ty.clr().to_string(),
+                    p.mandatory,
+                    p.position.map(u64::from),
+                    p.from_pipeline,
+                )
+            })
+            .collect();
+        assert_eq!(
+            have,
+            want,
+            "{} and the {kernel} descriptor disagree",
+            C::NAME
+        );
+    }
+
+    #[test]
+    fn every_kernel_cmdlet_matches_its_descriptor() {
+        check::<InvokeFlynnelMap>("Map");
+        check::<UpdateFlynnelArray>("MapInPlace");
+        check::<InvokeFlynnelZip>("Zip");
+        check::<MeasureFlynnelReduce>("Reduce");
+        check::<GetFlynnelPrefixSum>("PrefixSum");
+        check::<GetFlynnelHistogram>("Histogram");
+        check::<GetFlynnelDotProduct>("DotProduct");
+        check::<SortFlynnelArray>("Sort");
+        check::<MeasureFlynnelFileHash>("FileHash");
+        check::<TestFlynnelFileHash>("FileHashCheck");
+        check::<SearchFlynnelFile>("SearchFile");
+        check::<MeasureFlynnelFileLine>("FileLine");
+        check::<MeasureFlynnelFileByte>("FileByte");
+        check::<SearchFlynnelText>("SearchText");
+        check::<MeasureFlynnelTextCount>("TextCount");
+        check::<SplitFlynnelText>("SplitText");
+        check::<UpdateFlynnelText>("UpdateText");
+        assert_eq!(
+            kernels::DESCRIPTORS.len(),
+            17,
+            "every descriptor was checked"
+        );
+    }
+
+    #[test]
+    fn the_module_enums_name_the_crate_operations_alike() {
+        for (op, name) in kernels::MapOp::ALL.iter().zip(kernels::MapOp::NAMES) {
+            let ours = match op {
+                kernels::MapOp::Square => MapOp::Square,
+                kernels::MapOp::Abs => MapOp::Abs,
+                kernels::MapOp::Negate => MapOp::Negate,
+                kernels::MapOp::Reciprocal => MapOp::Reciprocal,
+                kernels::MapOp::Sqrt => MapOp::Sqrt,
+                kernels::MapOp::Log => MapOp::Log,
+                kernels::MapOp::Log2 => MapOp::Log2,
+                kernels::MapOp::Exp => MapOp::Exp,
+                kernels::MapOp::Round => MapOp::Round,
+                kernels::MapOp::Floor => MapOp::Floor,
+                kernels::MapOp::Ceiling => MapOp::Ceiling,
+                kernels::MapOp::Clamp => MapOp::Clamp,
+                kernels::MapOp::Scale => MapOp::Scale,
+                kernels::MapOp::Offset => MapOp::Offset,
+            };
+            assert_eq!(format!("{ours:?}"), name);
+            assert_eq!(ours.to_kernel(), *op);
         }
+        for (op, name) in kernels::ZipOp::ALL.iter().zip(kernels::ZipOp::NAMES) {
+            let ours = match op {
+                kernels::ZipOp::Add => ZipOp::Add,
+                kernels::ZipOp::Subtract => ZipOp::Subtract,
+                kernels::ZipOp::Multiply => ZipOp::Multiply,
+                kernels::ZipOp::Divide => ZipOp::Divide,
+                kernels::ZipOp::Min => ZipOp::Min,
+                kernels::ZipOp::Max => ZipOp::Max,
+            };
+            assert_eq!(format!("{ours:?}"), name);
+            assert_eq!(ours.to_kernel(), *op);
+        }
+        for (op, name) in kernels::ReduceOp::ALL.iter().zip(kernels::ReduceOp::NAMES) {
+            let ours = match op {
+                kernels::ReduceOp::Sum => ReduceOp::Sum,
+                kernels::ReduceOp::Min => ReduceOp::Min,
+                kernels::ReduceOp::Max => ReduceOp::Max,
+                kernels::ReduceOp::Mean => ReduceOp::Mean,
+                kernels::ReduceOp::Variance => ReduceOp::Variance,
+                kernels::ReduceOp::Product => ReduceOp::Product,
+                kernels::ReduceOp::CountMatching => ReduceOp::CountMatching,
+            };
+            assert_eq!(format!("{ours:?}"), name);
+            assert_eq!(ours.to_kernel(), *op);
+        }
+        for (op, name) in kernels::TextTransform::ALL
+            .iter()
+            .zip(kernels::TextTransform::NAMES)
+        {
+            let ours = match op {
+                kernels::TextTransform::Replace => TextTransform::Replace,
+                kernels::TextTransform::ToUpper => TextTransform::ToUpper,
+                kernels::TextTransform::ToLower => TextTransform::ToLower,
+            };
+            assert_eq!(format!("{ours:?}"), name);
+            assert_eq!(ours.to_kernel(), *op);
+        }
+    }
+
+    #[test]
+    fn unequal_columns_are_refused_naming_both_lengths() {
+        let refused = TextMatch::from_columns(vec![1, 2], vec![1], vec!["a".to_string()])
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|m| m.contains("Index has 2 element(s) and LineNumber has 1")),
+            "{refused:?}"
+        );
+        let rows = HashCheck::from_columns(
+            vec!["a".to_string(), "b".to_string()],
+            vec!["x".to_string(), "y".to_string()],
+            vec!["x".to_string(), String::new()],
+            vec![true, false],
+        )
+        .expect("equal columns");
+        assert_eq!(rows[0].actual.as_deref(), Some("x"));
+        assert_eq!(rows[1].actual, None);
     }
 }

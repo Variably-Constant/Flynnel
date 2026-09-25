@@ -8,9 +8,11 @@
 # run twice: a boundary a match straddles, a chunk whose offset is
 # wrong, a per-chunk accumulator that does not combine.
 #
-# Sizes are chosen so the input is cut into more chunks than there are
-# workers. A kernel tested only on eight elements runs in one chunk and
-# never exercises the combine at all.
+# Sizes are chosen so every kernel's input is cut into several blocks.
+# The kernels cut an array into blocks of at least 2,048 elements and
+# text into blocks of at least 64 KiB, at most 256 either way, from the
+# input's length alone, so a kernel tested only on eight elements runs
+# in one block and never exercises the combine at all.
 
 BeforeAll {
     . (Join-Path $PSScriptRoot 'Common.ps1')
@@ -50,6 +52,7 @@ Describe 'the types this family exports' {
             'Flynnel.FileMeasure'  = @('Path', 'Lines', 'Bytes')
             'Flynnel.TextMatch'    = @('Index', 'LineNumber', 'Line')
             'Flynnel.TextMeasure'  = @('Bytes', 'Lines', 'Words', 'Matches')
+            'Flynnel.PrimitiveRun' = @('Primitive', 'Operation', 'Count', 'Sum', 'ElapsedNs')
         }
         foreach ($type in $shape.Keys) {
             $properties = @(Get-FlynnelTypeProperty -TypeName $type | ForEach-Object Name)
@@ -61,7 +64,7 @@ Describe 'the types this family exports' {
 
     It 'gives every operation enum at least one value' {
         foreach ($name in 'Flynnel.MapOp', 'Flynnel.ZipOp', 'Flynnel.ReduceOp',
-                          'Flynnel.TextTransform') {
+                          'Flynnel.TextTransform', 'Flynnel.Primitive') {
             $type = $name -as [type]
             $type | Should -Not -BeNullOrEmpty -Because "$name must be exported"
             [Enum]::GetValues($type).Count | Should -BeGreaterThan 0
@@ -449,7 +452,9 @@ Describe 'Sort-FlynnelArray' {
     }
 
     It 'sorts an odd run count, where the last run has no partner' {
-        $odd = 1..9999 | ForEach-Object { [double]((7919 * $_) % 9973) }
+        # A sort cuts runs of at least 4,096 elements, so 13,000 is three
+        # runs and the third waits a round for a partner.
+        $odd = 1..13000 | ForEach-Object { [double]((7919 * $_) % 9973) }
         $got = Sort-FlynnelArray -InputObject $odd
         $want = $odd | Sort-Object
         (Compare-Object $got $want -SyncWindow 0).Count | Should -Be 0
@@ -700,9 +705,8 @@ Describe 'Measure-FlynnelFileLine and Measure-FlynnelFileByte' {
 
 Describe 'Search-FlynnelText' {
     BeforeAll {
-        # Long enough to be cut into more chunks than the host has
-        # workers, and the pattern lands on boundaries as the chunking
-        # falls where it falls.
+        # About 400 KB, so six blocks, with the pattern on every line and
+        # so on either side of every boundary.
         $script:Text = (1..20000 | ForEach-Object { "row $_ value ABCD" }) -join "`n"
     }
 
@@ -735,13 +739,14 @@ Describe 'Search-FlynnelText' {
         $got[4].LineNumber | Should -Be 5
     }
 
-    It 'finds a match that straddles a chunk boundary' {
-        # A pattern occurring once, in the middle, is found only if the
-        # chunk that owns its first byte reaches past its own end.
-        $big = ('x' * 100000) + 'MIDDLE' + ('y' * 100000)
+    It 'finds a match that straddles a block boundary' {
+        # 200,006 bytes is three blocks of 66,669, so a pattern starting
+        # at 66,666 crosses the first boundary. It is found only if the
+        # block that owns its first byte reads past its own end.
+        $big = ('x' * 66666) + 'MIDDLE' + ('y' * 133334)
         $got = @(Search-FlynnelText -Text $big -Pattern 'MIDDLE')
         $got.Count | Should -Be 1
-        $got[0].Index | Should -Be 100000
+        $got[0].Index | Should -Be 66666
     }
 }
 
@@ -758,7 +763,7 @@ Describe 'Measure-FlynnelTextCount' {
         (Measure-FlynnelTextCount -Text "one`ntwo").Lines | Should -Be 2
     }
 
-    It 'counts words across a chunk boundary exactly once' {
+    It 'counts words across a block boundary exactly once' {
         $text = (1..40000 | ForEach-Object { "w$_" }) -join ' '
         (Measure-FlynnelTextCount -Text $text).Words | Should -Be 40000
     }
@@ -780,7 +785,7 @@ Describe 'Measure-FlynnelTextCount' {
 
 Describe 'Split-FlynnelText' {
     It 'splits exactly as the .NET string does' {
-        $text = (1..5000 | ForEach-Object { "field$_" }) -join ','
+        $text = (1..30000 | ForEach-Object { "field$_" }) -join ','
         $got = Split-FlynnelText -Text $text -Separator ','
         $want = $text.Split(',')
         $got.Count | Should -Be $want.Count
@@ -814,7 +819,7 @@ Describe 'Split-FlynnelText' {
 
 Describe 'Update-FlynnelText' {
     It 'replaces exactly as the .NET string does' {
-        $text = (1..5000 | ForEach-Object { "row $_ OLD" }) -join "`n"
+        $text = (1..30000 | ForEach-Object { "row $_ OLD" }) -join "`n"
         $got = Update-FlynnelText -Text $text -Operation Replace -Pattern 'OLD' -Replacement 'NEW'
         $got | Should -Be $text.Replace('OLD', 'NEW')
     }
@@ -823,15 +828,17 @@ Describe 'Update-FlynnelText' {
         (Update-FlynnelText -Text 'a-b-c' -Operation Replace -Pattern '-') | Should -Be 'abc'
     }
 
-    It 'replaces a match that straddles a chunk boundary' {
-        $big = ('x' * 100000) + 'MIDDLE' + ('y' * 100000)
+    It 'replaces a match that straddles a block boundary' {
+        # The same construction as the search's: the match crosses the
+        # first of three blocks' boundaries.
+        $big = ('x' * 66666) + 'MIDDLE' + ('y' * 133334)
         $got = Update-FlynnelText -Text $big -Operation Replace -Pattern 'MIDDLE' -Replacement 'M'
         $got.Length | Should -Be ($big.Length - 5)
         $got | Should -Be $big.Replace('MIDDLE', 'M')
     }
 
     It 'upper-cases and lower-cases as .NET does' {
-        $text = (1..5000 | ForEach-Object { "Mixed Case Row $_" }) -join "`n"
+        $text = (1..30000 | ForEach-Object { "Mixed Case Row $_" }) -join "`n"
         (Update-FlynnelText -Text $text -Operation ToUpper) | Should -Be $text.ToUpper()
         (Update-FlynnelText -Text $text -Operation ToLower) | Should -Be $text.ToLower()
     }
@@ -870,5 +877,76 @@ Describe 'the plan a kernel runs under' {
         $verbose = Invoke-FlynnelMap -InputObject (1..1000) -Operation Abs -Plan $plan -Verbose 4>&1 |
             Where-Object { $_ -is [System.Management.Automation.VerboseRecord] }
         ($verbose -join ' ') | Should -Match '1 worker\(s\)'
+    }
+
+    It 'gives the same bits under any plan, because the blocks come from the input' {
+        # Non-integer values, so the order of the additions shows in the
+        # last bits wherever it changes. The blocks are cut from the
+        # length and folded in block order, so no plan can change it.
+        $x = [double[]](1..$script:N | ForEach-Object { 1.0 / $_ })
+        $pinned = New-FlynnelPlan -KOuter 10 -BatchSize $script:N -Workers 1
+        $one = (Measure-FlynnelReduce -InputObject $x -Operation Sum -Plan $pinned).Value
+        $many = (Measure-FlynnelReduce -InputObject $x -Operation Sum).Value
+        [BitConverter]::DoubleToInt64Bits($one) | Should -Be ([BitConverter]::DoubleToInt64Bits($many))
+        $dotOne = Get-FlynnelDotProduct -Left $x -Right $x -Plan $pinned
+        $dotMany = Get-FlynnelDotProduct -Left $x -Right $x
+        [BitConverter]::DoubleToInt64Bits($dotOne) | Should -Be ([BitConverter]::DoubleToInt64Bits($dotMany))
+    }
+}
+
+Describe 'the bulk constructors' {
+    It 'builds each row class from its columns' {
+        $rows = [Flynnel.TextMatch]::FromColumns([uint64[]](0, 7), [uint64[]](1, 2), [string[]]('a', 'b'))
+        $rows.Count | Should -Be 2
+        $rows[1].GetType().FullName | Should -Be 'Flynnel.TextMatch'
+        $rows[1].Index | Should -Be 7
+        $rows[1].LineNumber | Should -Be 2
+        $rows[1].Line | Should -Be 'b'
+
+        $files = [Flynnel.FileMatch]::FromColumns([string[]]('p', 'q'), [uint64[]](3, 4), [string[]]('x', 'y'))
+        $files[0].Path | Should -Be 'p'
+        $measures = [Flynnel.FileMeasure]::FromColumns([string[]]('p'), [uint64[]](5), [uint64[]](6))
+        $measures[0].Lines | Should -Be 5
+        $hashes = [Flynnel.FileHash]::FromColumns([string[]]('p'), [string[]]('ab'), [uint64[]](9))
+        $hashes[0].Hash | Should -Be 'ab'
+        $bins = [Flynnel.HistogramBin]::FromColumns([uint32[]](0, 1), [double[]](0, 1), [double[]](1, 2), [uint64[]](3, 4))
+        $bins[1].High | Should -Be 2
+        $bins[1].Count | Should -Be 4
+    }
+
+    It 'turns an empty Actual into a null, because a real root is never empty' {
+        $checks = [Flynnel.HashCheck]::FromColumns(
+            [string[]]('a', 'b'), [string[]]('x', 'y'), [string[]]('x', ''), [bool[]]($true, $false))
+        $checks[0].Actual | Should -Be 'x'
+        $checks[1].Actual | Should -BeNullOrEmpty
+        $checks[1].IsMatch | Should -BeFalse
+    }
+
+    It 'refuses columns of different lengths, naming both' {
+        { [Flynnel.TextMatch]::FromColumns([uint64[]](0, 1), [uint64[]](1), [string[]]('a')) } |
+            Should -Throw -ExpectedMessage '*Index has 2 element(s) and LineNumber has 1*'
+    }
+}
+
+Describe 'Measure-FlynnelPrimitive' {
+    It 'answers the same sum through every primitive' {
+        # Squares of integers stay exact in a double at this size, so
+        # every split sums to the same value.
+        $x = [double[]](1..$script:N)
+        $want = 0.0
+        foreach ($v in $x) { $want += $v * $v }
+        foreach ($primitive in [Enum]::GetValues([Flynnel.Primitive])) {
+            $run = Measure-FlynnelPrimitive -InputObject $x -Primitive $primitive
+            $run.Primitive | Should -Be $primitive
+            $run.Operation | Should -Be ([Flynnel.MapOp]::Square)
+            $run.Count | Should -Be $script:N
+            $run.Sum | Should -Be $want -Because "$primitive must sum what a serial pass sums"
+            $run.ElapsedNs | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'refuses an operation that needs an operand it does not take' {
+        { Measure-FlynnelPrimitive -InputObject 1, 2, 3 -Primitive ForEachChunk -Operation Clamp -ErrorAction Stop } |
+            Should -Throw -ExpectedMessage '*Clamp needs both Min and Max*'
     }
 }

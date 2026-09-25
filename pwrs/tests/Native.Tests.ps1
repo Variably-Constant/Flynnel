@@ -29,6 +29,13 @@ Describe 'Get-FlynnelNativeEntry' {
         $script:Entry.AbiVersion.GetType().FullName | Should -Be 'System.UInt32'
     }
 
+    It 'reports the kernels revision this build carries as a UInt32' {
+        # A library linking the crate compares its own kernels revision
+        # with this one before it runs a kernel's blocks on this pool.
+        $script:Entry.KernelsRevision | Should -BeGreaterOrEqual 1
+        $script:Entry.KernelsRevision.GetType().FullName | Should -Be 'System.UInt32'
+    }
+
     It 'reports the run-chunks entry as a nonzero UInt64' {
         # An address wider than 32 bits is the ordinary case on a 64-bit
         # process, so anything narrower than UInt64 would truncate it.

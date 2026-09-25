@@ -199,12 +199,14 @@ Describe 'Get-FlynnelThreadTick' {
 }
 
 Describe 'Get-FlynnelReducePath' {
-    It 'names the path after a reduce has run on this thread' {
-        $null = Measure-FlynnelReduce -InputObject (1..50000) -Operation Sum
+    It 'names the path after reduce_chunks has run on this thread' {
+        # The declared kernels run on blocks they cut themselves and do
+        # not reach reduce_chunks; Measure-FlynnelPrimitive is the
+        # cmdlet that does. The crate records the path per thread, and
+        # the cmdlet starts reduce_chunks from the pipeline thread, so a
+        # fold run just now is visible here.
+        $null = Measure-FlynnelPrimitive -InputObject (1..50000) -Primitive ReduceChunks
         $path = Get-FlynnelReducePath
-        # The crate records this per thread. A cmdlet and the kernels
-        # both run on the pipeline thread, so a reduce run just now is
-        # visible here.
         $path | Should -BeIn @([Flynnel.ReducePath]::Flat, [Flynnel.ReducePath]::Bisect)
     }
 }

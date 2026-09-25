@@ -555,19 +555,20 @@ impl Cmdlet for GetFlynnelThreadTick {
 // Paths and spreads
 // ---------------------------------------------------------------------
 
-/// Reads which shape the last reduce on this thread took.
+/// Reads which shape the last `reduce_chunks` fold on this thread took.
 ///
-/// The crate records this per thread, not per process. A cmdlet runs on
-/// the pipeline thread, and so do the kernels here, so a reduce run by
-/// this module is visible to this cmdlet. A reduce run on a worker is
-/// not.
+/// The crate records this per thread, not per process. The declared
+/// kernels run on blocks they cut themselves and do not reach
+/// `reduce_chunks`; Measure-FlynnelPrimitive with `-Primitive
+/// ReduceChunks` does, from the pipeline thread, so its fold is visible
+/// to this cmdlet. A fold started on a worker is not.
 ///
-/// Null means no reduce has run on this thread, which is not the same
-/// as a reduce that took neither path.
+/// Null means no fold has run on this thread, which is not the same as
+/// a fold that took neither path.
 ///
 /// # Examples
 ///
-/// `Measure-FlynnelReduce -InputObject $x -Operation Sum; Get-FlynnelReducePath`
+/// `Measure-FlynnelPrimitive -InputObject $x -Primitive ReduceChunks; Get-FlynnelReducePath`
 #[cmdlet(
     verb = "Get",
     noun = "FlynnelReducePath",

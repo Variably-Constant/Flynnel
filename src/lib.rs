@@ -71,6 +71,7 @@ pub mod flat;
 pub mod foundation;
 #[cfg(feature = "gpu-peer")]
 pub mod gpu_peer;
+pub mod kernels;
 pub mod numa_topology;
 pub mod op_class;
 pub mod sched;

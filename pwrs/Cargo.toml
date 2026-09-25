@@ -68,21 +68,20 @@ flynnel = { path = ".." }
 pwrs = { package = "PoWerRuSt", version = "0.2.0" }
 # The same BLAKE3 flynnel's verify-chain feature already links, pinned
 # to the same version so cargo unifies them and the binary carries one
-# copy. Named here rather than reached through the crate's hasher
-# because the tree functions this module needs live in blake3::hazmat,
-# and a path needs the crate in scope.
-#
-# What they buy: set_input_offset and finalize_non_root give a subtree's
-# chaining value, and merge_subtrees_non_root and merge_subtrees_root
-# combine them, so a file's chunks hash on Flynnel's workers in parallel
-# and still produce the standard BLAKE3 root. Without them the only
-# parallelism is across files.
+# copy. The verify cmdlets digest each chunk they are handed with it
+# (src/verify.rs); the file kernels hash through flynnel::kernels.
 blake3 = "1.8.5"
 # The census tool's parser, and only its. Optional and behind the
 # `census` feature so a module build never compiles it: the tool reads
 # the scheduler's source to prove the binding covers it, and nothing
 # the shipped library does needs a Rust parser.
 syn = { version = "2", features = ["full", "parsing", "clone-impls"], optional = true }
+
+[dev-dependencies]
+# Reads each cmdlet's descriptor in the test that holds it to the
+# crate's kernel descriptor. The same serde_json flynnel's default
+# features already link.
+serde_json = "1"
 
 [features]
 # Builds src/bin/census.rs, which walks ../src and fails when a public

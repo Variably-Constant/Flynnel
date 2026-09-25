@@ -55,34 +55,50 @@
 # is a guess, and a guess here is indistinguishable from coverage.
 
 # ---------------------------------------------------------------------
-# Closure-taking primitives, each reached by a declared kernel
+# The declared kernels, and the closure-taking primitives a declared
+# body reaches
 # ---------------------------------------------------------------------
 # A script has no closure to give and this module never runs a script
 # block on a worker, so these are exercised by naming a body the module
-# owns. Each cmdlet below calls the primitive directly in
-# pwrs/src/kernels.rs.
+# owns. The declared kernels are the crate's own jobs, each cutting its
+# input into fixed blocks, and every kernel cmdlet in pwrs/src/kernels.rs
+# dispatches its job's blocks through for_each_chunk_indexed_min_leaf,
+# the entry flynnel_run_chunks_v1 runs a native caller's chunks on. The
+# pool's other primitives are reached by Measure-FlynnelPrimitive, which
+# runs a declared element operation through the one it is asked for.
+
+[[entry]]
+item = "crate::kernels"
+reason = "internal-to-another-surface"
+note = "the declared kernels as jobs, bound through the kernel cmdlets family: each of Invoke-FlynnelMap, Update-FlynnelArray, Invoke-FlynnelZip, Measure-FlynnelReduce, Get-FlynnelPrefixSum, Get-FlynnelHistogram, Get-FlynnelDotProduct, Sort-FlynnelArray, Measure-FlynnelFileHash, Test-FlynnelFileHash, Search-FlynnelFile, Measure-FlynnelFileLine, Measure-FlynnelFileByte, Search-FlynnelText, Measure-FlynnelTextCount, Split-FlynnelText and Update-FlynnelText builds its kernel's job and drives it on the pool. The job protocol and the answer types are what that driving reads, DESCRIPTORS is held to those cmdlets' metadata by the module's own test, and REVISION is Get-FlynnelNativeEntry's KernelsRevision"
+
+[[entry]]
+item = "crate::sched::par_iter::for_each_chunk_indexed_min_leaf"
+reason = "takes-a-rust-closure"
+reaches = "Invoke-FlynnelMap"
+note = "every declared kernel dispatches its job's blocks through it with a floor of one block, and flynnel_run_chunks_v1 runs a native caller's chunks on it with the caller's floor"
 
 [[entry]]
 item = "crate::sched::par_iter::for_each_chunk"
 reason = "takes-a-rust-closure"
-reaches = "Invoke-FlynnelMap"
-note = "fourteen element-wise operations, one closure each; also Update-FlynnelArray, which runs the same body over a pinned buffer"
+reaches = "Measure-FlynnelPrimitive"
+note = "a declared element operation applied in place, chunk by chunk, under -Primitive ForEachChunk"
 
 [[entry]]
 item = "crate::sched::par_iter::for_each_chunk_indexed"
 reason = "takes-a-rust-closure"
-reaches = "Invoke-FlynnelZip"
-note = "six pairwise operations; the chunk's start index is what reaches the right operand"
+reaches = "Measure-FlynnelPrimitive"
+note = "the same, each chunk handed its start index, under -Primitive ForEachChunkIndexed"
 
 [[entry]]
 item = "crate::sched::par_iter::par_map_in_place"
 reason = "internal-to-another-surface"
-note = "the per-element entry point to the work Invoke-FlynnelMap does through for_each_chunk. It dispatches one task an element, which the crate documents as the shape for few large units; measured at 200,000 doubles that cost 5.21 ms against 0.38 ms chunked, so no kernel here uses it and none should until one has per-element work heavy enough to want it"
+note = "the per-element entry point to element-wise work, which Measure-FlynnelPrimitive runs chunked through for_each_chunk and the declared Map runs on fixed blocks. It dispatches one task an element, which the crate documents as the shape for few large units; measured at 200,000 doubles that cost 5.21 ms against 0.38 ms chunked, so no kernel here uses it and none should until one has per-element work heavy enough to want it"
 
 [[entry]]
 item = "crate::sched::par_iter::par_zip_apply"
 reason = "internal-to-another-surface"
-note = "the per-index entry point to the work Invoke-FlynnelZip does through for_each_chunk_indexed, on the same measurement: 5.67 ms against 0.48 ms"
+note = "the per-index entry point to pairwise work, which the declared Zip runs on fixed blocks; on the same measurement it cost 5.67 ms against 0.48 ms chunked"
 
 # ---------------------------------------------------------------------
 # The dispatch profile, read through the calibration family
@@ -169,7 +185,7 @@ note = "the age past which a stored calibration is re-measured; a constant the s
 [[entry]]
 item = "crate::sched::par_iter::for_each_chunk_min_leaf"
 reason = "internal-to-another-surface"
-note = "for_each_chunk with the 256-item floor replaced by the caller's, for bodies heavy enough per element that a smaller leaf still amortizes. Every declared kernel here is light per element and takes the floor"
+note = "for_each_chunk with the 256-item floor replaced by the caller's, for bodies heavy enough per element that a smaller leaf still amortizes. The declared kernels dispatch whole blocks through for_each_chunk_indexed_min_leaf instead, and Measure-FlynnelPrimitive's element operations are light enough for the default floor"
 
 [[entry]]
 item = "crate::sched::par_iter::for_each_fixed_chunk"
@@ -179,17 +195,12 @@ note = "one task per fixed run of items, which is what par_map_in_place wraps at
 [[entry]]
 item = "crate::sched::par_iter::for_each_chunk_triple"
 reason = "internal-to-another-surface"
-note = "three slices walked in lockstep for out = f(a, b). Invoke-FlynnelZip writes into its left operand instead and so needs two, which for_each_chunk_indexed covers"
+note = "three slices walked in lockstep for out = f(a, b). Invoke-FlynnelZip writes into its left operand instead and so needs two, which its job's blocks cover"
 
 [[entry]]
 item = "crate::sched::par_iter::for_each_chunk_triple_min_leaf"
 reason = "internal-to-another-surface"
 note = "the same three slices with the caller's leaf floor"
-
-[[entry]]
-item = "crate::sched::par_iter::for_each_chunk_indexed_min_leaf"
-reason = "internal-to-another-surface"
-note = "for_each_chunk_indexed with the caller's floor, for a per-element cost heavy enough that the 256 floor would leave the pool serial"
 
 [[entry]]
 item = "crate::sched::par_iter::for_each_indexed"
@@ -199,7 +210,7 @@ note = "per-index rather than per-chunk, so the closure runs once an item. The c
 [[entry]]
 item = "crate::sched::par_iter::for_each_chunk_ref"
 reason = "internal-to-another-surface"
-note = "chunks a shared slice rather than a mutable one, for a body that only reads. Every kernel here either writes through its slice or reduces, and a reduce goes through reduce_chunks"
+note = "chunks a shared slice rather than a mutable one, for a body that only reads. A declared kernel reads and writes through its job's own blocks, and Measure-FlynnelPrimitive's read-only run goes through reduce_chunks"
 
 [[entry]]
 item = "crate::sched::par_iter::collect_indexed_heartbeat"
@@ -219,14 +230,14 @@ note = "collect_indexed for items too cheap to carry a leaf each"
 [[entry]]
 item = "crate::sched::par_iter::reduce_chunks"
 reason = "takes-a-rust-closure"
-reaches = "Measure-FlynnelReduce"
-note = "seven reductions; the init, fold and reduce closures are the module's"
+reaches = "Measure-FlynnelPrimitive"
+note = "a declared element operation's results summed under -Primitive ReduceChunks; the init, fold and reduce closures are the module's, and Get-FlynnelReducePath reads the path the fold took"
 
 [[entry]]
 item = "crate::sched::par_iter::collect_indexed"
 reason = "takes-a-rust-closure"
-reaches = "Get-FlynnelPrefixSum"
-note = "also the two-phase scan, the histogram, the sort's merge rounds, the file kernels and the parallel BLAKE3 subtrees"
+reaches = "Measure-FlynnelPrimitive"
+note = "one sum per chunk of a declared element operation, four chunks a worker, under -Primitive CollectIndexed; the racing family reaches it too, through sched::race"
 
 # ---------------------------------------------------------------------
 # The adaptive profile, read through the calibration family
@@ -1031,7 +1042,7 @@ note = "zeroes and first-touches pages ahead of an allocation that will need the
 item = "crate::sched::arena"
 reason = "takes-a-rust-closure"
 reaches = "Invoke-FlynnelMap"
-note = "join and its conveniences: the two-way fork every bisect is built from. Every array kernel reaches it through for_each_chunk, and Measure-FlynnelHybridJoin reaches the hybrid form of the same shape"
+note = "join and its conveniences: the two-way fork every bisect is built from. Every declared kernel reaches it through the bisect that dispatches its blocks, and Measure-FlynnelHybridJoin reaches the hybrid form of the same shape"
 
 [[entry]]
 item = "crate::sched::cooperative"
@@ -1274,7 +1285,7 @@ note = "a trait a caller's own operation type implements so the dispatcher can c
 item = "crate::flat"
 reason = "takes-a-rust-closure"
 reaches = "Invoke-FlynnelMap"
-note = "the flat re-export of join and the two par_for_each helpers, for callers who want the scheduler without the module path. Same closures as sched::arena and sched::par_iter, reached the same way"
+note = "the flat re-export of join and the two par_for_each helpers, for callers who want the scheduler without the module path. The same closures as sched::arena and sched::par_iter: join through every declared kernel's block dispatch, the par_for_each helpers' for_each_chunk through Measure-FlynnelPrimitive"
 
 [[entry]]
 item = "crate::backend::tpu_jax"

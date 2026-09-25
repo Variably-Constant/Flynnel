@@ -156,6 +156,11 @@ pub struct NativeEntry {
     pub run_chunks_v1: u64,
     /// The ABI version of the entries in this object.
     pub abi_version: u32,
+    /// The revision of the declared kernels this module's cmdlets run,
+    /// `flynnel::kernels::REVISION` in the build that made it. A library
+    /// driving the same kernels from the crate it links answers what
+    /// these cmdlets answer when the two revisions agree.
+    pub kernels_revision: u32,
 }
 
 /// Get the addresses of the module's native entry points.
@@ -194,6 +199,7 @@ impl Cmdlet for GetFlynnelNativeEntry {
         ps.write(NativeEntry {
             run_chunks_v1: flynnel_run_chunks_v1 as RunChunksV1 as usize as u64,
             abi_version: NATIVE_ABI_VERSION,
+            kernels_revision: flynnel::kernels::REVISION,
         })
     }
 }
