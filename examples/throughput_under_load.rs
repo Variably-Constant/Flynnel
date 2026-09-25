@@ -32,7 +32,8 @@
 //! on-core path, whether the on-core spread differs from the wall
 //! spread, whether a window has been classified, what the SMT answer
 //! came out as, how the resolved width compares to the width the
-//! process is allowed, and where the spin window ended up. A switch
+//! process is allowed, where the spin window ended up, and how often
+//! this process's latch waits armed and took the monitor rung. A switch
 //! whose figures are identical across its own on and off arms did not
 //! engage, and its throughput row says nothing about the mechanism.
 //!
@@ -422,6 +423,7 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
          smt_declined={} smt_allowed={} \
          spin_adaptive={} spin_window={} spin_adapts={} idle_yields={} \
          join_park={} join_parks={} slot_park_now={} join_park_oversubscribed={} long_yields={} \
+         latch_monitor={} latch_monitor_arms={} latch_monitor_waits={} \
          arm_ewma_default_ns={} arm_ewma_alternative_ns={}",
         site.leaf_count(),
         site.oncore_items(),
@@ -447,6 +449,9 @@ fn engagement(smt_prior: bool, duty_ms: u64, reps: u32, irregular: u8, block_ite
         flynnel::sched::levers::slot_park_now(),
         flynnel::sched::levers::join_park_oversubscribed(),
         flynnel::total_long_yields(),
+        flynnel::sched::levers::latch_monitor(),
+        flynnel::sched::total_latch_monitor_arms(),
+        flynnel::sched::total_latch_monitor_waits(),
         reading(Some(site.arm_ewmas().0).filter(|ns| *ns > 0)),
         reading(Some(site.arm_ewmas().1).filter(|ns| *ns > 0)),
     );
