@@ -69,6 +69,30 @@ fn per_item_cv2(sumsq_per_item: u64, mean: u64, items: u64) -> u64 {
     (spread.saturating_mul(1000) / expected) as u64
 }
 
+/// Lowers `slot` to `value` where `value` is below it, from a plain load
+/// and a plain store that lands only when the extreme moves.
+fn publish_min(slot: &AtomicU64, value: u64) {
+    if value < slot.load(Ordering::Relaxed) {
+        slot.store(value, Ordering::Relaxed);
+    }
+}
+
+/// Raises `slot` to `value` where `value` is above it, the same way as
+/// [`publish_min`].
+fn publish_max(slot: &AtomicU64, value: u64) {
+    if value > slot.load(Ordering::Relaxed) {
+        slot.store(value, Ordering::Relaxed);
+    }
+}
+
+/// Adds one to `slot` with a plain load and store.
+fn publish_count(slot: &AtomicU64) {
+    slot.store(
+        slot.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+}
+
 /// The weight of a batch that spent its whole interval on a core.
 const FULL_WEIGHT: u64 = 1000;
 
@@ -267,6 +291,12 @@ pub struct CallSiteState {
     // Mean leaf time in nanoseconds and cv^2 per mille of the delta
     // window the latest tick classified, and how many windows have been
     // classified.
+    //
+    // The tick writes these and the fields below with plain loads and
+    // stores, as it keeps the snapshot above, and takes no locked
+    // read-modify-write. Two ticks that overlap can each store over the
+    // other, so under overlap a count can miss a window and an extreme
+    // can miss the window that set it.
     window_mean_ns: AtomicU64,
     window_cv2: AtomicU64,
     window_ticks: AtomicU64,
@@ -1225,21 +1255,17 @@ impl CallSiteState {
         let cv2 = oncore_used.unwrap_or(wall_cv2);
         self.window_mean_ns.store(mean_ns, Ordering::Relaxed);
         self.window_cv2.store(cv2, Ordering::Relaxed);
-        self.window_ticks.fetch_add(1, Ordering::Relaxed);
-        self.window_cv2_min.fetch_min(cv2, Ordering::Relaxed);
-        self.window_cv2_max.fetch_max(cv2, Ordering::Relaxed);
+        publish_count(&self.window_ticks);
+        publish_min(&self.window_cv2_min, cv2);
+        publish_max(&self.window_cv2_max, cv2);
         self.window_wall_cv2.store(wall_cv2, Ordering::Relaxed);
-        self.window_wall_cv2_min
-            .fetch_min(wall_cv2, Ordering::Relaxed);
-        self.window_wall_cv2_max
-            .fetch_max(wall_cv2, Ordering::Relaxed);
+        publish_min(&self.window_wall_cv2_min, wall_cv2);
+        publish_max(&self.window_wall_cv2_max, wall_cv2);
         if let Some(oncore) = oncore_used {
             self.window_oncore_cv2.store(oncore, Ordering::Relaxed);
-            self.window_oncore_cv2_min
-                .fetch_min(oncore, Ordering::Relaxed);
-            self.window_oncore_cv2_max
-                .fetch_max(oncore, Ordering::Relaxed);
-            self.window_oncore_ticks.fetch_add(1, Ordering::Relaxed);
+            publish_min(&self.window_oncore_cv2_min, oncore);
+            publish_max(&self.window_oncore_cv2_max, oncore);
+            publish_count(&self.window_oncore_ticks);
         }
         let observed = classify_observed(mean_ns, cv2);
         let observed_tag = class_tag_encode(observed);

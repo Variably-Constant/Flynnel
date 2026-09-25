@@ -9,6 +9,18 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- The classifier tick publishes its window readers with plain loads and
+  stores. It kept the extremes and counts behind
+  `window_cv2_range_per_mille`, `window_wall_cv2_range_per_mille`,
+  `window_oncore_cv2_range_per_mille`, `window_ticks` and
+  `window_oncore_ticks` with `fetch_min`, `fetch_max` and `fetch_add` on
+  every tick, each a locked read-modify-write and on x86 the first two a
+  compare-exchange loop. It now reads each extreme and stores only when
+  it moves, the way it already kept its snapshot of the counters. Two
+  ticks that overlap can each store over the other, so under overlap a
+  count can miss a window and an extreme can miss the window that set
+  it. No scheduling decision reads any of them.
+
 - `external_dispatch`'s documentation says what the caller does: it
   hands the join to a worker, spins for the plan's budget, then parks
   until the latch sets, and runs none of the join's work itself.
