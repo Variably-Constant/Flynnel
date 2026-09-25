@@ -563,7 +563,7 @@ fn arg_to_json(arg: &KernelArg<'_>) -> Result<serde_json::Value, BackendError> {
         KernelArg::F32(v) => serde_json::json!({"f32": v}),
         KernelArg::F64(v) => serde_json::json!({"f64": v}),
         KernelArg::DevicePtr(p) => serde_json::json!({"device_ptr": p as u64}),
-        KernelArg::HostSlice(_) => return Err(BackendError::NotSupported),
+        KernelArg::HostSlice(_) | KernelArg::Buffer(_) => return Err(BackendError::NotSupported),
     };
     Ok(v)
 }

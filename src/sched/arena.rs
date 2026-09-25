@@ -121,12 +121,22 @@ where
 /// Worker count per node picked from [`crate::cpu_info`]
 /// + per-node CPU mask with env overrides (see module doc).
 pub fn global_local_arena() -> &'static Arc<NumaArena> {
-    static ARENA: OnceLock<Arc<NumaArena>> = OnceLock::new();
-    ARENA.get_or_init(|| {
+    GLOBAL_ARENA.get_or_init(|| {
         let per_node_override = pick_worker_count_per_node();
         NumaArena::new(per_node_override)
     })
 }
+
+/// Whether [`global_local_arena`] has started in this process, read
+/// without starting it. A library that links the crate beside another
+/// module's pool, and must not start a second one, can hold itself to
+/// that with this.
+pub fn global_local_arena_started() -> bool {
+    GLOBAL_ARENA.get().is_some()
+}
+
+/// The arena [`global_local_arena`] starts on first use.
+static GLOBAL_ARENA: OnceLock<Arc<NumaArena>> = OnceLock::new();
 
 /// Decide how many workers each NUMA sub-arena should spawn.
 ///

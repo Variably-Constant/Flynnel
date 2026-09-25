@@ -17,23 +17,46 @@
 //!     single persistent worker thread the constructor spawns
 //!     (routed via a flynnel `NotifyHub` MPMC ring); `Drop` shuts
 //!     the hub down and joins the worker;
-//!   - implements `register_kernel` by parsing PTX source text
-//!     via cudarc's safe `CudaContext::load_module` API and
-//!     storing the resulting function pointer in an internal
-//!     map;
-//!   - implements `dispatch_kernel` by reading the registered
-//!     function and launching it through cudarc's safe
-//!     `launch_builder` API and the corresponding `unsafe`
-//!     `launch` call (argument count / type correctness is a
-//!     kernel-author contract that cudarc's launch cannot
-//!     verify) with the supplied `count` work-items and
-//!     `KernelArg` list.
+//!   - implements `register_kernel` as [`CudaBackend::register_ptx`]
+//!     over the UTF-8 text of the source bytes;
+//!   - implements `dispatch_kernel` by launching the registered
+//!     function through cudarc's `launch_builder` with the supplied
+//!     `count` work-items and [`KernelArg`] list. Argument count and
+//!     type correctness is a contract with the kernel's author, which
+//!     cudarc's launch cannot verify.
+//! - Device memory: a [`DeviceBuffer`] is made by
+//!   [`CudaBackend::alloc_zeroed`] or [`CudaBackend::upload`], written
+//!   by [`CudaBackend::copy_in`], read by [`CudaBackend::copy_out`] or
+//!   [`CudaBackend::copy_out_range`], handed to a kernel by
+//!   [`DeviceBuffer::arg`], and freed when dropped.
+//! - [`CudaBackend::device_name`] and [`CudaBackend::mem_info`], so a
+//!   caller can refuse or cut a block before allocating it.
+//!
+//! ## Nothing beyond the driver
+//!
+//! A kernel loads from PTX text through the driver's own JIT, and every
+//! allocation, copy and launch is a driver call. Nothing here calls NVRTC
+//! or needs the CUDA toolkit, so PTX written once for a target the driver
+//! supports loads on any machine with an NVIDIA driver and no other CUDA
+//! software.
+//!
+//! ## Order
+//!
+//! Copies and launches on one stream run in the order they were called;
+//! the copies, and [`DispatchBackend::dispatch_kernel`], use the default
+//! stream. [`CudaBackend::copy_out`] and [`CudaBackend::copy_out_range`]
+//! return only once the host slice holds the data. A [`DeviceBuffer`] is
+//! freed when dropped, and the free waits for every copy and launch that
+//! used it, on whichever stream. A launch through
+//! [`CudaBackend::dispatch_kernel_on_stream`] on another stream is ordered
+//! against the default stream's copies only by the caller: synchronize or
+//! join that stream before reading back what the kernel wrote.
 //!
 //! ## When to use
 //!
 //! For consumers that have pre-compiled PTX they want to launch
 //! through a uniform Flynnel surface. Consumers that need richer
-//! CUDA semantics (per-launch streams, async H2D copies, CUDA
+//! CUDA semantics (per-launch streams, pinned host memory, CUDA
 //! graphs) typically ship their own
 //! [`crate::backend::DispatchBackend`] impl backed by their
 //! preferred CUDA wrapper.
@@ -44,17 +67,154 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, DriverError, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchArgs,
+    LaunchConfig, PushKernelArg,
+};
 
-use crate::sched::notify_ring::{NotifyHub, NotifySender};
+use crate::sched::notify_ring::{NotifyHub, NotifySendResult, NotifySender};
 
 use crate::backend::{
-    Backend, BackendCapabilities, BackendError, DispatchBackend, KernelArg, KernelHandle,
+    Backend, BackendCapabilities, BackendError, DeviceArg, DispatchBackend, KernelArg, KernelHandle,
 };
 
 /// Boxed closure shape the persistent worker thread consumes from
 /// the dispatch_one channel.
 type WorkItem = Box<dyn FnOnce() + Send + 'static>;
+
+mod sealed {
+    /// What a [`super::DeviceElement`] needs from cudarc, kept off the
+    /// public trait so no cudarc name reaches a caller's signature.
+    pub trait Sealed:
+        cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy + Send + Sync + 'static
+    {
+    }
+
+    impl Sealed for u8 {}
+    impl Sealed for i32 {}
+    impl Sealed for u32 {}
+    impl Sealed for i64 {}
+    impl Sealed for u64 {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+}
+
+/// An element type a [`DeviceBuffer`] holds: `u8`, `i32`, `u32`, `i64`,
+/// `u64`, `f32` or `f64`. Sealed, so the set is exactly the one a launch
+/// knows how to pass as a [`KernelArg::Buffer`].
+pub trait DeviceElement: sealed::Sealed {}
+
+impl DeviceElement for u8 {}
+impl DeviceElement for i32 {}
+impl DeviceElement for u32 {}
+impl DeviceElement for i64 {}
+impl DeviceElement for u64 {}
+impl DeviceElement for f32 {}
+impl DeviceElement for f64 {}
+
+/// Device memory holding a run of `T` on one CUDA device, made by
+/// [`CudaBackend::alloc_zeroed`] or [`CudaBackend::upload`].
+///
+/// Freed when dropped. The free waits for every copy and launch that
+/// used the buffer, on whichever of the backend's streams, so dropping it
+/// while a kernel that reads it is still queued is safe. Only the backend
+/// that allocated it accepts it for a copy or a launch.
+pub struct DeviceBuffer<T: DeviceElement> {
+    slice: CudaSlice<T>,
+}
+
+impl<T: DeviceElement> DeviceBuffer<T> {
+    /// Elements the buffer holds.
+    pub fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    /// Whether it holds none, which an allocation never makes.
+    pub fn is_empty(&self) -> bool {
+        self.slice.is_empty()
+    }
+
+    /// The buffer as a kernel argument. It reaches the kernel as a 64-bit
+    /// device pointer to its first element.
+    pub fn arg(&self) -> KernelArg<'_> {
+        KernelArg::Buffer(self)
+    }
+}
+
+impl<T: DeviceElement> DeviceArg for DeviceBuffer<T> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl<T: DeviceElement> std::fmt::Debug for DeviceBuffer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceBuffer")
+            .field("element", &std::any::type_name::<T>())
+            .field("len", &self.slice.len())
+            .field("device", &self.slice.ordinal())
+            .finish()
+    }
+}
+
+/// A launch's view of one [`KernelArg::Buffer`]: the typed slice, handed
+/// to cudarc as it is, so cudarc orders the launch after the buffer's
+/// last write and its free after the launch.
+enum BufferRef<'a> {
+    U8(&'a CudaSlice<u8>),
+    I32(&'a CudaSlice<i32>),
+    U32(&'a CudaSlice<u32>),
+    I64(&'a CudaSlice<i64>),
+    U64(&'a CudaSlice<u64>),
+    F32(&'a CudaSlice<f32>),
+    F64(&'a CudaSlice<f64>),
+}
+
+impl<'a> BufferRef<'a> {
+    /// The [`DeviceBuffer`] behind `arg`, or `None` when it is some other
+    /// backend's memory.
+    fn of(arg: &'a dyn DeviceArg) -> Option<Self> {
+        let any = arg.as_any();
+        macro_rules! find {
+            ($($t:ty => $variant:ident),*) => {
+                $(
+                    if let Some(buffer) = any.downcast_ref::<DeviceBuffer<$t>>() {
+                        return Some(BufferRef::$variant(&buffer.slice));
+                    }
+                )*
+            };
+        }
+        find!(u8 => U8, i32 => I32, u32 => U32, i64 => I64, u64 => U64, f32 => F32, f64 => F64);
+        None
+    }
+
+    fn context(&self) -> &Arc<CudaContext> {
+        match self {
+            BufferRef::U8(s) => s.context(),
+            BufferRef::I32(s) => s.context(),
+            BufferRef::U32(s) => s.context(),
+            BufferRef::I64(s) => s.context(),
+            BufferRef::U64(s) => s.context(),
+            BufferRef::F32(s) => s.context(),
+            BufferRef::F64(s) => s.context(),
+        }
+    }
+
+    fn push_to<'b>(&self, builder: &mut LaunchArgs<'b>)
+    where
+        'a: 'b,
+    {
+        match *self {
+            BufferRef::U8(s) => builder.arg(s),
+            BufferRef::I32(s) => builder.arg(s),
+            BufferRef::U32(s) => builder.arg(s),
+            BufferRef::I64(s) => builder.arg(s),
+            BufferRef::U64(s) => builder.arg(s),
+            BufferRef::F32(s) => builder.arg(s),
+            BufferRef::F64(s) => builder.arg(s),
+        };
+    }
+}
 
 /// cudarc-backed reference CUDA backend.
 pub struct CudaBackend {
@@ -101,6 +261,10 @@ struct LoadedKernel {
 /// slot whether or not it is used.
 const MAX_KERNELS: usize = 1024;
 
+/// Bytes kept for each of the driver JIT's two logs when a registration
+/// is refused.
+const JIT_LOG_BYTES: usize = 16 * 1024;
+
 impl std::fmt::Debug for CudaBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CudaBackend")
@@ -116,8 +280,7 @@ impl CudaBackend {
     /// removed, and they are freed in `Drop`, which cannot run while
     /// a caller holds `&self`.
     fn loaded(&self, handle: KernelHandle) -> Result<&LoadedKernel, BackendError> {
-        let unknown =
-            || BackendError::Launch(format!("unknown kernel handle {handle:?}"));
+        let unknown = || BackendError::Launch(format!("unknown kernel handle {handle:?}"));
         let slot = self.kernels.get(handle.0 as usize).ok_or_else(unknown)?;
         let published = slot.load(Ordering::Acquire);
         if published.is_null() {
@@ -138,6 +301,10 @@ impl CudaBackend {
     /// Initialize the CUDA driver on a specific device. `device_id`
     /// indexes into the platform's enumerated GPUs (0 for the
     /// first NVIDIA GPU).
+    ///
+    /// A driver refusal is [`BackendError::DeviceUnavailable`], which
+    /// carries no text, so the driver's own error is written to stderr
+    /// beside it.
     pub fn with_device(device_id: u32) -> Result<Self, BackendError> {
         // Two gates before the first driver call. cudarc resolves its
         // symbols lazily and panics when it cannot load libcuda, so the
@@ -232,6 +399,199 @@ impl CudaBackend {
         }
     }
 
+    /// The device's name, as the driver reports it.
+    pub fn device_name(&self) -> Result<String, BackendError> {
+        self.context
+            .name()
+            .map_err(|e| map_driver_error(self.device_id, e))
+    }
+
+    /// Free and total memory on the device, in bytes, as the driver
+    /// reports them at the moment of the call, so a caller can refuse or
+    /// cut a block before allocating it.
+    pub fn mem_info(&self) -> Result<(usize, usize), BackendError> {
+        self.context
+            .mem_get_info()
+            .map_err(|e| memory_error(format!("reading device {}'s memory", self.device_id), e))
+    }
+
+    /// Device memory for `len` elements of `T`, set to zero. Refused for
+    /// zero elements, which the driver cannot allocate.
+    pub fn alloc_zeroed<T: DeviceElement>(
+        &self,
+        len: usize,
+    ) -> Result<DeviceBuffer<T>, BackendError> {
+        if len == 0 {
+            return Err(BackendError::Memory(
+                "a device buffer needs at least one element".to_string(),
+            ));
+        }
+        let slice = self.stream.alloc_zeros::<T>(len).map_err(|e| {
+            memory_error(
+                format!(
+                    "allocating {len} {} on device {}",
+                    std::any::type_name::<T>(),
+                    self.device_id
+                ),
+                e,
+            )
+        })?;
+        Ok(DeviceBuffer { slice })
+    }
+
+    /// Device memory holding a copy of `data`. Refused for an empty slice.
+    pub fn upload<T: DeviceElement>(&self, data: &[T]) -> Result<DeviceBuffer<T>, BackendError> {
+        if data.is_empty() {
+            return Err(BackendError::Memory(
+                "a device buffer needs at least one element".to_string(),
+            ));
+        }
+        let slice = self.stream.clone_htod(data).map_err(|e| {
+            memory_error(
+                format!(
+                    "uploading {} {} to device {}",
+                    data.len(),
+                    std::any::type_name::<T>(),
+                    self.device_id
+                ),
+                e,
+            )
+        })?;
+        Ok(DeviceBuffer { slice })
+    }
+
+    /// Copies `data` into the start of `buf`, leaving the rest as it was.
+    /// Refused when `data` is longer than `buf`, or `buf` belongs to
+    /// another backend.
+    pub fn copy_in<T: DeviceElement>(
+        &self,
+        data: &[T],
+        buf: &mut DeviceBuffer<T>,
+    ) -> Result<(), BackendError> {
+        self.check_owner(&buf.slice)?;
+        if data.len() > buf.len() {
+            return Err(BackendError::Memory(format!(
+                "{} elements do not fit a buffer of {}",
+                data.len(),
+                buf.len()
+            )));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.stream
+            .memcpy_htod(data, &mut buf.slice)
+            .map_err(|e| memory_error(format!("copying {} elements in", data.len()), e))
+    }
+
+    /// Copies every element of `buf` into `out`, whose length must be the
+    /// buffer's, and returns once `out` holds them.
+    pub fn copy_out<T: DeviceElement>(
+        &self,
+        buf: &DeviceBuffer<T>,
+        out: &mut [T],
+    ) -> Result<(), BackendError> {
+        if out.len() != buf.len() {
+            return Err(BackendError::Memory(format!(
+                "a buffer of {} elements read into a slice of {}",
+                buf.len(),
+                out.len()
+            )));
+        }
+        self.copy_out_range(buf, 0, out)
+    }
+
+    /// Copies `out.len()` elements of `buf`, starting at element
+    /// `offset`, into `out`, and returns once `out` holds them. A buffer
+    /// whose use is a prefix of it reads back only that prefix.
+    pub fn copy_out_range<T: DeviceElement>(
+        &self,
+        buf: &DeviceBuffer<T>,
+        offset: usize,
+        out: &mut [T],
+    ) -> Result<(), BackendError> {
+        self.check_owner(&buf.slice)?;
+        let end = offset
+            .checked_add(out.len())
+            .filter(|&end| end <= buf.len())
+            .ok_or_else(|| {
+                BackendError::Memory(format!(
+                    "{} elements from element {offset} of a buffer of {}",
+                    out.len(),
+                    buf.len()
+                ))
+            })?;
+        if out.is_empty() {
+            return Ok(());
+        }
+        let view = buf.slice.slice(offset..end);
+        self.stream
+            .memcpy_dtoh(&view, out)
+            .map_err(|e| memory_error(format!("copying elements {offset}..{end} out"), e))?;
+        // The copy is queued on the stream; the data is the caller's only
+        // once the stream has run it.
+        self.stream
+            .synchronize()
+            .map_err(|e| memory_error(format!("waiting for elements {offset}..{end}"), e))
+    }
+
+    /// Refuses a slice this backend did not allocate: memory another
+    /// context owns is not addressable from this one.
+    fn check_owner<T>(&self, slice: &CudaSlice<T>) -> Result<(), BackendError> {
+        if Arc::ptr_eq(slice.context(), &self.context) {
+            Ok(())
+        } else {
+            Err(BackendError::Memory(format!(
+                "a buffer allocated by another CUDA backend was handed to device {}'s",
+                self.device_id
+            )))
+        }
+    }
+
+    /// Loads kernel `name` from PTX text and returns the handle
+    /// [`DispatchBackend::dispatch_kernel`] launches it by.
+    ///
+    /// The PTX is compiled for this device by the driver's own JIT, so
+    /// loading needs no CUDA toolkit and never calls NVRTC: PTX written
+    /// once for a target the driver supports loads on any machine with an
+    /// NVIDIA driver. A refusal is [`BackendError::KernelCompile`] carrying
+    /// the driver's error and the JIT's error and information logs.
+    pub fn register_ptx(&self, name: &str, ptx: &str) -> Result<KernelHandle, BackendError> {
+        if ptx.contains('\0') {
+            return Err(BackendError::KernelCompile(format!(
+                "the PTX for `{name}` holds a NUL byte, which ends the text the driver reads"
+            )));
+        }
+        let module = match self.context.load_module(cudarc::nvrtc::Ptx::from_src(ptx)) {
+            Ok(module) => module,
+            Err(e) => {
+                return Err(BackendError::KernelCompile(format!(
+                    "the driver refused the PTX for `{name}`: {e:?}; {}",
+                    jit_logs(&self.context, ptx)
+                )));
+            }
+        };
+        let function = module
+            .load_function(name)
+            .map_err(|e| BackendError::KernelCompile(format!("function lookup `{name}`: {e:?}")))?;
+        let handle_id = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let index = handle_id as usize;
+        if index >= MAX_KERNELS {
+            return Err(BackendError::KernelCompile(format!(
+                "this backend holds {MAX_KERNELS} kernels and `{name}` would be the {index}th"
+            )));
+        }
+        let entry = Box::into_raw(Box::new(LoadedKernel {
+            _module: module,
+            function,
+        }));
+        // The counter handed this index to this call alone, so nothing
+        // else writes this slot, and the entry is complete before the
+        // pointer that publishes it.
+        self.kernels[index].store(entry, Ordering::Release);
+        Ok(KernelHandle(handle_id))
+    }
+
     /// Launch a registered kernel on a caller-chosen stream.
     /// Same semantics as [`DispatchBackend::dispatch_kernel`] but
     /// targets `stream` (typically [`Self::stream`] or
@@ -239,6 +599,11 @@ impl CudaBackend {
     /// Consumers driving a ping-pong pipeline call this with
     /// `stream_for_slot(iter & 1)` so adjacent iterations queue
     /// on independent streams and overlap on the GPU.
+    ///
+    /// A count of zero launches nothing and answers `Ok`. A
+    /// [`KernelArg::HostSlice`] is copied to device memory of its own on
+    /// `stream` before the launch and freed after it. A
+    /// [`KernelArg::Buffer`] must be one this backend allocated.
     pub fn dispatch_kernel_on_stream(
         &self,
         stream: &Arc<CudaStream>,
@@ -247,20 +612,20 @@ impl CudaBackend {
         args: &[KernelArg<'_>],
     ) -> Result<(), BackendError> {
         let function = self.loaded(handle)?.function.clone();
-        let block = 256u32.min(count.max(1));
-        let grid = count.div_ceil(block);
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (block, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut builder = stream.launch_builder(&function);
+        if count == 0 {
+            return Ok(());
+        }
+        // Owned storage for every value the builder points into: it holds
+        // raw pointers until `launch` returns, so all of it is declared
+        // before the builder and outlives it.
         let mut i32s: Vec<i32> = Vec::new();
         let mut i64s: Vec<i64> = Vec::new();
         let mut u32s: Vec<u32> = Vec::new();
         let mut u64s: Vec<u64> = Vec::new();
         let mut f32s: Vec<f32> = Vec::new();
         let mut f64s: Vec<f64> = Vec::new();
+        let mut staged: Vec<CudaSlice<u8>> = Vec::new();
+        let mut buffers: Vec<BufferRef<'_>> = Vec::new();
         for arg in args {
             match arg {
                 KernelArg::I32(v) => i32s.push(*v),
@@ -270,11 +635,22 @@ impl CudaBackend {
                 KernelArg::F32(v) => f32s.push(*v),
                 KernelArg::F64(v) => f64s.push(*v),
                 KernelArg::DevicePtr(p) => u64s.push(*p as u64),
-                KernelArg::HostSlice(_) => return Err(BackendError::NotSupported),
+                KernelArg::HostSlice(bytes) => staged.push(self.stage(stream, bytes)?),
+                KernelArg::Buffer(buffer) => buffers.push(self.own_buffer(*buffer)?),
             }
         }
+        let block = 256u32.min(count);
+        let cfg = LaunchConfig {
+            grid_dim: (count.div_ceil(block), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&function);
+        // Second pass: push references into the storage in the order the
+        // caller gave the arguments.
         let (mut ii32, mut ii64, mut iu32, mut iu64, mut if32, mut if64) =
             (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut istaged, mut ibuffer) = (0usize, 0usize);
         for arg in args {
             match arg {
                 KernelArg::I32(_) => {
@@ -289,7 +665,7 @@ impl CudaBackend {
                     builder.arg(&u32s[iu32]);
                     iu32 += 1;
                 }
-                KernelArg::U64(_) => {
+                KernelArg::U64(_) | KernelArg::DevicePtr(_) => {
                     builder.arg(&u64s[iu64]);
                     iu64 += 1;
                 }
@@ -301,20 +677,61 @@ impl CudaBackend {
                     builder.arg(&f64s[if64]);
                     if64 += 1;
                 }
-                KernelArg::DevicePtr(_) => {
-                    builder.arg(&u64s[iu64]);
-                    iu64 += 1;
+                KernelArg::HostSlice(_) => {
+                    builder.arg(&staged[istaged]);
+                    istaged += 1;
                 }
-                KernelArg::HostSlice(_) => unreachable!("rejected in first pass"),
+                KernelArg::Buffer(_) => {
+                    buffers[ibuffer].push_to(&mut builder);
+                    ibuffer += 1;
+                }
             }
         }
-        // SAFETY: identical to dispatch_kernel - the typed
-        // storage Vecs live until this function returns, after
-        // the launch returns. Argument count / type correctness
-        // is the kernel author's contract.
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| BackendError::Launch(format!("{e:?}")))?;
+        // SAFETY: every argument reference points into the storage above,
+        // which is declared before the builder and lives until this
+        // function returns, after the launch returns. The function comes
+        // from a module the kernel table keeps alive. Argument count and
+        // type correctness is a contract with the kernel's author, the
+        // safety hole cudarc documents on launch().
+        unsafe { builder.launch(cfg) }.map_err(|e| BackendError::Launch(format!("{e:?}")))?;
         Ok(())
+    }
+
+    /// A host slice's bytes in device memory of their own for one launch
+    /// on `stream`. Dropped after the launch, its free waits for the
+    /// kernel.
+    fn stage(&self, stream: &Arc<CudaStream>, bytes: &[u8]) -> Result<CudaSlice<u8>, BackendError> {
+        if bytes.is_empty() {
+            return Err(BackendError::Memory(
+                "an empty host slice has no device copy to pass".to_string(),
+            ));
+        }
+        stream.clone_htod(bytes).map_err(|e| {
+            memory_error(
+                format!(
+                    "copying a {}-byte host slice to device {}",
+                    bytes.len(),
+                    self.device_id
+                ),
+                e,
+            )
+        })
+    }
+
+    /// The typed buffer behind a [`KernelArg::Buffer`]. Another
+    /// backend's kind of memory is [`BackendError::NotSupported`]; a CUDA
+    /// buffer another backend allocated is refused on the terms of
+    /// [`Self::check_owner`].
+    fn own_buffer<'a>(&self, arg: &'a dyn DeviceArg) -> Result<BufferRef<'a>, BackendError> {
+        let buffer = BufferRef::of(arg).ok_or(BackendError::NotSupported)?;
+        if Arc::ptr_eq(buffer.context(), &self.context) {
+            Ok(buffer)
+        } else {
+            Err(BackendError::Memory(format!(
+                "{arg:?} was allocated by another CUDA backend than device {}'s",
+                self.device_id
+            )))
+        }
     }
 }
 
@@ -364,38 +781,22 @@ impl DispatchBackend for CudaBackend {
     fn dispatch_one(&self, work: Box<dyn FnOnce() + Send>) {
         // Send to the persistent worker thread (no per-call OS
         // thread spawn). The notify hub is MPMC and lock-free on
-        // the hot path.
-        drop(self.worker_tx.send(work));
+        // the hot path. It closes only in Drop, which cannot run while
+        // a caller holds `&self`, and a closed hub is said rather than
+        // passed over.
+        if let NotifySendResult::Closed(_) = self.worker_tx.send(work) {
+            eprintln!(
+                "[flynnel::cuda] device {}: the worker has shut down, so the work item did not run",
+                self.device_id
+            );
+        }
     }
 
     fn register_kernel(&self, name: &str, source: &[u8]) -> Result<KernelHandle, BackendError> {
         // The `source` is expected to be PTX text (UTF-8 bytes).
-        let ptx_text = std::str::from_utf8(source)
+        let ptx = std::str::from_utf8(source)
             .map_err(|e| BackendError::KernelCompile(format!("PTX must be UTF-8: {e}")))?;
-        let ptx = cudarc::nvrtc::Ptx::from_src(ptx_text);
-        let module = self
-            .context
-            .load_module(ptx)
-            .map_err(|e| BackendError::KernelCompile(format!("{e:?}")))?;
-        let function = module
-            .load_function(name)
-            .map_err(|e| BackendError::KernelCompile(format!("function lookup `{name}`: {e:?}")))?;
-        let handle_id = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let index = handle_id as usize;
-        if index >= MAX_KERNELS {
-            return Err(BackendError::KernelCompile(format!(
-                "this backend holds {MAX_KERNELS} kernels and `{name}` would be the {index}th"
-            )));
-        }
-        let entry = Box::into_raw(Box::new(LoadedKernel {
-            _module: module,
-            function,
-        }));
-        // The counter handed this index to this call alone, so nothing
-        // else writes this slot, and the entry is complete before the
-        // pointer that publishes it.
-        self.kernels[index].store(entry, Ordering::Release);
-        Ok(KernelHandle(handle_id))
+        self.register_ptx(name, ptx)
     }
 
     fn dispatch_kernel(
@@ -404,93 +805,11 @@ impl DispatchBackend for CudaBackend {
         count: u32,
         args: &[KernelArg<'_>],
     ) -> Result<(), BackendError> {
-        let function = self.loaded(handle)?.function.clone();
-        // Launch geometry: pick a sensible block size (256) and
-        // grid size to cover `count` work-items. Consumers that
-        // need precise launch configuration ship their own backend
-        // impl; the reference impl provides a one-size-fits-most
-        // heuristic.
-        let block = 256u32.min(count.max(1));
-        let grid = count.div_ceil(block);
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (block, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        // Build the launch through cudarc's safe builder. Each
-        // KernelArg variant maps to a typed reference push; the
-        // builder handles pointer marshalling internally.
-        let mut builder = self.stream.launch_builder(&function);
-        // Owned storage for the scalar values we push: the builder
-        // holds raw pointers into these for the duration of
-        // .launch(), so they must outlive the call.
-        let mut i32s: Vec<i32> = Vec::new();
-        let mut i64s: Vec<i64> = Vec::new();
-        let mut u32s: Vec<u32> = Vec::new();
-        let mut u64s: Vec<u64> = Vec::new();
-        let mut f32s: Vec<f32> = Vec::new();
-        let mut f64s: Vec<f64> = Vec::new();
-        // First pass: fill the typed storage so backing pointers
-        // do not move once we start pushing args.
-        for arg in args {
-            match arg {
-                KernelArg::I32(v) => i32s.push(*v),
-                KernelArg::I64(v) => i64s.push(*v),
-                KernelArg::U32(v) => u32s.push(*v),
-                KernelArg::U64(v) => u64s.push(*v),
-                KernelArg::F32(v) => f32s.push(*v),
-                KernelArg::F64(v) => f64s.push(*v),
-                KernelArg::DevicePtr(p) => u64s.push(*p as u64),
-                KernelArg::HostSlice(_) => return Err(BackendError::NotSupported),
-            }
-        }
-        // Second pass: push references into the typed storage in
-        // the original caller-supplied order.
-        let (mut ii32, mut ii64, mut iu32, mut iu64, mut if32, mut if64) =
-            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-        for arg in args {
-            match arg {
-                KernelArg::I32(_) => {
-                    builder.arg(&i32s[ii32]);
-                    ii32 += 1;
-                }
-                KernelArg::I64(_) => {
-                    builder.arg(&i64s[ii64]);
-                    ii64 += 1;
-                }
-                KernelArg::U32(_) => {
-                    builder.arg(&u32s[iu32]);
-                    iu32 += 1;
-                }
-                KernelArg::U64(_) => {
-                    builder.arg(&u64s[iu64]);
-                    iu64 += 1;
-                }
-                KernelArg::F32(_) => {
-                    builder.arg(&f32s[if32]);
-                    if32 += 1;
-                }
-                KernelArg::F64(_) => {
-                    builder.arg(&f64s[if64]);
-                    if64 += 1;
-                }
-                KernelArg::DevicePtr(_) => {
-                    builder.arg(&u64s[iu64]);
-                    iu64 += 1;
-                }
-                KernelArg::HostSlice(_) => unreachable!("rejected in first pass"),
-            }
-        }
-        // SAFETY: every arg reference points into one of the typed
-        // storage Vecs above; the Vecs live until this function
-        // returns, after the launch returns. The kernel function
-        // pointer comes from a cudarc-loaded module also kept alive
-        // by the kernel table. Argument count / type correctness is
-        // a contract with the kernel author (the safety hole cudarc
-        // documents on launch()).
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| BackendError::Launch(format!("{e:?}")))?;
-        Ok(())
+        // Launch geometry: blocks of 256 work-items and as many as cover
+        // `count`. Consumers that need precise launch configuration ship
+        // their own backend impl; the reference impl provides a
+        // one-size-fits-most heuristic.
+        self.dispatch_kernel_on_stream(&self.stream, handle, count, args)
     }
 
     fn dispatch_kernel_sync(
@@ -527,8 +846,88 @@ fn probe_capabilities() -> BackendCapabilities {
     }
 }
 
-fn map_driver_error(device_id: u32, _e: DriverError) -> BackendError {
-    BackendError::DeviceUnavailable(Backend::Cuda { device_id })
+/// `DeviceUnavailable` for a driver refusal. The variant carries no text,
+/// so the driver's own error is written to stderr beside it rather than
+/// dropped.
+fn map_driver_error(device_id: u32, e: DriverError) -> BackendError {
+    BackendError::DeviceUnavailable(Backend::Cuda { device_id }).map_io_context(format!("{e:?}"))
+}
+
+/// A memory call's failure with the driver's error beside what was asked.
+fn memory_error(what: String, e: DriverError) -> BackendError {
+    BackendError::Memory(format!("{what}: {e:?}"))
+}
+
+/// The driver JIT's own account of why it refused `ptx`. The text is
+/// loaded a second time through `cuModuleLoadDataEx` with error and
+/// information log buffers, and the logs are what that answers; a second
+/// attempt that loads is unloaded at once and says so.
+fn jit_logs(context: &CudaContext, ptx: &str) -> String {
+    use cudarc::driver::sys;
+    let source = match std::ffi::CString::new(ptx) {
+        Ok(source) => source,
+        Err(nul) => return format!("the PTX holds a NUL byte at {}", nul.nul_position()),
+    };
+    if let Err(e) = context.bind_to_thread() {
+        return format!("no JIT log, the context would not bind: {e:?}");
+    }
+    let mut error_log = vec![0u8; JIT_LOG_BYTES];
+    let mut info_log = vec![0u8; JIT_LOG_BYTES];
+    let mut options = [
+        sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+        sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+        sys::CUjit_option::CU_JIT_INFO_LOG_BUFFER,
+        sys::CUjit_option::CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+        sys::CUjit_option::CU_JIT_LOG_VERBOSE,
+    ];
+    // The two sizes and the verbosity flag travel in their pointer slots
+    // by value, as the driver API defines for these options.
+    let mut values: [*mut std::ffi::c_void; 5] = [
+        error_log.as_mut_ptr().cast(),
+        std::ptr::without_provenance_mut(JIT_LOG_BYTES),
+        info_log.as_mut_ptr().cast(),
+        std::ptr::without_provenance_mut(JIT_LOG_BYTES),
+        std::ptr::without_provenance_mut(1),
+    ];
+    let mut module: sys::CUmodule = std::ptr::null_mut();
+    // SAFETY: `source` is a NUL-terminated image that outlives the call;
+    // `options` and `values` hold five entries each; both log buffers are
+    // JIT_LOG_BYTES long, as their size entries say, and outlive the call.
+    let loaded = unsafe {
+        sys::cuModuleLoadDataEx(
+            &mut module,
+            source.as_ptr().cast(),
+            options.len() as u32,
+            options.as_mut_ptr(),
+            values.as_mut_ptr(),
+        )
+    };
+    let mut text = format!(
+        "JIT {loaded:?}; error log: {}; information log: {}",
+        log_text(&error_log),
+        log_text(&info_log)
+    );
+    if !module.is_null() {
+        // SAFETY: the call above loaded this module, and nothing else
+        // holds it.
+        let unloaded = unsafe { cudarc::driver::result::module::unload(module) };
+        text.push_str(&format!(
+            "; that load succeeded, and unloading it answered {unloaded:?}"
+        ));
+    }
+    text
+}
+
+/// A NUL-terminated log buffer as text, or `empty` when the driver wrote
+/// nothing into it.
+fn log_text(buffer: &[u8]) -> String {
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    let text = String::from_utf8_lossy(&buffer[..end]).trim().to_string();
+    if text.is_empty() {
+        "empty".to_string()
+    } else {
+        text
+    }
 }
 
 impl Drop for CudaBackend {
@@ -594,6 +993,19 @@ mod tests {
     use super::*;
     use crate::backend::detect::cuda_available;
 
+    const ADD_ONE_PTX: &str = include_str!("../../kernels/add_one.ptx");
+
+    /// The backend on device 0, or `None` on a host with no usable CUDA
+    /// device, which is what these tests skip on. Any other refusal
+    /// fails the test that asked, rather than reading as no device.
+    fn backend() -> Option<CudaBackend> {
+        match CudaBackend::new() {
+            Ok(backend) => Some(backend),
+            Err(BackendError::DeviceUnavailable(_)) => None,
+            Err(other) => panic!("the backend refused for a reason other than no device: {other}"),
+        }
+    }
+
     #[test]
     fn cuda_backend_construction_matches_availability() {
         let res = CudaBackend::new();
@@ -610,14 +1022,14 @@ mod tests {
 
     #[test]
     fn capabilities_report_warp_width_32() {
-        if let Ok(b) = CudaBackend::new() {
+        if let Some(b) = backend() {
             assert_eq!(b.capabilities().simt_width, 32);
         }
     }
 
     #[test]
     fn dispatch_parallel_for_invokes_each_index_on_host_fanout() {
-        let Ok(backend) = CudaBackend::new() else {
+        let Some(backend) = backend() else {
             return;
         };
         use std::sync::atomic::AtomicU32;
@@ -640,7 +1052,7 @@ mod tests {
     /// available on the host.
     #[test]
     fn register_and_dispatch_trivial_kernel() {
-        let Ok(backend) = CudaBackend::new() else {
+        let Some(backend) = backend() else {
             return;
         };
         const TRIVIAL_PTX: &str = include_str!("../../kernels/mul3.ptx");
@@ -658,5 +1070,173 @@ mod tests {
             .stream()
             .synchronize()
             .expect("sync after trivial kernel dispatch");
+    }
+
+    #[test]
+    fn a_buffer_round_trips_through_a_kernel() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let handle = backend
+            .register_ptx("add_one", ADD_ONE_PTX)
+            .expect("add_one loads");
+        // More than one block, and not a multiple of the block size, so
+        // the tail threads' bound check is exercised.
+        let data: Vec<u32> = (0..1000).map(|i| i * 3).collect();
+        let buf = backend.upload(&data).expect("upload");
+        let n = data.len() as u32;
+        backend
+            .dispatch_kernel(handle, n, &[buf.arg(), KernelArg::U32(n)])
+            .expect("launch");
+        let mut out = vec![0u32; data.len()];
+        backend.copy_out(&buf, &mut out).expect("copy out");
+        let want: Vec<u32> = data.iter().map(|v| v + 1).collect();
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn a_ranged_readback_reads_only_its_range() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let data: Vec<f64> = (0..300).map(f64::from).collect();
+        let buf = backend.upload(&data).expect("upload");
+        let mut part = vec![0.0f64; 10];
+        backend
+            .copy_out_range(&buf, 100, &mut part)
+            .expect("ranged copy");
+        assert_eq!(part, data[100..110]);
+        let mut past = vec![0.0f64; 10];
+        assert!(matches!(
+            backend.copy_out_range(&buf, 295, &mut past),
+            Err(BackendError::Memory(_))
+        ));
+    }
+
+    #[test]
+    fn a_zero_count_launches_nothing() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let handle = backend
+            .register_ptx("add_one", ADD_ONE_PTX)
+            .expect("add_one loads");
+        let data = vec![7u32; 64];
+        let buf = backend.upload(&data).expect("upload");
+        backend
+            .dispatch_kernel(handle, 0, &[buf.arg(), KernelArg::U32(64)])
+            .expect("a zero count is not an error");
+        let mut out = vec![0u32; 64];
+        backend.copy_out(&buf, &mut out).expect("copy out");
+        assert_eq!(out, data, "nothing ran, so nothing changed");
+    }
+
+    #[test]
+    fn a_host_slice_reaches_the_kernel_as_device_memory() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let handle = backend
+            .register_ptx("copy_add_one", ADD_ONE_PTX)
+            .expect("copy_add_one loads");
+        let src: Vec<u32> = (0..257).collect();
+        let bytes: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let dst = backend.alloc_zeroed::<u32>(src.len()).expect("alloc");
+        let n = src.len() as u32;
+        backend
+            .dispatch_kernel(
+                handle,
+                n,
+                &[KernelArg::HostSlice(&bytes), dst.arg(), KernelArg::U32(n)],
+            )
+            .expect("launch");
+        let mut out = vec![0u32; src.len()];
+        backend.copy_out(&dst, &mut out).expect("copy out");
+        let want: Vec<u32> = src.iter().map(|v| v + 1).collect();
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn copy_in_fills_a_prefix_and_leaves_the_rest() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let mut buf = backend.alloc_zeroed::<i64>(8).expect("alloc");
+        backend.copy_in(&[1, 2, 3], &mut buf).expect("copy in");
+        let mut out = vec![9i64; 8];
+        backend.copy_out(&buf, &mut out).expect("copy out");
+        assert_eq!(out, [1, 2, 3, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            backend.copy_in(&[0i64; 9], &mut buf),
+            Err(BackendError::Memory(_))
+        ));
+    }
+
+    #[test]
+    fn bad_ptx_is_refused_with_the_jit_log() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let bad = ".version 7.0\n.target sm_70\n.address_size 64\n\
+                   .visible .entry broken() { this is not an instruction; }\n";
+        match backend.register_ptx("broken", bad) {
+            Err(BackendError::KernelCompile(text)) => {
+                assert!(text.contains("error log"), "{text}");
+                assert!(text.contains("broken"), "{text}");
+            }
+            other => panic!("malformed PTX must be refused, got {other:?}"),
+        }
+        assert!(matches!(
+            backend.register_ptx("nul", "a\0b"),
+            Err(BackendError::KernelCompile(_))
+        ));
+    }
+
+    #[test]
+    fn the_device_answers_its_name_and_memory() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let name = backend.device_name().expect("name");
+        assert!(!name.trim().is_empty());
+        let (free, total) = backend.mem_info().expect("mem_info");
+        assert!(total > 0);
+        assert!(free <= total, "{free} free of {total}");
+        eprintln!("device 0: {name}, {free} of {total} bytes free");
+    }
+
+    #[test]
+    fn another_backends_buffer_is_refused() {
+        let (Some(one), Some(two)) = (backend(), backend()) else {
+            return;
+        };
+        let handle = one
+            .register_ptx("add_one", ADD_ONE_PTX)
+            .expect("add_one loads");
+        let theirs = two.upload(&[1u32, 2, 3]).expect("upload");
+        assert!(matches!(
+            one.dispatch_kernel(handle, 3, &[theirs.arg(), KernelArg::U32(3)]),
+            Err(BackendError::Memory(_))
+        ));
+        let mut out = [0u32; 3];
+        assert!(matches!(
+            one.copy_out(&theirs, &mut out),
+            Err(BackendError::Memory(_))
+        ));
+    }
+
+    #[test]
+    fn zero_elements_are_refused_before_the_driver() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        assert!(matches!(
+            backend.alloc_zeroed::<u8>(0),
+            Err(BackendError::Memory(_))
+        ));
+        assert!(matches!(
+            backend.upload::<u8>(&[]),
+            Err(BackendError::Memory(_))
+        ));
     }
 }

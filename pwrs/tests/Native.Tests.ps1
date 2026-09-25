@@ -48,4 +48,13 @@ Describe 'Get-FlynnelNativeEntry' {
         # per dispatch sees a change only when a reload loads a new copy.
         (Get-FlynnelNativeEntry).RunChunksV1 | Should -Be $script:Entry.RunChunksV1
     }
+
+    It 'reports whether the pool has started, and a started pool as started' {
+        # Read without starting the pool, so the first answer depends on
+        # what ran before it in this session; once Start-FlynnelPool has
+        # run it can only be true.
+        $script:Entry.PoolStarted | Should -BeOfType [bool]
+        $null = Start-FlynnelPool
+        (Get-FlynnelNativeEntry).PoolStarted | Should -BeTrue
+    }
 }

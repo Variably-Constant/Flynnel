@@ -475,7 +475,7 @@ impl DispatchBackend for WasmBackend {
                 KernelArg::F32(v) => vals.push(Val::F32(v.to_bits())),
                 KernelArg::F64(v) => vals.push(Val::F64(v.to_bits())),
                 KernelArg::DevicePtr(p) => vals.push(Val::I32(*p as i32)),
-                KernelArg::HostSlice(_) => {
+                KernelArg::HostSlice(_) | KernelArg::Buffer(_) => {
                     return Err(BackendError::NotSupported);
                 }
             }

@@ -66,7 +66,9 @@ pub fn encode_args(args: &[KernelArg<'_>]) -> Result<Vec<u8>, BackendError> {
                 out.push(tag::DEV_PTR);
                 out.extend_from_slice(&(*v as u64).to_le_bytes());
             }
-            KernelArg::HostSlice(_) => {
+            // Neither host memory nor another backend's device memory
+            // can cross the process boundary as a value.
+            KernelArg::HostSlice(_) | KernelArg::Buffer(_) => {
                 return Err(BackendError::NotSupported);
             }
         }

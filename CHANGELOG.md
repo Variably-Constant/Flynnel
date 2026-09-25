@@ -332,6 +332,34 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- **Device memory on the CUDA backend, and PTX through the driver
+  alone.** `CudaBackend::alloc_zeroed` and `upload` make a
+  `DeviceBuffer<T>` of `u8`, `i32`, `u32`, `i64`, `u64`, `f32` or
+  `f64`. `copy_in` writes a prefix of one, `copy_out` reads all of it
+  back and `copy_out_range` reads a run from an offset, and both reads
+  return only once the host slice holds the data. A buffer is freed when
+  dropped, after every copy and launch that used it. `DeviceBuffer::arg`
+  passes one to a kernel as a 64-bit device pointer, through the new
+  `KernelArg::Buffer` and the `DeviceArg` trait a backend implements for
+  its own memory; the other backends answer `NotSupported` to it, and a
+  match over `KernelArg` outside the crate needs an arm for it. A
+  `KernelArg::HostSlice` is copied to device memory of its own for the
+  launch, where it was refused. `register_ptx` loads PTX through the
+  driver's JIT, and a refusal carries the JIT's error and information
+  logs; nothing on the path calls NVRTC or needs the CUDA toolkit, so PTX
+  written for a target the driver supports loads on any machine with an
+  NVIDIA driver. `device_name` and `mem_info` answer the device's name
+  and its free and total memory. A launch of zero work-items launches
+  nothing and answers `Ok`, where it asked the driver for a zero-size
+  grid, and a driver refusal during construction writes the driver's
+  error to stderr beside the `DeviceUnavailable` it answers.
+
+  `sched::arena::global_local_arena_started` answers whether the
+  process's arena has started, without starting it, and
+  Get-FlynnelNativeEntry carries it as `PoolStarted`. A library that
+  links the crate beside the module's pool can hold itself to starting
+  none; `tests/cuda_device_memory.rs` does, in a test binary of its own.
+
 - `flynnel::kernels`: every declared kernel as plain Rust, its
   partition, per-block work and combine, with no pool, plan or arena
   behind any of it. A kernel is a `Job` from a validating constructor

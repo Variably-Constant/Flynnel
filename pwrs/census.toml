@@ -690,6 +690,11 @@ reason = "unsafe-or-structural"
 note = "carries raw host and device pointers whose lifetime and size the caller guarantees for the whole call. A script cannot hold one safely and nothing checks that it did"
 
 [[entry]]
+item = "crate::backend::DeviceArg"
+reason = "unsafe-or-structural"
+note = "the trait a backend implements for its own device memory so a KernelArg can carry it. A script holds no device memory and has nothing to implement it for"
+
+[[entry]]
 item = "crate::backend::KernelHandle"
 reason = "internal-to-another-surface"
 note = "an opaque u64 the backend issued; it reaches a script as the KernelHandle column of Flynnel.AccelTarget, which is the only place one is meaningful"
@@ -713,6 +718,16 @@ note = "the always-registered implementation behind the Cpu row. A script reads 
 item = "crate::backend::cuda::CudaBackend"
 reason = "unsafe-or-structural"
 note = "its accessors hand out CUDA contexts, streams and per-slot streams: raw driver handles whose validity depends on the current device and on nothing this module can check. The Cuda row reports that it is registered and what it can do, which is the part a script can act on"
+
+[[entry]]
+item = "crate::backend::cuda::DeviceBuffer"
+reason = "unsafe-or-structural"
+note = "device memory one CudaBackend allocated, valid only on that backend's context and freed when dropped. A script cannot hold the backend that makes one, so it has no allocator to get one from"
+
+[[entry]]
+item = "crate::backend::cuda::DeviceElement"
+reason = "generic-over-caller-type"
+note = "a sealed trait naming the element types a DeviceBuffer holds; it bounds the Rust caller's choice of T and has no value of its own"
 
 [[entry]]
 item = "crate::backend::accel_op::AccelOpId"

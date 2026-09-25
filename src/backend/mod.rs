@@ -213,6 +213,23 @@ pub enum KernelArg<'a> {
     /// Host-side byte slice the backend should copy to device
     /// memory as part of the launch (synchronous H2D copy).
     HostSlice(&'a [u8]),
+    /// Device memory one backend allocated, passed by reference; on
+    /// CUDA it reaches the kernel as a 64-bit pointer to its first
+    /// element. The borrow lasts for the launch call, and the backend
+    /// that allocated it orders its free after every launch that used
+    /// it. A backend handed memory it did not allocate refuses it.
+    Buffer(&'a dyn DeviceArg),
+}
+
+/// Device memory a backend can pass to one of its kernels as a
+/// [`KernelArg::Buffer`]. Each backend implements it for its own buffer
+/// type and finds that type again through [`Self::as_any`]; a backend
+/// that owns no such memory answers [`BackendError::NotSupported`] to a
+/// buffer argument.
+pub trait DeviceArg: Send + Sync + std::fmt::Debug {
+    /// The buffer as `Any`, which is how the backend that made it
+    /// recovers its own type.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Error variants returned from [`DispatchBackend`] methods that

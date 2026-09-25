@@ -161,6 +161,10 @@ pub struct NativeEntry {
     /// driving the same kernels from the crate it links answers what
     /// these cmdlets answer when the two revisions agree.
     pub kernels_revision: u32,
+    /// Whether this module's worker pool has started, read without
+    /// starting it. The first dispatch starts it, here or through
+    /// `flynnel_run_chunks_v1`.
+    pub pool_started: bool,
 }
 
 /// Get the addresses of the module's native entry points.
@@ -200,6 +204,7 @@ impl Cmdlet for GetFlynnelNativeEntry {
             run_chunks_v1: flynnel_run_chunks_v1 as RunChunksV1 as usize as u64,
             abi_version: NATIVE_ABI_VERSION,
             kernels_revision: flynnel::kernels::REVISION,
+            pool_started: flynnel::sched::arena::global_local_arena_started(),
         })
     }
 }
