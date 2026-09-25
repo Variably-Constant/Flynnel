@@ -362,6 +362,16 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   links the crate beside the module's pool can hold itself to starting
   none; `tests/cuda_device_memory.rs` does, in a test binary of its own.
 
+  The launch path, measured against the build before it on both hosts
+  with a card: one kernel launched back to back on one stream for a
+  window, with no load and beside threads spinning on half and on all
+  of the logical processors, at 16, 512 and 4,096 work-items, a copy of
+  the earlier build as every cell's floor, six trials a cell. Every
+  cell's median sits inside its copy's 95 per cent interval, 0.848 to
+  1.088 on the 7900X's RTX 5070 and 0.914 to 1.089 on the 2700's RTX
+  3070. The CPU dispatch path, which this touches nowhere, reads the
+  same way on all three hosts (the leaf-spread entry under Fixed).
+
 - `flynnel::kernels`: every declared kernel as plain Rust, its
   partition, per-block work and combine, with no pool, plan or arena
   behind any of it. A kernel is a `Job` from a validating constructor
