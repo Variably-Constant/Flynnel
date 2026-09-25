@@ -44,8 +44,10 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   its kernel's job, dispatches the job's blocks on the pool through
   `for_each_chunk_indexed_min_leaf`, the entry `flynnel_run_chunks_v1`
   runs a native caller's chunks on, and writes the answer as the
-  module's own classes. Every class, cmdlet and parameter keeps its name
-  and shape.
+  module's own classes. Each cmdlet's dispatch is a call site of its
+  own, so what the pool learns from one kernel's leaves never decides
+  how another kernel's blocks are dispatched. Every class, cmdlet and
+  parameter keeps its name and shape.
 
   An answer now depends on the input alone. The kernels cut their input
   from its length rather than into four chunks a worker, and fold in

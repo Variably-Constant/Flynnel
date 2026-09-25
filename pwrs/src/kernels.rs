@@ -195,11 +195,19 @@ fn say_refusals(ps: &Pipeline<'_>, refused: usize, total: usize) -> PsResult<()>
 /// The job fixes its own blocks, so the plan decides only how they are
 /// dispatched: one leaf holds one or more whole blocks, and which worker
 /// ran which block cannot reach the answer.
+///
+/// The pool learns each dispatch at the call site of whoever called
+/// this, so every cmdlet's kernel keeps a classifier of its own. The
+/// site of the chunk runner's call below would be one for every kernel,
+/// and the leaves of a map, a sort and a file hash would train one
+/// class together.
+#[track_caller]
 fn run_on_pool<J: Job>(plan: &flynnel::JobPlan, job: J) -> PsResult<J::Answer> {
+    let plan = (*plan).with_site_if_none(flynnel::sched::call_site::caller_site());
     kernels::drive(job, |n, body| {
         let first: Mutex<Option<BlockError>> = Mutex::new(None);
         let mut blocks = vec![(); n];
-        for_each_chunk_indexed_min_leaf(plan, &mut blocks, 1, |start, chunk| {
+        for_each_chunk_indexed_min_leaf(&plan, &mut blocks, 1, |start, chunk| {
             for b in start..start + chunk.len() {
                 if let Err(e) = body(b) {
                     // Nothing can panic while this lock is held, so a
