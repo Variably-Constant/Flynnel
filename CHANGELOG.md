@@ -908,6 +908,20 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   were. Get-FlynnelCallSite rows carry the counts as `WindowSpreadTicks`
   and `WindowWallTicks`.
 
+  What it costs, measured on the default path together with the CUDA
+  backend's device memory, which touches no CPU dispatch path: the
+  build before both against the build with both, through one load
+  harness on the indexed entry and on the heartbeat entry whose router
+  this moves, with a copy of the earlier build as every cell's floor,
+  six trials a cell on the 24-thread 7900X and the 2700 and eighteen on
+  the Linux guest. No cell's interval lies below its copy's, and of 72
+  cells one median sits under its copy's 95 per cent interval, by a
+  tenth of a per cent (the 7900X's heartbeat entry at 4,096 reps with
+  no load, 0.996 against a copy interval from 0.997), while eight sit
+  over theirs. The medians ran 0.975 to 1.594 and 0.960 to 1.242 on the
+  7900X's two entries, 0.939 to 1.241 and 1.023 to 1.112 on the guest's,
+  and 0.933 to 1.065 and 0.945 to 1.092 on the 2700's.
+
 - **Heartbeat and token-bucket spans reached a call site's classifier in
   counter ticks.** Both fillers time the serial stretch between their
   promotions with the timestamp counter and recorded the difference
