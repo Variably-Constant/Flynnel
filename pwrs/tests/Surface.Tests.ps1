@@ -279,12 +279,13 @@ Describe 'help' {
             "export: " + (($bad | Sort-Object -Unique) -join ', '))
     }
 
-    It 'names only cmdlets that the module exports' {
+    It 'names only commands that the module exports, as cmdlets or aliases' {
         # Same defect one layer out: help that points at a sibling
         # command by a name the module no longer has. A rename moves
         # the command and leaves every reference to it reading
-        # correctly, because prose is not compiled.
-        $known = @($script:Cmdlets | ForEach-Object Name)
+        # correctly, because prose is not compiled. A name the module
+        # exports as an alias is one it answers to, so help may use it.
+        $known = @($script:Cmdlets | ForEach-Object Name) + @($script:Aliases | ForEach-Object Name)
         $bad = @()
         foreach ($cmdlet in $script:Cmdlets) {
             $help = Get-Help $cmdlet.Name -ErrorAction SilentlyContinue
@@ -294,7 +295,7 @@ Describe 'help' {
                 $bad += "$($cmdlet.Name): $($hit.Value)"
             }
         }
-        $bad.Count | Should -Be 0 -Because ("this help names a cmdlet the module does not " +
+        $bad.Count | Should -Be 0 -Because ("this help names a command the module does not " +
             "export: " + (($bad | Sort-Object -Unique) -join ', '))
     }
 }
