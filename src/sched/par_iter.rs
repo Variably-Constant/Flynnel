@@ -2029,14 +2029,21 @@ pub fn sample_iqr_per_mille(sorted: &[u64]) -> u32 {
     (q3.saturating_sub(q1).saturating_mul(1000) / median).min(u32::MAX as u64) as u32
 }
 
+/// True when the caller capped this dispatch to a single worker, which
+/// [`JobPlan::with_workers`] documents as serial execution on the
+/// calling thread. Read from the plan alone, so a capped call touches
+/// neither the pool nor the host profile, at every data-parallel entry.
+#[inline]
+fn capped_to_caller(plan: &JobPlan) -> bool {
+    plan.worker_cap == Some(1)
+}
+
 /// True when this dispatch runs its body on the calling thread: the
 /// caller capped it to a single worker, or the caller's own estimate
-/// puts the total under the collapse threshold. The worker cap is
-/// read from the plan alone, so a capped call touches neither the
-/// pool nor the host profile.
+/// puts the total under the collapse threshold.
 #[inline]
 fn runs_on_caller(plan: &JobPlan, n: usize) -> bool {
-    plan.worker_cap == Some(1) || collapses_inline(plan, n)
+    capped_to_caller(plan) || collapses_inline(plan, n)
 }
 
 /// True when the caller's explicit estimate puts `n` items under
@@ -2063,13 +2070,21 @@ fn collapses_inline(plan: &JobPlan, n: usize) -> bool {
         })
 }
 
-/// Run `body` on the calling thread, recording it as a leaf and
-/// latching the site when it outruns the collapse threshold.
+/// Run `body` on the calling thread and record it as a leaf.
+///
+/// Called only where [`runs_on_caller`] answered true, so a call the
+/// worker cap did not put here is one the caller's estimate admitted,
+/// and a body of that kind which outruns the collapse threshold latches
+/// the site against its estimate. A body the cap put here says nothing
+/// about the estimate, so it leaves the latch alone and never reads the
+/// host profile, whose first read measures by dispatching into the pool.
 #[inline]
 fn run_on_caller<R>(plan: &JobPlan, items: usize, body: impl FnOnce() -> R) -> R {
     let t0 = std::time::Instant::now();
     let out = record_leaf(plan.site, items, body);
-    if let Some(site) = plan.site {
+    if !capped_to_caller(plan)
+        && let Some(site) = plan.site
+    {
         site.get()
             .note_collapsed_body(t0.elapsed().as_nanos() as u64, inline_collapse_threshold_ns());
     }
@@ -2568,6 +2583,16 @@ where
         let t0 = std::time::Instant::now();
         op(items);
         record_leaf_span_ns(plan.site, t0.elapsed().as_nanos() as u64, n as u64);
+        return;
+    }
+    if capped_to_caller(plan) {
+        // The same chunks a dispatch would hand out, in order: a caller
+        // such as par_zip_apply builds its body around the width.
+        run_on_caller(plan, n, || {
+            for c in items.chunks_mut(chunk) {
+                op(c);
+            }
+        });
         return;
     }
     let n_chunks = n.div_ceil(chunk);
@@ -3530,6 +3555,9 @@ where
     let _routing = RecordRoutingArm::start(plan_owned.site, routing_arm);
     let plan = &plan_owned;
     let _flush_on_exit = FlushLeafStatsOnExit;
+    if capped_to_caller(plan) {
+        return run_on_caller(plan, n, || (0..n).map(&f).collect());
+    }
 
     let leaf = min_leaf.max(1);
     let workers = plan.effective_workers(global_local_arena().total_workers());
@@ -3780,6 +3808,9 @@ where
         .apply_site_class_measured();
     let _routing = RecordRoutingArm::start(plan_owned.site, routing_arm);
     let plan = &plan_owned;
+    if capped_to_caller(plan) {
+        return run_on_caller(plan, n, || (0..n).map(&f).collect());
+    }
 
     // Plan-estimate gate (entry-only, no rdtsc-polling in hot loop).
     // When the caller supplied an authoritative per-item cost, the
@@ -4023,6 +4054,9 @@ where
         .apply_site_class_measured();
     let _routing = RecordRoutingArm::start(plan_owned.site, routing_arm);
     let plan = &plan_owned;
+    if capped_to_caller(plan) {
+        return run_on_caller(plan, n, || (0..n).map(&f).collect());
+    }
 
     // Entry gate identical to `collect_indexed_heartbeat`: skip the
     // token-bucket machinery if the caller's authoritative estimate
@@ -4069,6 +4103,10 @@ where
 {
     if n == 0 {
         return Vec::new();
+    }
+    // Before the pool's width is read, since reading it starts the pool.
+    if capped_to_caller(plan) {
+        return collect_indexed(plan, n, 1, f);
     }
     let workers = plan.effective_workers(global_local_arena().total_workers());
     let chunks = plan.optimal_chunk_count(workers);
@@ -4227,7 +4265,10 @@ where
 ///
 /// # Strategy selection (adaptive)
 ///
-/// Two dispatch shapes, picked automatically per call:
+/// A plan capped at one worker takes neither shape below: `fold` runs
+/// once over the whole input on the calling thread, and
+/// [`last_reduce_chunks_path`] answers [`ReduceChunksPath::Caller`].
+/// Otherwise two dispatch shapes, picked automatically per call:
 ///
 /// - **Flat fan-out**: pre-split into `workers * split_multiplier()`
 ///   contiguous chunks and dispatch via
@@ -4279,6 +4320,10 @@ where
     // flows into the inner collect/for_each dispatches.
     let plan_owned = plan.with_site_if_none(crate::sched::call_site::caller_site());
     let plan = &plan_owned;
+    if capped_to_caller(plan) {
+        record_reduce_chunks_path(ReduceChunksPath::Caller);
+        return run_on_caller(plan, items.len(), || fold(init(), items));
+    }
     let site = plan.site.expect("attached above").get();
     // Trivial-reduce ceiling from the live calibratable thresholds
     // (default 30k cycles ~= 10us at 3 GHz; separates a 256-bin
@@ -4394,6 +4439,9 @@ pub enum ReduceChunksPath {
     /// observer hasn't converged yet OR observed reduce is
     /// non-trivial OR input is too small.
     Bisect,
+    /// One fold over the whole input on the calling thread, because
+    /// the plan capped the dispatch at one worker.
+    Caller,
 }
 
 thread_local! {
@@ -6085,65 +6133,216 @@ mod tests {
         for_each_chunk_ref(&plan, &v, 16, |_, _| panic!("must not run"));
     }
 
-    /// A worker cap of one runs the body on the calling thread, at
-    /// every data-parallel entry rather than only the first. The
-    /// entries used to read the pool width raw, so the cap reached
-    /// only `for_each_chunk`.
+    /// A worker cap of one runs the body on the calling thread at every
+    /// data-parallel entry, each named here and each run under a plan
+    /// that carries its own per-item estimate and under one that does
+    /// not, since several entries branch on the estimate first.
     #[test]
     fn a_worker_cap_of_one_keeps_every_entry_on_the_calling_thread() {
-        let caller = std::thread::current().id();
         use std::sync::atomic::AtomicUsize;
-        // Two counters rather than the thread ids themselves. The
-        // assertion is that no body ran anywhere but here, and a count
-        // of the ones that did answers it; the ids were collected only
-        // to be compared one at a time against this thread's.
+        let caller = std::thread::current().id();
+        // Counters rather than the thread ids themselves: the assertion
+        // is that no body ran anywhere but here, and a count answers it.
         let bodies = AtomicUsize::new(0);
         let elsewhere = AtomicUsize::new(0);
-        let note = |caller: std::thread::ThreadId| {
+        let note = || {
             bodies.fetch_add(1, Ordering::Relaxed);
             if std::thread::current().id() != caller {
                 elsewhere.fetch_add(1, Ordering::Relaxed);
             }
         };
         let n = 4096usize;
-
-        let mut v: Vec<u32> = (0..n as u32).collect();
-        let plan = JobPlan::new(6, n as u32).with_workers(1).with_estimated_per_item_ns(5_000);
-        for_each_chunk(&plan, &mut v, |c| {
-            note(caller);
-            for x in c.iter_mut() {
-                *x += 1;
-            }
-        });
-
         let a: Vec<u32> = vec![1; n];
         let b: Vec<u32> = vec![2; n];
-        let mut out: Vec<u32> = vec![0; n];
-        for_each_chunk_triple_min_leaf(&plan, &mut out, &a, &b, 1, |o, x, y| {
-            note(caller);
-            for ((o, x), y) in o.iter_mut().zip(x).zip(y) {
-                *o = x + y;
-            }
-        });
+        let estimated = JobPlan::new(6, n as u32).with_workers(1).with_estimated_per_item_ns(5_000);
+        let bare = JobPlan::new(6, n as u32).with_workers(1);
 
-        let mut idx: Vec<u32> = vec![0; n];
-        for_each_chunk_indexed_min_leaf(&plan, &mut idx, 1, |start, chunk| {
-            note(caller);
-            for (k, slot) in chunk.iter_mut().enumerate() {
-                *slot = (start + k) as u32;
+        let mut ran = 0usize;
+        let mut idle: Vec<String> = Vec::new();
+        let mut left: Vec<String> = Vec::new();
+        for (label, plan) in [("estimated", &estimated), ("bare", &bare)] {
+            let entries: [(&str, &dyn Fn()); 16] = [
+                ("for_each_chunk", &|| {
+                    let mut v = a.clone();
+                    for_each_chunk(plan, &mut v, |c| {
+                        note();
+                        c.iter_mut().for_each(|x| *x += 1);
+                    });
+                }),
+                ("for_each_chunk_min_leaf", &|| {
+                    let mut v = a.clone();
+                    for_each_chunk_min_leaf(plan, &mut v, 1, |c| {
+                        note();
+                        c.iter_mut().for_each(|x| *x += 1);
+                    });
+                }),
+                ("for_each_fixed_chunk", &|| {
+                    let mut v = a.clone();
+                    for_each_fixed_chunk(plan, &mut v, 64, |c| {
+                        note();
+                        c.iter_mut().for_each(|x| *x += 1);
+                    });
+                }),
+                ("for_each_chunk_triple", &|| {
+                    let mut out = vec![0u32; n];
+                    for_each_chunk_triple(plan, &mut out, &a, &b, |o, x, y| {
+                        note();
+                        for ((o, x), y) in o.iter_mut().zip(x).zip(y) {
+                            *o = x + y;
+                        }
+                    });
+                    assert_eq!(out[n - 1], 3, "the triple entry still computed its output");
+                }),
+                ("for_each_chunk_triple_min_leaf", &|| {
+                    let mut out = vec![0u32; n];
+                    for_each_chunk_triple_min_leaf(plan, &mut out, &a, &b, 1, |o, x, y| {
+                        note();
+                        for ((o, x), y) in o.iter_mut().zip(x).zip(y) {
+                            *o = x + y;
+                        }
+                    });
+                    assert_eq!(out[0], 3, "the triple entry still computed its output");
+                }),
+                ("for_each_chunk_indexed", &|| {
+                    let mut idx = vec![0u32; n];
+                    for_each_chunk_indexed(plan, &mut idx, |start, chunk| {
+                        note();
+                        for (k, slot) in chunk.iter_mut().enumerate() {
+                            *slot = (start + k) as u32;
+                        }
+                    });
+                    assert_eq!(idx[n - 1], (n - 1) as u32, "the indexed entry filled its output");
+                }),
+                ("for_each_chunk_indexed_min_leaf", &|| {
+                    let mut idx = vec![0u32; n];
+                    for_each_chunk_indexed_min_leaf(plan, &mut idx, 1, |start, chunk| {
+                        note();
+                        for (k, slot) in chunk.iter_mut().enumerate() {
+                            *slot = (start + k) as u32;
+                        }
+                    });
+                    assert_eq!(idx[n - 1], (n - 1) as u32, "the indexed entry filled its output");
+                }),
+                ("for_each_indexed", &|| {
+                    for_each_indexed(plan, n, 1, |_i| note());
+                }),
+                ("for_each_chunk_ref", &|| {
+                    for_each_chunk_ref(plan, &a, 64, |_start, _chunk| note());
+                }),
+                ("collect_indexed", &|| {
+                    let got: Vec<usize> = collect_indexed(plan, n, 1, |i| {
+                        note();
+                        i
+                    });
+                    assert_eq!(got[n - 1], n - 1, "collect_indexed kept its order");
+                }),
+                ("collect_indexed_heartbeat", &|| {
+                    let got: Vec<usize> = collect_indexed_heartbeat(plan, n, |i| {
+                        note();
+                        i
+                    });
+                    assert_eq!(got[n - 1], n - 1, "the heartbeat collect kept its order");
+                }),
+                ("collect_indexed_token_bucket", &|| {
+                    let got: Vec<usize> = collect_indexed_token_bucket(
+                        plan,
+                        n,
+                        |_i| 1_000,
+                        |i| {
+                            note();
+                            i
+                        },
+                    );
+                    assert_eq!(got[n - 1], n - 1, "the token-bucket collect kept its order");
+                }),
+                ("collect_indexed_tiny_tasks", &|| {
+                    let got: Vec<usize> = collect_indexed_tiny_tasks(plan, n, |i| {
+                        note();
+                        i
+                    });
+                    assert_eq!(got[n - 1], n - 1, "the tiny-tasks collect kept its order");
+                }),
+                ("reduce_chunks", &|| {
+                    let sum = reduce_chunks(
+                        plan,
+                        &a,
+                        || 0u64,
+                        |acc, s| {
+                            note();
+                            acc + s.iter().map(|&x| u64::from(x)).sum::<u64>()
+                        },
+                        |x, y| x + y,
+                    );
+                    assert_eq!(sum, n as u64, "reduce_chunks folded every element");
+                    assert_eq!(last_reduce_chunks_path(), Some(ReduceChunksPath::Caller));
+                }),
+                ("par_map_in_place", &|| {
+                    let mut v = a.clone();
+                    par_map_in_place(plan, &mut v, |x| {
+                        note();
+                        *x += 1;
+                    });
+                }),
+                ("par_zip_apply", &|| {
+                    let mut v = a.clone();
+                    par_zip_apply(plan, &mut v, &b, |x, y| {
+                        note();
+                        *x += y;
+                    });
+                    assert_eq!(v[n - 1], 3, "par_zip_apply paired every index");
+                }),
+            ];
+            for (name, run) in entries {
+                let bodies_before = bodies.load(Ordering::Relaxed);
+                let elsewhere_before = elsewhere.load(Ordering::Relaxed);
+                run();
+                ran += 1;
+                if bodies.load(Ordering::Relaxed) == bodies_before {
+                    idle.push(format!("{name} ({label})"));
+                }
+                if elsewhere.load(Ordering::Relaxed) != elsewhere_before {
+                    left.push(format!("{name} ({label})"));
+                }
             }
-        });
-
-        assert!(bodies.load(Ordering::Relaxed) > 0, "the bodies must have run");
-        assert_eq!(
-            elsewhere.load(Ordering::Relaxed),
-            0,
-            "a worker cap of one must not leave the caller, and {} of {} bodies did",
-            elsewhere.load(Ordering::Relaxed),
-            bodies.load(Ordering::Relaxed)
+        }
+        assert_eq!(ran, 32, "every entry ran under both plans");
+        assert!(idle.is_empty(), "these entries never ran their body: {idle:?}");
+        assert!(
+            left.is_empty(),
+            "a worker cap of one must not leave the caller, and these did: {left:?}"
         );
-        assert_eq!(out[0], 3, "the triple entry still computed its output");
-        assert_eq!(idx[n - 1], (n - 1) as u32, "the indexed entry still filled its output");
+    }
+
+    /// A body the worker cap put on the calling thread says nothing
+    /// about the caller's estimate, so however long it runs it leaves
+    /// the site's collapse latch alone. The estimate here would admit
+    /// the collapse on its own, and the cap is what decided.
+    #[test]
+    fn a_capped_body_past_the_collapse_threshold_leaves_the_latch_alone() {
+        static SITE: crate::sched::call_site::CallSiteState =
+            crate::sched::call_site::CallSiteState::new();
+        let site = crate::sched::call_site::SiteRef::new(&SITE);
+        let limit = inline_collapse_threshold_ns();
+        let n = 64usize;
+        let mut v = vec![0u64; n];
+        let plan = JobPlan::new(6, n as u32)
+            .with_site(site)
+            .with_workers(1)
+            .with_estimated_per_item_ns(1);
+        for_each_chunk_indexed_min_leaf(&plan, &mut v, 1, |start, chunk| {
+            let t0 = std::time::Instant::now();
+            while (t0.elapsed().as_nanos() as u64) <= limit {
+                std::hint::spin_loop();
+            }
+            for (k, slot) in chunk.iter_mut().enumerate() {
+                *slot = (start + k) as u64;
+            }
+        });
+        assert_eq!(v[n - 1], (n - 1) as u64, "the capped body ran");
+        assert!(
+            !SITE.collapse_overran(),
+            "a body the cap put on the caller ran past {limit} ns and latched the site"
+        );
     }
 
     /// The caller's own oversubscription factor decides the split

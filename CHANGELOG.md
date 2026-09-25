@@ -819,6 +819,29 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
+- **A plan capped at one worker ran on the pool at most entries.**
+  `JobPlan::with_workers(1)` is documented as serial execution on the
+  calling thread, which is what a caller holding a lock, a thread-local
+  or a context bound to its thread relies on. Only
+  `for_each_chunk_min_leaf`, `for_each_chunk_triple_min_leaf`,
+  `for_each_chunk_indexed_min_leaf` and the entries built on them
+  honored it. `collect_indexed` with its heartbeat, token-bucket and
+  tiny-tasks variants, `reduce_chunks`, and `for_each_fixed_chunk` with
+  `par_map_in_place` and `par_zip_apply` split the input as usual and
+  dispatched it: on the 24-thread host a variance through
+  `reduce_chunks` under a one-worker plan had all 24 workers taking
+  jobs, at 34.7 times as much processor time as wall time.
+
+  Every data-parallel entry now runs a capped call on the calling
+  thread, before it reads the pool's width, which starts the pool.
+  `reduce_chunks` folds the whole input once and reports
+  `ReduceChunksPath::Caller`, which Get-FlynnelReducePath answers as
+  `Caller`; `for_each_fixed_chunk` hands its body the same chunks a
+  dispatch would. A capped body also no longer reads the host dispatch
+  profile, whose first read in a process measures by dispatching into
+  the pool, and no longer latches its site against the inline-collapse
+  estimate, which a body the cap put on the caller says nothing about.
+
 - **A wide cooperative fan-out stranded work in parked workers'
   mailboxes.** A mailbox is drained only by the worker that owns it,
   and a mailbox push was served by the deque's wake, which claims

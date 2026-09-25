@@ -390,3 +390,44 @@ Describe 'Get-FlynnelDispatchProfile' {
         $rows['PortBound'].DefaultNsPerElem | Should -BeGreaterThan 0
     }
 }
+
+Describe 'a plan capped at one worker' {
+    # A worker's counters move only for a job it popped from its own
+    # deque or stole from a peer, so a run that never reaches the pool
+    # leaves their total exactly where it was, whatever else the box is
+    # doing. The crate's lib test of the same name checks the thread each
+    # body ran on.
+    BeforeAll {
+        $script:Numbers = [double[]](1..200000)
+        # The sum of the squares of 1 to 200000, an integer below 2^53, so
+        # every order of adding the squares gives it exactly.
+        $script:SumOfSquares = [double]2666686666700000
+        $script:One = New-FlynnelPlan -KOuter 10 -BatchSize 200000 -Workers 1
+        function Get-PoolJobs {
+            $total = [uint64]0
+            foreach ($w in @(Get-FlynnelWorker)) {
+                $total += [uint64]$w.LocalPops + [uint64]$w.PeerStealHits
+            }
+            $total
+        }
+    }
+
+    It 'keeps <Primitive> off the pool and answers what the pool answers' -TestCases @(
+        @{ Primitive = 'ReduceChunks' }
+        @{ Primitive = 'CollectIndexed' }
+        @{ Primitive = 'ForEachChunk' }
+        @{ Primitive = 'ForEachChunkIndexed' }
+    ) {
+        $pooled = Measure-FlynnelPrimitive -InputObject $script:Numbers -Primitive $Primitive
+        $before = Get-PoolJobs
+        $capped = Measure-FlynnelPrimitive -InputObject $script:Numbers -Primitive $Primitive -Plan $script:One
+        Get-PoolJobs | Should -Be $before -Because 'a plan capped at one worker runs on the calling thread'
+        $capped.Sum | Should -Be $script:SumOfSquares
+        $pooled.Sum | Should -Be $script:SumOfSquares
+    }
+
+    It 'reports the fold it took on the calling thread' {
+        $null = Measure-FlynnelPrimitive -InputObject $script:Numbers -Primitive ReduceChunks -Plan $script:One
+        Get-FlynnelReducePath | Should -Be ([Flynnel.ReducePath]::Caller)
+    }
+}

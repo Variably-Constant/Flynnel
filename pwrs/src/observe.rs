@@ -77,6 +77,9 @@ pub enum ReducePath {
     Flat,
     /// A bisecting tree.
     Bisect,
+    /// One fold on the calling thread, because the plan capped the
+    /// dispatch at one worker.
+    Caller,
 }
 
 impl From<ReduceChunksPath> for ReducePath {
@@ -84,6 +87,7 @@ impl From<ReduceChunksPath> for ReducePath {
         match p {
             ReduceChunksPath::Flat => ReducePath::Flat,
             ReduceChunksPath::Bisect => ReducePath::Bisect,
+            ReduceChunksPath::Caller => ReducePath::Caller,
         }
     }
 }
