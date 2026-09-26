@@ -54,61 +54,53 @@ exclude = [
 [dependencies]
 # Per-thread CPU affinity pinning. Non-optional so the pinning code
 # path is available in every build; on platforms where pinning is
-# unsupported the calls degrade to OS-managed placement. crates.io
-# 2026-06-03: 0.8.3 latest.
+# unsupported the calls degrade to OS-managed placement.
 core_affinity = "0.8.3"
 # BLAKE3 hashing for the VerifyChain primitive (CPU/GPU bit-exact
 # trace verification). Optional because not every consumer needs the
-# verification surface; gate with the `verify-chain` feature. crates.io
-# 2026-06-03: 1.8.5 latest.
-blake3 = { version = "1.8.5", optional = true }
+# verification surface; gate with the `verify-chain` feature.
+blake3 = { version = "1.8.7", optional = true }
 # Cross-platform dlopen wrapper used by `crate::backend::detect` to
 # probe whether GPU runtimes (libcuda, libamdhip64) are loadable on
 # the host WITHOUT linking the SDK at build time. ~50 KB no-deps
 # crate; non-optional because detection is a stable surface and the
-# binary cost is trivial. crates.io 2026-06-03: 0.9.0 latest.
-libloading = "0.9"
+# binary cost is trivial.
+libloading = "0.9.0"
 # CUDA reference backend (optional). cudarc with the
-# `dynamic-loading` feature dlopens libcuda at runtime, so no nvcc
-# or CUDA SDK is required at build time. The `cuda-12060` feature
-# selects the CUDA 12.6 ABI; CUDA's runtime ABI is backward
-# compatible so a host with driver >= 12.6 satisfies any binary
-# built with this feature. crates.io 2026-06-03: 0.19.7 latest.
-cudarc = { version = "0.19", optional = true, default-features = false, features = ["fallback-dynamic-loading", "driver", "nvrtc", "cuda-13010"] }
+# `fallback-dynamic-loading` feature dlopens libcuda at runtime, so no
+# nvcc or CUDA SDK is required at build time. The `cuda-13010` feature
+# selects cudarc's bindings for the CUDA 13.1 driver API.
+cudarc = { version = "0.19.10", optional = true, default-features = false, features = ["fallback-dynamic-loading", "driver", "nvrtc", "cuda-13010"] }
 # TPU JAX reference backend (optional). Spawns a Python child
 # process running the embedded `tpu_jax_bridge.py` script and talks
 # to it over line-oriented JSON on stdin/stdout. No JAX dep at
 # build time; the host needs python3 + jax installed at runtime
 # for kernel launches to succeed (detection probe + graceful
-# degradation when missing). crates.io 2026-06-03: serde 1.0.228,
-# serde_json 1.0.150.
-serde = { version = "1.0.228", optional = true, features = ["derive"] }
-serde_json = { version = "1.0.150", optional = true }
+# degradation when missing).
+serde = { version = "1.0.229", optional = true, features = ["derive"] }
+serde_json = { version = "1.0.151", optional = true }
 # WebAssembly reference backend (optional). wasmtime is a pure-Rust
 # embeddable WASM runtime; no system shared library is required at
 # build or run time. Gated by `wasm-reference` so hosts that do not
-# need WASM dispatch do not pull it in. crates.io 2026-06-04: 25.0
-# is the current major release line.
+# need WASM dispatch do not pull it in.
 wasmtime = { version = "25.0", optional = true, default-features = false, features = ["cranelift", "runtime"] }
 # Memory-mapped file primitive used by the shared-memory worker
 # backend. Pure-Rust, no system library at build time; relies on
 # OS mmap (POSIX) / CreateFileMapping (Windows) at runtime. Gated
 # by `shared-memory-worker-reference` so hosts that do not need
-# cross-process dispatch do not pull it in. crates.io 2026-06-04:
-# 0.9.10 is the current stable line.
-memmap2 = { version = "0.9.10", optional = true }
+# cross-process dispatch do not pull it in.
+memmap2 = { version = "0.9.11", optional = true }
 
 [dev-dependencies]
 # Reference scheduler for the taxonomy Flynnel inherits from. Not
 # a production dep; only referenced by benches that show flynnel's
 # join / for_each_chunk / cooperative surfaces alongside the
-# rayon-style API they extend. crates.io 2026-06-03: 1.12.0 latest.
-rayon = "1.12"
+# rayon-style API they extend.
+rayon = "1.12.0"
 # Statistics-driven micro-benchmarking. Used by the criterion
 # benches under `benches/` (flynn_axes, inline_collapse). The
 # `html_reports` feature is on by default; we keep it for the
-# target/criterion/report/index.html dashboard. crates.io
-# 2026-06-03: 0.8.2 latest.
+# target/criterion/report/index.html dashboard.
 criterion = { version = "0.8.2", features = ["html_reports"] }
 
 # Sets the process affinity mask in tests/affinity_follows_process_mask.rs.
@@ -117,7 +109,7 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 # both. Windows needs no dependency: that arm declares the two kernel32
 # symbols it calls.
 [target.'cfg(unix)'.dev-dependencies]
-libc = "0.2"
+libc = "0.2.189"
 
 [features]
 # EVERYTHING ON BY DEFAULT (owner directive, 2026-08-04). A release

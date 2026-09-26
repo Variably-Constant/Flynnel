@@ -9,6 +9,28 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- Every dependency requirement names its newest stable release, written
+  in full: blake3 1.8.7, cudarc 0.19.10, libc 0.2.189, libloading 0.9.0,
+  memmap2 0.9.11, rayon 1.12.0, serde 1.0.229 and serde_json 1.0.151,
+  and in the PowerShell module blake3 1.8.7, serde_json 1.0.151 and syn
+  3.0.6, which the census tool parses the crate with. Both lock files
+  take the newest compatible releases. The census reads the same crate
+  under syn 3 as under syn 2, 111 files, 104 modules and 1,541 public
+  items, and the module's suites pass under Pester 6.2.0 as under 5.7.1,
+  653 tests in each shell.
+
+  The CUDA launch path, measured against the build before it on both
+  hosts with a card: one kernel launched back to back on one stream for
+  a window, once with a scalar argument and once with a device buffer,
+  with no load and beside threads spinning on half and on all of the
+  logical processors, at 16, 512 and 4,096 work-items, a copy of the
+  earlier build as every cell's floor, six trials a cell. In 60 cells no
+  interval lies below its copy's. The medians run 0.789 to 1.122 on the
+  7900X's RTX 5070 (copies 0.778 to 1.074) and 0.794 to 1.202 on the
+  2700's RTX 3070 (copies 0.686 to 1.173); two sit under their copy's
+  interval, both in a quiet window, 0.980 at 16 work-items on the 7900X
+  and 0.997 at 4,096 on the 2700, and two over.
+
 - The classifier tick publishes its window readers with plain loads and
   stores. It kept the extremes and counts behind
   `window_cv2_range_per_mille`, `window_wall_cv2_range_per_mille`,
