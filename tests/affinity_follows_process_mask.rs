@@ -29,11 +29,15 @@ const NARROW_TO: usize = 2;
 /// Read after narrowing so a failure says which half broke: a mask that
 /// did not take, or a mask that took and a width that did not follow.
 /// Without it both arrive as the same assertion.
+///
+/// On Linux the process mask is the thread-group leader's, the one
+/// `/proc/self/status` reports and the width reads, so the leader is
+/// named by the process id; pid 0 would name the test's own thread.
 #[cfg(target_os = "linux")]
 fn mask_cpu_count() -> Option<usize> {
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+        if libc::sched_getaffinity(libc::getpid(), size_of::<libc::cpu_set_t>(), &mut set) != 0 {
             return None;
         }
         Some(
@@ -89,7 +93,7 @@ fn set_affinity(cpus: &[usize]) -> bool {
         for &cpu in cpus {
             libc::CPU_SET(cpu, &mut set);
         }
-        libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set) == 0
+        libc::sched_setaffinity(libc::getpid(), size_of::<libc::cpu_set_t>(), &set) == 0
     }
 }
 
