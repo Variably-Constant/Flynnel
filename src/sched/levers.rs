@@ -353,6 +353,22 @@ pub fn backend_spin_monitor() -> bool {
     *V.get_or_init(|| read("FLYNNEL_LEVER_BACKEND_SPIN_MONITOR"))
 }
 
+/// Learn each phase of a declared kernel run through the PowerShell
+/// module at a site of its own, keyed by the kernel, the phase and the
+/// base-2 logarithm of the phase's block size in items, instead of at
+/// one site a kernel.
+///
+/// Off until measured. A site's class, leaf statistics and policy-arm
+/// averages are site-wide, and only hybrid placement buckets by size,
+/// while a kernel's phases cost differently per block and a block's
+/// cost grows with its size, so one site a kernel learns a mixture of
+/// them. The finer key learns each apart at the price of more sites to
+/// warm, at most a few dozen a kernel, all in the keyed table.
+pub fn kernel_phase_sites() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| read("FLYNNEL_LEVER_KERNEL_PHASE_SITES"))
+}
+
 /// Give the outside caller's slot-wait parker no yield rounds, so a
 /// caller whose spin budget is spent goes from the sleep handshake
 /// straight to the park.
@@ -537,9 +553,9 @@ pub fn calibration_refusal() -> bool {
 pub fn describe() -> String {
     format!(
         "oncore_spread={} batch_weight={} smt_window={} allowed_width={} \
-         calibration_refusal={} latch_monitor={} backend_spin_monitor={} spin_monitor={} \
-         join_park={} join_park_oversubscribed={} slot_park_now={} spin_adaptive={} \
-         spin_window={} serve_policy={:?} occupancy_floor={}",
+         calibration_refusal={} latch_monitor={} backend_spin_monitor={} \
+         kernel_phase_sites={} spin_monitor={} join_park={} join_park_oversubscribed={} \
+         slot_park_now={} spin_adaptive={} spin_window={} serve_policy={:?} occupancy_floor={}",
         oncore_spread(),
         batch_weight(),
         smt_from_window(),
@@ -547,6 +563,7 @@ pub fn describe() -> String {
         calibration_refusal(),
         latch_monitor(),
         backend_spin_monitor(),
+        kernel_phase_sites(),
         spin_monitor(),
         join_park(),
         join_park_oversubscribed(),

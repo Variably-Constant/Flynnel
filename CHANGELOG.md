@@ -674,6 +674,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   Ryzen 7 2700, with the rung reached 193,739 to 530,504 times a run
   when on and never when off.
 
+- `FLYNNEL_LEVER_KERNEL_PHASE_SITES`, off. The PowerShell module's
+  kernels dispatch each phase of a job under a site keyed by the kernel,
+  the phase and the log2 of the phase's block size in items, rather than
+  one site per kernel, so the scheduler learns what a phase costs at a
+  block size instead of a mix of every phase and size the kernel runs; a
+  site the caller's plan carries still wins. With the lever off a call
+  reads the switch once and runs as before. KernelShapes records the
+  keyed sites its process holds and any site warnings with each result.
+  On the Ryzen 9 7900X under PowerShell 7.6.6, on against off with a
+  copy of off, six rounds, keyed 24 sites a run when on and none when
+  off, and separated no cell either way on a machine running other
+  builds throughout.
+
 - `FLYNNEL_LEVER_JOIN_PARK` and `FLYNNEL_LEVER_SLOT_PARK_NOW`, both off.
   A thread that waits by calling `yield_now` while its process holds
   more runnable threads than cores gives its core to a ready thread for

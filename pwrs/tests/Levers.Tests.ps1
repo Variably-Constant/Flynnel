@@ -52,7 +52,7 @@ Describe 'Get-FlynnelLever' {
         $names = @($script:Levers | ForEach-Object Name)
         foreach ($lever in 'oncore_spread', 'batch_weight', 'smt_window', 'allowed_width',
                            'calibration_refusal', 'latch_monitor', 'backend_spin_monitor',
-                           'spin_monitor', 'join_park',
+                           'kernel_phase_sites', 'spin_monitor', 'join_park',
                            'join_park_oversubscribed', 'slot_park_now', 'spin_adaptive',
                            'spin_window', 'serve_policy', 'occupancy_floor',
                            'wasm_local_store') {
@@ -99,7 +99,8 @@ Describe 'Get-FlynnelLever' {
             $row.Price | Should -Not -BeNullOrEmpty -Because "$name ships on and must say what it costs"
         }
         foreach ($name in 'batch_weight', 'smt_window', 'latch_monitor', 'backend_spin_monitor',
-                          'spin_monitor', 'join_park', 'slot_park_now', 'wasm_local_store') {
+                          'kernel_phase_sites', 'spin_monitor', 'join_park', 'slot_park_now',
+                          'wasm_local_store') {
             $row = $script:Levers | Where-Object Name -eq $name
             $row.Default | Should -Be 'false'
         }

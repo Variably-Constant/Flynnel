@@ -311,6 +311,13 @@ fn all_levers() -> Vec<Lever> {
             NO_PRICE,
         ),
         switch_row(
+            "kernel_phase_sites",
+            "FLYNNEL_LEVER_KERNEL_PHASE_SITES",
+            levers::kernel_phase_sites(),
+            false,
+            NO_PRICE,
+        ),
+        switch_row(
             "spin_monitor",
             "FLYNNEL_LEVER_SPIN_MONITOR",
             levers::spin_monitor(),

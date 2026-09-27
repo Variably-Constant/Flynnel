@@ -879,8 +879,23 @@ $runRows | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $RunStore -Encodin
 # Report
 # ----------------------------------------------------------------------
 
+# The keyed call sites this process holds. kernel_phase_sites learns each
+# phase of a kernel at each block size class at a keyed site of its own,
+# so with it on this counts the sites the run made, and with it off the
+# module makes none; a key the keyed table could not hold is named in a
+# warning, kept beside the count. A module older than the listing, or
+# than keyed sites, answers null rather than a zero it did not measure.
+$siteWarnings = $null
+$keyedSites = $null
+if (Get-Command -Name Get-FlynnelCallSite -ErrorAction SilentlyContinue) {
+    $keyedSites = @(Get-FlynnelCallSite -WarningAction SilentlyContinue -WarningVariable siteWarnings |
+            Where-Object { $_.PSObject.Properties['Key'] -and $null -ne $_.Key }).Count
+}
+
 $result = [PSCustomObject]@{
     Tag             = $Tag
+    KeyedSites      = $keyedSites
+    SiteWarnings    = @($siteWarnings | ForEach-Object { [string]$_ })
     When            = (Get-Date -Format 'o')
     Host            = $hostInfo
     Repeats         = $Repeats

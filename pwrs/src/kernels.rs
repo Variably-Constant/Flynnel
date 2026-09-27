@@ -201,13 +201,30 @@ fn say_refusals(ps: &Pipeline<'_>, refused: usize, total: usize) -> PsResult<()>
 /// site of the chunk runner's call below would be one for every kernel,
 /// and the leaves of a map, a sort and a file hash would train one
 /// class together.
+///
+/// With `kernel_phase_sites` on, each phase learns at a keyed site of
+/// its own instead, keyed by [`phase_site_key`] from that call site, the
+/// phase and the phase's block size, which `items`, the job's input
+/// length, gives over its block count. A site the caller's plan already
+/// carries wins either way.
 #[track_caller]
-fn run_on_pool<J: Job>(plan: &flynnel::JobPlan, job: J) -> PsResult<J::Answer> {
-    let plan = (*plan).with_site_if_none(flynnel::sched::call_site::caller_site());
+fn run_on_pool<J: Job>(plan: &flynnel::JobPlan, job: J, items: usize) -> PsResult<J::Answer> {
+    let caller = std::panic::Location::caller();
+    let kernel = flynnel::sched::levers::kernel_phase_sites().then(|| kernel_id(caller));
+    let located = (*plan).with_site_if_none(flynnel::sched::call_site::caller_site());
+    let mut phase = 0usize;
     kernels::drive(job, |n, body| {
+        let dispatch = match kernel {
+            Some(kernel) => {
+                let key = phase_site_key(kernel, phase, items.div_ceil(n.max(1)));
+                (*plan).with_site_if_none(flynnel::sched::call_site::site_for_key(key))
+            }
+            None => located,
+        };
+        phase += 1;
         let first: Mutex<Option<BlockError>> = Mutex::new(None);
         let mut blocks = vec![(); n];
-        for_each_chunk_indexed_min_leaf(&plan, &mut blocks, 1, |start, chunk| {
+        for_each_chunk_indexed_min_leaf(&dispatch, &mut blocks, 1, |start, chunk| {
             for b in start..start + chunk.len() {
                 if let Err(e) = body(b) {
                     // Nothing can panic while this lock is held, so a
@@ -232,6 +249,33 @@ fn run_on_pool<J: Job>(plan: &flynnel::JobPlan, job: J) -> PsResult<J::Answer> {
         }
     })
     .map_err(refusal_err)
+}
+
+/// A kernel's identity for [`phase_site_key`]: its call site, hashed.
+fn kernel_id(at: &std::panic::Location<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    at.file().hash(&mut hasher);
+    at.line().hash(&mut hasher);
+    at.column().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The keyed site one phase of a kernel learns at under
+/// `kernel_phase_sites`: the kernel, the phase, and the base-2
+/// logarithm of the phase's block size in items, hashed into one key.
+///
+/// Blocks within a factor of two of each other share a site, so the
+/// sites a kernel adds are its phases times the size classes its inputs
+/// reach: at most seven phases, the sort's, whose runs are capped at 64,
+/// and 32 classes for an input a .NET array can hold.
+fn phase_site_key(kernel: u64, phase: usize, block_items: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    kernel.hash(&mut hasher);
+    phase.hash(&mut hasher);
+    block_items.max(1).ilog2().hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Refuse unless every column has the first one's length.
@@ -562,7 +606,7 @@ impl Cmdlet for InvokeFlynnelMap {
         };
         let job =
             kernels::map(&mut items, self.operation.to_kernel(), operands).map_err(refusal_err)?;
-        run_on_pool(&plan, job)?;
+        run_on_pool(&plan, job, n)?;
         // PsArray and not a PsMemory view. The view hands the buffer
         // over without a managed copy and measured the same: 5.19 ms
         // against 5.18 over 200,000 elements, inside a control that
@@ -660,7 +704,7 @@ impl Cmdlet for UpdateFlynnelArray {
         };
         let job =
             kernels::map(&mut pinned, self.operation.to_kernel(), operands).map_err(refusal_err)?;
-        run_on_pool(&plan, job)
+        run_on_pool(&plan, job, n)
     }
 }
 
@@ -700,7 +744,7 @@ impl Cmdlet for InvokeFlynnelZip {
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         let job = kernels::zip(&mut lhs, &rhs, self.operation.to_kernel()).map_err(refusal_err)?;
         say_plan(ps, &plan, n, "Invoke-FlynnelZip")?;
-        run_on_pool(&plan, job)?;
+        run_on_pool(&plan, job, n)?;
         ps.write(PsArray(lhs))
     }
 }
@@ -745,7 +789,7 @@ impl Cmdlet for MeasureFlynnelReduce {
         say_plan(ps, &plan, n, "Measure-FlynnelReduce")?;
         let job = kernels::reduce(&items, self.operation.to_kernel(), self.min, self.max)
             .map_err(refusal_err)?;
-        let answer = run_on_pool(&plan, job)?;
+        let answer = run_on_pool(&plan, job, n)?;
         ps.write(Reduction {
             operation: self.operation,
             count: answer.count,
@@ -786,7 +830,7 @@ impl Cmdlet for GetFlynnelPrefixSum {
         let n = items.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Get-FlynnelPrefixSum")?;
-        run_on_pool(&plan, kernels::prefix_sum(&mut items))?;
+        run_on_pool(&plan, kernels::prefix_sum(&mut items), n)?;
         ps.write(PsArray(items))
     }
 }
@@ -852,7 +896,7 @@ impl Cmdlet for GetFlynnelHistogram {
         let job = kernels::histogram(&items, self.bins, self.min, self.max).map_err(refusal_err)?;
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Get-FlynnelHistogram")?;
-        let Some(histogram) = run_on_pool(&plan, job)? else {
+        let Some(histogram) = run_on_pool(&plan, job, n)? else {
             return Ok(());
         };
         if self.as_array {
@@ -903,7 +947,7 @@ impl Cmdlet for GetFlynnelDotProduct {
         let n = lhs.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Get-FlynnelDotProduct")?;
-        ps.write(run_on_pool(&plan, job)?)
+        ps.write(run_on_pool(&plan, job, n)?)
     }
 }
 
@@ -947,7 +991,7 @@ impl Cmdlet for InvokeFlynnelSort {
         let n = items.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Invoke-FlynnelSort")?;
-        let sorted = run_on_pool(&plan, kernels::sort(&items, self.descending))?;
+        let sorted = run_on_pool(&plan, kernels::sort(&items, self.descending), n)?;
         ps.write(PsArray(sorted))
     }
 }
@@ -1305,10 +1349,10 @@ impl Cmdlet for MeasureFlynnelFileHash {
                          workers. Set FLYNNEL_SCHED_SMT_AS_IO before the first dispatch to \
                          create one"
                     )?;
-                    run_on_pool(&plan, kernels::file_hash(&paths))?
+                    run_on_pool(&plan, kernels::file_hash(&paths), n)?
                 }
             },
-            (false, _) => run_on_pool(&plan, kernels::file_hash(&paths))?,
+            (false, _) => run_on_pool(&plan, kernels::file_hash(&paths), n)?,
         };
         write_rows(ps, rows, |h| vec![FileHash::from(h)])
     }
@@ -1354,7 +1398,7 @@ impl Cmdlet for TestFlynnelFileHash {
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Test-FlynnelFileHash")?;
         let mut refused = 0usize;
-        for checked in run_on_pool(&plan, job)? {
+        for checked in run_on_pool(&plan, job, n)? {
             if let Some(refusal) = checked.refusal {
                 refused += 1;
                 ps.write_error(&refusal_err(refusal))?;
@@ -1416,7 +1460,7 @@ impl Cmdlet for SearchFlynnelFile {
         let n = paths.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Search-FlynnelFile")?;
-        let rows = run_on_pool(&plan, job)?;
+        let rows = run_on_pool(&plan, job, n)?;
         write_rows(ps, rows, |matches| {
             matches.into_iter().map(FileMatch::from).collect()
         })
@@ -1453,7 +1497,7 @@ impl Cmdlet for MeasureFlynnelFileLine {
         let n = paths.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelFileLine")?;
-        let rows = run_on_pool(&plan, kernels::file_line(&paths))?;
+        let rows = run_on_pool(&plan, kernels::file_line(&paths), n)?;
         write_rows(ps, rows, |m| vec![FileMeasure::from(m)])
     }
 }
@@ -1491,7 +1535,7 @@ impl Cmdlet for MeasureFlynnelFileByte {
         let n = paths.len();
         let plan = kernel_plan(self.plan.as_ref(), n)?;
         say_plan(ps, &plan, n, "Measure-FlynnelFileByte")?;
-        let rows = run_on_pool(&plan, kernels::file_byte(&paths))?;
+        let rows = run_on_pool(&plan, kernels::file_byte(&paths), n)?;
         write_rows(ps, rows, |m| vec![FileMeasure::from(m)])
     }
 }
@@ -1602,7 +1646,7 @@ impl Cmdlet for SearchFlynnelText {
         let job = kernels::search_text(&text, &pattern).map_err(refusal_err)?;
         let plan = kernel_plan(self.plan.as_ref(), text.len())?;
         say_plan(ps, &plan, text.len(), "Search-FlynnelText")?;
-        for m in run_on_pool(&plan, job)? {
+        for m in run_on_pool(&plan, job, text.len())? {
             ps.write(TextMatch::from(m))?;
         }
         Ok(())
@@ -1643,7 +1687,7 @@ impl Cmdlet for MeasureFlynnelTextCount {
         let job = kernels::text_count(&text, self.pattern.as_deref()).map_err(refusal_err)?;
         let plan = kernel_plan(self.plan.as_ref(), text.len())?;
         say_plan(ps, &plan, text.len(), "Measure-FlynnelTextCount")?;
-        let m = run_on_pool(&plan, job)?;
+        let m = run_on_pool(&plan, job, text.len())?;
         ps.write(TextMeasure {
             bytes: m.bytes,
             lines: m.lines,
@@ -1690,7 +1734,7 @@ impl Cmdlet for SplitFlynnelText {
         let job = kernels::split_text(&text, &separator, self.no_empty).map_err(refusal_err)?;
         let plan = kernel_plan(self.plan.as_ref(), text.len())?;
         say_plan(ps, &plan, text.len(), "Split-FlynnelText")?;
-        ps.write(PsArray(run_on_pool(&plan, job)?))
+        ps.write(PsArray(run_on_pool(&plan, job, text.len())?))
     }
 }
 
@@ -1773,7 +1817,7 @@ impl Cmdlet for UpdateFlynnelText {
         .map_err(refusal_err)?;
         let plan = kernel_plan(self.plan.as_ref(), text.len())?;
         say_plan(ps, &plan, text.len(), "Update-FlynnelText")?;
-        ps.write(run_on_pool(&plan, job)?)
+        ps.write(run_on_pool(&plan, job, text.len())?)
     }
 }
 
@@ -1921,6 +1965,50 @@ impl Cmdlet for MeasureFlynnelPrimitive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phase_site_key_follows_the_kernel_the_phase_and_the_size_class() {
+        let map = kernel_id(std::panic::Location::caller());
+        let sort = kernel_id(std::panic::Location::caller());
+        assert_ne!(map, sort, "two call sites are two kernels");
+        let key = phase_site_key(map, 0, 4096);
+        assert_eq!(
+            key,
+            phase_site_key(map, 0, 4096),
+            "one phase at one size is one site"
+        );
+        assert_eq!(
+            key,
+            phase_site_key(map, 0, 8191),
+            "a size class shares its site"
+        );
+        assert_ne!(
+            key,
+            phase_site_key(map, 0, 8192),
+            "the next size class learns apart"
+        );
+        assert_ne!(
+            key,
+            phase_site_key(map, 1, 4096),
+            "the next phase learns apart"
+        );
+        assert_ne!(
+            key,
+            phase_site_key(sort, 0, 4096),
+            "another kernel learns apart"
+        );
+        let mut keys = std::collections::HashSet::new();
+        for phase in 0..7 {
+            for class in 0..32 {
+                keys.insert(phase_site_key(map, phase, 1usize << class));
+            }
+        }
+        assert_eq!(
+            keys.len(),
+            7 * 32,
+            "every phase and size class a kernel reaches is its own site"
+        );
+    }
 
     /// The parameters a cmdlet's own metadata declares, in its order:
     /// name, CLR type, mandatory, position, pipeline.
