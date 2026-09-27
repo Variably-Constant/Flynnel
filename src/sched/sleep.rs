@@ -214,6 +214,41 @@ pub(crate) fn note_latch_monitor_arm() {
     LATCH_MONITOR_ARMS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Waits on a shared-memory backend's result cell that reached the
+/// monitor rung of their spin phase, since process start. Zero unless
+/// [`crate::sched::levers::backend_spin_monitor`] is on and the host has
+/// a monitor that holds, which is what a harness reads to tell an arm
+/// that engaged from one that did not.
+pub fn total_backend_monitor_waits() -> u64 {
+    BACKEND_MONITOR_WAITS.load(Ordering::Relaxed)
+}
+
+static BACKEND_MONITOR_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// Monitor armings issued inside those waits, since process start; over
+/// [`total_backend_monitor_waits`] it is what the rung costs per wait,
+/// as [`total_latch_monitor_arms`] is for a latch.
+pub fn total_backend_monitor_arms() -> u64 {
+    BACKEND_MONITOR_ARMS.load(Ordering::Relaxed)
+}
+
+static BACKEND_MONITOR_ARMS: AtomicU64 = AtomicU64::new(0);
+
+/// Record that one backend wait reached its monitor rung.
+#[cfg(feature = "shared-memory-worker-reference")]
+#[inline]
+pub(crate) fn note_backend_monitor_wait() {
+    BACKEND_MONITOR_WAITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one arming of the monitor inside a backend wait's rung.
+/// Untraced, for the reason [`note_latch_monitor_arm`] is.
+#[cfg(feature = "shared-memory-worker-reference")]
+#[inline]
+pub(crate) fn note_backend_monitor_arm() {
+    BACKEND_MONITOR_ARMS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Record that one latch wait reached its monitor rung, and trace it
 /// where tracing is on. `slot` distinguishes the slot path's wait from
 /// a `LockLatch`'s, which take the same rung at different call sites.

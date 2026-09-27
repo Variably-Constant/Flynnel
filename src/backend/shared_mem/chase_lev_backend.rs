@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::chase_lev_mmf::{
     self, ARGS_INLINE_BYTES, MmfChaseLevDeque, RemoteJobSlot, Steal,
 };
-use super::latch_mmf::{ERR, MmfLatchArena, SET, UNSET};
+use super::latch_mmf::{ERR, MmfLatchArena, SET, UNSET, spin_phase};
 use super::pass_registry::{self, Pass};
 use super::wire;
 
@@ -335,20 +335,24 @@ impl SharedMemoryChaseLevBackend {
         }
     }
 
-    /// Originator-side: blocking wait. Spins (with `spin_loop` hint)
-    /// up to `iter_budget` times; if the latch is still unset, yields
-    /// the thread and tries again until set. Returns the same shape as
-    /// [`Self::poll_handle`].
+    /// Originator-side: blocking wait. [`spin_phase`] over `iter_budget`
+    /// polls; if the latch is still unset, yields the thread and tries
+    /// again until set. Returns the same shape as [`Self::poll_handle`].
     pub fn wait_handle(
         &self,
         handle: DispatchHandle,
         iter_budget: u32,
     ) -> Result<Result<Vec<u8>, String>, BackendError> {
-        for _ in 0..iter_budget {
-            if let Some(r) = self.poll_handle(handle)? {
-                return Ok(r);
-            }
-            std::hint::spin_loop();
+        let spun = spin_phase(
+            &self.latches,
+            handle.latch_offset,
+            iter_budget,
+            crate::sched::levers::backend_spin_monitor(),
+            |e| BackendError::Launch(format!("latch line: {e:?}")),
+            || self.poll_handle(handle),
+        )?;
+        if let Some(r) = spun {
+            return Ok(r);
         }
         // Past the spin budget: yield until set. No timeout - caller
         // controls outer dead-man timeout if they need one.

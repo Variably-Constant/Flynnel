@@ -214,6 +214,15 @@ fn bench_all(c: &mut Criterion) {
     bench_pick_only(c);
     bench_through_chase_lev(c);
     bench_through_khpd_batched(c);
+    // Which arm of the backend spin monitor these numbers came from, and
+    // whether it engaged: an arm with the switch on and no waits on the
+    // rung ran the same code as the arm with it off.
+    eprintln!(
+        "engagement backend_spin_monitor={} backend_monitor_waits={} backend_monitor_arms={}",
+        flynnel::sched::levers::backend_spin_monitor(),
+        flynnel::total_backend_monitor_waits(),
+        flynnel::total_backend_monitor_arms(),
+    );
 }
 
 criterion_group!(benches, bench_all);

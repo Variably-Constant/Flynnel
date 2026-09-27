@@ -353,6 +353,16 @@ impl MmfLatchArena {
         Ok(s != UNSET)
     }
 
+    /// The address of the cell's polled `state` byte, the first byte of
+    /// the cell's own cache line, for a waiter that arms the host's
+    /// monitor on that line. The publisher's `Release` store to `state`
+    /// lands on this line whichever process makes it. The pointer is
+    /// into this arena's mapping and is valid for as long as the arena.
+    pub(crate) fn state_line(&self, offset: u32) -> Result<*const u8, LatchError> {
+        let idx = self.offset_to_idx(offset)?;
+        Ok(self.cell(idx).state.as_ptr().cast_const())
+    }
+
     /// Publisher path. Copies `payload` into the cell's
     /// `result_bytes` and Release-stores `state = SET`. Returns
     /// [`LatchError::PayloadTooLarge`] if the payload exceeds
@@ -459,11 +469,185 @@ impl MmfLatchArena {
     }
 }
 
+/// The spin phase of a wait on one latch cell: `polls` calls of `poll`
+/// with a `PAUSE` after each, answering the first that completes, or
+/// `None` when the phase ends with the cell still unset, so the caller
+/// goes on to whatever follows its spin.
+///
+/// With `monitor`, on a host whose monitor holds, the phase is instead a
+/// timed floor of those polls and then bounded monitor waits on the
+/// cell's own line for as long as the rest of the polls would have taken
+/// on this host. Both arms leave the phase at the same moment and differ
+/// only in what the thread did inside it: a poll issues into the
+/// pipeline for the whole span, while a monitor wait issues nothing and
+/// ends on the publisher's store as promptly as the next poll would have
+/// seen it. It is the shape of
+/// [`crate::sched::latch::LockLatch::wait_spin_then_monitor`], for a store
+/// that comes from another process rather than another thread.
+///
+/// `monitor` is decided once, by the caller: the backends pass
+/// [`crate::sched::levers::backend_spin_monitor`], and a test passes
+/// either arm. `line_error` turns the one error only the monitor rung
+/// can meet, a cell with no line, into the caller's own error type.
+pub(crate) fn spin_phase<T, E>(
+    arena: &MmfLatchArena,
+    offset: u32,
+    polls: u32,
+    monitor: bool,
+    line_error: impl FnOnce(LatchError) -> E,
+    mut poll: impl FnMut() -> Result<Option<T>, E>,
+) -> Result<Option<T>, E> {
+    let polls = polls as usize;
+    let use_monitor = monitor && crate::sched::sleep::monitor_wait_available();
+    if !use_monitor {
+        for _ in 0..polls {
+            if let Some(done) = poll()? {
+                return Ok(Some(done));
+            }
+            std::hint::spin_loop();
+        }
+        return Ok(None);
+    }
+
+    // The floor covers a store already on its way, and its timing sizes
+    // the rung: a poll costs a different number of cycles on every part,
+    // so the only way to spend the wall time the other arm spends is to
+    // measure this host's poll here, on polls that were going to run.
+    let floor = polls.min(crate::sched::latch::MONITOR_SPIN_FLOOR);
+    let floor_start = crate::sched::sleep::cycles_now();
+    for _ in 0..floor {
+        if let Some(done) = poll()? {
+            return Ok(Some(done));
+        }
+        std::hint::spin_loop();
+    }
+    if floor == polls {
+        return Ok(None);
+    }
+    let per_poll = crate::sched::sleep::cycles_now().saturating_sub(floor_start) / floor as u64;
+    // A floor the scheduler interrupted measured the interruption, and a
+    // rung sized from it would hold this thread far past the polls it
+    // stands in for, so that phase takes the rest of its polls instead.
+    if per_poll == 0 || per_poll > crate::sched::latch::MAX_MEASURED_POLL_CYCLES {
+        for _ in floor..polls {
+            if let Some(done) = poll()? {
+                return Ok(Some(done));
+            }
+            std::hint::spin_loop();
+        }
+        return Ok(None);
+    }
+
+    let span = ((polls - floor) as u64).saturating_mul(per_poll);
+    let line = arena.state_line(offset).map_err(line_error)?;
+    let state = line.cast::<AtomicU8>();
+    // What the cell's poll reads, straight from the line the monitor is
+    // armed on: `state_line` has already located the cell, so this read
+    // has nothing left that can fail.
+    let set_now = || {
+        // SAFETY: `state` is this cell's `AtomicU8` state byte inside the
+        // arena's mapping, which lives as long as `arena`.
+        unsafe { &*state }.load(Ordering::Acquire) != UNSET
+    };
+    crate::sched::sleep::note_backend_monitor_wait();
+    let start = crate::sched::sleep::cycles_now();
+    loop {
+        if let Some(done) = poll()? {
+            return Ok(Some(done));
+        }
+        let left = span.saturating_sub(crate::sched::sleep::cycles_now().saturating_sub(start));
+        if left == 0 {
+            return Ok(None);
+        }
+        crate::sched::sleep::note_backend_monitor_arm();
+        // SAFETY: `line` points into this arena's own mapping, which
+        // lives as long as `arena`, and the wait is issued only where
+        // CPUID reported the instruction pair.
+        let waited = unsafe { crate::sched::sleep::monitor_wait_once(line, left, set_now) };
+        if !waited {
+            // The monitor stopped holding. The rest of the span polls, so
+            // this arm still leaves the phase when the other would.
+            while crate::sched::sleep::cycles_now().saturating_sub(start) < span {
+                if let Some(done) = poll()? {
+                    return Ok(Some(done));
+                }
+                std::hint::spin_loop();
+            }
+            return Ok(None);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    /// Removes a test's arena file, saying so when it cannot.
+    fn remove(path: &std::path::Path) {
+        if let Err(e) = std::fs::remove_file(path) {
+            eprintln!("could not remove {}: {e}", path.display());
+        }
+    }
+
+    /// The result of the cell at `off` once it is set, read the way a
+    /// backend's poll reads it. The tests publish only successes, so any
+    /// other state is a failure of the test itself.
+    fn poll_cell(arena: &MmfLatchArena, off: u32) -> Result<Option<Vec<u8>>, LatchError> {
+        if !arena.is_set(off)? {
+            return Ok(None);
+        }
+        let mut out = Vec::new();
+        let state = arena.read_result(off, &mut out)?;
+        assert_eq!(state, SET, "the tests publish only successes");
+        Ok(Some(out))
+    }
+
+    #[test]
+    fn the_spin_phase_answers_a_publish_on_both_arms() {
+        for monitor in [false, true] {
+            let path = temp_path(if monitor { "spin_monitor" } else { "spin_plain" });
+            let arena = Arc::new(MmfLatchArena::create(&path, 4).expect("create"));
+            let off = arena.alloc();
+            let publisher = {
+                let arena = Arc::clone(&arena);
+                thread::spawn(move || {
+                    thread::sleep(std::time::Duration::from_millis(5));
+                    arena.publish(off, b"done").expect("publish");
+                })
+            };
+            let got = spin_phase(&arena, off, u32::MAX, monitor, |e| e, || poll_cell(&arena, off))
+                .expect("the cell reads");
+            publisher.join().expect("publisher joined");
+            assert_eq!(got.as_deref(), Some(&b"done"[..]), "monitor = {monitor}");
+            remove(&path);
+        }
+    }
+
+    #[test]
+    fn the_spin_phase_ends_unset_when_nothing_publishes() {
+        for monitor in [false, true] {
+            let path = temp_path(if monitor { "spin_monitor_none" } else { "spin_plain_none" });
+            let arena = MmfLatchArena::create(&path, 4).expect("create");
+            let off = arena.alloc();
+            let got = spin_phase(&arena, off, 4096, monitor, |e| e, || poll_cell(&arena, off))
+                .expect("the cell reads");
+            assert!(got.is_none(), "monitor = {monitor}: an unpublished cell ends the phase unset");
+            remove(&path);
+        }
+    }
+
+    #[test]
+    fn the_spin_phase_reports_a_bad_offset_on_both_arms() {
+        let path = temp_path("spin_bad_offset");
+        let arena = MmfLatchArena::create(&path, 4).expect("create");
+        for monitor in [false, true] {
+            let r = spin_phase(&arena, 8, 4096, monitor, |e| e, || poll_cell(&arena, 8));
+            assert!(matches!(r, Err(LatchError::BadOffset(8))), "monitor = {monitor}");
+        }
+        remove(&path);
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();

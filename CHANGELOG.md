@@ -656,6 +656,24 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   `WindowWallCv2PerMille`, `WindowOncoreCv2PerMille`, their minima and
   maxima, and `WindowOncoreTicks`.
 
+- `FLYNNEL_LEVER_BACKEND_SPIN_MONITOR`, off. A shared-memory backend's
+  `wait_handle` (Chase-Lev, KHPD, LOH and URD) spends its `iter_budget`
+  polls as a timed floor of 512 and then bounded monitor waits on the
+  result cell's own cache line, for as long as the rest of the polls
+  would have taken, before the yields the wait has always ended in. The
+  cell is one 64-byte line whose state byte the publishing process
+  stores to, and the waiter has nothing else to do, so a monitor wait
+  there ends on the store a poll would have seen and issues nothing into
+  the pipeline while it waits. A host without a monitor, or whose
+  monitor stops holding, polls the whole span. `total_backend_monitor_waits()`
+  counts the waits that reached the rung and `total_backend_monitor_arms()`
+  the armings inside them; the `dispatcher_routing` bench prints both
+  beside the switch. It stays off: on against off through that bench,
+  with a second file of off as the copy and six rounds in the six
+  orders, separated no cell either way on the Ryzen 9 7900X or the
+  Ryzen 7 2700, with the rung reached 193,739 to 530,504 times a run
+  when on and never when off.
+
 - `FLYNNEL_LEVER_JOIN_PARK` and `FLYNNEL_LEVER_SLOT_PARK_NOW`, both off.
   A thread that waits by calling `yield_now` while its process holds
   more runnable threads than cores gives its core to a ready thread for

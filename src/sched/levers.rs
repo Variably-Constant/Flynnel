@@ -335,6 +335,24 @@ pub fn latch_monitor() -> bool {
     *V.get_or_init(|| read("FLYNNEL_LEVER_LATCH_MONITOR"))
 }
 
+/// Wait for a shared-memory backend's result through a timed floor of
+/// polls, then bounded monitor waits on the result cell's own line, in
+/// place of the rest of the caller's `PAUSE` budget, before the yields
+/// the budget has always ended in.
+///
+/// Off until measured. The originator of a cross-process dispatch polls
+/// one latch cell, a single 64-byte line whose state byte the publishing
+/// process stores to, and has nothing else to do while it waits: the
+/// same three conditions [`latch_monitor`] meets, with the store coming
+/// from another process instead of another thread. The rung spends the
+/// wall time the polls it replaces would have spent, so both arms reach
+/// the yields at the same moment and differ only in what the waiting
+/// thread did before them.
+pub fn backend_spin_monitor() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| read("FLYNNEL_LEVER_BACKEND_SPIN_MONITOR"))
+}
+
 /// Give the outside caller's slot-wait parker no yield rounds, so a
 /// caller whose spin budget is spent goes from the sleep handshake
 /// straight to the park.
@@ -519,15 +537,16 @@ pub fn calibration_refusal() -> bool {
 pub fn describe() -> String {
     format!(
         "oncore_spread={} batch_weight={} smt_window={} allowed_width={} \
-         calibration_refusal={} latch_monitor={} spin_monitor={} join_park={} \
-         join_park_oversubscribed={} slot_park_now={} spin_adaptive={} spin_window={} \
-         serve_policy={:?} occupancy_floor={}",
+         calibration_refusal={} latch_monitor={} backend_spin_monitor={} spin_monitor={} \
+         join_park={} join_park_oversubscribed={} slot_park_now={} spin_adaptive={} \
+         spin_window={} serve_policy={:?} occupancy_floor={}",
         oncore_spread(),
         batch_weight(),
         smt_from_window(),
         allowed_width(),
         calibration_refusal(),
         latch_monitor(),
+        backend_spin_monitor(),
         spin_monitor(),
         join_park(),
         join_park_oversubscribed(),

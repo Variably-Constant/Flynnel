@@ -304,6 +304,13 @@ fn all_levers() -> Vec<Lever> {
             NO_PRICE,
         ),
         switch_row(
+            "backend_spin_monitor",
+            "FLYNNEL_LEVER_BACKEND_SPIN_MONITOR",
+            levers::backend_spin_monitor(),
+            false,
+            NO_PRICE,
+        ),
+        switch_row(
             "spin_monitor",
             "FLYNNEL_LEVER_SPIN_MONITOR",
             levers::spin_monitor(),

@@ -849,6 +849,11 @@ reason = "internal-to-another-surface"
 note = "the latch_monitor row of Get-FlynnelLever. Defaults off and carries no price, because nothing has measured it yet"
 
 [[entry]]
+item = "crate::sched::levers::backend_spin_monitor"
+reason = "internal-to-another-surface"
+note = "the backend_spin_monitor row of Get-FlynnelLever. Defaults off and carries no price, because nothing has measured it yet"
+
+[[entry]]
 item = "crate::sched::levers::spin_monitor"
 reason = "internal-to-another-surface"
 note = "the spin_monitor row of Get-FlynnelLever. Defaults off and carries no price for the same reason"

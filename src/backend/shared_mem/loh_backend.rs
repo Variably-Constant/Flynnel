@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::chase_lev_backend::DispatchHandle;
 use super::lcrq_lifo::{self, LOH_ARGS_INLINE_BYTES, LohDeque, LohLifoEntry, Steal};
-use super::latch_mmf::{ERR, MmfLatchArena, SET, UNSET};
+use super::latch_mmf::{ERR, MmfLatchArena, SET, UNSET, spin_phase};
 use super::pass_registry::{self, Pass};
 use super::wire;
 
@@ -260,17 +260,23 @@ impl SharedMemoryLohBackend {
         }
     }
 
-    /// Originator-side blocking wait.
+    /// Originator-side blocking wait: [`spin_phase`] over `iter_budget`
+    /// polls, then yields until the result is set.
     pub fn wait_handle(
         &self,
         handle: DispatchHandle,
         iter_budget: u32,
     ) -> Result<Result<Vec<u8>, String>, BackendError> {
-        for _ in 0..iter_budget {
-            if let Some(r) = self.poll_handle(handle)? {
-                return Ok(r);
-            }
-            std::hint::spin_loop();
+        let spun = spin_phase(
+            &self.latches,
+            handle.latch_offset,
+            iter_budget,
+            crate::sched::levers::backend_spin_monitor(),
+            |e| BackendError::Launch(format!("latch line: {e:?}")),
+            || self.poll_handle(handle),
+        )?;
+        if let Some(r) = spun {
+            return Ok(r);
         }
         loop {
             if let Some(r) = self.poll_handle(handle)? {

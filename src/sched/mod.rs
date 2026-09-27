@@ -104,7 +104,10 @@ pub use adaptive_profile::{
     spawn_class_threshold_calibration,
 };
 pub use latch::{CoreLatch, Latch};
-pub use sleep::{total_latch_monitor_arms, total_latch_monitor_waits};
+pub use sleep::{
+    total_backend_monitor_arms, total_backend_monitor_waits, total_latch_monitor_arms,
+    total_latch_monitor_waits,
+};
 pub use jec_sleep::{
     reset_spin_stats, set_spin_adaptive, set_spin_window, spin_adapt_decisions, spin_adaptive,
     spin_window, total_idle_yields, total_monitor_rounds, total_park_events, total_rescue_events,

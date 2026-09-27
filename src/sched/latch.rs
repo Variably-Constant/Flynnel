@@ -732,14 +732,15 @@ impl LockLatch {
 
 /// `PAUSE` polls a monitor-waiting latch spins before its first
 /// monitor wait. 512, as the mailbox thief's floor is, because both
-/// are covering the same thing: a store already on its way.
-const MONITOR_SPIN_FLOOR: usize = 512;
+/// are covering the same thing: a store already on its way. A
+/// shared-memory backend's result wait takes the same floor.
+pub(crate) const MONITOR_SPIN_FLOOR: usize = 512;
 
 /// Cycles per poll above which the floor's timing is read as an
 /// interruption rather than as this host's `PAUSE`. A poll costs 20 to
 /// 140 cycles on the parts this runs on, so anything past four times
 /// the widest of those is something else.
-const MAX_MEASURED_POLL_CYCLES: u64 = 512;
+pub(crate) const MAX_MEASURED_POLL_CYCLES: u64 = 512;
 
 /// Diagnostic gate for LockLatch.wait() entry/exit logging. Reads
 /// the env var once via OnceLock so the hot wait path pays just a
