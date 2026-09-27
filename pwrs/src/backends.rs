@@ -651,21 +651,31 @@ pub struct GetFlynnelAccelOp {
     pub name: Option<String>,
 }
 
+/// Every registered operation's row, in registration order, shared by
+/// the cmdlet and the Flynnel drive's `backends\accel-ops` level so the
+/// two cannot describe an operation differently.
+pub(crate) fn accel_op_rows() -> Vec<AccelOp> {
+    flynnel::registered_accel_ops()
+        .into_iter()
+        .map(|op| AccelOp {
+            name: op.name,
+            bytes_per_item: op.bytes_per_item,
+            has_binding: !op.kernels.is_empty(),
+            bound_kinds: op.kernels.iter().map(|b| BackendKind::from(*b)).collect(),
+            bound_device_ids: op.kernels.iter().map(|b| device_id_of(*b)).collect(),
+        })
+        .collect()
+}
+
 impl Cmdlet for GetFlynnelAccelOp {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        for op in flynnel::registered_accel_ops() {
+        for row in accel_op_rows() {
             if let Some(filter) = &self.name
-                && !op.name.contains(filter.as_str())
+                && !row.name.contains(filter.as_str())
             {
                 continue;
             }
-            ps.write(AccelOp {
-                name: op.name,
-                bytes_per_item: op.bytes_per_item,
-                has_binding: !op.kernels.is_empty(),
-                bound_kinds: op.kernels.iter().map(|b| BackendKind::from(*b)).collect(),
-                bound_device_ids: op.kernels.iter().map(|b| device_id_of(*b)).collect(),
-            })?;
+            ps.write(row)?;
         }
         Ok(())
     }

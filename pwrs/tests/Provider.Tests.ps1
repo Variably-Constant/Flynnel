@@ -217,6 +217,30 @@ Describe 'the backends level' {
         $cuda | Should -Not -BeNullOrEmpty
         $cuda.Kind | Should -Be 'Cuda'
     }
+
+    It 'holds the accelerator operations in a container of their own' {
+        # A container whether or not anything is registered, and nothing
+        # is until a caller registers one, so an empty level is the
+        # ordinary state rather than a failed enumeration.
+        Test-Path 'Flynnel:\backends\accel-ops' | Should -BeTrue
+        (Get-Item Flynnel:\backends\accel-ops).PSIsContainer | Should -BeTrue
+        @(Get-ChildItem Flynnel:\backends | ForEach-Object { $_.PSChildName }) |
+            Should -Contain 'accel-ops'
+    }
+
+    It 'lists the same operations as Get-FlynnelAccelOp' {
+        $fromCmdlet = @(Get-FlynnelAccelOp)
+        @(Get-ChildItem Flynnel:\backends\accel-ops).Count | Should -Be $fromCmdlet.Count
+        if ($fromCmdlet.Count -eq 0) {
+            Set-ItResult -Skipped -Because 'no accelerator operation is registered in this process'
+            return
+        }
+        foreach ($row in $fromCmdlet) {
+            $name = $row.Name -replace '[\\/:]', '-'
+            $d = Test-SameRow -Left $row -Right (Get-Item "Flynnel:\backends\accel-ops\$name")
+            $d.Count | Should -Be 0 -Because ("$($row.Name) differs: " + ($d -join '; '))
+        }
+    }
 }
 
 Describe 'the sites level' {
@@ -266,16 +290,65 @@ Describe 'the calibration and trace levels' {
         $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
     }
 
-    It 'answers the same trace state as Get-FlynnelTraceState' {
-        $d = Test-SameRow -Left (Get-FlynnelTraceState) `
-            -Right (Get-Item Flynnel:\trace\state)
+    It 'answers the same store as Get-FlynnelCalibrationStore' {
+        $fromCmdlet = $null
+        try {
+            $fromCmdlet = Get-FlynnelCalibrationStore -ErrorAction Stop
+        } catch {
+            # The one case the cmdlet refuses. The leaf is still there and
+            # holds nothing, which is how the drive says a host took no
+            # such reading.
+            if ("$_" -notmatch 'no calibration directory') { throw }
+            Test-Path 'Flynnel:\calibration\store' | Should -BeTrue
+            @(Get-Content Flynnel:\calibration\store).Count | Should -Be 0
+            (Get-Item Flynnel:\calibration\store).Unavailable | Should -Not -BeNullOrEmpty
+            return
+        }
+        $d = Test-SameRow -Left $fromCmdlet -Right (Get-Item Flynnel:\calibration\store)
         $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
     }
 
-    It 'enumerates both calibration leaves' {
+    It 'answers the same trace state as Get-FlynnelTraceState' {
+        $d = Test-SameRow -Left (Get-FlynnelTraceState) `
+            -Right (Get-Item Flynnel:\trace\enabled)
+        $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
+    }
+
+    It 'streams the same events as Get-FlynnelTraceEvent, one row each' {
+        # The ring is the calling thread's, so the dispatch that fills it
+        # runs here, on the thread that then reads it both ways.
+        Clear-FlynnelTrace
+        $null = Set-FlynnelTraceState -On -WarningVariable ignored
+        try {
+            $null = Invoke-FlynnelMap -InputObject ([double[]](1..20000)) -Operation Square
+        } finally {
+            $null = Set-FlynnelTraceState -On:$false -WarningVariable ignored
+        }
+        try {
+            $fromCmdlet = @(Get-FlynnelTraceEvent)
+            $fromDrive = @(Get-Content Flynnel:\trace\events)
+            $fromCmdlet.Count | Should -BeGreaterThan 0
+            $fromDrive.Count | Should -Be $fromCmdlet.Count
+            for ($i = 0; $i -lt $fromCmdlet.Count; $i++) {
+                $d = Test-SameRow -Left $fromCmdlet[$i] -Right $fromDrive[$i]
+                $d.Count | Should -Be 0 -Because ("row $i differs: " + ($d -join '; '))
+            }
+            # The item holds every row as one object.
+            @(Get-Item Flynnel:\trace\events).Count | Should -Be 1
+            (Get-Item Flynnel:\trace\events).Count | Should -Be $fromCmdlet.Count
+        } finally {
+            Clear-FlynnelTrace
+        }
+    }
+
+    It 'enumerates every calibration and trace leaf' {
         $names = @(Get-ChildItem Flynnel:\calibration | ForEach-Object { $_.PSChildName })
         $names | Should -Contain 'summary'
         $names | Should -Contain 'thresholds'
+        $names | Should -Contain 'store'
+        $names = @(Get-ChildItem Flynnel:\trace | ForEach-Object { $_.PSChildName })
+        $names | Should -Contain 'enabled'
+        $names | Should -Contain 'events'
     }
 }
 
@@ -295,9 +368,10 @@ Describe 'the peer level' {
         }
         @(Get-ChildItem Flynnel:\peer).Count | Should -Be 0
         Test-Path 'Flynnel:\peer\summary' | Should -BeFalse
+        Test-Path 'Flynnel:\peer\watchdog' | Should -BeFalse
     }
 
-    It 'answers the same summary as Get-FlynnelGpuPeer once one runs' {
+    It 'answers the same summary and watchdog as the cmdlets once one runs' {
         $cuda = Get-FlynnelBackend | Where-Object { $_.Kind -eq 'Cuda' -and $_.Available }
         if (-not $cuda) {
             Set-ItResult -Skipped -Because 'no loadable CUDA driver on this host'
@@ -309,12 +383,19 @@ Describe 'the peer level' {
             $d = Test-SameRow -Left (Get-FlynnelGpuPeer) `
                 -Right (Get-Item Flynnel:\peer\summary)
             $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
+            # The default configuration starts the peer on device zero,
+            # so the leaf is that device's watchdog.
+            Test-Path 'Flynnel:\peer\watchdog' | Should -BeTrue
+            $d = Test-SameRow -Left (Get-FlynnelPeerWatchdog -Ordinal 0) `
+                -Right (Get-Item Flynnel:\peer\watchdog)
+            $d.Count | Should -Be 0 -Because ("these differ: " + ($d -join '; '))
         } finally {
             Remove-FlynnelGpuPeer -WarningAction SilentlyContinue | Out-Null
         }
-        # And it goes away again, so the level tracks the peer rather
+        # And both go away again, so the level tracks the peer rather
         # than remembering that one once existed.
         Test-Path 'Flynnel:\peer\summary' | Should -BeFalse
+        Test-Path 'Flynnel:\peer\watchdog' | Should -BeFalse
     }
 }
 

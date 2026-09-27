@@ -184,19 +184,24 @@ Text: `Search-FlynnelText`, `Measure-FlynnelTextCount`,
 Each takes an optional `-Plan`, and `-Verbose` reports the plan that
 ran the work, the workers it resolved to and the leaves it asked for.
 
-**Observation.** The dispatch counters, the pool's leaf statistics,
-occupancy, and which shape the last reduce took.
-`Get-FlynnelTraceState`, `Get-FlynnelTrace`, `Clear-FlynnelTrace`,
-`Request-FlynnelTraceFlush`, `Get-FlynnelLeafStat`,
-`Reset-FlynnelLeafStat`, `Measure-FlynnelOccupancy`,
-`Get-FlynnelThreadTick`, `Get-FlynnelReducePath`, `Get-FlynnelSpread`,
-`Get-FlynnelCallSite`, `Reset-FlynnelCallSite`,
-`Set-FlynnelTraceState`.
+**Observation.** The dispatch counters, the trace ring, the pool's leaf
+statistics, occupancy, and which shape the last reduce took.
+`Get-FlynnelTraceState`, `Get-FlynnelTrace`, `Get-FlynnelTraceEvent`,
+`Clear-FlynnelTrace`, `Request-FlynnelTraceFlush`,
+`Get-FlynnelLeafStat`, `Reset-FlynnelLeafStat`,
+`Measure-FlynnelOccupancy`, `Get-FlynnelThreadTick`,
+`Get-FlynnelReducePath`, `Get-FlynnelSpread`, `Get-FlynnelCallSite`,
+`Reset-FlynnelCallSite`, `Set-FlynnelTraceState`.
 
 `Set-FlynnelTraceState` is the one that could not exist until the
 crate stopped latching its flag: the ring was armed by an environment
 variable read once, and a module cannot set the environment of a
 process it is already inside.
+
+`Get-FlynnelTraceEvent` reads the trace ring of the thread running the
+command: the caller's side of every dispatch that thread entered,
+oldest event first. Each worker's ring is its own and reaches stderr
+through `Request-FlynnelTraceFlush`.
 
 `Get-FlynnelSpread` answers two statistics over a caller's samples,
 not one. The spread reads the extremes and one stalled sample moves

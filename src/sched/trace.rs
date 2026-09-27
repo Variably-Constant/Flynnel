@@ -41,22 +41,31 @@ pub enum TraceEvent {
     DispatchEnter = 1,
     /// `for_each_chunk` return. Payload = total item count.
     DispatchExit = 2,
-    /// A leaf body is about to execute. Payload = leaf item count.
+    /// A leaf body is about to execute. Payload = 0.
     LeafStart = 3,
-    /// The leaf body completed. Payload = leaf item count.
+    /// The leaf body completed. Payload = 0.
     LeafEnd = 4,
-    /// `join_in_worker` pushed the right half to the deque. Payload = 0.
+    /// `join_in_worker` pushed the right half to the deque, with
+    /// payload 0, or a cooperative fan-out published its jobs, with
+    /// payload = its closure count.
     JoinPush = 5,
     /// `join_in_worker` began its drain loop waiting for the right
-    /// half to finish. Payload = 0.
+    /// half to finish, with payload 0, or a cooperative fan-out began
+    /// waiting on its siblings, with payload = its closure count.
     JoinWaitBegin = 6,
-    /// `join_in_worker` returned (right half done). Payload = 0.
+    /// The wait ended. From `join_in_worker`, payload = 1 when a thief
+    /// had already run the right half and set its latch, and 0 when the
+    /// joining thread found the right half still in its deque and ran
+    /// it itself. From a cooperative fan-out, payload = its closure
+    /// count.
     JoinWaitEnd = 7,
-    /// A worker thread woke up from park to find work. Payload =
-    /// worker_id.
+    /// A sampled park ended in a wake. Payload = what the wake cost in
+    /// nanoseconds, from the unparker's stamp to this thread running,
+    /// saturating at `u32::MAX`. Only the parks the wait controller
+    /// samples emit it; an unsampled park, or one that ended without
+    /// an unpark, emits none.
     WorkerWake = 8,
-    /// A worker successfully stole from a peer. Payload = victim
-    /// worker_id.
+    /// A thief stole from a peer. No path in the library emits it.
     StealHit = 9,
     /// An external caller pushed its wrapped join to a slot deque
     /// and broadcast-woke the primaries. Payload = 0.
@@ -316,6 +325,23 @@ pub fn reset_current_thread() {
         let mut v = buf.borrow_mut();
         v.clear();
     });
+}
+
+/// A copy of every event the calling thread's ring holds, oldest
+/// first.
+///
+/// The ring is left as it is; [`reset_current_thread`] is what empties
+/// it. Only the calling thread's ring can be read, because each ring is
+/// a thread-local: a worker's events reach stderr through
+/// [`request_worker_flush`] and nowhere else.
+///
+/// A ring records only while [`is_enabled`] answers true and keeps
+/// what it recorded after tracing is turned off, so an empty answer is
+/// a thread that recorded nothing since its ring was last emptied.
+/// Reading a thread's ring for the first time allocates it, as its
+/// first event would.
+pub fn snapshot_current_thread() -> Vec<TraceRecord> {
+    THREAD_TRACE.with(|buf| buf.borrow().clone())
 }
 
 /// Per-thread registration. Worker threads call this once at startup

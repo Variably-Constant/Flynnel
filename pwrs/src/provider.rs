@@ -33,7 +33,8 @@
 //! path that is not there, and a script cannot tell them apart if the
 //! second is used for the first. So a reading this host cannot take -
 //! the latency table on a machine whose ping-pong sweep could not pin
-//! threads - is a leaf that exists and holds nothing.
+//! threads, or the calibration store where no calibration directory is
+//! configured - is a leaf that exists and holds nothing.
 
 use pwrs::prelude::*;
 
@@ -43,12 +44,13 @@ use pwrs::prelude::*;
 /// Held as a path list rather than built per call so enumerating a
 /// container is one pass over this table, and so a path that is not
 /// here is not there.
-const CONTAINERS: [&str; 8] = [
+const CONTAINERS: [&str; 9] = [
     "host",
     "pool",
     "pool/workers",
     "sites",
     "backends",
+    "backends/accel-ops",
     "calibration",
     "trace",
     "peer",
@@ -59,7 +61,7 @@ const CONTAINERS: [&str; 8] = [
 /// `pool/workers` has children too, but how many is a reading rather
 /// than a shape, so they are not here; [`FlynnelDrive::children_of`]
 /// asks the pool.
-const LEAVES: [&str; 10] = [
+const LEAVES: [&str; 12] = [
     "host/topology",
     "host/cpu",
     "host/latency",
@@ -69,7 +71,9 @@ const LEAVES: [&str; 10] = [
     "pool/split",
     "calibration/summary",
     "calibration/thresholds",
-    "trace/state",
+    "calibration/store",
+    "trace/enabled",
+    "trace/events",
 ];
 
 /// A provider path in internal form: forward slashes, no leading or
@@ -100,8 +104,8 @@ impl FlynnelDrive {
     /// The object at one leaf, or None where the host cannot take that
     /// reading.
     fn leaf_value(path: &str) -> PsResult<Option<PsObject>> {
-        // The three levels whose children are readings carry their key
-        // in the name, so they are matched before the fixed paths.
+        // The levels whose children are readings carry their key in
+        // the name, so they are matched before the fixed paths.
         if let Some(name) = path.strip_prefix("pool/workers/") {
             return match Self::worker_by_name(name) {
                 Some(w) => Ok(Some(w.into_ps()?)),
@@ -126,6 +130,17 @@ impl FlynnelDrive {
             }
             return Ok(None);
         }
+        // Before the backend kinds, because every path under
+        // `backends\accel-ops` also begins with `backends/`.
+        if let Some(name) = path.strip_prefix("backends/accel-ops/") {
+            return match crate::backends::accel_op_rows()
+                .into_iter()
+                .find(|r| Self::accel_op_name(&r.name) == name)
+            {
+                Some(row) => Ok(Some(row.into_ps()?)),
+                None => Ok(None),
+            };
+        }
         if let Some(name) = path.strip_prefix("backends/") {
             let detected = flynnel::backend::detect::detect_all();
             let found = crate::backends::BackendKind::ENUMERABLE
@@ -142,9 +157,9 @@ impl FlynnelDrive {
             "host/topology" => Some(crate::host::topology_snapshot().into_ps()?),
             "host/cpu" => Some(crate::host::cpu_info_row().into_ps()?),
             "host/cache" => Some(crate::host::cache_allocation_row().into_ps()?),
-            // The one reading a host can genuinely lack. An empty leaf
-            // rather than an absent path, so a script can tell "this
-            // host took no measurement" from "no such thing exists".
+            // A reading a host can genuinely lack. An empty leaf rather
+            // than an absent path, so a script can tell "this host took
+            // no measurement" from "no such thing exists".
             "host/latency" => match crate::host::latency_table_row() {
                 Some(row) => Some(row.into_ps()?),
                 None => None,
@@ -154,11 +169,26 @@ impl FlynnelDrive {
             "pool/split" => Some(crate::pool::split_snapshot().into_ps()?),
             "calibration/summary" => Some(crate::calibration::calibration_row().into_ps()?),
             "calibration/thresholds" => Some(crate::calibration::threshold_row().into_ps()?),
-            "trace/state" => Some(crate::observe::trace_state_row().into_ps()?),
+            // Empty where no calibration directory is configured, the
+            // one case Get-FlynnelCalibrationStore refuses. A host that
+            // has one and has never calibrated answers a row with
+            // Exists false, as the cmdlet does.
+            "calibration/store" => match crate::calibration::store_row()? {
+                Some(row) => Some(row.into_ps()?),
+                None => None,
+            },
+            "trace/enabled" => Some(crate::observe::trace_state_row().into_ps()?),
+            // Every row Get-FlynnelTraceEvent writes, as one object.
+            // Get-Content streams them one at a time instead.
+            "trace/events" => Some(crate::observe::trace_event_rows().into_ps()?),
             // Present only while a peer is. The container above stays
             // either way, so a script can tell "no peer is running"
             // from "this module has no peer level".
             "peer/summary" => match crate::gpupeer::running_peer_row() {
+                Some(row) => Some(row.into_ps()?),
+                None => None,
+            },
+            "peer/watchdog" => match crate::gpupeer::running_peer_watchdog_row() {
                 Some(row) => Some(row.into_ps()?),
                 None => None,
             },
@@ -239,6 +269,11 @@ impl FlynnelDrive {
                 out.push((format!("backends/{name}"), false));
             }
         }
+        if path == "backends/accel-ops" {
+            for name in Self::accel_op_names() {
+                out.push((format!("backends/accel-ops/{name}"), false));
+            }
+        }
         // The peer level exists whether or not a peer does. A host
         // with no GPU gets a container that enumerates nothing, not a
         // missing path, because a missing path and a missing device
@@ -246,6 +281,7 @@ impl FlynnelDrive {
         // retrying.
         if path == "peer" && crate::gpupeer::peer_is_running() {
             out.push(("peer/summary".to_string(), false));
+            out.push(("peer/watchdog".to_string(), false));
         }
         out
     }
@@ -298,6 +334,23 @@ impl FlynnelDrive {
             .collect()
     }
 
+    /// An accelerator operation's name as a path segment: the name it
+    /// registered under, with each separator a segment cannot carry
+    /// made a hyphen. The row still holds the registered name.
+    fn accel_op_name(registered: &str) -> String {
+        registered.replace(['\\', '/', ':'], "-")
+    }
+
+    /// Every accelerator operation registered in this process, which is
+    /// none until something registers one, so an empty level is the
+    /// ordinary state rather than a level that failed to enumerate.
+    fn accel_op_names() -> Vec<String> {
+        crate::backends::accel_op_rows()
+            .iter()
+            .map(|r| Self::accel_op_name(&r.name))
+            .collect()
+    }
+
     fn is_container(path: &str) -> bool {
         path.is_empty() || CONTAINERS.contains(&path)
     }
@@ -306,7 +359,7 @@ impl FlynnelDrive {
         if LEAVES.contains(&path) {
             return true;
         }
-        if path == "peer/summary" {
+        if path == "peer/summary" || path == "peer/watchdog" {
             return crate::gpupeer::peer_is_running();
         }
         if let Some(name) = path.strip_prefix("pool/workers/") {
@@ -314,6 +367,9 @@ impl FlynnelDrive {
         }
         if let Some(name) = path.strip_prefix("sites/") {
             return Self::site_names().iter().any(|n| n == name);
+        }
+        if let Some(name) = path.strip_prefix("backends/accel-ops/") {
+            return Self::accel_op_names().iter().any(|n| n == name);
         }
         if let Some(name) = path.strip_prefix("backends/") {
             return Self::backend_names().iter().any(|n| n == name);
@@ -419,9 +475,10 @@ impl Provider for FlynnelDrive {
     }
 
     /// A leaf's rows. One object for a leaf that answers a single row,
-    /// which is every leaf at this level; a leaf whose reading the
-    /// host cannot take streams nothing rather than a placeholder,
-    /// because Get-Content is asked for rows and there are none.
+    /// and one per event for `trace\events`, whose rows are what
+    /// Get-FlynnelTraceEvent writes; a leaf whose reading the host
+    /// cannot take streams nothing rather than a placeholder, because
+    /// Get-Content is asked for rows and there are none.
     fn get_content(&mut self, path: &str) -> PsResult<Vec<PsObject>> {
         let p = norm(path);
         if !Self::is_leaf(&p) {
@@ -430,6 +487,12 @@ impl Provider for FlynnelDrive {
                 "FlynnelDriveNotALeaf",
                 format!("{p} is not a leaf, so it has no content to read"),
             ));
+        }
+        if p == "trace/events" {
+            return crate::observe::trace_event_rows()
+                .into_iter()
+                .map(|row| row.into_ps())
+                .collect();
         }
         Ok(match Self::leaf_value(&p)? {
             Some(v) => vec![v],

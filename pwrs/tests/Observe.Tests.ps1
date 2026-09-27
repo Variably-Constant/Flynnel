@@ -24,6 +24,14 @@ Describe 'the types this family exports' {
             $properties | Should -Contain $wanted
         }
     }
+
+    It 'shapes the event row the way its cmdlet documents' {
+        $properties = @(Get-FlynnelTypeProperty -TypeName 'Flynnel.TraceEvent' |
+            ForEach-Object Name)
+        foreach ($wanted in 'Index', 'Event', 'Payload', 'Tsc') {
+            $properties | Should -Contain $wanted
+        }
+    }
 }
 
 Describe 'Get-FlynnelTraceState' {
@@ -284,6 +292,63 @@ Describe 'Set-FlynnelTraceState' {
         $warnings = @()
         $null = Set-FlynnelTraceState -On:$false -WarningVariable warnings
         "$warnings" | Should -BeLike '*already off*'
+    }
+}
+
+Describe 'Get-FlynnelTraceEvent' {
+    AfterAll {
+        # Process-wide, so leave it as the suite found it.
+        $null = Set-FlynnelTraceState -On:$false -WarningVariable ignored
+        Clear-FlynnelTrace
+    }
+
+    It 'reads what a traced dispatch left on this thread, and leaves it there' {
+        # The ring is the calling thread's, so the dispatch that fills it
+        # runs here, on the thread that then reads it.
+        Clear-FlynnelTrace
+        $null = Set-FlynnelTraceState -On -WarningVariable ignored
+        try {
+            $null = Invoke-FlynnelMap -InputObject ([double[]](1..20000)) -Operation Square
+        } finally {
+            $null = Set-FlynnelTraceState -On:$false -WarningVariable ignored
+        }
+        $first = @(Get-FlynnelTraceEvent)
+        $first.Count | Should -BeGreaterThan 0
+        $first[0].Event | Should -BeOfType ([Flynnel.TraceEventKind])
+        # Reading does not empty the ring, and with the trace off nothing
+        # new arrives, so a second read answers the same rows in the same
+        # order.
+        $second = @(Get-FlynnelTraceEvent)
+        $second.Count | Should -Be $first.Count
+        for ($i = 0; $i -lt $first.Count; $i++) {
+            $first[$i].Index | Should -Be $i
+            $second[$i].Event | Should -Be $first[$i].Event
+            $second[$i].Payload | Should -Be $first[$i].Payload
+        }
+    }
+
+    It 'gives a time stamp only where the ring reads a counter' {
+        # Off x86-64 the ring's figure is not a time, and a null says so
+        # where a number would be quoted as one.
+        $rows = @(Get-FlynnelTraceEvent)
+        if ($rows.Count -eq 0) {
+            Set-ItResult -Skipped -Because 'the ring is empty'
+            return
+        }
+        $arch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
+        if ("$arch" -eq 'X64') {
+            $rows[0].Tsc | Should -Not -BeNullOrEmpty
+        } else {
+            $rows[0].Tsc | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'is emptied by Clear-FlynnelTrace, and says why nothing came back' {
+        Clear-FlynnelTrace
+        $warnings = @()
+        $rows = @(Get-FlynnelTraceEvent -WarningVariable warnings)
+        $rows.Count | Should -Be 0
+        ($warnings -join ' ') | Should -Match 'trace ring is off'
     }
 }
 

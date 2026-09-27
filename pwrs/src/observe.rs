@@ -273,6 +273,185 @@ impl Cmdlet for GetFlynnelTrace {
     }
 }
 
+/// What a recorded trace event marks.
+#[psenum(name = "Flynnel.TraceEventKind")]
+#[derive(Clone, Copy, Default)]
+pub enum TraceEventKind {
+    /// A dispatch began. Payload is its item count.
+    #[default]
+    DispatchEnter,
+    /// A dispatch returned. Payload is its item count.
+    DispatchExit,
+    /// A leaf body is about to run. Payload is zero.
+    LeafStart,
+    /// A leaf body finished. Payload is zero.
+    LeafEnd,
+    /// A join pushed its right half, payload zero, or a cooperative
+    /// fan-out published its jobs, payload its closure count.
+    JoinPush,
+    /// A join began waiting for its right half, payload zero, or a
+    /// cooperative fan-out began waiting on its siblings, payload its
+    /// closure count.
+    JoinWaitBegin,
+    /// That wait ended. From a join, payload 1 when a thief had already
+    /// run the right half and 0 when the joining thread ran it itself;
+    /// from a cooperative fan-out, its closure count.
+    JoinWaitEnd,
+    /// A park the wait controller sampled ended in a wake. Payload is
+    /// what the wake cost in nanoseconds, saturating at 4294967295.
+    WorkerWake,
+    /// A thief stole from a peer. No path in the scheduler records it.
+    StealHit,
+    /// An external caller pushed its dispatch to a slot and woke the
+    /// primaries. Payload is zero.
+    SlotPush,
+    /// That caller's wait ended. Payload is 1 when it ended while
+    /// spinning and 0 when it ended after parking.
+    SlotWaitEnd,
+    /// A primary began running an external caller's dispatch. Payload
+    /// is zero.
+    SlotJobStart,
+    /// That dispatch returned on the primary. Payload is zero.
+    SlotJobEnd,
+    /// A parker is about to wait. Payload is the strategy it chose: 0 a
+    /// kernel park, 1 WAITPKG, 2 MONITORX, plus 16 when the park is
+    /// timed for the wait controller.
+    ParkEnter,
+    /// The wait controller moved the process to another strategy.
+    /// Payload is the strategy now in use, coded as for ParkEnter.
+    WaitSwitch,
+    /// A pool worker committed to parking. Payload is its index.
+    PoolPark,
+    /// A producer claimed a parked pool worker to wake it. Payload is
+    /// that worker's index.
+    PoolWake,
+    /// A pool worker began an idle episode waiting on the host's
+    /// monitor. Payload is 1 for WAITPKG and 2 for MONITORX.
+    SpinMonitor,
+    /// A waiting caller took the host's monitor for part of its spin.
+    /// Payload is 1 for WAITPKG and 2 for MONITORX, plus 32 when the
+    /// wait was the slot path's.
+    LatchMonitor,
+    /// A thief is about to set the latch of a stolen job it ran.
+    /// Payload is zero.
+    LatchSet,
+    /// A join's wait ended after at least one yield. Payload is the
+    /// last yield's length in microseconds, saturating at 4294967295.
+    JoinLastYield,
+}
+
+impl From<trace::TraceEvent> for TraceEventKind {
+    fn from(e: trace::TraceEvent) -> Self {
+        use trace::TraceEvent as E;
+        match e {
+            E::DispatchEnter => TraceEventKind::DispatchEnter,
+            E::DispatchExit => TraceEventKind::DispatchExit,
+            E::LeafStart => TraceEventKind::LeafStart,
+            E::LeafEnd => TraceEventKind::LeafEnd,
+            E::JoinPush => TraceEventKind::JoinPush,
+            E::JoinWaitBegin => TraceEventKind::JoinWaitBegin,
+            E::JoinWaitEnd => TraceEventKind::JoinWaitEnd,
+            E::WorkerWake => TraceEventKind::WorkerWake,
+            E::StealHit => TraceEventKind::StealHit,
+            E::SlotPush => TraceEventKind::SlotPush,
+            E::SlotWaitEnd => TraceEventKind::SlotWaitEnd,
+            E::SlotJobStart => TraceEventKind::SlotJobStart,
+            E::SlotJobEnd => TraceEventKind::SlotJobEnd,
+            E::ParkEnter => TraceEventKind::ParkEnter,
+            E::WaitSwitch => TraceEventKind::WaitSwitch,
+            E::PoolPark => TraceEventKind::PoolPark,
+            E::PoolWake => TraceEventKind::PoolWake,
+            E::SpinMonitor => TraceEventKind::SpinMonitor,
+            E::LatchMonitor => TraceEventKind::LatchMonitor,
+            E::LatchSet => TraceEventKind::LatchSet,
+            E::JoinLastYield => TraceEventKind::JoinLastYield,
+        }
+    }
+}
+
+/// One event the calling thread's trace ring recorded.
+#[psclass(name = "Flynnel.TraceEvent")]
+#[derive(Clone, Default)]
+pub struct TraceEventRow {
+    /// Its place in the ring, from zero for the oldest.
+    pub index: u64,
+    /// What it marks.
+    pub event: TraceEventKind,
+    /// The integer it carries. What it means depends on Event, whose
+    /// help names it for each kind.
+    pub payload: u32,
+    /// The processor's time stamp counter when it was recorded. Null
+    /// off x86-64, where the ring reads no counter and its figure is
+    /// not a time.
+    pub tsc: Option<u64>,
+}
+
+/// The calling thread's ring as rows, shared by the cmdlet that reads
+/// it and the drive's `trace\events` leaf, so the two cannot describe
+/// the ring differently.
+pub(crate) fn trace_event_rows() -> Vec<TraceEventRow> {
+    trace::snapshot_current_thread()
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| TraceEventRow {
+            index: i as u64,
+            event: TraceEventKind::from(r.event),
+            payload: r.payload,
+            tsc: if cfg!(target_arch = "x86_64") {
+                Some(r.tsc)
+            } else {
+                None
+            },
+        })
+        .collect()
+}
+
+/// Reads the events the calling thread's trace ring holds, oldest
+/// first.
+///
+/// The ring is per thread, and this reads the one belonging to the
+/// thread running the command. A dispatch is entered on the thread
+/// that runs it, so the ring holds the caller's side of the dispatches
+/// that thread entered: each one's entry and exit, a slot push and the
+/// wait after it, and any park that wait took. What the workers did is
+/// in their own rings, which reach stderr through
+/// Request-FlynnelTraceFlush and nowhere else.
+///
+/// The ring records only while the trace is on, and keeps what it
+/// recorded after the trace is turned off, until Clear-FlynnelTrace
+/// empties it. Reading it does not.
+///
+/// # Examples
+///
+/// `Set-FlynnelTraceState -On; Invoke-FlynnelMap -InputObject $data -Operation Square; Get-FlynnelTraceEvent`
+///
+/// `Get-FlynnelTraceEvent | Group-Object Event`
+#[cmdlet(
+    verb = "Get",
+    noun = "FlynnelTraceEvent",
+    alias = "Get-FlyTraceEvent",
+    output = ["Flynnel.TraceEvent"]
+)]
+#[derive(Default)]
+pub struct GetFlynnelTraceEvent {}
+
+impl Cmdlet for GetFlynnelTraceEvent {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let rows = trace_event_rows();
+        if rows.is_empty() && !trace::is_enabled() {
+            pwrs::warning!(
+                ps,
+                "the trace ring is off, so this thread recorded nothing. Set-FlynnelTraceState \
+                 -On turns it on"
+            )?;
+        }
+        for row in rows {
+            ps.write(row)?;
+        }
+        Ok(())
+    }
+}
+
 /// Clears the calling thread's trace ring and any pending worker-flush
 /// request.
 ///

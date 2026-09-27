@@ -494,6 +494,33 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- **Four more readings on the `Flynnel:` drive, and the trace ring as
+  rows.** `backends\accel-ops\<name>` holds a leaf per registered
+  accelerator operation, the row Get-FlynnelAccelOp writes.
+  `calibration\store` is the row Get-FlynnelCalibrationStore writes, and
+  holds nothing where no calibration directory is configured.
+  `peer\watchdog` is Get-FlynnelPeerWatchdog's row for the device the
+  running peer was started on, present while a peer is. `trace\state` is
+  now `trace\enabled`, the same Flynnel.TraceState row, and
+  `trace\events` streams one Flynnel.TraceEvent per event under
+  Get-Content, while Get-Item answers them all as one object.
+
+  Get-FlynnelTraceEvent writes those rows: the events held by the trace
+  ring of the thread running the command, oldest first, which is the
+  caller's side of each dispatch that thread entered. Reading leaves the
+  ring as it was; Clear-FlynnelTrace empties it. Each worker's ring
+  still reaches stderr only. `sched::trace::snapshot_current_thread` is
+  the crate's read of the calling thread's ring, a copy that no dispatch
+  path calls. A row's Tsc is null off x86-64, where the ring reads no
+  counter.
+
+  `TraceEvent`'s documentation gives each payload as the scheduler
+  emits it: LeafStart and LeafEnd carry zero; a cooperative fan-out's
+  JoinPush, JoinWaitBegin and JoinWaitEnd carry its closure count;
+  `join_in_worker`'s JoinWaitEnd carries 1 when a thief ran the right
+  half and 0 when the joining thread ran it; WorkerWake carries a
+  sampled park's wake cost in nanoseconds; and no path emits StealHit.
+
 - **Mapped host memory and the device's facts on the CUDA backend.**
   `CudaBackend::map_host::<T>(len)` answers a `MappedBuffer<T>`:
   page-locked host memory the device reads and writes directly, set to

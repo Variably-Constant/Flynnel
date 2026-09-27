@@ -5,7 +5,7 @@ weight: 10
 
 Every command the Flynnel PowerShell module exports, by family, with the objects and enumerations each one deals in. For the task-oriented introduction see [How To Use The PowerShell Module](../how-to/How-To-Use-The-PowerShell-Module/).
 
-112 commands, 83 object types, 37 enumerations. Every command answers to a shorter name with the `Fly` prefix; the alias is listed beside each.
+113 commands, 84 object types, 38 enumerations. Every command answers to a shorter name with the `Fly` prefix; the alias is listed beside each.
 
 `Get-Help <command> -Full` carries the parameters, the examples and what each parameter means. This page is the map, not a substitute for it.
 
@@ -134,15 +134,16 @@ The declared kernels cut their own blocks and run them through one chunk runner,
 
 `Get-FlynnelHistogram` takes `-AsArray` to answer bare counts instead of one `Flynnel.HistogramBin` record per bin. At 50,000 bins the record shape is the pipeline's cost, not the kernel's.
 
-## Observation - 13 commands
+## Observation - 14 commands
 
-The dispatch counters, the pool's leaf statistics, occupancy, call sites, and which shape the last reduce took.
+The dispatch counters, the trace ring, the pool's leaf statistics, occupancy, call sites, and which shape the last reduce took.
 
 | command | alias |
 |---|---|
 | `Get-FlynnelTraceState` | `Get-FlyTraceState` |
 | `Set-FlynnelTraceState` | `Set-FlyTraceState` |
 | `Get-FlynnelTrace` | `Get-FlyTrace` |
+| `Get-FlynnelTraceEvent` | `Get-FlyTraceEvent` |
 | `Clear-FlynnelTrace` | `Clear-FlyTrace` |
 | `Request-FlynnelTraceFlush` | `Request-FlyTraceFlush` |
 | `Get-FlynnelLeafStat` | `Get-FlyLeafStat` |
@@ -154,13 +155,15 @@ The dispatch counters, the pool's leaf statistics, occupancy, call sites, and wh
 | `Get-FlynnelCallSite` | `Get-FlyCallSite` |
 | `Reset-FlynnelCallSite` | `Reset-FlyCallSite` |
 
-Objects: `Flynnel.TraceState`, `Flynnel.TraceCounters`, `Flynnel.LeafStats`, `Flynnel.Occupancy`, `Flynnel.Spread`, `Flynnel.CallSite`.
+Objects: `Flynnel.TraceState`, `Flynnel.TraceCounters`, `Flynnel.TraceEvent`, `Flynnel.LeafStats`, `Flynnel.Occupancy`, `Flynnel.Spread`, `Flynnel.CallSite`.
 
-Enumerations: `Flynnel.NoReading`, `Flynnel.ReducePath`.
+Enumerations: `Flynnel.NoReading`, `Flynnel.ReducePath`, `Flynnel.TraceEventKind`.
 
 `Get-FlynnelReducePath` answers `Flat` or `Bisect` for a fold the pool ran, and `Caller` for one a plan capped at one worker kept on the calling thread.
 
 `Set-FlynnelTraceState` could not exist until the crate stopped latching its flag: the ring was armed by an environment variable read once, and a module cannot set the environment of a process it is already inside. `Get-FlynnelTraceState` reports `EnabledBy` as real provenance: the variable until a setter has decided, and the command after.
+
+`Get-FlynnelTraceEvent` reads the trace ring of the thread running the command, oldest event first, and leaves it as it was; `Clear-FlynnelTrace` empties it. A dispatch is entered on the thread that runs it, so the ring holds the caller's side of the dispatches that thread entered: a slot push and the wait after it, the leaves it ran itself, any park the wait took. Each worker's ring is its own and reaches stderr through `Request-FlynnelTraceFlush`. `Tsc` is null off x86-64, where the ring reads no counter.
 
 `Get-FlynnelSpread` answers two statistics rather than one. The spread reads the extremes and one stalled sample moves it; the interquartile range reads the middle half and does not. A run with a wide spread and a narrow range was steady with an interruption in it, which is a different finding from one that was not steady.
 
@@ -407,9 +410,10 @@ Flynnel:\
   pool\         summary, spin, split, workers\<n>
   sites\        one per call site the scheduler has materialized
   backends\     one per backend kind, present on this host or not
-  calibration\  summary, thresholds
-  trace\        state
-  peer\         summary, while a GPU peer is running
+    accel-ops\  one per registered accelerator operation
+  calibration\  summary, thresholds, store
+  trace\        enabled, events
+  peer\         summary, watchdog, while a GPU peer is running
 ```
 
 **Read only, and by not implementing rather than by refusing.** There is no `New-Item`, `Remove-Item` or `Set-Content`: the binding framework's own defaults answer an error for every write. A drive that could change the scheduler would be a second way to do what the `Set-` commands already do, and two ways to write one setting is how they drift apart.
@@ -418,7 +422,9 @@ Flynnel:\
 
 **A leaf therefore has no `Name`.** A `Flynnel.CpuInfo` carries no such property and adding one would make the drive's object differ from the command's. `PSChildName` is the name, supplied by the engine from the path. Containers do carry `Name`, because their object is the provider's own.
 
-**A level that cannot be read says so.** `peer\` exists on a host with no GPU and enumerates nothing; `host\latency` is a leaf that exists and holds no rows where the ping-pong sweep could not run. A missing path and a missing reading look alike to a script, and only one of them is worth retrying.
+**A level that cannot be read says so.** `peer\` exists on a host with no GPU and enumerates nothing; `host\latency` is a leaf that exists and holds no rows where the ping-pong sweep could not run, and `calibration\store` holds none where no calibration directory is configured. A missing path and a missing reading look alike to a script, and only one of them is worth retrying.
+
+**`trace\events` is the one leaf with many rows.** `Get-Content` streams one `Flynnel.TraceEvent` per event, the rows `Get-FlynnelTraceEvent` writes; `Get-Item` answers them all as one object. Like the command, it reads the ring of the thread doing the reading.
 
 **`pool\workers` is built in one pass**, not one call into Rust per child. Its children are matched against the names the level lists, so `5` finds worker five and `05` finds nothing. The external slots a foreign thread pushes through are left out: they are real rows and they are not workers, and `Get-FlynnelWorker -IncludeExternalSlot` is where a caller who wants them asks.
 

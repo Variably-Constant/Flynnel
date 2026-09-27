@@ -136,24 +136,30 @@ pub struct GetFlynnelPeerWatchdog {
     pub ordinal: Option<u32>,
 }
 
+/// The watchdog row for one device, shared by Get-FlynnelPeerWatchdog
+/// and the Flynnel drive's `peer\watchdog` leaf so the two cannot
+/// describe it differently.
+pub(crate) fn watchdog_row(ordinal: u32) -> PeerWatchdog {
+    let (model, state) = watchdog::detect_with_model(ordinal as usize);
+    let (kind, known, problem) = match model {
+        Ok(m) => (DriverModelKind::from(m), true, None),
+        Err(err) => (DriverModelKind::Unknown, false, Some(err)),
+    };
+    PeerWatchdog {
+        ordinal,
+        applies: state.applies(),
+        delay_ns: state.delay_ns,
+        delay_seconds: state.delay_ns.map(|ns| ns as f64 / 1_000_000_000.0),
+        driver_model: kind,
+        driver_model_known: known,
+        driver_model_problem: problem,
+        basis: state.basis,
+    }
+}
+
 impl Cmdlet for GetFlynnelPeerWatchdog {
     fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-        let ordinal = self.ordinal.unwrap_or(0);
-        let (model, state) = watchdog::detect_with_model(ordinal as usize);
-        let (kind, known, problem) = match model {
-            Ok(m) => (DriverModelKind::from(m), true, None),
-            Err(err) => (DriverModelKind::Unknown, false, Some(err)),
-        };
-        ps.write(PeerWatchdog {
-            ordinal,
-            applies: state.applies(),
-            delay_ns: state.delay_ns,
-            delay_seconds: state.delay_ns.map(|ns| ns as f64 / 1_000_000_000.0),
-            driver_model: kind,
-            driver_model_known: known,
-            driver_model_problem: problem,
-            basis: state.basis,
-        })
+        ps.write(watchdog_row(self.ordinal.unwrap_or(0)))
     }
 }
 
@@ -379,6 +385,21 @@ fn requested_blocks() -> std::sync::MutexGuard<'static, u32> {
         Ok(guard) => guard,
         // A poisoned lock still holds the number some earlier call
         // wrote, and that number is what this reports.
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The device the running peer was started on, kept beside it because
+/// the peer does not report it and the watchdog that bounds its work is
+/// read per device.
+static PEER_ORDINAL: Mutex<u32> = Mutex::new(0);
+
+/// The running peer's device, on the same terms as [`peer_slot`].
+fn peer_ordinal() -> std::sync::MutexGuard<'static, u32> {
+    match PEER_ORDINAL.lock() {
+        Ok(guard) => guard,
+        // A poisoned lock still holds the ordinal some earlier call
+        // wrote, and that ordinal is what this reports.
         Err(poisoned) => poisoned.into_inner(),
     }
 }
@@ -812,6 +833,25 @@ pub(crate) fn running_peer_row() -> Option<PeerRow> {
     Some(peer_row(&slot, requested))
 }
 
+/// The watchdog row for the running peer's device, or None when no
+/// peer runs, so the drive's `peer\watchdog` leaf answers the object
+/// Get-FlynnelPeerWatchdog writes for that device.
+pub(crate) fn running_peer_watchdog_row() -> Option<PeerWatchdog> {
+    // The ordinal is read under the peer's own lock, which
+    // New-FlynnelGpuPeer holds while it records it, so a peer torn down
+    // and restarted on another device cannot pair one peer's presence
+    // with the other's device. The reading itself runs after the lock
+    // is released, because its first call per device loads NVML.
+    let ordinal = {
+        let slot = peer_slot();
+        if slot.is_none() {
+            return None;
+        }
+        *peer_ordinal()
+    };
+    Some(watchdog_row(ordinal))
+}
+
 /// Starts the GPU peer: maps the shared region, registers it with the
 /// driver, launches the resident poller and calibrates this host.
 ///
@@ -888,8 +928,10 @@ impl Cmdlet for NewFlynnelGpuPeer {
             None => PeerConfig::default(),
         };
         let requested = config.blocks_per_lane;
+        let ordinal = config.device_ordinal;
         let peer = GpuPeer::init(config.to_crate()).map_err(peer_err)?;
         *requested_blocks() = requested;
+        *peer_ordinal() = ordinal;
         *slot = Some(peer);
         ps.write(peer_row(&slot, requested))
     }
@@ -927,6 +969,7 @@ impl Cmdlet for RemoveFlynnelGpuPeer {
         // slot empty while this teardown is still running.
         *slot = None;
         *requested_blocks() = 0;
+        *peer_ordinal() = 0;
         if !had {
             pwrs::warning!(ps, "no GPU peer was running, so nothing was torn down")?;
         }

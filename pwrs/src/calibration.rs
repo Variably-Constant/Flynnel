@@ -767,18 +767,17 @@ mod store {
     pub struct GetFlynnelCalibrationStore {}
 
     /// The row an open table answers, so the cmdlet that reads the
-    /// store and the one that clears it describe it the same way.
+    /// store, the one that clears it and the Flynnel drive describe it
+    /// the same way.
     ///
-    /// Takes the pipeline because a table that will not settle is
-    /// reported as an error record beside a row that is still partly
-    /// true: the path and the stamps are real, and only the record
-    /// columns are missing.
-    fn opened_store_row(
-        ps: &Pipeline<'_>,
+    /// A table that will not settle still answers a row, because the
+    /// path and the stamps are real; ReadSettled false says the record
+    /// columns are absent because the read failed.
+    fn opened_row(
         path: &std::path::Path,
         process_hash: u64,
         opened: &CalibrationStore,
-    ) -> PsResult<StoreInfo> {
+    ) -> StoreInfo {
         let stamp_hash = opened.stamp_hash();
         let mut row = StoreInfo {
             exists: true,
@@ -793,63 +792,91 @@ mod store {
             cpu_measured_at: None,
             cpu_trustworthy: None,
         };
-        match opened.read() {
-            Some((cpu, accels)) => {
-                row.read_settled = true;
-                row.accel_records = Some(accels.len() as u32);
-                row.cpu_samples = Some(cpu.samples);
-                row.cpu_measured_at = if cpu.samples == 0 {
-                    None
-                } else {
-                    Some(cpu.measured_unix_s)
-                };
-                row.cpu_trustworthy = Some(cpu.is_trustworthy());
-            }
-            None => {
-                // A writer held the table through the whole retry
-                // window. The row still goes out, because the path
-                // and the stamps are real, but the failure is named
-                // rather than left to look like an empty table.
-                ps.write_error(&store_err(
-                    "the table did not settle within its retry window, so a writer is \
-                     holding it; the record columns are absent because the read failed, \
-                     not because the table is empty",
-                ))?;
-            }
+        if let Some((cpu, accels)) = opened.read() {
+            row.read_settled = true;
+            row.accel_records = Some(accels.len() as u32);
+            row.cpu_samples = Some(cpu.samples);
+            row.cpu_measured_at = if cpu.samples == 0 {
+                None
+            } else {
+                Some(cpu.measured_unix_s)
+            };
+            row.cpu_trustworthy = Some(cpu.is_trustworthy());
+        }
+        row
+    }
+
+    /// The error a cmdlet writes beside a row whose read did not
+    /// settle, so a writer holding the table through the whole retry
+    /// window is named rather than left to look like an empty table.
+    fn unsettled_err() -> PsError {
+        store_err(
+            "the table did not settle within its retry window, so a writer is holding it; the \
+             record columns are absent because the read failed, not because the table is empty",
+        )
+    }
+
+    /// [`opened_row`] for a cmdlet, with [`unsettled_err`] written
+    /// beside a row whose read did not settle.
+    fn opened_store_row(
+        ps: &Pipeline<'_>,
+        path: &std::path::Path,
+        process_hash: u64,
+        opened: &CalibrationStore,
+    ) -> PsResult<StoreInfo> {
+        let row = opened_row(path, process_hash, opened);
+        if !row.read_settled {
+            ps.write_error(&unsettled_err())?;
         }
         Ok(row)
     }
 
+    /// This host's store row, the one Get-FlynnelCalibrationStore
+    /// writes, or None when no calibration directory is configured,
+    /// which is the one case the cmdlet refuses rather than answers.
+    ///
+    /// Separate from the cmdlet so the Flynnel drive's
+    /// `calibration\store` leaf answers the same object.
+    pub(crate) fn store_row() -> PsResult<Option<StoreInfo>> {
+        let stamp = HostStamp::detect();
+        let process_hash = stamp.hash();
+        let Some(dir) = calibration_dir() else {
+            return Ok(None);
+        };
+        let path = table_path(&dir, &stamp);
+        if !path.exists() {
+            return Ok(Some(StoreInfo {
+                exists: false,
+                path: path.display().to_string(),
+                layout_version: LAYOUT_VERSION,
+                stamp_hash: None,
+                process_stamp_hash: process_hash,
+                stamp_matches: None,
+                read_settled: false,
+                accel_records: None,
+                cpu_samples: None,
+                cpu_measured_at: None,
+                cpu_trustworthy: None,
+            }));
+        }
+        let opened = CalibrationStore::open_or_create(&dir, &stamp)
+            .map_err(|e| store_err(format!("{e:?}")))?;
+        Ok(Some(opened_row(&path, process_hash, &opened)))
+    }
+
     impl Cmdlet for GetFlynnelCalibrationStore {
         fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
-            let stamp = HostStamp::detect();
-            let process_hash = stamp.hash();
-            let Some(dir) = calibration_dir() else {
+            let Some(row) = store_row()? else {
                 return Err(store_err(
                     "no calibration directory is configured on this host; set \
                      FLYNNEL_CALIBRATION_DIR",
                 )
                 .terminating());
             };
-            let path = table_path(&dir, &stamp);
-            if !path.exists() {
-                return ps.write(StoreInfo {
-                    exists: false,
-                    path: path.display().to_string(),
-                    layout_version: LAYOUT_VERSION,
-                    stamp_hash: None,
-                    process_stamp_hash: process_hash,
-                    stamp_matches: None,
-                    read_settled: false,
-                    accel_records: None,
-                    cpu_samples: None,
-                    cpu_measured_at: None,
-                    cpu_trustworthy: None,
-                });
+            if row.exists && !row.read_settled {
+                ps.write_error(&unsettled_err())?;
             }
-            let opened = CalibrationStore::open_or_create(&dir, &stamp)
-                .map_err(|e| store_err(format!("{e:?}")))?;
-            ps.write(opened_store_row(ps, &path, process_hash, &opened)?)
+            ps.write(row)
         }
     }
 
@@ -1160,6 +1187,7 @@ mod store {
     }
 }
 
+pub(crate) use store::store_row;
 pub use store::{
     AccelKind, AccelRecord, ClearFlynnelCalibrationStore, CpuRecord, GetFlynnelAccelCalibration,
     GetFlynnelCalibrationStore, GetFlynnelCpuCalibration, GetFlynnelHostStamp, Stamp, StoreInfo,

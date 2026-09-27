@@ -5,7 +5,7 @@ weight: 3
 
 Flynnel as PowerShell commands and objects, bound straight to the Rust with [PWRS](https://crates.io/crates/PoWerRuSt). The cmdlets are the library: nothing here shells out, and no result is parsed from text.
 
-112 commands, 83 object types and 37 enumerations. Every command answers to a shorter name with the `Fly` prefix, so `Measure-FlyReduce` is `Measure-FlynnelReduce`.
+113 commands, 84 object types and 38 enumerations. Every command answers to a shorter name with the `Fly` prefix, so `Measure-FlyReduce` is `Measure-FlynnelReduce`.
 
 Windows x64 and Linux x64 in one module, on PowerShell 7 and Windows PowerShell 5.1.
 
