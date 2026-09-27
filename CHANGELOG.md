@@ -74,6 +74,32 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   interval, both in a quiet window, 0.980 at 16 work-items on the 7900X
   and 0.997 at 4,096 on the 2700, and two over.
 
+- The WebAssembly backend runs on wasmtime 49.0.1, from 25.0.3, with the
+  same `cranelift` and `runtime` features. The crate's lock moves
+  wasmtime's tree with it; what stays behind the newest stable in that
+  lock is each held by a dependent at its own newest release, most of it
+  by wasmtime 49 itself.
+
+  wasmtime 49's untyped `Func::call` builds the function's type from the
+  engine's shared type registry on every call, taking the registry's
+  lock and its reference counts, where 25 borrowed it from the store.
+  Timed in one process with both releases linked and a second 25 as the
+  copy, the untyped call went from 83 to 161 ns on Ubuntu 24.04 in a
+  16-processor virtual machine on a Ryzen 7 5700G, from 68-84 to 105-114
+  ns on the Ryzen 9 7900X and from 122-164 to 255-291 ns on the Ryzen 7
+  2700 (ranges over three runs), and the backend's dispatch path over it
+  from 133 to 200 ns on the virtual machine and from 273-344 to 392-479
+  ns on the 2700.
+
+  The backend now reads each kernel's parameter types and result count
+  once, when it instantiates the kernel, checks every dispatch's
+  argument count and types against them itself, refusing a mismatch
+  with the same errors as before, and calls the kernel through
+  `Func::call_unchecked` over at most 16 stack slots, with no allocation
+  per dispatch. `call_unchecked` itself reads about 27 ns under either
+  release on the virtual machine, 20 to 26 ns under 49 on the 7900X, and
+  35 to 54 ns under 49 against 47 to 59 under 25 on the 2700.
+
 - The classifier tick publishes its window readers with plain loads and
   stores. It kept the extremes and counts behind
   `window_cv2_range_per_mille`, `window_wall_cv2_range_per_mille`,

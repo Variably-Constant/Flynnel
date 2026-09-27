@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use wasmtime::{Engine, Instance, Module, Store, Val};
+use wasmtime::{Engine, Instance, Module, Store, ValRaw, ValType};
 
 use crate::backend::{
     Backend, BackendCapabilities, BackendError, DispatchBackend, KernelArg, KernelHandle,
@@ -55,12 +55,76 @@ struct KernelEntry {
     export: String,
 }
 
-/// A store and the function resolved in it. The instance keeps the
-/// module memory alive while the wrapper holds the function.
+/// A store and the function resolved in it, with the function's
+/// signature as a dispatch checks it. The instance keeps the module
+/// memory alive while the wrapper holds the function.
 struct SharedInstance {
     store: Store<()>,
     func: wasmtime::Func,
+    /// Each parameter's type, read once from the function's type; a
+    /// parameter no [`KernelArg`] can carry reads `None`.
+    params: Box<[Option<Scalar>]>,
+    /// How many results the function returns.
+    results: usize,
 }
+
+impl SharedInstance {
+    /// `func` in `store`, with its signature read from its type once.
+    fn new(store: Store<()>, func: wasmtime::Func) -> Self {
+        let ty = func.ty(&store);
+        let params = ty.params().map(|p| Scalar::of(&p)).collect();
+        let results = ty.results().len();
+        Self {
+            store,
+            func,
+            params,
+            results,
+        }
+    }
+}
+
+/// The scalar types a [`KernelArg`] carries into a kernel, as a
+/// dispatch checks them against the function's parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scalar {
+    I32,
+    I64,
+    F32,
+    F64,
+}
+
+impl Scalar {
+    /// The parameter type `ty` as a scalar, or `None` for one no
+    /// argument can carry, such as a vector or a reference.
+    fn of(ty: &ValType) -> Option<Self> {
+        match ty {
+            ValType::I32 => Some(Self::I32),
+            ValType::I64 => Some(Self::I64),
+            ValType::F32 => Some(Self::F32),
+            ValType::F64 => Some(Self::F64),
+            _ => None,
+        }
+    }
+
+    /// `arg` as the scalar it carries and its raw slot, or `None` for an
+    /// argument a wasm kernel cannot take.
+    fn raw(arg: &KernelArg<'_>) -> Option<(Self, ValRaw)> {
+        Some(match arg {
+            KernelArg::I32(v) => (Self::I32, ValRaw::i32(*v)),
+            KernelArg::I64(v) => (Self::I64, ValRaw::i64(*v)),
+            KernelArg::U32(v) => (Self::I32, ValRaw::i32(*v as i32)),
+            KernelArg::U64(v) => (Self::I64, ValRaw::i64(*v as i64)),
+            KernelArg::F32(v) => (Self::F32, ValRaw::f32(v.to_bits())),
+            KernelArg::F64(v) => (Self::F64, ValRaw::f64(v.to_bits())),
+            KernelArg::DevicePtr(p) => (Self::I32, ValRaw::i32(*p as i32)),
+            KernelArg::HostSlice(_) | KernelArg::Buffer(_) => return None,
+        })
+    }
+}
+
+/// Slots a dispatch holds on the stack, one per parameter or result,
+/// whichever is more; a function needing more takes them from the heap.
+const INLINE_SLOTS: usize = 16;
 
 /// Distinguishes one backend's kernels from another's in the
 /// thread-local table below. Handles come from a counter per backend
@@ -347,30 +411,66 @@ fn instantiate(entry: &KernelEntry) -> Result<SharedInstance, BackendError> {
                 entry.export
             ))
         })?;
-    Ok(SharedInstance { store, func })
+    Ok(SharedInstance::new(store, func))
 }
 
-/// Call `instance` with `vals`, checking the arity first.
+/// Call `instance` with `args` through wasmtime's unchecked call, after
+/// checking them against the signature the instance read when it was
+/// made.
 ///
-/// wasmtime errors at call time on a wrong count, so this only makes
-/// the message say which count was expected and which arrived.
-fn call_instance(instance: &mut SharedInstance, vals: &[Val]) -> Result<(), BackendError> {
-    let func_ty = instance.func.ty(&instance.store);
-    let expected_params = func_ty.params().len();
-    if expected_params != vals.len() {
+/// wasmtime's checked call rebuilds the function's type from the
+/// engine's shared type registry on every call. The count and each
+/// argument's type are checked here instead, against a signature read
+/// once, and answer the errors the checked call would; the slots are on
+/// the stack for a function of up to [`INLINE_SLOTS`] parameters and
+/// results.
+fn call_instance(
+    instance: &mut SharedInstance,
+    args: &[KernelArg<'_>],
+) -> Result<(), BackendError> {
+    let expected_params = instance.params.len();
+    if expected_params != args.len() {
         return Err(BackendError::Launch(format!(
             "wasm kernel arg count mismatch: function expects {} params, caller provided {}",
             expected_params,
-            vals.len(),
+            args.len(),
         )));
     }
-    let n_results = func_ty.results().len();
-    let mut results: Vec<Val> = (0..n_results).map(|_| Val::I32(0)).collect();
+    let slots = args.len().max(instance.results);
+    let mut inline = [ValRaw::i32(0); INLINE_SLOTS];
+    let mut spilled: Vec<ValRaw> = Vec::new();
+    let buf: &mut [ValRaw] = if slots <= INLINE_SLOTS {
+        &mut inline[..slots]
+    } else {
+        spilled.resize(slots, ValRaw::i32(0));
+        &mut spilled[..]
+    };
+    for (i, (arg, want)) in args.iter().zip(instance.params.iter()).enumerate() {
+        let (got, raw) = Scalar::raw(arg).ok_or(BackendError::NotSupported)?;
+        if Some(got) != *want {
+            return Err(BackendError::Launch(match want {
+                Some(want) => format!(
+                    "wasm kernel call failed: argument type mismatch: argument {i} is {got:?}, parameter {i} is {want:?}"
+                ),
+                None => format!(
+                    "wasm kernel call failed: argument type mismatch: parameter {i} is a type no argument can carry"
+                ),
+            }));
+        }
+        buf[i] = raw;
+    }
     let SharedInstance {
         ref mut store,
         ref func,
+        ..
     } = *instance;
-    func.call(store, vals, &mut results)
+    // SAFETY: `buf` holds a slot for every parameter and every result;
+    // the arguments' count matched the function's and each argument's
+    // type matched its parameter's in the loop above, against the type
+    // read from this function when the instance was made; every argument
+    // is a scalar, so none is a reference needing a root; and `func`
+    // belongs to `store`.
+    unsafe { func.call_unchecked(store, buf as *mut [ValRaw]) }
         .map_err(|e| BackendError::Launch(format!("wasm kernel call failed: {e}")))?;
     Ok(())
 }
@@ -450,7 +550,7 @@ impl DispatchBackend for WasmBackend {
         // store, because a thread building a store of its own needs
         // both and neither can be recovered from the store.
         let entry = KernelEntry {
-            shared: Mutex::new(SharedInstance { store, func }),
+            shared: Mutex::new(SharedInstance::new(store, func)),
             module,
             export: name.to_string(),
         };
@@ -464,21 +564,10 @@ impl DispatchBackend for WasmBackend {
         _count: u32,
         args: &[KernelArg<'_>],
     ) -> Result<(), BackendError> {
-        // Convert KernelArg slice into wasmtime Val slots.
-        let mut vals: Vec<Val> = Vec::with_capacity(args.len());
-        for a in args {
-            match a {
-                KernelArg::I32(v) => vals.push(Val::I32(*v)),
-                KernelArg::I64(v) => vals.push(Val::I64(*v)),
-                KernelArg::U32(v) => vals.push(Val::I32(*v as i32)),
-                KernelArg::U64(v) => vals.push(Val::I64(*v as i64)),
-                KernelArg::F32(v) => vals.push(Val::F32(v.to_bits())),
-                KernelArg::F64(v) => vals.push(Val::F64(v.to_bits())),
-                KernelArg::DevicePtr(p) => vals.push(Val::I32(*p as i32)),
-                KernelArg::HostSlice(_) | KernelArg::Buffer(_) => {
-                    return Err(BackendError::NotSupported);
-                }
-            }
+        // A wasm kernel takes scalars only; a slice or a buffer is refused
+        // before the kernel is looked up.
+        if args.iter().any(|a| Scalar::raw(a).is_none()) {
+            return Err(BackendError::NotSupported);
         }
         // Locate the kernel entry and call its function.
         let entry_arc = self.kernels.get(handle.0).ok_or_else(|| {
@@ -489,14 +578,14 @@ impl DispatchBackend for WasmBackend {
                 self.backend_id,
                 handle.0,
                 || instantiate(&entry_arc),
-                |instance| call_instance(instance, &vals),
+                |instance| call_instance(instance, args),
             );
         }
         let mut shared = entry_arc
             .shared
             .lock()
             .map_err(|_| BackendError::Launch("wasm kernel store mutex poisoned".into()))?;
-        call_instance(&mut shared, &vals)
+        call_instance(&mut shared, args)
     }
 }
 
@@ -535,7 +624,7 @@ mod tests {
             .get_func(&mut store, "add")
             .expect("add is exported");
         Arc::new(KernelEntry {
-            shared: Mutex::new(SharedInstance { store, func }),
+            shared: Mutex::new(SharedInstance::new(store, func)),
             module,
             export: "add".to_string(),
         })
@@ -689,6 +778,68 @@ mod tests {
             .dispatch_kernel(handle, 1, &[KernelArg::I32(3)])
             .expect_err("arity mismatch must error");
         assert!(matches!(err, BackendError::Launch(_)));
+    }
+
+    /// A module exporting `add` over two f64 parameters, returning their
+    /// sum, from the WAT source:
+    ///   (module
+    ///     (func (export "add") (param f64 f64) (result f64)
+    ///       local.get 0
+    ///       local.get 1
+    ///       f64.add))
+    const F64_ADD_WASM: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, // magic
+        0x01, 0x00, 0x00, 0x00, // version
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7c, 0x7c, 0x01, 0x7c, // type: (f64, f64) -> (f64)
+        0x03, 0x02, 0x01, 0x00, // function: type 0
+        0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00, // export: "add", function 0
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0xa0, 0x0b, // code: f64.add
+    ];
+
+    /// A module exporting `seven`, which takes nothing and returns 7: a
+    /// function with more results than parameters, from the WAT source:
+    ///   (module (func (export "seven") (result i32) i32.const 7))
+    const SEVEN_WASM: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, // magic
+        0x01, 0x00, 0x00, 0x00, // version
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type: () -> (i32)
+        0x03, 0x02, 0x01, 0x00, // function: type 0
+        0x07, 0x09, 0x01, 0x05, 0x73, 0x65, 0x76, 0x65, 0x6e, 0x00, 0x00, // export: "seven"
+        0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0b, // code: i32.const 7
+    ];
+
+    #[test]
+    fn wasm_backend_rejects_an_argument_of_the_wrong_type() {
+        let b = WasmBackend::new().expect("init");
+        let handle = b.register_kernel("add", ADD_WASM).expect("register");
+        // `add` takes two i32; an i64 in the first place is refused as a
+        // Launch error before the unchecked call, never passed to it.
+        let err = b
+            .dispatch_kernel(handle, 1, &[KernelArg::I64(3), KernelArg::I32(4)])
+            .expect_err("a mistyped argument must error");
+        assert!(matches!(err, BackendError::Launch(_)), "{err:?}");
+    }
+
+    #[test]
+    fn wasm_backend_runs_a_float_kernel_and_refuses_the_other_float() {
+        let b = WasmBackend::new().expect("init");
+        let handle = b.register_kernel("add", F64_ADD_WASM).expect("register");
+        b.dispatch_kernel(handle, 1, &[KernelArg::F64(1.5), KernelArg::F64(2.25)])
+            .expect("two f64 arguments reach an (f64, f64) kernel");
+        let err = b
+            .dispatch_kernel(handle, 1, &[KernelArg::F32(1.5), KernelArg::F64(2.25)])
+            .expect_err("an f32 where the kernel takes an f64 must error");
+        assert!(matches!(err, BackendError::Launch(_)), "{err:?}");
+    }
+
+    #[test]
+    fn wasm_backend_runs_a_kernel_returning_more_than_it_takes() {
+        let b = WasmBackend::new().expect("init");
+        let handle = b.register_kernel("seven", SEVEN_WASM).expect("register");
+        // No arguments and one result, so the call's slots are sized by
+        // the result rather than by the arguments.
+        b.dispatch_kernel(handle, 1, &[])
+            .expect("a kernel taking nothing runs");
     }
 
     #[test]
