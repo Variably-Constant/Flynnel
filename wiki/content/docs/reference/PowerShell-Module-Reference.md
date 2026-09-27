@@ -5,7 +5,7 @@ weight: 10
 
 Every command the Flynnel PowerShell module exports, by family, with the objects and enumerations each one deals in. For the task-oriented introduction see [How To Use The PowerShell Module](../how-to/How-To-Use-The-PowerShell-Module/).
 
-114 commands, 85 object types, 38 enumerations. Every command answers to a shorter name with the `Fly` prefix; the alias is listed beside each.
+115 commands, 86 object types, 38 enumerations. Every command answers to a shorter name with the `Fly` prefix; the alias is listed beside each.
 
 `Get-Help <command> -Full` carries the parameters, the examples and what each parameter means. This page is the map, not a substitute for it.
 
@@ -391,15 +391,20 @@ Objects: `Flynnel.RaceOutcome`, `Flynnel.RaceArm`.
 
 **Only two of the crate's nine racing entry points are bound.** The other seven need an arm that can decline a contract it failed, refute a peer, or disagree with one. Every body this module can offer is a declared deterministic kernel, so a cmdlet over `race_agree` would always answer unanimous - a property of the binding rather than of the work.
 
-## The native entry - 1 command
+## The native entry - 2 commands
 
 For a native library in this process that runs work on this module's worker pool rather than starting a pool of its own.
 
 | command | alias |
 |---|---|
 | `Get-FlynnelNativeEntry` | `Get-FlyNativeEntry` |
+| `New-FlynnelNativePlan` | `New-FlyNativePlan` |
 
-Object: `Flynnel.NativeEntry`: the addresses of the module's native entry points, `AbiVersion`, `KernelsRevision`, which a library linking the crate compares with its own `kernels::REVISION` to know the cmdlets answer as its kernels do, and `PoolStarted`, read without starting the pool.
+Object: `Flynnel.NativeEntry`: the addresses of the module's native entry points, `RunChunksPlanV1` among them, `AbiVersion`, `KernelsRevision`, which a library linking the crate compares with its own `kernels::REVISION` to know the cmdlets answer as its kernels do, `PlanHandle`, true where the plan entry is present, and `PoolStarted`, read without starting the pool.
+
+Object: `Flynnel.NativePlan`: `Handle`, a nonzero 64-bit number that names a `Flynnel.Plan` to `flynnel_run_chunks_plan_v1`, and the plan's `KOuter` and `BatchSize`. The handle is valid while the object lives; call `Dispose()` or let the object go, and a call naming it runs no body and returns -2, as a call naming 0 or a number never issued does.
+
+**A plan handle is for one kind of call.** `flynnel_run_chunks_v1` sizes its plan to each call's item count; `flynnel_run_chunks_plan_v1` runs the call under the plan the handle names, resolved as `-Plan` is on the kernel cmdlets, with the call's site key still naming the site.
 
 **An address can go stale.** It stays callable for the life of the process, because the library PWRS loaded is never freed, but a reload after a rebuild loads a new copy at a new address with a pool of its own. A caller asks again whenever the process has loaded a native library since its answer was taken, and one serving several runspaces keeps an answer per runspace.
 

@@ -67,4 +67,34 @@ Describe 'Get-FlynnelNativeEntry' {
         $null = Start-FlynnelPool
         (Get-FlynnelNativeEntry).PoolStarted | Should -BeTrue
     }
+
+    It 'reports the plan entry as a nonzero UInt64 and says it has one, as a Boolean' {
+        # A caller checks PlanHandle before calling the plan entry, whose
+        # address is a separate symbol from the one RunChunksV1 names.
+        $script:Entry.PlanHandle | Should -BeTrue
+        $script:Entry.PlanHandle.GetType().FullName | Should -Be 'System.Boolean'
+        $script:Entry.RunChunksPlanV1 | Should -Not -Be 0
+        $script:Entry.RunChunksPlanV1.GetType().FullName | Should -Be 'System.UInt64'
+        $script:Entry.RunChunksPlanV1 | Should -Not -Be $script:Entry.RunChunksV1
+    }
+}
+
+Describe 'New-FlynnelNativePlan' {
+    It 'writes a Flynnel.NativePlan carrying a nonzero UInt64 handle and the plan it names' {
+        $native = New-FlynnelPlan -KOuter 8 -BatchSize 100000 | New-FlynnelNativePlan
+        $native.GetType().FullName | Should -Be 'Flynnel.NativePlan'
+        $native.Handle | Should -Not -Be 0
+        $native.Handle.GetType().FullName | Should -Be 'System.UInt64'
+        $native.KOuter | Should -Be 8
+        $native.BatchSize | Should -Be 100000
+        $native.Dispose()
+    }
+
+    It 'gives two plans two handles' {
+        $first = New-FlynnelNativePlan -Plan (New-FlynnelPlan -KOuter 8 -BatchSize 1000)
+        $second = New-FlynnelNativePlan -Plan (New-FlynnelPlan -KOuter 8 -BatchSize 1000)
+        $second.Handle | Should -Not -Be $first.Handle
+        $first.Dispose()
+        $second.Dispose()
+    }
 }

@@ -553,6 +553,26 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   half and 0 when the joining thread ran it; WorkerWake carries a
   sampled park's wake cost in nanoseconds; and no path emits StealHit.
 
+- **A native caller can hand the chunk runner a plan for one call.**
+  `flynnel_run_chunks_plan_v1(n, min_leaf, site, plan, body, ctx)` sits
+  beside `flynnel_run_chunks_v1` and runs the call under the plan a
+  handle names, resolved as the kernel cmdlets resolve `-Plan`, with the
+  call's site key still naming the site; `flynnel_run_chunks_v1` still
+  sizes its plan to each call's item count. New-FlynnelNativePlan turns
+  a Flynnel.Plan into a Flynnel.NativePlan whose `Handle` names that plan
+  while the object lives. A released handle, 0 or a number never issued
+  runs no body and returns -2. Get-FlynnelNativeEntry reports the
+  entry's address as `RunChunksPlanV1` and its presence as `PlanHandle`;
+  `AbiVersion` stays 1, the entry being a new symbol beside the old one.
+
+  `examples/chunk_stack_headroom.rs` reports the least stack a body is
+  left under the sized plan and under caller plans chosen to split as
+  deep as a plan can: a task per item at 100 microseconds an item, one
+  worker, and eight times the pool's workers, one dispatch at a time and
+  4 and 16 at once. On the Ryzen 9 7900X, 24 workers of 8 MiB, the least
+  any body was left was 7,994 KiB, under the per-item plan at 1,048,576
+  items with 4 callers.
+
 - **Mapped host memory and the device's facts on the CUDA backend.**
   `CudaBackend::map_host::<T>(len)` answers a `MappedBuffer<T>`:
   page-locked host memory the device reads and writes directly, set to

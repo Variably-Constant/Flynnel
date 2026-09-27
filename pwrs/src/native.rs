@@ -16,12 +16,14 @@
 //! has, so a caller built for the other form refuses rather than calls.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use flynnel::sched::par_iter::for_each_chunk_indexed_min_leaf;
 use pwrs::prelude::*;
 
 use crate::kernels::band_for;
+use crate::plan::Plan;
 
 /// The ABI version `Get-FlynnelNativeEntry` reports for the entries it
 /// hands out.
@@ -35,6 +37,11 @@ pub const NATIVE_ABI_VERSION: u32 = 1;
 /// boundary, before control returns here.
 pub const RUN_CHUNKS_PANIC: i32 = -1;
 
+/// Returned by [`flynnel_run_chunks_plan_v1`] when its plan handle names
+/// no live `Flynnel.NativePlan`: one never handed out, or one whose object
+/// has been disposed or collected. No body runs.
+pub const RUN_CHUNKS_NO_PLAN: i32 = -2;
+
 /// The body a caller runs over one chunk: `ctx` as the caller passed it
 /// and the half-open index range `[start, end)`. Zero continues; any
 /// other value stops the run.
@@ -46,6 +53,16 @@ pub type RunChunksV1 = unsafe extern "C" fn(
     n: usize,
     min_leaf: usize,
     site: u64,
+    body: ChunkBodyV1,
+    ctx: *const c_void,
+) -> i32;
+
+/// [`flynnel_run_chunks_plan_v1`] as a function pointer.
+pub type RunChunksPlanV1 = unsafe extern "C" fn(
+    n: usize,
+    min_leaf: usize,
+    site: u64,
+    plan: u64,
     body: ChunkBodyV1,
     ctx: *const c_void,
 ) -> i32;
@@ -103,6 +120,58 @@ pub unsafe extern "C" fn flynnel_run_chunks_v1(
     body: ChunkBodyV1,
     ctx: *const c_void,
 ) -> i32 {
+    run_chunks(n, min_leaf, site, None, body, ctx, "flynnel_run_chunks_v1")
+}
+
+/// [`flynnel_run_chunks_v1`] under a plan the caller chose rather than the
+/// one this module sizes to `n`.
+///
+/// `plan` is the `Handle` of a live `Flynnel.NativePlan`, which
+/// `New-FlynnelNativePlan` makes from a `Flynnel.JobPlan`. The dispatch runs
+/// under that plan as the kernel cmdlets run under their `-Plan`, and
+/// learns at the site `site` keys. A handle that names no live plan
+/// returns [`RUN_CHUNKS_NO_PLAN`] and runs no body. Every other argument,
+/// the other returns and the contract are [`flynnel_run_chunks_v1`]'s.
+///
+/// # Safety
+///
+/// As [`flynnel_run_chunks_v1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flynnel_run_chunks_plan_v1(
+    n: usize,
+    min_leaf: usize,
+    site: u64,
+    plan: u64,
+    body: ChunkBodyV1,
+    ctx: *const c_void,
+) -> i32 {
+    match plan_for(plan) {
+        Some(chosen) => run_chunks(
+            n,
+            min_leaf,
+            site,
+            Some(chosen),
+            body,
+            ctx,
+            "flynnel_run_chunks_plan_v1",
+        ),
+        None => RUN_CHUNKS_NO_PLAN,
+    }
+}
+
+/// Both entries' shared body: inject the dispatch onto a worker, wait for
+/// it, and answer the first nonzero code or [`RUN_CHUNKS_PANIC`]. `plan`
+/// is the caller's, or `None` for the one sized to `n`. `entry` names the
+/// entry in the message a caught panic prints.
+fn run_chunks(
+    n: usize,
+    min_leaf: usize,
+    site: u64,
+    plan: Option<flynnel::JobPlan>,
+    body: ChunkBodyV1,
+    ctx: *const c_void,
+    entry: &str,
+) -> i32 {
     // A raw pointer is neither Send nor Sync, so the address travels as
     // an integer and is rebuilt in each chunk. The caller's contract is
     // what makes sharing it sound.
@@ -121,7 +190,7 @@ pub unsafe extern "C" fn flynnel_run_chunks_v1(
             flynnel::JobPlan::new(0, 8).with_leaf_shape(flynnel::LeafShape::PortCompute);
         flynnel::join(
             &onto_a_worker,
-            || dispatch_chunks(n, min_leaf, site, body, ctx_addr, &stop),
+            || dispatch_chunks(n, min_leaf, site, plan, body, ctx_addr, &stop),
             || (),
         );
     }));
@@ -133,28 +202,32 @@ pub unsafe extern "C" fn flynnel_run_chunks_v1(
                 .copied()
                 .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("a panic that carried no message");
-            eprintln!("flynnel_run_chunks_v1 caught a panic in its dispatch: {what}");
+            eprintln!("{entry} caught a panic in its dispatch: {what}");
             RUN_CHUNKS_PANIC
         }
     }
 }
 
-/// The chunked dispatch itself, which [`flynnel_run_chunks_v1`] runs from
-/// a worker.
+/// The chunked dispatch itself, which [`run_chunks`] runs from a worker.
 ///
 /// Records into `stop` the first nonzero code a body returns and skips
-/// every chunk that has not started by then. The dispatch learns at the
-/// site `site` keys, not at this function's own source location.
+/// every chunk that has not started by then. Runs under `plan`, or one
+/// sized to `n` when that is `None`, and learns at the site `site` keys,
+/// not at this function's own source location.
 fn dispatch_chunks(
     n: usize,
     min_leaf: usize,
     site: u64,
+    plan: Option<flynnel::JobPlan>,
     body: ChunkBodyV1,
     ctx_addr: usize,
     stop: &AtomicI32,
 ) {
-    let plan = flynnel::JobPlan::new(band_for(n), n.min(u32::MAX as usize) as u32)
-        .with_site(flynnel::site_for_key(site));
+    let plan = match plan {
+        Some(chosen) => chosen,
+        None => flynnel::JobPlan::new(band_for(n), n.min(u32::MAX as usize) as u32),
+    }
+    .with_site(flynnel::site_for_key(site));
     // One zero-sized slot per index. The indexed helper splits a slice,
     // and a slice of unit values carries the range and allocates nothing.
     let mut slots = vec![(); n];
@@ -172,6 +245,107 @@ fn dispatch_chunks(
             }
         }
     });
+}
+
+/// The plans `New-FlynnelNativePlan` has handed out, each under the handle
+/// its object carries. An entry lives exactly as long as that object.
+static PLANS: Mutex<Vec<(u64, flynnel::JobPlan)>> = Mutex::new(Vec::new());
+
+/// Strictly increasing handles from 1, so 0 names no plan and a handle
+/// is never reused within a process.
+static NEXT_PLAN: AtomicU64 = AtomicU64::new(1);
+
+/// The plan table, recovered from poisoning: nothing here keeps an
+/// invariant across two steps, so a panic while the lock was held leaves
+/// the entries sound.
+fn plans() -> MutexGuard<'static, Vec<(u64, flynnel::JobPlan)>> {
+    match PLANS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The plan `handle` names, if its object still lives.
+fn plan_for(handle: u64) -> Option<flynnel::JobPlan> {
+    plans()
+        .iter()
+        .find(|(h, _)| *h == handle)
+        .map(|(_, plan)| *plan)
+}
+
+/// Removes a plan's entry when the object holding its handle goes, by
+/// `Dispose` or collection. Rust-only, so the class cannot be read back
+/// by value and no copy can take the live entry with it.
+struct PlanGuard(u64);
+
+impl Drop for PlanGuard {
+    fn drop(&mut self) {
+        let mut table = plans();
+        if let Some(at) = table.iter().position(|(h, _)| *h == self.0) {
+            table.remove(at);
+        }
+    }
+}
+
+/// A plan a native caller passes to `flynnel_run_chunks_plan_v1` by its
+/// handle. The handle names the plan until this object is disposed or
+/// collected; after that the entry refuses it.
+#[psclass(name = "Flynnel.NativePlan", mode = proxy)]
+pub struct NativePlan {
+    /// The value a native caller passes as the entry's `plan` argument.
+    pub handle: u64,
+    /// The plan's `k_outer`, as resolved when the handle was made.
+    pub k_outer: u8,
+    /// The plan's batch size, as resolved when the handle was made.
+    pub batch_size: u32,
+    // Read by nothing. Its Drop is the whole of its job, and that is what
+    // removes the table entry when the object is disposed or collected.
+    #[allow(dead_code)]
+    #[psfield(skip)]
+    guard: PlanGuard,
+}
+
+/// Turn a plan into a handle a native caller can pass to
+/// `flynnel_run_chunks_plan_v1`.
+///
+/// The plan is resolved now, as the kernel cmdlets resolve their -Plan,
+/// so a plan whose numbers are missing is refused here rather than at the
+/// call. The handle stays valid while the object this writes lives;
+/// dispose it, or let it be collected, and the entry refuses the handle.
+///
+/// # Examples
+///
+/// `$native = New-FlynnelPlan -KOuter 8 -BatchSize 100000 -Workers 4 | New-FlynnelNativePlan`
+#[cmdlet(
+    verb = "New",
+    noun = "FlynnelNativePlan",
+    alias = "New-FlyNativePlan",
+    output = ["Flynnel.NativePlan"]
+)]
+#[derive(Default)]
+pub struct NewFlynnelNativePlan {
+    /// The plan the native caller's dispatch runs under.
+    #[param(mandatory, position = 0, value_from_pipeline)]
+    pub plan: Plan,
+}
+
+impl Cmdlet for NewFlynnelNativePlan {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        ps.write(native_plan(&self.plan)?)
+    }
+}
+
+/// Registers `plan` and answers the object that keeps its handle live.
+fn native_plan(plan: &Plan) -> PsResult<NativePlan> {
+    let job = plan.to_job_plan()?;
+    let handle = NEXT_PLAN.fetch_add(1, Ordering::Relaxed);
+    plans().push((handle, job));
+    Ok(NativePlan {
+        handle,
+        k_outer: job.k_outer,
+        batch_size: job.batch_size,
+        guard: PlanGuard(handle),
+    })
 }
 
 /// Where the native entry points are in the library that is loaded now,
@@ -198,6 +372,15 @@ pub struct NativeEntry {
     /// starting it. The first dispatch starts it, here or through
     /// `flynnel_run_chunks_v1`.
     pub pool_started: bool,
+    /// The address of `flynnel_run_chunks_plan_v1`, which takes a plan
+    /// handle from `New-FlynnelNativePlan` as its fourth argument:
+    /// `(n, min_leaf, site, plan, body, ctx)`. Zero in a module without
+    /// the entry.
+    pub run_chunks_plan_v1: u64,
+    /// Whether this module has `flynnel_run_chunks_plan_v1` and
+    /// `New-FlynnelNativePlan`. A module without this property, or with it
+    /// false, has neither, so a caller checks this before calling.
+    pub plan_handle: bool,
 }
 
 /// Get the addresses of the module's native entry points.
@@ -239,6 +422,8 @@ impl Cmdlet for GetFlynnelNativeEntry {
             site_key: true,
             kernels_revision: flynnel::kernels::REVISION,
             pool_started: flynnel::sched::arena::global_local_arena_started(),
+            run_chunks_plan_v1: flynnel_run_chunks_plan_v1 as RunChunksPlanV1 as usize as u64,
+            plan_handle: true,
         })
     }
 }
@@ -428,5 +613,269 @@ mod tests {
     fn the_entry_reports_this_symbol_and_version_one() {
         assert_eq!(NATIVE_ABI_VERSION, 1);
         assert_ne!(flynnel_run_chunks_v1 as RunChunksV1 as usize, 0);
+        assert_ne!(flynnel_run_chunks_plan_v1 as RunChunksPlanV1 as usize, 0);
+    }
+
+    /// A plan with the two numbers every plan needs and no hints.
+    fn test_plan(k_outer: u8, batch_size: u32) -> Plan {
+        Plan {
+            k_outer,
+            batch_size,
+            ..Plan::default()
+        }
+    }
+
+    #[test]
+    fn a_plan_handle_runs_every_index_exactly_once() {
+        let n = 100_000;
+        let native = native_plan(&test_plan(10, n as u32)).expect("the plan resolves");
+        let seen = marks(n);
+        // SAFETY: as in every_index_runs_exactly_once.
+        let code = unsafe {
+            flynnel_run_chunks_plan_v1(
+                n,
+                1,
+                TEST_SITE,
+                native.handle,
+                mark,
+                &seen as *const Vec<AtomicU8> as *const c_void,
+            )
+        };
+        assert_eq!(code, 0);
+        assert!((0..n).all(|i| seen[i].load(Ordering::Relaxed) == 1));
+    }
+
+    #[test]
+    fn the_callers_plan_is_the_one_the_dispatch_runs() {
+        // Two plans over one range whose stated costs ask for opposite
+        // splits: a task priced far above the work wants one chunk, and a
+        // heavy item with a free task wants about one chunk an item. The
+        // chunk counts part only if each handle's plan is the one the
+        // dispatch ran.
+        let n = 100_000;
+        let few = native_plan(&Plan {
+            per_item_ns: Some(1),
+            task_overhead_ns: Some(1_000_000_000),
+            ..test_plan(10, n as u32)
+        })
+        .expect("the plan resolves");
+        let many = native_plan(&Plan {
+            per_item_ns: Some(100_000),
+            task_overhead_ns: Some(1),
+            ..test_plan(10, n as u32)
+        })
+        .expect("the plan resolves");
+        let few_calls = AtomicUsize::new(0);
+        let many_calls = AtomicUsize::new(0);
+        // SAFETY: both counters outlive their calls.
+        let codes = unsafe {
+            (
+                flynnel_run_chunks_plan_v1(
+                    n,
+                    1,
+                    TEST_SITE,
+                    few.handle,
+                    count,
+                    &few_calls as *const AtomicUsize as *const c_void,
+                ),
+                flynnel_run_chunks_plan_v1(
+                    n,
+                    1,
+                    TEST_SITE,
+                    many.handle,
+                    count,
+                    &many_calls as *const AtomicUsize as *const c_void,
+                ),
+            )
+        };
+        assert_eq!(codes, (0, 0));
+        let (few_calls, many_calls) = (
+            few_calls.load(Ordering::Relaxed),
+            many_calls.load(Ordering::Relaxed),
+        );
+        assert!(
+            many_calls > 10 * few_calls,
+            "the plans split alike: {few_calls} chunks against {many_calls}"
+        );
+    }
+
+    /// Adds each chunk's length to the counter `ctx` points at: the least
+    /// a body can do and still touch every chunk.
+    extern "C" fn light(ctx: *const c_void, start: usize, end: usize) -> i32 {
+        // SAFETY: the timings pass a pointer to a live AtomicUsize.
+        let total = unsafe { &*(ctx as *const AtomicUsize) };
+        total.fetch_add(end - start, Ordering::Relaxed);
+        0
+    }
+
+    /// Threads spinning until dropped.
+    struct Spinners {
+        stop: std::sync::Arc<AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl Spinners {
+        fn start(count: usize) -> Self {
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let threads = (0..count)
+                .map(|_| {
+                    let stop = std::sync::Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                    })
+                })
+                .collect();
+            Self { stop, threads }
+        }
+    }
+
+    impl Drop for Spinners {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            for thread in self.threads.drain(..) {
+                if let Err(panicked) = thread.join() {
+                    panic!("a spinner panicked: {panicked:?}");
+                }
+            }
+        }
+    }
+
+    /// Per-call nanoseconds of `call` at each of `rounds` rounds of
+    /// `calls` calls, sorted.
+    fn per_call_ns(rounds: usize, calls: usize, mut call: impl FnMut()) -> Vec<f64> {
+        let mut out: Vec<f64> = (0..rounds)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                for _ in 0..calls {
+                    call();
+                }
+                start.elapsed().as_nanos() as f64 / calls as f64
+            })
+            .collect();
+        out.sort_by(|a, b| a.total_cmp(b));
+        out
+    }
+
+    /// Prints one timing the way criterion does, an id line and then
+    /// `time: [low median high]`, so the reader that reads criterion's
+    /// logs reads these.
+    fn print_criterion(id: &str, sorted_ns: &[f64]) {
+        let low = sorted_ns[0];
+        let median = sorted_ns[sorted_ns.len() / 2];
+        let high = sorted_ns[sorted_ns.len() - 1];
+        println!("{id}");
+        println!("                        time:   [{low:.1} ns {median:.1} ns {high:.1} ns]");
+    }
+
+    /// Per-call time of `flynnel_run_chunks_v1` over a light body at three
+    /// sizes, quiet and beside a spinning thread on every logical
+    /// processor. Built in two trees, the rows compare two builds of the
+    /// entry: run the base, the tip and the base again as the copy, one
+    /// process a run:
+    /// `cargo test --release --manifest-path pwrs/Cargo.toml native::tests::v1_entry_timing -- --ignored --exact --nocapture`
+    #[test]
+    #[ignore = "a timing, read by hand"]
+    fn v1_entry_timing() {
+        let logical = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .expect("logical processor count");
+        for (label, spinners) in [("quiet", 0), ("all", logical)] {
+            let load = Spinners::start(spinners);
+            for n in [1_000usize, 100_000, 1_000_000] {
+                let total = AtomicUsize::new(0);
+                let ctx = &total as *const AtomicUsize as *const c_void;
+                // SAFETY: `total` outlives every call and `light` reads it
+                // only through an atomic.
+                let mut call = || {
+                    let code = unsafe { flynnel_run_chunks_v1(n, 1, TEST_SITE, light, ctx) };
+                    assert_eq!(code, 0);
+                };
+                for _ in 0..20 {
+                    call();
+                }
+                let ns = per_call_ns(15, 50, &mut call);
+                print_criterion(&format!("chunks_{label}/v1/n{n}"), &ns);
+            }
+            drop(load);
+        }
+    }
+
+    /// Per-call time of `flynnel_run_chunks_plan_v1` under a plan equal to
+    /// the one `flynnel_run_chunks_v1` sizes to each n, beside v1 itself,
+    /// the two alternating round by round in one process, quiet and beside
+    /// a spinning thread on every logical processor:
+    /// `cargo test --release --manifest-path pwrs/Cargo.toml native::tests::plan_entry_timing -- --ignored --exact --nocapture`
+    #[test]
+    #[ignore = "a timing, read by hand"]
+    fn plan_entry_timing() {
+        let logical = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .expect("logical processor count");
+        for (label, spinners) in [("quiet", 0), ("all", logical)] {
+            let load = Spinners::start(spinners);
+            for n in [1_000usize, 100_000, 1_000_000] {
+                let native =
+                    native_plan(&test_plan(band_for(n), n as u32)).expect("the plan resolves");
+                let total = AtomicUsize::new(0);
+                let ctx = &total as *const AtomicUsize as *const c_void;
+                // SAFETY: `total` outlives every call and `light` reads it
+                // only through an atomic.
+                let mut v1 = || {
+                    let code = unsafe { flynnel_run_chunks_v1(n, 1, TEST_SITE, light, ctx) };
+                    assert_eq!(code, 0);
+                };
+                // SAFETY: as for `v1`; the handle's object lives past the calls.
+                let mut planned = || {
+                    let code = unsafe {
+                        flynnel_run_chunks_plan_v1(n, 1, TEST_SITE, native.handle, light, ctx)
+                    };
+                    assert_eq!(code, 0);
+                };
+                for _ in 0..20 {
+                    v1();
+                    planned();
+                }
+                let (mut v1_ns, mut plan_ns) = (Vec::new(), Vec::new());
+                for round in 0..15 {
+                    if round % 2 == 0 {
+                        v1_ns.extend(per_call_ns(1, 50, &mut v1));
+                        plan_ns.extend(per_call_ns(1, 50, &mut planned));
+                    } else {
+                        plan_ns.extend(per_call_ns(1, 50, &mut planned));
+                        v1_ns.extend(per_call_ns(1, 50, &mut v1));
+                    }
+                }
+                v1_ns.sort_by(|a, b| a.total_cmp(b));
+                plan_ns.sort_by(|a, b| a.total_cmp(b));
+                print_criterion(&format!("chunks_{label}/v1/n{n}"), &v1_ns);
+                print_criterion(&format!("chunks_{label}/plan/n{n}"), &plan_ns);
+            }
+            drop(load);
+        }
+    }
+
+    #[test]
+    fn a_released_or_unknown_handle_is_refused_and_runs_no_body() {
+        let calls = AtomicUsize::new(0);
+        let native = native_plan(&test_plan(10, 1_000)).expect("the plan resolves");
+        let released = native.handle;
+        drop(native);
+        for handle in [released, 0] {
+            // SAFETY: `calls` outlives the call.
+            let code = unsafe {
+                flynnel_run_chunks_plan_v1(
+                    1_000,
+                    1,
+                    TEST_SITE,
+                    handle,
+                    count,
+                    &calls as *const AtomicUsize as *const c_void,
+                )
+            };
+            assert_eq!(code, RUN_CHUNKS_NO_PLAN, "handle {handle}");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 }

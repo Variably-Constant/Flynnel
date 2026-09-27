@@ -155,9 +155,11 @@ pwrs::export_module! {
         racing::MeasureFlynnelRaceAny,
         racing::MeasureFlynnelExploreSelect,
         native::GetFlynnelNativeEntry,
+        native::NewFlynnelNativePlan,
     ],
     classes: [
         native::NativeEntry,
+        native::NativePlan,
         host::CpuInfo,
         host::Topology,
         host::NumaDistance,

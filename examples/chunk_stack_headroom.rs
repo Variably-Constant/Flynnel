@@ -5,11 +5,17 @@
 //! `join` on a plan that is never routed inline, which puts the whole
 //! call on a pool worker, and then through
 //! `for_each_chunk_indexed_min_leaf` on a plan carrying the site the
-//! caller's key names. This runs that same dispatch with a body that
+//! caller's key names. `flynnel_run_chunks_plan_v1` does the same under a
+//! plan the caller chose. This runs that same dispatch with a body that
 //! asks the operating system where its own thread's stack ends and
 //! records the least room any body was left with. A caller whose body
 //! needs more than that can overflow, and an overflow ends the process
 //! with nothing able to catch it.
+//!
+//! The `sized` rows run under the plan the first entry sizes to `n`. The
+//! other rows run under caller plans chosen to split as deep as a plan
+//! can: a task per item at a heavy per-item cost, one worker, and an
+//! oversubscribed pool.
 //!
 //! The dispatch nests: a bisect recurses once per halving, and a worker
 //! waiting on a join runs whatever it steals on the same stack. So one
@@ -82,16 +88,45 @@ fn stack_left() -> usize {
 /// passes one per kind of work.
 const SITE_KEY: u64 = 0x57AC_4EAD;
 
-/// Run the chunk runner's dispatch over `n` items and return the least
-/// stack any body was left with.
-fn one_dispatch(n: usize, min_leaf: usize) -> usize {
+/// `n` as a plan's batch size.
+fn batch(n: usize) -> u32 {
+    n.min(u32::MAX as usize) as u32
+}
+
+/// The plan the first entry sizes to `n`.
+fn sized(n: usize) -> JobPlan {
+    JobPlan::new(band_for(n), batch(n))
+}
+
+/// A caller plan asking for a task per item at 100 microseconds an item.
+fn per_item(n: usize) -> JobPlan {
+    JobPlan::new(10, batch(n))
+        .with_effective_task_count(batch(n))
+        .with_estimated_per_item_ns(100_000)
+}
+
+/// A caller plan pinned to one worker.
+fn one_worker(n: usize) -> JobPlan {
+    JobPlan::new(10, batch(n)).with_workers(1)
+}
+
+/// A caller plan asking for eight times the pool's workers.
+fn oversubscribed(n: usize) -> JobPlan {
+    JobPlan::new(10, batch(n)).with_oversubscription_log2(3)
+}
+
+/// A row of plans: its name, the plan for a size, and the sizes it runs.
+type PlanRow = (&'static str, fn(usize) -> JobPlan, &'static [usize]);
+
+/// Run the chunk runner's dispatch over `n` items under `plan_for(n)` and
+/// return the least stack any body was left with.
+fn one_dispatch(n: usize, min_leaf: usize, plan_for: fn(usize) -> JobPlan) -> usize {
     let least = AtomicUsize::new(usize::MAX);
     let onto_a_worker = JobPlan::new(0, 8).with_leaf_shape(LeafShape::PortCompute);
     join(
         &onto_a_worker,
         || {
-            let plan = JobPlan::new(band_for(n), n.min(u32::MAX as usize) as u32)
-                .with_site(flynnel::site_for_key(SITE_KEY));
+            let plan = plan_for(n).with_site(flynnel::site_for_key(SITE_KEY));
             let mut slots = vec![(); n];
             for_each_chunk_indexed_min_leaf(&plan, &mut slots, min_leaf, |_start, _chunk| {
                 least.fetch_min(stack_left(), Ordering::Relaxed);
@@ -108,9 +143,11 @@ fn one_dispatch(n: usize, min_leaf: usize) -> usize {
 
 /// Run `callers` dispatches at once, each from its own thread, and
 /// return the least stack any body in any of them was left with.
-fn concurrent(n: usize, min_leaf: usize, callers: usize) -> usize {
+fn concurrent(n: usize, min_leaf: usize, callers: usize, plan_for: fn(usize) -> JobPlan) -> usize {
     std::thread::scope(|s| {
-        let handles: Vec<_> = (0..callers).map(|_| s.spawn(|| one_dispatch(n, min_leaf))).collect();
+        let handles: Vec<_> = (0..callers)
+            .map(|_| s.spawn(move || one_dispatch(n, min_leaf, plan_for)))
+            .collect();
         handles
             .into_iter()
             .map(|h| match h.join() {
@@ -125,16 +162,30 @@ fn concurrent(n: usize, min_leaf: usize, callers: usize) -> usize {
 fn main() {
     let workers = flynnel::sched::arena::global_local_arena().local_worker_count();
     println!("workers {workers}; each has an 8 MiB stack");
-    println!("{:>10} {:>9} {:>8}  {:>12}", "n", "min_leaf", "callers", "least left");
-    for &n in &[1_000usize, 65_536, 1_048_576, 16_777_216] {
-        for &min_leaf in &[1usize, 256] {
-            for &callers in &[1usize, 4, 16] {
-                let least = if callers == 1 {
-                    one_dispatch(n, min_leaf)
-                } else {
-                    concurrent(n, min_leaf, callers)
-                };
-                println!("{n:>10} {min_leaf:>9} {callers:>8}  {:>9} KiB", least / 1024);
+    println!(
+        "{:>15} {:>10} {:>9} {:>8}  {:>12}",
+        "plan", "n", "min_leaf", "callers", "least left"
+    );
+    let plans: [PlanRow; 4] = [
+        ("sized", sized, &[1_000, 65_536, 1_048_576, 16_777_216]),
+        ("per-item", per_item, &[65_536, 1_048_576]),
+        ("one-worker", one_worker, &[65_536, 1_048_576]),
+        ("oversubscribed", oversubscribed, &[65_536, 1_048_576]),
+    ];
+    for (name, plan_for, sizes) in plans {
+        for &n in sizes {
+            for &min_leaf in &[1usize, 256] {
+                for &callers in &[1usize, 4, 16] {
+                    let least = if callers == 1 {
+                        one_dispatch(n, min_leaf, plan_for)
+                    } else {
+                        concurrent(n, min_leaf, callers, plan_for)
+                    };
+                    println!(
+                        "{name:>15} {n:>10} {min_leaf:>9} {callers:>8}  {:>9} KiB",
+                        least / 1024
+                    );
+                }
             }
         }
     }
