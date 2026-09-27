@@ -2,7 +2,7 @@
 //! running total, histograms, the dot product and the sort.
 
 use super::{
-    ARRAY_BLOCK_MIN, BlockError, Blocks, Job, MAX_BLOCKS, Parts, Refusal, Slots, Tracker, tracked,
+    ARRAY_BLOCK_MIN, Block, Blocks, Job, MAX_BLOCKS, Parts, Refusal, Slots, Tracker, tracked,
 };
 
 /// Blocks in the first phase of a job cut on `blocks`, or `None` when
@@ -222,7 +222,9 @@ pub enum Element {
 
 /// `f` applied to every element of `xs` in place. Generic, so each
 /// operation's loop is compiled on its own and the compiler sees the
-/// arithmetic rather than a call per element.
+/// arithmetic rather than a call per element, and always inlined, so each
+/// level's copy of a block compiles the loop for that level.
+#[inline(always)]
 fn each(xs: &mut [f64], f: impl Fn(f64) -> f64) {
     for x in xs.iter_mut() {
         *x = f(*x);
@@ -292,6 +294,7 @@ impl Element {
 
     /// The operation applied to every element of `xs` in place, the
     /// choice of operation made once for the slice.
+    #[inline(always)]
     pub fn apply_slice(self, xs: &mut [f64]) {
         match self {
             Self::Square => each(xs, |x| x * x),
@@ -339,17 +342,18 @@ pub fn map(data: &mut [f64], op: MapOp, operands: MapOperands) -> Result<MapJob<
     })
 }
 
+impl Block for MapJob<'_> {
+    #[inline(always)]
+    fn run_block(&self, _phase: usize, block: usize) {
+        let mut part = self.parts.lock(block);
+        self.element.apply_slice(&mut part);
+    }
+}
+
 impl Job for MapJob<'_> {
     type Answer = ();
 
     tracked!();
-
-    fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            let mut part = self.parts.lock(block);
-            self.element.apply_slice(&mut part);
-        })
-    }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
         self.tracker.check_ended(phase)?;
@@ -393,9 +397,37 @@ pub fn zip<'a>(left: &'a mut [f64], right: &'a [f64], op: ZipOp) -> Result<ZipJo
 }
 
 /// `f` applied to each pair, writing into the left one.
+#[inline(always)]
 fn pairwise(left: &mut [f64], right: &[f64], f: impl Fn(f64, f64) -> f64) {
     for (a, &b) in left.iter_mut().zip(right) {
         *a = f(*a, b);
+    }
+}
+
+impl Block for ZipJob<'_> {
+    #[inline(always)]
+    fn run_block(&self, _phase: usize, block: usize) {
+        let mut part = self.parts.lock(block);
+        let right = &self.right[self.blocks.range(block)];
+        match self.op {
+            ZipOp::Add => pairwise(&mut part, right, |a, b| a + b),
+            ZipOp::Subtract => pairwise(&mut part, right, |a, b| a - b),
+            ZipOp::Multiply => pairwise(&mut part, right, |a, b| a * b),
+            ZipOp::Divide => pairwise(&mut part, right, |a, b| a / b),
+            // The right operand first. The compiler builds min and max from
+            // a compare that answers its second operand when either is NaN
+            // and a select that repairs that case with the first operand.
+            // Written `a.min(b)`, the repair value is the one already in the
+            // slot, so at AVX2 the compiler writes the slot with a masked
+            // store that leaves those lanes alone, which Zen runs slower
+            // than the baseline's blend: 1.4 to 1.6 times on a Ryzen 9
+            // 7900X. Written `b.min(a)`, the repair value is the right
+            // operand, so every level blends in registers and stores whole.
+            // The two orders answer alike but for which zero a +0 and -0
+            // pair gives and which of two NaNs survives.
+            ZipOp::Min => pairwise(&mut part, right, |a, b| b.min(a)),
+            ZipOp::Max => pairwise(&mut part, right, |a, b| b.max(a)),
+        }
     }
 }
 
@@ -403,21 +435,6 @@ impl Job for ZipJob<'_> {
     type Answer = ();
 
     tracked!();
-
-    fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            let mut part = self.parts.lock(block);
-            let right = &self.right[self.blocks.range(block)];
-            match self.op {
-                ZipOp::Add => pairwise(&mut part, right, |a, b| a + b),
-                ZipOp::Subtract => pairwise(&mut part, right, |a, b| a - b),
-                ZipOp::Multiply => pairwise(&mut part, right, |a, b| a * b),
-                ZipOp::Divide => pairwise(&mut part, right, |a, b| a / b),
-                ZipOp::Min => pairwise(&mut part, right, f64::min),
-                ZipOp::Max => pairwise(&mut part, right, f64::max),
-            }
-        })
-    }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
         self.tracker.check_ended(phase)?;
@@ -460,6 +477,7 @@ struct Moments {
 }
 
 impl Moments {
+    #[inline(always)]
     fn push(mut self, x: f64) -> Self {
         self.n += 1;
         let delta = x - self.mean;
@@ -535,6 +553,7 @@ pub fn reduce(
 }
 
 impl ReduceJob<'_> {
+    #[inline(always)]
     fn partial(&self, s: &[f64]) -> Partial {
         match self.op {
             ReduceOp::Sum => Partial::Value(s.iter().sum::<f64>()),
@@ -563,17 +582,18 @@ fn value_of(p: &Partial) -> Result<f64, Refusal> {
     }
 }
 
+impl Block for ReduceJob<'_> {
+    #[inline(always)]
+    fn run_block(&self, _phase: usize, block: usize) {
+        let p = self.partial(&self.input[self.blocks.range(block)]);
+        self.partials.put(block, p);
+    }
+}
+
 impl Job for ReduceJob<'_> {
     type Answer = Reduction;
 
     tracked!();
-
-    fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            let p = self.partial(&self.input[self.blocks.range(block)]);
-            self.partials.put(block, p);
-        })
-    }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
         self.tracker.check_ended(phase)?;
@@ -683,25 +703,26 @@ pub fn prefix_sum(data: &mut [f64]) -> PrefixSumJob<'_> {
     }
 }
 
+impl Block for PrefixSumJob<'_> {
+    #[inline(always)]
+    fn run_block(&self, phase: usize, block: usize) {
+        let mut part = self.parts.lock(block);
+        if phase == 0 {
+            self.sums.put(block, part.iter().sum::<f64>());
+        } else {
+            let mut acc = self.offsets[block];
+            for x in part.iter_mut() {
+                acc += *x;
+                *x = acc;
+            }
+        }
+    }
+}
+
 impl Job for PrefixSumJob<'_> {
     type Answer = ();
 
     tracked!();
-
-    fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            let mut part = self.parts.lock(block);
-            if phase == 0 {
-                self.sums.put(block, part.iter().sum::<f64>());
-            } else {
-                let mut acc = self.offsets[block];
-                for x in part.iter_mut() {
-                    acc += *x;
-                    *x = acc;
-                }
-            }
-        })
-    }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
         self.tracker.check_ended(phase)?;
@@ -866,40 +887,41 @@ fn scale_for(lo: f64, hi: f64, bins: usize) -> Result<(f64, f64, f64), Refusal> 
     Ok((lo, hi, width))
 }
 
+impl Block for HistogramJob<'_> {
+    #[inline(always)]
+    fn run_block(&self, phase: usize, block: usize) {
+        if phase < self.binning_phase {
+            let s = &self.input[self.extreme_blocks.range(block)];
+            let lo = s.iter().fold(f64::INFINITY, |a, &x| a.min(x));
+            let hi = s.iter().fold(f64::NEG_INFINITY, |a, &x| a.max(x));
+            self.extremes.put(block, (lo, hi));
+            return;
+        }
+        let Some((lo, hi, width)) = self.scale else {
+            panic!("block {block} of the binning phase ran before the range was known");
+        };
+        let mut local = vec![0u64; self.bins];
+        for &x in &self.input[self.bin_blocks.range(block)] {
+            if x.is_nan() || x < lo || x > hi {
+                continue;
+            }
+            let slot = if width > 0.0 {
+                // The top of the range belongs to the last bin rather than
+                // to a bin past the end.
+                (((x - lo) / width) as usize).min(self.bins - 1)
+            } else {
+                0
+            };
+            local[slot] += 1;
+        }
+        self.counts.put(block, local);
+    }
+}
+
 impl Job for HistogramJob<'_> {
     type Answer = Option<Histogram>;
 
     tracked!();
-
-    fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            if phase < self.binning_phase {
-                let s = &self.input[self.extreme_blocks.range(block)];
-                let lo = s.iter().fold(f64::INFINITY, |a, &x| a.min(x));
-                let hi = s.iter().fold(f64::NEG_INFINITY, |a, &x| a.max(x));
-                self.extremes.put(block, (lo, hi));
-                return;
-            }
-            let Some((lo, hi, width)) = self.scale else {
-                panic!("block {block} of the binning phase ran before the range was known");
-            };
-            let mut local = vec![0u64; self.bins];
-            for &x in &self.input[self.bin_blocks.range(block)] {
-                if x.is_nan() || x < lo || x > hi {
-                    continue;
-                }
-                let slot = if width > 0.0 {
-                    // The top of the range belongs to the last bin rather
-                    // than to a bin past the end.
-                    (((x - lo) / width) as usize).min(self.bins - 1)
-                } else {
-                    0
-                };
-                local[slot] += 1;
-            }
-            self.counts.put(block, local);
-        })
-    }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
         self.tracker.check_ended(phase)?;
@@ -979,22 +1001,23 @@ pub fn dot_product<'a>(left: &'a [f64], right: &'a [f64]) -> Result<DotProductJo
     })
 }
 
+impl Block for DotProductJob<'_> {
+    #[inline(always)]
+    fn run_block(&self, _phase: usize, block: usize) {
+        let r = self.blocks.range(block);
+        let s = self.left[r.clone()]
+            .iter()
+            .zip(&self.right[r])
+            .map(|(x, y)| x * y)
+            .sum::<f64>();
+        self.partials.put(block, s);
+    }
+}
+
 impl Job for DotProductJob<'_> {
     type Answer = f64;
 
     tracked!();
-
-    fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            let r = self.blocks.range(block);
-            let s = self.left[r.clone()]
-                .iter()
-                .zip(&self.right[r])
-                .map(|(x, y)| x * y)
-                .sum::<f64>();
-            self.partials.put(block, s);
-        })
-    }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
         self.tracker.check_ended(phase)?;
@@ -1075,23 +1098,24 @@ fn merge_runs(left: &[f64], right: &[f64]) -> Vec<f64> {
     out
 }
 
+impl Block for SortJob<'_> {
+    #[inline(always)]
+    fn run_block(&self, phase: usize, block: usize) {
+        if phase == 0 {
+            let mut run = self.input[self.blocks.range(block)].to_vec();
+            run.sort_unstable_by(f64::total_cmp);
+            self.next.put(block, run);
+        } else {
+            let merged = merge_runs(&self.runs[2 * block], &self.runs[2 * block + 1]);
+            self.next.put(block, merged);
+        }
+    }
+}
+
 impl Job for SortJob<'_> {
     type Answer = Vec<f64>;
 
     tracked!();
-
-    fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            if phase == 0 {
-                let mut run = self.input[self.blocks.range(block)].to_vec();
-                run.sort_unstable_by(f64::total_cmp);
-                self.next.put(block, run);
-            } else {
-                let merged = merge_runs(&self.runs[2 * block], &self.runs[2 * block + 1]);
-                self.next.put(block, merged);
-            }
-        })
-    }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
         self.tracker.check_ended(phase)?;
@@ -1129,7 +1153,7 @@ impl Job for SortJob<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{BlockState, drive, drive_serial};
+    use super::super::{BlockError, BlockState, drive, drive_serial, simd};
     use super::*;
 
     /// Whether two slices hold the same values bit for bit, which tells
@@ -1154,6 +1178,107 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// `sample(n)` with every seventh element an edge case, taken in turn
+    /// from a list that `shift` rotates: signed zeros, infinities, NaNs
+    /// with two payloads and both signs, a signaling NaN, subnormals,
+    /// halves, the largest double below one half, values at the edge of
+    /// the integers, and the extremes. Two inputs one shift apart pair
+    /// each case with the next, the zeros and the NaNs in both orders.
+    fn with_edge_cases(n: usize, shift: usize) -> Vec<f64> {
+        let cases = [
+            0.0,
+            -0.0,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::from_bits(0x7FF8_0000_0000_0001),
+            f64::from_bits(0xFFF8_0000_0000_0002),
+            f64::from_bits(0x7FF8_0000_0000_0001),
+            f64::from_bits(0x7FF4_0000_0000_0003),
+            f64::from_bits(1),
+            -f64::from_bits(0x000F_FFFF_FFFF_FFFF),
+            2.5,
+            -2.5,
+            f64::from_bits(0x3FDF_FFFF_FFFF_FFFF),
+            -0.5,
+            4_503_599_627_370_495.5,
+            4_503_599_627_370_497.0,
+            1.0e300,
+            -1.0e-300,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+        ];
+        let mut values = sample(n);
+        for (i, v) in values.iter_mut().enumerate().step_by(7) {
+            *v = cases[(i / 7 + shift) % cases.len()];
+        }
+        values
+    }
+
+    /// `n` zeros, every third one negative counting from `shift`, so every
+    /// reduction's answer, and a histogram's range, is a zero whose sign
+    /// the order of the arithmetic decides.
+    fn signed_zeros(n: usize, shift: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                if (i + shift).is_multiple_of(3) {
+                    -0.0
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    /// Whether two words of an answer agree: the same bits, or two NaNs,
+    /// whose sign and payload a kernel leaves unspecified at every level.
+    fn same_word(a: u64, b: u64) -> bool {
+        a == b || (f64::from_bits(a).is_nan() && f64::from_bits(b).is_nan())
+    }
+
+    /// What `answer` gives at each level this CPU offers set against the
+    /// baseline's, a NaN agreeing with any NaN: one line for each level
+    /// that differs, naming the first element that does and, where
+    /// `inputs` line up with the answer element for element, the input
+    /// bits there.
+    fn level_differences(
+        what: &str,
+        inputs: &[&[f64]],
+        answer: impl Fn() -> Vec<u64>,
+    ) -> Vec<String> {
+        let base = simd::with_level(simd::Level::Base, &answer);
+        let mut found = Vec::new();
+        for level in simd::levels_offered() {
+            let got = simd::with_level(level, &answer);
+            let first = got.iter().zip(&base).position(|(g, b)| !same_word(*g, *b));
+            if first.is_none() && got.len() == base.len() {
+                continue;
+            }
+            found.push(match first {
+                Some(i) => {
+                    let at: Vec<String> = inputs
+                        .iter()
+                        .map(|x| format!("{:#018x}", x[i].to_bits()))
+                        .collect();
+                    format!(
+                        "{what} at {level:?}: element {i}, input [{}], answered {:#018x} where the \
+                         baseline answered {:#018x}",
+                        at.join(", "),
+                        got[i],
+                        base[i]
+                    )
+                }
+                None => format!(
+                    "{what} at {level:?}: {} elements where the baseline has {}",
+                    got.len(),
+                    base.len()
+                ),
+            });
+        }
+        found
     }
 
     /// Run every phase's blocks in reverse order on the calling thread.
@@ -1287,8 +1412,8 @@ mod tests {
                     ZipOp::Subtract => x - y,
                     ZipOp::Multiply => x * y,
                     ZipOp::Divide => x / y,
-                    ZipOp::Min => x.min(*y),
-                    ZipOp::Max => x.max(*y),
+                    ZipOp::Min => y.min(*x),
+                    ZipOp::Max => y.max(*x),
                 })
                 .collect();
             assert!(same_bits(&left, &want), "{op:?}");
@@ -1516,5 +1641,124 @@ mod tests {
         for (op, name) in ReduceOp::ALL.iter().zip(ReduceOp::NAMES) {
             assert_eq!(format!("{op:?}"), name);
         }
+    }
+
+    #[test]
+    fn every_kernel_answers_the_baseline_s_bits_at_every_level() {
+        let operands = MapOperands {
+            min: Some(-10.0),
+            max: Some(10.0),
+            factor: Some(2.5),
+            addend: Some(-3.0),
+        };
+        let inputs = [
+            (
+                "plain",
+                sample(100_003),
+                sample(100_004)[1..].to_vec(),
+                None,
+            ),
+            (
+                "edge cases",
+                with_edge_cases(100_003, 0),
+                with_edge_cases(100_003, 1),
+                Some((-1.0e5, 1.0e5)),
+            ),
+            (
+                "signed zeros",
+                signed_zeros(100_003, 0),
+                signed_zeros(100_003, 1),
+                None,
+            ),
+        ];
+        let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|p| p.to_bits()).collect() };
+        let mut found = Vec::new();
+        for (input, x, y, range) in &inputs {
+            let (x, y) = (x.as_slice(), y.as_slice());
+            for op in MapOp::ALL {
+                found.extend(level_differences(
+                    &format!("{input}: map {op:?}"),
+                    &[x],
+                    || {
+                        let mut data = x.to_vec();
+                        drive_threaded(map(&mut data, op, operands).expect("the operands hold"))
+                            .expect("the map finishes");
+                        bits(&data)
+                    },
+                ));
+            }
+            for op in ZipOp::ALL {
+                found.extend(level_differences(
+                    &format!("{input}: zip {op:?}"),
+                    &[x, y],
+                    || {
+                        let mut left = x.to_vec();
+                        drive_threaded(zip(&mut left, y, op).expect("equal lengths"))
+                            .expect("the zip finishes");
+                        bits(&left)
+                    },
+                ));
+            }
+            for op in ReduceOp::ALL {
+                found.extend(level_differences(
+                    &format!("{input}: reduce {op:?}"),
+                    &[],
+                    || {
+                        let r = drive_threaded(
+                            reduce(x, op, Some(-1.0e5), Some(1.0e5)).expect("bounds"),
+                        )
+                        .expect("the reduction finishes");
+                        vec![
+                            u64::from(r.value.is_some()),
+                            r.value.map_or(0, f64::to_bits),
+                            r.count,
+                        ]
+                    },
+                ));
+            }
+            found.extend(level_differences(
+                &format!("{input}: prefix sum"),
+                &[x],
+                || {
+                    let mut a = x.to_vec();
+                    drive_threaded(prefix_sum(&mut a)).expect("the scan finishes");
+                    bits(&a)
+                },
+            ));
+            found.extend(level_differences(
+                &format!("{input}: histogram"),
+                &[],
+                || {
+                    let (min, max) = range.map_or((None, None), |(lo, hi)| (Some(lo), Some(hi)));
+                    let h = drive_threaded(histogram(x, 16, min, max).expect("bins"))
+                        .expect("the histogram finishes")
+                        .expect("a non-empty input");
+                    let mut answer = h.counts;
+                    answer.extend(bits(&[h.low, h.high, h.width]));
+                    answer
+                },
+            ));
+            found.extend(level_differences(
+                &format!("{input}: dot product"),
+                &[],
+                || {
+                    vec![
+                        drive_threaded(dot_product(x, y).expect("equal lengths"))
+                            .expect("the dot product finishes")
+                            .to_bits(),
+                    ]
+                },
+            ));
+            found.extend(level_differences(&format!("{input}: sort"), &[], || {
+                bits(&drive_threaded(sort(x, false)).expect("the sort finishes"))
+            }));
+        }
+        assert!(
+            found.is_empty(),
+            "{} kernel(s) answered other bits at some level than at the baseline, a NaN \
+             agreeing with any NaN:\n{}",
+            found.len(),
+            found.join("\n")
+        );
     }
 }

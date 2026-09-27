@@ -10,7 +10,9 @@
 use std::ops::Range;
 
 use super::files::{unterminated_tail, without_cr};
-use super::{BlockError, Blocks, Job, MAX_BLOCKS, Refusal, Slots, Tracker, tracked};
+use super::{
+    Block, BlockError, Blocks, Job, MAX_BLOCKS, OneCopy, Refusal, Slots, Tracker, tracked,
+};
 
 /// The least number of bytes a text block holds, where the text has that
 /// many.
@@ -173,19 +175,19 @@ pub fn search_text<'a>(text: &'a str, pattern: &str) -> Result<SearchTextJob<'a>
     })
 }
 
+impl Block for SearchTextJob<'_> {
+    fn run_block(&self, _phase: usize, block: usize) {
+        let span = self.blocks.range(block);
+        let hits = hits_in(self.hay, &self.needle, span.clone());
+        let newlines = newlines_in(self.hay, span);
+        self.found.put(block, (hits, newlines));
+    }
+}
+
 impl Job for SearchTextJob<'_> {
     type Answer = Vec<TextMatch>;
 
     tracked!();
-
-    fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            let span = self.blocks.range(block);
-            let hits = hits_in(self.hay, &self.needle, span.clone());
-            let newlines = newlines_in(self.hay, span);
-            self.found.put(block, (hits, newlines));
-        })
-    }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
         self.tracker.check_ended(phase)?;
@@ -248,39 +250,40 @@ pub fn text_count<'a>(text: &'a str, pattern: Option<&str>) -> Result<TextCountJ
     })
 }
 
+impl Block for TextCountJob<'_> {
+    #[inline(always)]
+    fn run_block(&self, _phase: usize, block: usize) {
+        let span = self.blocks.range(block);
+        let (lo, hi) = (span.start, span.end);
+        // A word is counted where it starts, so a block needs to know
+        // whether the byte before its span was whitespace; reading one
+        // byte to the left makes the per-block counts add up to the
+        // serial answer.
+        let mut lines = 0u64;
+        let mut words = 0u64;
+        let mut prev_space = lo == 0 || self.hay[lo - 1].is_ascii_whitespace();
+        for &b in &self.hay[lo..hi] {
+            if b == b'\n' {
+                lines += 1;
+            }
+            let space = b.is_ascii_whitespace();
+            if prev_space && !space {
+                words += 1;
+            }
+            prev_space = space;
+        }
+        let hits = match &self.needle {
+            Some(needle) => hits_in(self.hay, needle, span),
+            None => Vec::new(),
+        };
+        self.counts.put(block, (lines, words, hits));
+    }
+}
+
 impl Job for TextCountJob<'_> {
     type Answer = TextMeasure;
 
     tracked!();
-
-    fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            let span = self.blocks.range(block);
-            let (lo, hi) = (span.start, span.end);
-            // A word is counted where it starts, so a block needs to know
-            // whether the byte before its span was whitespace; reading
-            // one byte to the left makes the per-block counts add up to
-            // the serial answer.
-            let mut lines = 0u64;
-            let mut words = 0u64;
-            let mut prev_space = lo == 0 || self.hay[lo - 1].is_ascii_whitespace();
-            for &b in &self.hay[lo..hi] {
-                if b == b'\n' {
-                    lines += 1;
-                }
-                let space = b.is_ascii_whitespace();
-                if prev_space && !space {
-                    words += 1;
-                }
-                prev_space = space;
-            }
-            let hits = match &self.needle {
-                Some(needle) => hits_in(self.hay, needle, span),
-                None => Vec::new(),
-            };
-            self.counts.put(block, (lines, words, hits));
-        })
-    }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
         self.tracker.check_ended(phase)?;
@@ -343,10 +346,7 @@ impl<'a> Find<'a> {
     }
 
     fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            let hits = hits_in(self.hay, &self.needle, self.blocks.range(block));
-            self.found.put(block, hits);
-        })
+        self.tracker.run(phase, block, self)
     }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
@@ -370,6 +370,13 @@ impl<'a> Find<'a> {
         }
         out.push(&self.hay[cursor..]);
         out
+    }
+}
+
+impl Block for Find<'_> {
+    fn run_block(&self, _phase: usize, block: usize) {
+        let hits = hits_in(self.hay, &self.needle, self.blocks.range(block));
+        self.found.put(block, hits);
     }
 }
 
@@ -575,15 +582,19 @@ impl Job for UpdateTextJob<'_> {
                 pieces,
                 tracker,
                 ..
-            } => tracker.run(phase, block, || {
-                let piece = &text[bounds[block]..bounds[block + 1]];
-                let mapped = if *upper {
-                    piece.to_uppercase()
-                } else {
-                    piece.to_lowercase()
-                };
-                pieces.put(block, mapped);
-            }),
+            } => tracker.run(
+                phase,
+                block,
+                &OneCopy(|_phase, block| {
+                    let piece = &text[bounds[block]..bounds[block + 1]];
+                    let mapped = if *upper {
+                        piece.to_uppercase()
+                    } else {
+                        piece.to_lowercase()
+                    };
+                    pieces.put(block, mapped);
+                }),
+            ),
         }
     }
 
@@ -629,7 +640,7 @@ impl Job for UpdateTextJob<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{drive, drive_serial};
+    use super::super::{drive, drive_serial, simd};
     use super::*;
 
     /// Run every phase's blocks in reverse order.
@@ -773,6 +784,34 @@ mod tests {
     fn the_transform_names_follow_the_declaration_order() {
         for (op, name) in TextTransform::ALL.iter().zip(TextTransform::NAMES) {
             assert_eq!(format!("{op:?}"), name);
+        }
+    }
+
+    #[test]
+    fn every_kernel_answers_the_baseline_s_bits_at_every_level() {
+        let text = long_text();
+        simd::assert_every_level_agrees("search", || {
+            drive_reversed(search_text(&text, "ERROR").expect("a pattern")).expect("finishes")
+        });
+        simd::assert_every_level_agrees("count", || {
+            drive_reversed(text_count(&text, Some("ERRORERROR")).expect("a pattern"))
+                .expect("finishes")
+        });
+        simd::assert_every_level_agrees("split", || {
+            drive_reversed(split_text(&text, "ERROR", false).expect("a separator"))
+                .expect("finishes")
+        });
+        let mut greek = String::new();
+        while greek.len() < 300_000 {
+            greek.push_str("ΟΔΟΣΣΟΦΙΑΣ ΑΣΑ ΣΑΣ ERROR\n");
+        }
+        for input in [&text, &greek] {
+            for op in TextTransform::ALL {
+                simd::assert_every_level_agrees(&format!("update {op:?}"), || {
+                    drive_reversed(update_text(input, op, Some("ERROR"), Some("ok")).expect("ok"))
+                        .expect("finishes")
+                });
+            }
         }
     }
 }

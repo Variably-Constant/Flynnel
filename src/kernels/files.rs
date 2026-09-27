@@ -6,7 +6,7 @@
 //! reports the nine it could not open rather than stopping at the first
 //! or answering 991 rows with nothing to say which are missing.
 
-use super::{BlockError, Job, Refusal, Slots, Tracker};
+use super::{BlockError, Job, OneCopy, Refusal, Slots, Tracker};
 
 /// A line of a file that matched.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,17 +111,23 @@ impl<'a, R: Send + Sync> PerFile<'a, R> {
         }
     }
 
+    /// Run block `block` of `phase`: `work` over its file, as one copy at
+    /// every level, since a file's time goes to reading it.
     fn run(
         &self,
         phase: usize,
         block: usize,
-        work: impl FnOnce(&str) -> Result<R, String>,
+        work: impl Fn(&str) -> Result<R, String>,
     ) -> Result<(), BlockError> {
-        self.tracker.run(phase, block, || {
-            let path = &self.paths[block];
-            let row = work(path).map_err(|detail| Refusal::unreadable(path, detail));
-            self.rows.put(block, row);
-        })
+        self.tracker.run(
+            phase,
+            block,
+            &OneCopy(|_phase, block| {
+                let path = &self.paths[block];
+                let row = work(path).map_err(|detail| Refusal::unreadable(path, detail));
+                self.rows.put(block, row);
+            }),
+        )
     }
 
     fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
@@ -302,7 +308,7 @@ mod hashing {
         merge_subtrees_root,
     };
 
-    use super::super::{BlockError, BlockState, Job, Refusal, Slots, Tracker};
+    use super::super::{BlockError, BlockState, Job, OneCopy, Refusal, Slots, Tracker};
 
     /// A file's BLAKE3 root.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -527,21 +533,26 @@ mod hashing {
         }
 
         fn run(&self, phase: usize, block: usize) -> Result<(), BlockError> {
-            self.tracker.run(phase, block, || {
-                if !self.one_file() {
-                    self.streamed
-                        .put(block, hash_file_streaming(&self.paths[block]));
-                } else if phase == 0 {
-                    self.read.put(block, Self::read_one(&self.paths[0]));
-                } else {
-                    let (start, len) = self.spans[block];
-                    let cv = blake3::Hasher::new()
-                        .set_input_offset(start as u64)
-                        .update(&self.bytes[start..start + len])
-                        .finalize_non_root();
-                    self.cvs.put(block, cv);
-                }
-            })
+            // One copy at every level: BLAKE3 picks its own instructions.
+            self.tracker.run(
+                phase,
+                block,
+                &OneCopy(|phase, block| {
+                    if !self.one_file() {
+                        self.streamed
+                            .put(block, hash_file_streaming(&self.paths[block]));
+                    } else if phase == 0 {
+                        self.read.put(block, Self::read_one(&self.paths[0]));
+                    } else {
+                        let (start, len) = self.spans[block];
+                        let cv = blake3::Hasher::new()
+                            .set_input_offset(start as u64)
+                            .update(&self.bytes[start..start + len])
+                            .finalize_non_root();
+                        self.cvs.put(block, cv);
+                    }
+                }),
+            )
         }
 
         fn end_phase(&mut self, phase: usize) -> Result<(), Refusal> {
@@ -684,7 +695,7 @@ mod hashing {
 
     #[cfg(test)]
     mod tests {
-        use super::super::super::drive_serial;
+        use super::super::super::{drive_serial, simd};
         use super::*;
 
         fn scratch(name: &str, bytes: &[u8]) -> String {
@@ -735,12 +746,21 @@ mod hashing {
             assert_eq!(checked[1].check.actual, None);
             assert!(checked[1].refusal.is_some());
         }
+
+        #[test]
+        fn a_hash_answers_the_same_at_every_level() {
+            let bytes: Vec<u8> = (0..3_000_000u32).map(|i| (i * 31 % 251) as u8).collect();
+            let paths = vec![scratch("levels", &bytes)];
+            simd::assert_every_level_agrees("hash", || {
+                drive_serial(file_hash(&paths)).expect("finishes")
+            });
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::drive_serial;
+    use super::super::{drive_serial, simd};
     use super::*;
 
     fn scratch(name: &str, bytes: &[u8]) -> String {
@@ -786,5 +806,30 @@ mod tests {
                 .as_deref(),
             Some("Pattern must not be empty")
         );
+    }
+
+    #[test]
+    fn every_kernel_answers_the_baseline_s_bits_at_every_level() {
+        let mut text = String::new();
+        let mut i = 0u64;
+        while text.len() < 400_000 {
+            text.push_str(&format!("line {i} with panic and PANIC in it\r\n"));
+            i += 1;
+        }
+        let a = scratch("levels-a", text.as_bytes());
+        let b = scratch("levels-b", b"panic\n");
+        let paths = vec![a, "missing-file-for-flynnel".to_string(), b];
+        simd::assert_every_level_agrees("lines", || {
+            drive_serial(file_line(&paths)).expect("finishes")
+        });
+        simd::assert_every_level_agrees("bytes", || {
+            drive_serial(file_byte(&paths)).expect("finishes")
+        });
+        for ignore_case in [true, false] {
+            simd::assert_every_level_agrees(&format!("search ignore_case={ignore_case}"), || {
+                drive_serial(search_file("PANIC", &paths, ignore_case).expect("a pattern"))
+                    .expect("finishes")
+            });
+        }
     }
 }

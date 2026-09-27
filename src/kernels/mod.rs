@@ -7,7 +7,9 @@
 //! the pool that runs it, and folds per-block results in block order, so
 //! which worker ran which block cannot reach an answer. Two callers that
 //! drive the same job over the same input answer alike to the bit, on any
-//! host and with any number of workers.
+//! host, at any instruction-set level and with any number of workers, but
+//! for a NaN in an answer, which is a NaN everywhere with its sign and
+//! payload unspecified, as Rust leaves them for floating-point arithmetic.
 //!
 //! Nothing here starts a pool, reads a [`crate::JobPlan`] or touches the
 //! scheduler's global state. A caller runs the blocks wherever it likes:
@@ -56,7 +58,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 mod arrays;
 mod descriptor;
 mod files;
+mod simd;
 mod text;
+
+use simd::{Block, OneCopy};
 
 pub use arrays::{
     DotProductJob, Element, Histogram, HistogramBin, HistogramJob, MapJob, MapOp, MapOperands,
@@ -88,7 +93,7 @@ pub use text::{
 /// The module reports it beside its native entry points, which is how a
 /// library driving these jobs on the module's pool can tell that the
 /// module's cmdlets were built from the same kernels it links.
-pub const REVISION: u32 = 1;
+pub const REVISION: u32 = 2;
 
 // ---------------------------------------------------------------------
 // Refusals
@@ -424,27 +429,32 @@ fn fresh(n: usize) -> Vec<AtomicU8> {
         .collect()
 }
 
-/// The open phase of a job and where each of its blocks stands.
+/// The open phase of a job, where each of its blocks stands, and the
+/// instruction-set level every block of the job runs at.
 pub(crate) struct Tracker {
     phase: usize,
     states: Vec<AtomicU8>,
     finished: bool,
+    level: simd::Level,
 }
 
 impl Tracker {
     /// Phase 0 open with `blocks` blocks, or every phase already ended
     /// when `None`, which is a job with nothing to run.
     pub(crate) fn new(blocks: Option<usize>) -> Self {
+        let level = simd::for_new_job();
         match blocks {
             Some(n) => Self {
                 phase: 0,
                 states: fresh(n),
                 finished: false,
+                level,
             },
             None => Self {
                 phase: 0,
                 states: Vec::new(),
                 finished: true,
+                level,
             },
         }
     }
@@ -466,14 +476,14 @@ impl Tracker {
             .map(|s| decode(s.load(Ordering::Acquire)))
     }
 
-    /// Claim block `block` of `phase`, run `work` on it, and mark it
-    /// finished. A panic in `work` leaves the block claimed and not
-    /// finished, which [`Tracker::check_ended`] then names.
-    pub(crate) fn run(
+    /// Claim block `block` of `phase`, run it through `work` at the job's
+    /// level, and mark it finished. A panic in `work` leaves the block
+    /// claimed and not finished, which [`Tracker::check_ended`] then names.
+    pub(crate) fn run<B: Block>(
         &self,
         phase: usize,
         block: usize,
-        work: impl FnOnce(),
+        work: &B,
     ) -> Result<(), BlockError> {
         if self.open() != Some(phase) {
             return Err(BlockError::NotThisPhase {
@@ -497,7 +507,7 @@ impl Tracker {
                 found: decode(held),
             });
         }
-        work();
+        simd::run_at(self.level, work, phase, block);
         state.store(DONE, Ordering::Release);
         Ok(())
     }
@@ -633,7 +643,8 @@ impl<'a, T> Parts<'a, T> {
     }
 }
 
-/// The two [`Job`] methods every job answers from its tracker.
+/// The three [`Job`] methods every job answers from its tracker, a block
+/// run through the job's own [`Block`] implementation.
 macro_rules! tracked {
     () => {
         fn blocks(&self, phase: usize) -> Option<usize> {
@@ -642,6 +653,10 @@ macro_rules! tracked {
 
         fn state(&self, phase: usize, block: usize) -> Option<$crate::kernels::BlockState> {
             self.tracker.state(phase, block)
+        }
+
+        fn run(&self, phase: usize, block: usize) -> Result<(), $crate::kernels::BlockError> {
+            self.tracker.run(phase, block, self)
         }
     };
 }
@@ -680,12 +695,13 @@ mod tests {
 
     #[test]
     fn a_block_runs_once_and_a_phase_ends_only_when_every_block_finished() {
+        let nothing = OneCopy(|_phase, _block| ());
         let mut t = Tracker::new(Some(3));
         assert_eq!(t.blocks(0), Some(3));
         assert_eq!(t.blocks(1), None);
-        t.run(0, 1, || ()).expect("block 1 runs");
+        t.run(0, 1, &nothing).expect("block 1 runs");
         assert_eq!(
-            t.run(0, 1, || ()),
+            t.run(0, 1, &nothing),
             Err(BlockError::AlreadyRan {
                 phase: 0,
                 block: 1,
@@ -693,7 +709,7 @@ mod tests {
             })
         );
         assert_eq!(
-            t.run(0, 3, || ()),
+            t.run(0, 3, &nothing),
             Err(BlockError::OutOfRange {
                 phase: 0,
                 block: 3,
@@ -701,7 +717,7 @@ mod tests {
             })
         );
         assert_eq!(
-            t.run(1, 0, || ()),
+            t.run(1, 0, &nothing),
             Err(BlockError::NotThisPhase {
                 phase: 1,
                 open: Some(0)
@@ -710,8 +726,8 @@ mod tests {
         let refused = t.check_ended(0).expect_err("blocks 0 and 2 never ran");
         assert_eq!(refused.message, "block 0 of phase 0 never ran");
         assert_eq!(t.state(0, 2), Some(BlockState::NotRun));
-        t.run(0, 0, || ()).expect("block 0 runs");
-        t.run(0, 2, || ()).expect("block 2 runs");
+        t.run(0, 0, &nothing).expect("block 0 runs");
+        t.run(0, 2, &nothing).expect("block 2 runs");
         t.check_ended(0).expect("every block of phase 0 finished");
         t.advance(None);
         assert_eq!(t.blocks(1), None);
@@ -722,7 +738,7 @@ mod tests {
     fn a_block_that_panicked_stays_started_and_its_phase_cannot_end() {
         let t = Tracker::new(Some(1));
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            t.run(0, 0, || panic!("mid-block"))
+            t.run(0, 0, &OneCopy(|_phase, _block| panic!("mid-block")))
         }));
         match outcome {
             Ok(returned) => panic!("the block's panic did not reach the caller: {returned:?}"),
@@ -730,7 +746,7 @@ mod tests {
         }
         assert_eq!(t.state(0, 0), Some(BlockState::Started));
         assert_eq!(
-            t.run(0, 0, || ()),
+            t.run(0, 0, &OneCopy(|_phase, _block| ())),
             Err(BlockError::AlreadyRan {
                 phase: 0,
                 block: 0,
@@ -749,5 +765,215 @@ mod tests {
             refusal_tally(1, 2).as_deref(),
             Some("1 of 2 input(s) could not be read; each one has an error record above")
         );
+    }
+
+    /// Each kernel's time at every level this CPU offers against the
+    /// baseline's, in one process: fifteen rounds, each running every
+    /// level and the baseline a second time, as the control, in an order
+    /// the round rotates, on the calling thread with any in-place input
+    /// restored outside the clock, first quiet and then beside a spinning
+    /// thread on every logical processor. A level's median over the
+    /// baseline's is read against the control's. Only a build for the
+    /// x86-64 floor has an SSE2 baseline copy:
+    /// `cargo test --profile release-test --lib kernels::tests::ladder_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a timing, read by hand in a floor build"]
+    fn ladder_timing() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+        const ROUNDS: usize = 15;
+        let x: Vec<f64> = (0..1_000_000u64)
+            .map(|i| ((i * 7919) % 1_000_003) as f64 * 0.37 - 1.0e5)
+            .collect();
+        let y: Vec<f64> = x.iter().map(|v| v * 0.5 + 1.0).collect();
+        let mut text = String::new();
+        let mut line = 0u64;
+        while text.len() < 4_000_000 {
+            text.push_str(&format!("line {line} has ERROR and ERRORERROR\r\n"));
+            line += 1;
+        }
+        let operands = MapOperands {
+            min: Some(-10.0),
+            max: Some(10.0),
+            factor: Some(2.5),
+            addend: Some(-3.0),
+        };
+        let (xs, ys, ts) = (&x, &y, text.as_str());
+        type Timed<'a> = Box<dyn FnMut() -> Duration + 'a>;
+        let mut kernels: Vec<(String, Timed<'_>)> = Vec::new();
+        for op in MapOp::ALL {
+            let mut buf = xs.clone();
+            let run: Timed<'_> = Box::new(move || {
+                buf.copy_from_slice(xs);
+                let start = Instant::now();
+                drive_serial(map(&mut buf, op, operands).expect("operands")).expect("map");
+                start.elapsed()
+            });
+            kernels.push((format!("map {op:?}"), run));
+        }
+        for op in ZipOp::ALL {
+            let mut buf = xs.clone();
+            let run: Timed<'_> = Box::new(move || {
+                buf.copy_from_slice(xs);
+                let start = Instant::now();
+                drive_serial(zip(&mut buf, ys, op).expect("lengths")).expect("zip");
+                start.elapsed()
+            });
+            kernels.push((format!("zip {op:?}"), run));
+        }
+        for op in ReduceOp::ALL {
+            let run: Timed<'_> = Box::new(move || {
+                let start = Instant::now();
+                let r = drive_serial(reduce(xs, op, Some(-1.0e5), Some(1.0e5)).expect("bounds"));
+                let elapsed = start.elapsed();
+                black_box(r.expect("reduce"));
+                elapsed
+            });
+            kernels.push((format!("reduce {op:?}"), run));
+        }
+        let mut scan = xs.clone();
+        let run: Timed<'_> = Box::new(move || {
+            scan.copy_from_slice(xs);
+            let start = Instant::now();
+            drive_serial(prefix_sum(&mut scan)).expect("prefix sum");
+            start.elapsed()
+        });
+        kernels.push(("prefix sum".to_string(), run));
+        let answers: [(&str, Timed<'_>); 7] = [
+            (
+                "histogram",
+                Box::new(move || {
+                    let start = Instant::now();
+                    let h = drive_serial(histogram(xs, 64, None, None).expect("bins"));
+                    let elapsed = start.elapsed();
+                    black_box(h.expect("histogram"));
+                    elapsed
+                }),
+            ),
+            (
+                "dot product",
+                Box::new(move || {
+                    let start = Instant::now();
+                    let d = drive_serial(dot_product(xs, ys).expect("lengths"));
+                    let elapsed = start.elapsed();
+                    black_box(d.expect("dot product"));
+                    elapsed
+                }),
+            ),
+            (
+                "sort",
+                Box::new(move || {
+                    let start = Instant::now();
+                    let s = drive_serial(sort(xs, false));
+                    let elapsed = start.elapsed();
+                    black_box(s.expect("sort"));
+                    elapsed
+                }),
+            ),
+            (
+                "text search",
+                Box::new(move || {
+                    let start = Instant::now();
+                    let found = drive_serial(search_text(ts, "ERROR").expect("pattern"));
+                    let elapsed = start.elapsed();
+                    black_box(found.expect("search"));
+                    elapsed
+                }),
+            ),
+            (
+                "text count",
+                Box::new(move || {
+                    let start = Instant::now();
+                    let counted =
+                        drive_serial(text_count(ts, Some("ERRORERROR")).expect("pattern"));
+                    let elapsed = start.elapsed();
+                    black_box(counted.expect("count"));
+                    elapsed
+                }),
+            ),
+            (
+                "text split",
+                Box::new(move || {
+                    let start = Instant::now();
+                    let parts = drive_serial(split_text(ts, "ERROR", false).expect("separator"));
+                    let elapsed = start.elapsed();
+                    black_box(parts.expect("split"));
+                    elapsed
+                }),
+            ),
+            (
+                "text lower",
+                Box::new(move || {
+                    let start = Instant::now();
+                    let job =
+                        update_text(ts, TextTransform::ToLower, None, None).expect("no operand");
+                    let lowered = drive_serial(job);
+                    let elapsed = start.elapsed();
+                    black_box(lowered.expect("lower"));
+                    elapsed
+                }),
+            ),
+        ];
+        for (name, run) in answers {
+            kernels.push((name.to_string(), run));
+        }
+
+        let offered = simd::levels_offered();
+        let mut arms: Vec<(String, simd::Level)> =
+            offered.iter().map(|&l| (format!("{l:?}"), l)).collect();
+        arms.push(("control".to_string(), simd::Level::Base));
+        let logical = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .expect("logical processor count");
+        println!(
+            "LADDER_LEVELS offered={offered:?} process={:?} rounds={ROUNDS} logical={logical}",
+            simd::process_level()
+        );
+        for spinners in [0, logical] {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let load: Vec<std::thread::JoinHandle<u64>> = (0..spinners)
+                .map(|_| {
+                    let stop = std::sync::Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        let mut spins = 0u64;
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            spins = black_box(spins.wrapping_add(1));
+                        }
+                        spins
+                    })
+                })
+                .collect();
+            for (name, run) in &mut kernels {
+                let mut times: Vec<Vec<Duration>> = vec![Vec::new(); arms.len()];
+                for round in 0..ROUNDS {
+                    for k in 0..arms.len() {
+                        let arm = (k + round) % arms.len();
+                        times[arm].push(simd::with_level(arms[arm].1, &mut *run));
+                    }
+                }
+                let medians: Vec<f64> = times
+                    .iter_mut()
+                    .map(|t| {
+                        t.sort_unstable();
+                        t[t.len() / 2].as_secs_f64()
+                    })
+                    .collect();
+                let ratios: Vec<String> = arms
+                    .iter()
+                    .zip(&medians)
+                    .skip(1)
+                    .map(|((arm, _level), m)| format!("{arm}={:.3}", m / medians[0]))
+                    .collect();
+                println!(
+                    "LADDER {name:<22} spinners={spinners:<3} base_us={:.1} {}",
+                    medians[0] * 1e6,
+                    ratios.join(" ")
+                );
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            for spinner in load {
+                black_box(spinner.join().expect("a spinner thread ends"));
+            }
+        }
     }
 }

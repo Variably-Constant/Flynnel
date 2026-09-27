@@ -29,6 +29,64 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   the `as_chunks` form is slower in none and faster in none, and every
   cell sits inside its control's range.
 
+- The declared kernels run each block at the highest x86-64 level the
+  CPU offers, so a library built for the x86-64 floor, SSE2 alone, runs
+  them with AVX2 or AVX-512 wherever the CPU has them. A job records a
+  level when it is made, and each block runs through one of three
+  `#[target_feature]` functions, for x86-64-v2, -v3 and -v4, or as built
+  at the baseline. A kernel whose loop can use a wider level implements
+  the crate-private `Block` trait with its block marked
+  `#[inline(always)]`, and so are the helpers in that loop, so its body
+  compiles inside each level's function: the map, zip and reduction
+  kernels and the histogram hold AVX2 and AVX-512 copies, and the running
+  total, the dot product and the sort hold per-level copies that keep
+  their serial order of arithmetic. The text search, split, replace and
+  case mapping, the file kernels and hashing spend their time in I/O or
+  in code built outside the crate, and run one copy at every level. The
+  level is the highest whose every extension the CPU reports with the
+  operating system's state for it, read once per process and capped by
+  `PWRS_CPU_MAX` as PoWerRuSt caps it (`x86-64`, `x86-64-v2`,
+  `x86-64-v3` or `x86-64-v4`; `native`, empty or unset is no cap).
+
+  Every answer that is not a NaN is the same bits at every level: no
+  level contracts a multiply and an add or reorders floating-point
+  arithmetic, and the tests run every array, text and file kernel at
+  every level the CPU offers and compare the bits, the array kernels
+  over signed zeros, infinities, NaNs, subnormals and halves. A NaN
+  answer is a NaN at every level, its sign and payload unspecified, as
+  Rust specifies for floating-point arithmetic: Round can keep a
+  signaling NaN at the baseline, where the C runtime rounds it, and
+  quiets it from x86-64-v2 up, where it rounds inline; two NaNs meeting
+  in a zip's addition or multiplication, or in a mean, a variance or a
+  dot product, can leave either one's payload from x86-64-v3 up.
+
+  Zip's Min and Max now take the right operand first, `right.min(left)`
+  and `right.max(left)`. Written the other way, AVX2 code stored each
+  block through a masked store that Zen runs 1.4 to 1.6 times slower than
+  the baseline's blend; this order blends in registers at every level.
+  The two orders answer alike except for which zero a +0 and -0 pair
+  gives and which of two NaNs survives, so `kernels::REVISION` is 2.
+
+  Measured with `benches/kernels.rs` before and after, a second file of
+  the base build as the copy, six rounds in rotated order, one process a
+  run, every cell quiet and beside a spinning thread on every logical
+  processor; no cell of any row was slower with every run separated, and
+  the copy arm separated in none. On the Ryzen 9 7900X a build for the
+  host moved no cell, and a floor build ran 8 of 28 cells faster: the
+  square root at 0.46 to 0.48 of the base, the counted reduction at 0.41
+  to 0.58, the histogram at 0.64 to 0.71, and zip's Min and Max under
+  load at 0.68 and 0.62. On Ubuntu 24.04 in a 16-processor virtual
+  machine on a Ryzen 7 5700G a floor build ran 13 of 28 faster: the
+  square root at 0.51 to 0.53, the clamp at 0.62 to 0.71, zip's Min and
+  Max at 0.59 to 0.84, the counted reduction at 0.47 to 0.69; an
+  x86-64-v3 build there ran zip's Min and Max faster and no other cell,
+  at 0.68 and 0.70 quiet and 0.36 and 0.41 under load. On the Ryzen 7
+  2700 a floor build separated no cell either way. The per-level timing,
+  every level against the baseline timed again as the control in one
+  process, puts zip's Min and Max at x86-64-v3 at 0.49 to 0.61 of the
+  baseline under load and 0.82 to 0.93 quiet on the 7900X and on the
+  virtual machine.
+
 - The PowerShell module is built on PoWerRuSt 0.2.3, from 0.2.0, by
   cargo-pwrs 0.2.3, and PoWerRuSt, pwrs-macros and pwrs-sys all stand at
   0.2.3 in its lock. A class whose constructor refuses, such as
