@@ -21,12 +21,34 @@
 //! ## Hot-path design
 //!
 //! - **Push**: `FlynnelRing::push` (CAS-loop on slot sequence)
-//!   then `wake_one`. The wake reads the next parker via a
-//!   `Relaxed` load on the next-wake cursor + an `OnceLock::get`
-//!   (an `AtomicPtr::load(Acquire)`). No `Mutex`, no spinlock.
-//! - **Recv**: `FlynnelRing::pop` first; on `Empty` enter
+//!   then `wake_one`. With one consumer the wake unparks it
+//!   whatever it is doing, through an `OnceLock::get` (an
+//!   `AtomicPtr::load(Acquire)`). With several, the wake goes only
+//!   to a consumer that has announced it is about to park: a
+//!   `SeqCst` fence, one load of the announced count, and when that
+//!   is not zero a scan from the round-robin cursor for a raised
+//!   flag this producer can lower. No `Mutex`, no spinlock.
+//! - **Recv**: `FlynnelRing::pop` first; on `Empty`, a consumer of
+//!   a hub with several raises its flag, fences, and enters
 //!   `Parker::park_until` with the predicate that re-checks
-//!   `!ring.is_empty() || shutdown` during the spin floor.
+//!   `!ring.is_empty() || shutdown` during the spin floor. The flag
+//!   comes down when the park returns, unless a producer lowered it
+//!   first to wake this consumer.
+//!
+//! ## Why a wake goes only to an announced consumer
+//!
+//! Any consumer takes any item, so one in its spin floor, or one
+//! just registered, can pop an item whose wake went to another.
+//! That other consumer finds the ring empty and parks again. A wake
+//! addressed by position alone can then land on the consumer that
+//! took the item and is busy running it, while an item waits in the
+//! ring and the other consumer sleeps with nothing to wake it: on a
+//! pool of long-running tasks, a worker short for as long as they
+//! run. A wake that claims a raised flag reaches a consumer that is
+//! parked or about to park, which then pops. The announcement and
+//! the push are each followed by a `SeqCst` fence before the other
+//! side is read, so either the producer sees the flag or the
+//! consumer's last look at the ring sees the item.
 //!
 //! ## Cross-platform discipline
 //!
@@ -38,7 +60,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, OnceLock};
 
 use crate::sched::flynnel_ring::{FlynnelRing, PopResult, PushResult};
@@ -91,12 +113,21 @@ struct NotifyInner<T: Send> {
     /// `n_consumers` at hub construction so the wake path can
     /// index directly with no Mutex.
     parker_slots: Box<[OnceLock<Arc<Parker>>]>,
+    /// One flag per parker slot, raised by that slot's consumer once
+    /// it has found the ring empty and is about to park, and lowered
+    /// by whichever comes first of a producer claiming it for a wake
+    /// and the consumer's park returning. Only a hub with more than
+    /// one slot uses them.
+    idle: Box<[AtomicBool]>,
+    /// How many `idle` flags are raised. A send that reads zero after
+    /// its fence has no consumer to wake and skips the scan.
+    idle_count: AtomicUsize,
     /// Atomic claim cursor for `register_consumer`: each call
     /// increments and uses the previous value as its slot index
     /// modulo `parker_slots.len()`.
     register_next: AtomicUsize,
-    /// Round-robin wake cursor. Relaxed because the read-modify-
-    /// write only needs to distribute load.
+    /// Where a send starts its scan for a raised flag. Relaxed
+    /// because the read-modify-write only needs to spread the wakes.
     next_wake: AtomicUsize,
     /// Shutdown latch. Producers stop sending; consumers drain
     /// the ring then exit.
@@ -117,10 +148,13 @@ impl<T: Send> NotifyHub<T> {
         let n = n_consumers.max(1);
         let slots: Vec<OnceLock<Arc<Parker>>> =
             (0..n).map(|_| OnceLock::new()).collect();
+        let idle: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
         Self {
             inner: Arc::new(NotifyInner {
                 ring: FlynnelRing::new(capacity),
                 parker_slots: slots.into_boxed_slice(),
+                idle: idle.into_boxed_slice(),
+                idle_count: AtomicUsize::new(0),
                 register_next: AtomicUsize::new(0),
                 next_wake: AtomicUsize::new(0),
                 shutdown: AtomicBool::new(false),
@@ -143,15 +177,18 @@ impl<T: Send> NotifyHub<T> {
         let n = self.inner.parker_slots.len();
         let raw = self.inner.register_next.fetch_add(1, Ordering::Relaxed);
         let idx = raw % n;
-        // Try to set this slot. If it was already set (caller
-        // over-registered), the duplicate parker is used for the
-        // returned NotifyReceiver but other producers wake the
-        // original via the established slot. drop() the Result
-        // because the failure-to-set case is benign.
-        drop(self.inner.parker_slots[idx].set(Arc::clone(&parker)));
+        // A slot keeps the parker set first. A caller that registers
+        // more consumers than the hub has slots gets a receiver whose
+        // parker no producer wakes, so that receiver holds no slot and
+        // never announces itself.
+        let slot = self.inner.parker_slots[idx]
+            .set(Arc::clone(&parker))
+            .is_ok()
+            .then_some(idx);
         NotifyReceiver {
             inner: Arc::clone(&self.inner),
             parker,
+            slot,
         }
     }
 
@@ -295,12 +332,20 @@ impl<T: Send> NotifySender<T> {
 pub struct NotifyReceiver<T: Send> {
     inner: Arc<NotifyInner<T>>,
     parker: Arc<Parker>,
+    /// The parker slot this receiver's parker holds, which is the
+    /// flag it raises before parking; `None` for a receiver
+    /// registered past the hub's slot count.
+    slot: Option<usize>,
 }
 
 impl<T: Send> NotifyReceiver<T> {
     /// Blocking receive. Returns `Some(t)` on a successful pop;
     /// `None` when the hub is shut down and the ring is drained.
     pub fn recv(&self) -> Option<T> {
+        // A hub with several consumers wakes only one that has
+        // announced itself, so this receiver raises its flag before
+        // it parks. A hub with one wakes its consumer on every send.
+        let announced = self.slot.filter(|_| self.inner.idle.len() > 1);
         loop {
             match self.inner.ring.pop() {
                 PopResult::Ok(t) => return Some(t),
@@ -314,9 +359,15 @@ impl<T: Send> NotifyReceiver<T> {
                         return None;
                     }
                     let inner = &self.inner;
+                    if let Some(slot) = announced {
+                        inner.announce_idle(slot);
+                    }
                     let ready = self.parker.park_until(|| {
                         !inner.ring.is_empty() || inner.shutdown.load(Ordering::Acquire)
                     });
+                    if let Some(slot) = announced {
+                        inner.withdraw_idle(slot);
+                    }
                     if !ready {
                         if let PopResult::Ok(t) = self.inner.ring.pop() {
                             return Some(t);
@@ -339,19 +390,61 @@ impl<T: Send> NotifyReceiver<T> {
     }
 }
 
-/// Wake one consumer via the round-robin cursor. Walks at most
-/// `n_consumers` slots to find a registered parker.
+impl<T: Send> NotifyInner<T> {
+    /// Count `slot` as idle and raise its flag, then fence, so either
+    /// a producer that pushes after this sees the flag or the caller's
+    /// next look at the ring sees the push. The count goes up before
+    /// the flag, which is a release store, so a producer that lowers
+    /// the flag lowers the count after this raised it.
+    #[inline]
+    fn announce_idle(&self, slot: usize) {
+        self.idle_count.fetch_add(1, Ordering::Relaxed);
+        self.idle[slot].store(true, Ordering::Release);
+        fence(Ordering::SeqCst);
+    }
+
+    /// Lower `slot`'s flag unless a producer already has.
+    #[inline]
+    fn withdraw_idle(&self, slot: usize) {
+        if self.idle[slot].swap(false, Ordering::AcqRel) {
+            self.idle_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Wake one consumer. A hub with one slot unparks that slot's
+/// consumer whatever it is doing, which its park's permit turns into
+/// a prompt return. A hub with several wakes only a consumer whose
+/// raised flag this call lowers, scanning from the round-robin cursor,
+/// and wakes none when no flag is raised: every consumer is then busy
+/// and pops when it returns, or has yet to announce and looks at the
+/// ring after it does.
 #[inline]
 fn wake_one<T: Send>(inner: &Arc<NotifyInner<T>>) {
     let n = inner.parker_slots.len();
     if n == 0 {
         return;
     }
+    if n == 1 {
+        if let Some(p) = inner.parker_slots[0].get() {
+            p.unpark();
+        }
+        return;
+    }
+    // Pairs with the fence in `announce_idle`.
+    fence(Ordering::SeqCst);
+    if inner.idle_count.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let start = inner.next_wake.fetch_add(1, Ordering::Relaxed) % n;
     for offset in 0..n {
         let idx = (start + offset) % n;
-        if let Some(p) = inner.parker_slots[idx].get() {
-            p.unpark();
+        let flag = &inner.idle[idx];
+        if flag.load(Ordering::Relaxed) && flag.swap(false, Ordering::AcqRel) {
+            inner.idle_count.fetch_sub(1, Ordering::Relaxed);
+            if let Some(p) = inner.parker_slots[idx].get() {
+                p.unpark();
+            }
             return;
         }
     }
@@ -464,5 +557,111 @@ mod tests {
         assert_eq!(consumed.load(O::Relaxed), total);
         assert_eq!(sum.load(O::Relaxed), expected,
             "sum invariant: every pushed value consumed exactly once");
+    }
+
+    /// A consumer pops an item no wake was addressed to, as one in its
+    /// spin floor does, and then stays busy, while the consumer that wake
+    /// went to finds the ring empty and parks again. The next send's wake
+    /// goes to the busy consumer's slot, and the item it carries has to
+    /// reach the parked consumer anyway. The busy consumer stands in for a
+    /// spinning one by polling `try_recv`; an attempt in which the woken
+    /// consumer wins the first item instead is repeated:
+    /// `cargo test --profile release-test --lib sched::notify_ring::tests::a_wake_on_a_busy_consumer_still_reaches_a_parked_one -- --ignored --nocapture`
+    #[test]
+    #[ignore = "stages a stranded item; run by hand"]
+    fn a_wake_on_a_busy_consumer_still_reaches_a_parked_one() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+        const ATTEMPTS: usize = 20;
+        let bound = Duration::from_secs(2);
+        for attempt in 1..=ATTEMPTS {
+            let hub = NotifyHub::<u32>::new(8, 2);
+            let tx = hub.sender();
+            let a_got = Arc::new(AtomicUsize::new(0));
+            let b_got = Arc::new(AtomicUsize::new(0));
+            let registered = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(AtomicBool::new(false));
+            // A claims slot 0 before B starts, so the first wake is A's.
+            let a = {
+                let hub = hub.clone();
+                let (got, registered) = (Arc::clone(&a_got), Arc::clone(&registered));
+                thread::spawn(move || {
+                    let rx = hub.register_consumer();
+                    registered.fetch_add(1, O::SeqCst);
+                    if let Some(v) = rx.recv() {
+                        got.store(v as usize, O::SeqCst);
+                    }
+                })
+            };
+            while registered.load(O::SeqCst) < 1 {
+                thread::yield_now();
+            }
+            let b = {
+                let hub = hub.clone();
+                let (got, registered, release) = (
+                    Arc::clone(&b_got),
+                    Arc::clone(&registered),
+                    Arc::clone(&release),
+                );
+                thread::spawn(move || {
+                    let rx = hub.register_consumer();
+                    registered.fetch_add(1, O::SeqCst);
+                    loop {
+                        if let Some(v) = rx.try_recv() {
+                            got.store(v as usize, O::SeqCst);
+                            break;
+                        }
+                        if release.load(O::SeqCst) {
+                            return;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    while !release.load(O::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                })
+            };
+            while registered.load(O::SeqCst) < 2 {
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(100));
+            assert!(tx.send(1).is_ok());
+            let start = Instant::now();
+            while a_got.load(O::SeqCst) == 0
+                && b_got.load(O::SeqCst) == 0
+                && start.elapsed() < bound
+            {
+                thread::yield_now();
+            }
+            let staged = b_got.load(O::SeqCst) == 1 && a_got.load(O::SeqCst) == 0;
+            if staged {
+                // A woke to an empty ring; this gives it time to park again.
+                thread::sleep(Duration::from_millis(100));
+                assert!(tx.send(2).is_ok());
+                let start = Instant::now();
+                while a_got.load(O::SeqCst) == 0 && start.elapsed() < bound {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            let reached = a_got.load(O::SeqCst) == 2;
+            release.store(true, O::SeqCst);
+            hub.shutdown();
+            a.join().expect("consumer a");
+            b.join().expect("consumer b");
+            if staged {
+                println!(
+                    "STRAND hub attempt={attempt} second_item_reached_parked_consumer={reached} bound_ms={}",
+                    bound.as_millis()
+                );
+                assert!(
+                    reached,
+                    "the second item stayed queued while consumer A slept, its wake spent on busy consumer B"
+                );
+                return;
+            }
+        }
+        panic!(
+            "in {ATTEMPTS} attempts the woken consumer always won the first item, so the interleaving was never staged"
+        );
     }
 }

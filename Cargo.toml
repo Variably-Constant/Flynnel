@@ -467,6 +467,10 @@ name = "jax_bridge_transport"
 harness = false
 
 [[bench]]
+name = "notify_hub"
+harness = false
+
+[[bench]]
 name = "simc_n12_bisect"
 harness = false
 

@@ -273,6 +273,77 @@ mod tests {
         );
     }
 
+    /// Each of n tasks submitted to a pool of n workers runs at once.
+    /// Every task marks itself started and then blocks until released,
+    /// the shape of a caller whose tasks run for the life of the pool, so
+    /// a task left queued behind a busy worker never starts while the
+    /// others run. Repeated on a fresh pool each round, with the tasks
+    /// submitted the moment the pool is built and with a pause between
+    /// submits. A round is short when fewer than n tasks have started a
+    /// second after the last submit, and stranded when fewer than n have
+    /// started eleven seconds after it: a late task on a loaded host starts
+    /// in that time, and a stranded one never does while the others hold
+    /// their workers.
+    /// `cargo test --profile release-test --lib sched::io_pool::tests::n_tasks_on_n_workers_all_run_together -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a stress repetition, read by hand"]
+    fn n_tasks_on_n_workers_all_run_together() {
+        use std::sync::atomic::AtomicUsize;
+        const ROUNDS: usize = 400;
+        let n = thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .expect("logical processor count");
+        let mut total_stranded = 0usize;
+        for gap_us in [0u64, 20, 200] {
+            let gap = Duration::from_micros(gap_us);
+            let (mut short, mut stranded, mut fewest) = (0usize, 0usize, n);
+            for _ in 0..ROUNDS {
+                let pool = IoPool::new(n);
+                let started = Arc::new(AtomicUsize::new(0));
+                let release = Arc::new(AtomicBool::new(false));
+                for _ in 0..n {
+                    let (started, release) = (Arc::clone(&started), Arc::clone(&release));
+                    pool.submit(move || {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        while !release.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    });
+                    let until = Instant::now() + gap;
+                    while Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                }
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while started.load(Ordering::SeqCst) < n && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let running = started.load(Ordering::SeqCst);
+                if running < n {
+                    short += 1;
+                    fewest = fewest.min(running);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while started.load(Ordering::SeqCst) < n && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    if started.load(Ordering::SeqCst) < n {
+                        stranded += 1;
+                    }
+                }
+                release.store(true, Ordering::Release);
+                drop(pool);
+            }
+            total_stranded += stranded;
+            println!(
+                "STRAND pool gap_us={gap_us} rounds={ROUNDS} n={n} short_rounds={short} stranded_rounds={stranded} fewest_running={fewest}"
+            );
+        }
+        assert_eq!(
+            total_stranded, 0,
+            "some rounds left a task queued while a worker slept"
+        );
+    }
+
     #[test]
     fn submit_io_or_inline_runs_when_pool_disabled() {
         // FLYNNEL_SCHED_SMT_AS_IO is not set in the test

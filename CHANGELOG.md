@@ -1176,6 +1176,27 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
+- **An IoPool task could sit queued while a worker was parked.** A
+  NotifyHub with several consumers, which every IoPool is, woke the next
+  consumer round-robin whether it was parked or busy, and a consumer
+  that was running or had just started took an item no wake was meant
+  for, so the wake the parked consumer needed landed on a busy one.
+  Where the park has no deadline, the task then waited until some
+  running task returned: n long tasks submitted to a fresh pool of n
+  workers could leave some unstarted. A consumer of a hub with several
+  consumers now counts itself idle and raises its slot's flag, behind a
+  fence, before it parks, and a send wakes only a consumer whose raised
+  flag it lowers, and none when no consumer is idle; a hub with one
+  consumer is woken on every send as before. A full ring never dropped a
+  task and still does not. Two ignored tests reproduce the stranding,
+  `sched::notify_ring::tests::a_wake_on_a_busy_consumer_still_reaches_a_parked_one`
+  and `sched::io_pool::tests::n_tasks_on_n_workers_all_run_together`;
+  both failed on the Ryzen 9 7900X and the Ryzen 7 2700 before and pass
+  on the 7900X after. `benches/notify_hub.rs` times the hub's hand-offs
+  and the pool's start, drain and idle cost; before and after on the
+  7900X with a copy arm, six rounds, no cell separated either way in a
+  build for the host or for the floor.
+
 - **A plan capped at one worker ran on the pool at most entries.**
   `JobPlan::with_workers(1)` is documented as serial execution on the
   calling thread, which is what a caller holding a lock, a thread-local
