@@ -497,9 +497,9 @@ reason = "unsafe-or-structural"
 note = "one step of the observer's own loop: it closes the current window and retunes the multiplier from it. Called out of band it would end a window the observer is midway through, so the next sample describes part of one window and part of another"
 
 [[entry]]
-item = "crate::sched::split_observer::acquire_test_lock"
+item = "crate::sched::hazard"
 reason = "unsafe-or-structural"
-note = "serializes the crate's own tests against the process-wide leaf statistics; a script holding it would block the observer rather than read anything"
+note = "hazard-pointer reclamation for lock-free slots: a reader publishes the raw pointer it will follow and a writer frees only what no published slot holds. A script holds no raw pointer and follows none, and the protocol rests on the caller unlinking before it retires, an ordering no cmdlet could keep on its behalf"
 
 [[entry]]
 item = "crate::sched::split_observer::AUTO_CLASSIFY_QUANTUM"
@@ -1387,6 +1387,11 @@ note = "a mailbox per thief. Same reasoning; Get-FlynnelCpuInfo reports HasWaitp
 item = "crate::backend::shared_mem::lcrq_lifo"
 reason = "unsafe-or-structural"
 note = "the LCRQ-on-LIFO hybrid. Same reasoning"
+
+[[entry]]
+item = "crate::backend::shared_mem::stager"
+reason = "internal-to-another-surface"
+note = "the per-thread staging slots the khpd, urd and lcrq_lifo backends batch items in before a flush. A script reaches staging only through those backends' dispatch, and a slot index belongs to one thread for the life of the process, so a cmdlet claiming one would spend an index a staging thread needs"
 
 [[entry]]
 item = "crate::backend::shared_mem::latch_mmf"
