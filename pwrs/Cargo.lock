@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "PoWerRuSt"
-version = "0.2.0"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e90eb3f3a89122c171cf3e8f7162ea426e28ad33c3054a922eb079b898d243a5"
+checksum = "a762088c7956b572920d4eff2351a26f4102894e091769c3de45eb8d59b2f8b1"
 dependencies = [
  "pwrs-macros",
  "pwrs-sys",
@@ -580,20 +580,20 @@ dependencies = [
 
 [[package]]
 name = "pwrs-macros"
-version = "0.2.0"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92869f624bd3f60cec1c490a6d293d1fc41dcd31ef7d85281da56d493e8b51da"
+checksum = "f5ea6dde85f0c62e5796d0603fb6c8ba926fd702a01ee47179f55bec274a23a9"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.6",
 ]
 
 [[package]]
 name = "pwrs-sys"
-version = "0.2.0"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c342116da46ff88f7a6f3b1026972d2b4bc204264d21e254d285fad51580811e"
+checksum = "81a100a8c7c04e7cd4269e82aa8967df555821c8aba08bb386cdf10070d4a51b"
 
 [[package]]
 name = "quote"

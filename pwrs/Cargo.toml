@@ -65,7 +65,7 @@ flynnel = { path = ".." }
 # library. Registered under the project's own name because crates.io
 # carries an unrelated `pwrs` from 2015; the library it builds is still
 # `pwrs`, which is what the source writes.
-pwrs = { package = "PoWerRuSt", version = "0.2.0" }
+pwrs = { package = "PoWerRuSt", version = "0.2.3" }
 # The same BLAKE3 flynnel's verify-chain feature already links, pinned
 # to the same version so cargo unifies them and the binary carries one
 # copy. The verify cmdlets digest each chunk they are handed with it

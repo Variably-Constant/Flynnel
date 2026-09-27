@@ -9,6 +9,29 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- The PowerShell module is built on PoWerRuSt 0.2.3, from 0.2.0, by
+  cargo-pwrs 0.2.3, and PoWerRuSt, pwrs-macros and pwrs-sys all stand at
+  0.2.3 in its lock. A class whose constructor refuses, such as
+  `[Flynnel.IoPool]::new(0)`, throws and the host goes on, as it did on
+  0.2.0; 0.2.2, whose finalizer ended the process on such an object, is
+  skipped.
+
+  What it costs: on the Ryzen 7 2700, Measure-FlynnelTextCount run
+  serially over one large text takes 1.177 times as long as on 0.2.0
+  under PowerShell 7 and 1.100 times under Windows PowerShell 5.1, each
+  against a second copy of the 0.2.0 module at about 1.0. The cost grows
+  with the text, about 10 to 12 percent a character from 71,000
+  characters up, and a short call costs what it did; it is in
+  PoWerRuSt's reading of a string argument. The same comparison on the
+  Ryzen 9 7900X and on Ubuntu 24.04 in a 16-processor virtual machine on
+  a Ryzen 7 5700G separates nothing. PoWerRuSt's string conversion timed
+  alone, both releases linked in one process with a second 0.2.0 as the
+  copy: a 25-character call reads 3.1 to 9.9 percent slower on the
+  7900X in every run against copies of 0.958 to 0.981, and no slower on
+  the 2700; 40,000 and 160,000 rows read no slower on the 7900X and, on
+  the 2700, above the copy in two of three runs at 160,000 rows (1.030
+  and 1.085 against 1.022).
+
 - Every dependency requirement names its newest stable release, written
   in full: blake3 1.8.7, cudarc 0.19.10, libc 0.2.189, libloading 0.9.0,
   memmap2 0.9.11, rayon 1.12.0, serde 1.0.229 and serde_json 1.0.151,
