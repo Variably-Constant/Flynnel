@@ -9,6 +9,19 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- The PowerShell module's notices quote a license text for every crate
+  its library links. Seven crates of the wasmtime repository ship no
+  license file in their packages at the versions wasmtime 49 brings:
+  cranelift-assembler-x64 and cranelift-bitset 0.136.1, and
+  pulley-interpreter, wasmtime-internal-component-util,
+  wasmtime-internal-core, wasmtime-internal-jit-debug and
+  wasmtime-internal-jit-icache-coherence 49.0.1, each licensed
+  `Apache-2.0 WITH LLVM-exception`. The module supplies that
+  repository's license, as the wasmtime 49.0.1 and cranelift-codegen
+  0.136.1 packages ship it, from `pwrs/licenses/wasmtime-LICENSE.txt`
+  under `[package.metadata.pwrs.license-files]`, so cargo-pwrs 0.2.3
+  builds the module naming no crate without a text.
+
 - The twenty constant-size `chunks_exact` calls clippy 1.98's
   `chunks_exact_to_as_chunks` names read through `as_chunks` instead,
   whose chunks are arrays, so a value is read with `from_le_bytes(*c)`

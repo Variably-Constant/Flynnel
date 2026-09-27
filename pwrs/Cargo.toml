@@ -47,6 +47,21 @@ copyright = "Copyright (c) 2026 Markus Newton"
 company = "Variably Constant"
 release-notes = """First release."""
 
+# The wasmtime repository's license, `Apache-2.0 WITH LLVM-exception`, as the
+# wasmtime 49.0.1 and cranelift-codegen 0.136.1 packages ship it, for the
+# crates of that repository the library links whose own packages carry no
+# license file. The notices quote it under each. Every entry names the
+# version the lock resolves, and cargo-pwrs refuses an entry for a version
+# the library does not link, so a wasmtime move moves these with it.
+[package.metadata.pwrs.license-files]
+"cranelift-assembler-x64@0.136.1" = "licenses/wasmtime-LICENSE.txt"
+"cranelift-bitset@0.136.1" = "licenses/wasmtime-LICENSE.txt"
+"pulley-interpreter@49.0.1" = "licenses/wasmtime-LICENSE.txt"
+"wasmtime-internal-component-util@49.0.1" = "licenses/wasmtime-LICENSE.txt"
+"wasmtime-internal-core@49.0.1" = "licenses/wasmtime-LICENSE.txt"
+"wasmtime-internal-jit-debug@49.0.1" = "licenses/wasmtime-LICENSE.txt"
+"wasmtime-internal-jit-icache-coherence@49.0.1" = "licenses/wasmtime-LICENSE.txt"
+
 [lib]
 crate-type = ["cdylib"]
 
