@@ -2035,7 +2035,7 @@ pub fn sample_iqr_per_mille(sorted: &[u64]) -> u32 {
 /// neither the pool nor the host profile, at every data-parallel entry.
 #[inline]
 fn capped_to_caller(plan: &JobPlan) -> bool {
-    plan.worker_cap == Some(1)
+    plan.capped_to_caller()
 }
 
 /// True when this dispatch runs its body on the calling thread: the

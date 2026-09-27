@@ -54,6 +54,12 @@ use crate::sched::plan::JobPlan;
 /// No shape places a closure on a worker the caller can name, so a
 /// closure must not depend on which worker runs it.
 ///
+/// A plan capped at one worker ([`JobPlan::with_workers`]`(1)`) runs
+/// every closure on the calling thread in caller order, here and in
+/// [`cooperative_join_n_tree`], [`cooperative_join_n_flat`] and
+/// [`cooperative_join_n_flat_mailbox`], without reading or starting the
+/// pool.
+///
 /// # Determinism contract
 ///
 /// The returned `Vec<R>` is in caller-supplied order, invariant
@@ -80,6 +86,9 @@ pub fn cooperative_join_n<R>(
 where
     R: Send + 'static,
 {
+    if plan.capped_to_caller() {
+        return run_on_caller(closures);
+    }
     let n = closures.len();
     if n < 3 {
         // Inline / 2-way fast paths live inside the tree variant.
@@ -180,6 +189,12 @@ fn mailbox_gate(n_workers: usize) -> usize {
     n_workers.saturating_mul(MAILBOX_GATE_POOL_MULTIPLE)
 }
 
+/// Every closure run on the calling thread, in caller order: the shape
+/// a plan capped at one worker takes in each variant.
+fn run_on_caller<R>(closures: Vec<Box<dyn FnOnce() -> R + Send>>) -> Vec<R> {
+    closures.into_iter().map(|c| c()).collect()
+}
+
 /// Tree-shape cooperative fork-join: balanced binary bisect of
 /// `sched::join` calls, depth `log2(N)`. Pick this directly when
 /// you know per-closure work is short (sub-100us) and want to
@@ -202,6 +217,9 @@ pub fn cooperative_join_n_tree<R>(
 where
     R: Send + 'static,
 {
+    if plan.capped_to_caller() {
+        return run_on_caller(closures);
+    }
     let n = closures.len();
     if n == 0 {
         return Vec::new();
@@ -276,6 +294,9 @@ pub fn cooperative_join_n_flat<R>(
 where
     R: Send + 'static,
 {
+    if plan.capped_to_caller() {
+        return run_on_caller(closures);
+    }
     let n = closures.len();
     if n == 0 {
         return Vec::new();
@@ -337,6 +358,9 @@ pub fn cooperative_join_n_flat_mailbox<R>(
 where
     R: Send + 'static,
 {
+    if plan.capped_to_caller() {
+        return run_on_caller(closures);
+    }
     let n = closures.len();
     if n == 0 {
         return Vec::new();
@@ -1070,5 +1094,58 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("mailbox fan-out must complete after a foreign pool has run");
         assert_eq!(results, (0..n as u32).collect::<Vec<_>>());
+    }
+
+    /// A worker cap of one runs `sched::join` and every cooperative
+    /// variant on the calling thread, under a plan whose tier without
+    /// the cap is the pool's, so the cap is what keeps them there.
+    #[test]
+    fn a_worker_cap_of_one_keeps_every_join_on_the_calling_thread() {
+        use crate::numa_topology::numa_topology;
+        use crate::sched::plan::{SchedTier, pick_tier};
+        use std::thread::ThreadId;
+
+        let uncapped = JobPlan::new(6, 4096);
+        assert_ne!(
+            pick_tier(&uncapped, numa_topology()),
+            SchedTier::Inline,
+            "without its cap the plan must reach the pool, or this test cannot see the cap"
+        );
+        let capped = uncapped.with_workers(1);
+        let caller = std::thread::current().id();
+
+        let halves = join(
+            &capped,
+            || std::thread::current().id(),
+            || std::thread::current().id(),
+        );
+        assert_eq!(
+            halves,
+            (caller, caller),
+            "sched::join ran a half off the calling thread"
+        );
+
+        type Shape = fn(&JobPlan, Vec<Box<dyn FnOnce() -> ThreadId + Send>>) -> Vec<ThreadId>;
+        let shapes: [(&str, Shape); 4] = [
+            ("cooperative_join_n", cooperative_join_n),
+            ("cooperative_join_n_tree", cooperative_join_n_tree),
+            ("cooperative_join_n_flat", cooperative_join_n_flat),
+            (
+                "cooperative_join_n_flat_mailbox",
+                cooperative_join_n_flat_mailbox,
+            ),
+        ];
+        for (name, run) in shapes {
+            let closures: Vec<Box<dyn FnOnce() -> ThreadId + Send>> = (0..64)
+                .map(|_| Box::new(|| std::thread::current().id()) as _)
+                .collect();
+            let ids = run(&capped, closures);
+            assert_eq!(ids.len(), 64, "{name} returned every result");
+            let elsewhere = ids.iter().filter(|&&id| id != caller).count();
+            assert_eq!(
+                elsewhere, 0,
+                "{name} ran {elsewhere} of 64 closures off the calling thread"
+            );
+        }
     }
 }

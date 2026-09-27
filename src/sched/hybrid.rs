@@ -59,9 +59,13 @@ use crate::sched::plan::JobPlan;
 /// The backend hint, through [`JobPlan::pick_backend`], and nothing
 /// else. There is no fan-out here: the CPU half is one closure on the
 /// calling thread and the GPU half is one dispatch to the backend. So
-/// the plan's leaf shape, `use_smt`, oversubscription factor, mailbox
-/// routing and deque tier hint are all unread, and setting them on a
-/// plan built for this call changes nothing.
+/// the plan's leaf shape, `use_smt`, oversubscription factor, worker
+/// cap, mailbox routing and deque tier hint are all unread, and setting
+/// them on a plan built for this call changes nothing. A cap of one
+/// ([`JobPlan::with_workers`]`(1)`) does not bring the second half onto
+/// the calling thread: this call exists to run the two halves at once,
+/// and the second goes to the backend even when that is the CPU
+/// backend.
 ///
 /// Those knobs belong on the plan of whatever the CPU half dispatches
 /// internally, which is a separate call with a plan of its own. A shape

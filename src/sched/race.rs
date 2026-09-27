@@ -18,6 +18,16 @@
 //! [`explore_select`] is its complement: every explorer completes
 //! and a caller comparator picks by result quality, which is the
 //! contract for episode racing / population search.
+//!
+//! A race forks its arms with [`crate::sched::join`] on a copy of the
+//! plan without its worker cap, so a cap of one
+//! ([`JobPlan::with_workers`]`(1)`) never runs [`race_variants`]'
+//! tiers, [`race_refute`]'s two sides or [`race_deadline`]'s clock and
+//! explorers one after another: running them at once is what a race
+//! is. A fan-out through the indexed walker follows the cap as that
+//! walker does, so under a cap of one the explorers of
+//! [`race_deadline`], and the attempts of the races that fan out
+//! through it alone, run in turn on one thread.
 
 use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -137,11 +147,12 @@ where
     // alive after join returns. That breaks Arc::try_unwrap
     // below. With `move`, each closure owns its Arc clone and
     // drops it on return.
+    let arms = plan.without_worker_cap();
     join(
-        plan,
+        &arms,
         move || {
             join(
-                plan,
+                &arms,
                 move || {
                     if let Some(r) = fast(&token_f) {
                         let _ = winner_f.set((r, Variant::Fast));
@@ -369,7 +380,7 @@ where
     let verdict_r = Arc::clone(&verdict);
 
     join(
-        plan,
+        &plan.without_worker_cap(),
         move || {
             if let Some(p) = prove(&token_p)
                 && verdict_p.set(Settled::Proved(p)).is_ok()
@@ -528,8 +539,10 @@ where
 
     // One arm is the clock; the other fans the explorers out. When the
     // clock arm flips the flag, the explorers observe it and return.
+    // The two arms run at once whatever the plan caps; the explorers'
+    // fan-out follows the cap.
     let (_timer, published) = join(
-        plan,
+        &plan.without_worker_cap(),
         move || {
             std::thread::sleep(budget);
             timer_flag.store(true, Ordering::Release);
@@ -1022,6 +1035,28 @@ mod tests {
         let (score, value) = out.expect("someone published");
         assert_eq!(score, 7.0, "highest published score kept");
         assert_eq!(value, 7u32);
+    }
+
+    /// Under a worker cap of one the clock still runs beside the
+    /// explorers, so the first explorer publishes inside the budget;
+    /// the explorers themselves run in turn, as the cap asks.
+    #[test]
+    fn a_worker_cap_of_one_keeps_race_deadline_s_clock_beside_its_explorers() {
+        let plan = JobPlan::new(6, 8).with_workers(1);
+        let out = race_deadline(&plan, Duration::from_millis(60), 2, |i, ctx| {
+            if !ctx.is_expired() {
+                ctx.submit(i as f64 + 1.0, i as u32);
+            }
+            while !ctx.is_expired() {
+                std::hint::spin_loop();
+            }
+        });
+        let (score, value) = out.expect("the first explorer ran before the clock expired");
+        assert_eq!(
+            (score, value),
+            (1.0, 0u32),
+            "the explorers ran in turn, the first alone inside the budget"
+        );
     }
 
     #[test]

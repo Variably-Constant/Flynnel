@@ -1109,6 +1109,26 @@ impl JobPlan {
             .max(1)
     }
 
+    /// True when the caller capped this dispatch to a single worker,
+    /// which [`Self::with_workers`] documents as serial execution on
+    /// the calling thread. Read from the plan alone, so a dispatch
+    /// surface can take the serial path before it reads the pool's
+    /// width or starts the pool.
+    #[inline]
+    pub(crate) fn capped_to_caller(&self) -> bool {
+        self.worker_cap == Some(1)
+    }
+
+    /// A copy of this plan with no worker cap, for a fork whose arms
+    /// must run at once whatever the caller capped: a race's arms.
+    #[inline]
+    pub(crate) fn without_worker_cap(&self) -> Self {
+        Self {
+            worker_cap: None,
+            ..*self
+        }
+    }
+
     /// Variance-corrected SMT activation decision. Combines the
     /// plan's `use_smt` prior with the observer's measured per-
     /// leaf execution-time variance:

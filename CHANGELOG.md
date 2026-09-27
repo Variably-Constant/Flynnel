@@ -973,6 +973,33 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   medians ran 0.853 to 1.096 on the 7900X, 0.940 to 1.159 on the 2700
   and 0.920 to 1.138 on the guest.
 
+- **`join` and the cooperative joins ran a plan capped at one worker on
+  the pool.** `join` and `join_context` with a plan, and
+  `cooperative_join_n` with its tree, flat and mailbox variants, chose
+  their tier without reading the worker cap, so a capped plan's closures
+  went to workers. Each now runs a capped call's closures on the calling
+  thread, in the caller's order, before it reads the pool, so a capped
+  call does not start it. `race_variants`, `race_refute` and
+  `race_deadline` keep their arms concurrent under any cap, since each
+  arm is timed against the others and `race_deadline`'s clock runs
+  beside its explorers; their fan-outs through `collect_indexed` follow
+  the cap as before.
+
+  What it costs on an uncapped plan, one compare of the plan's worker
+  cap at each of these entries: the build before it against the build
+  with it, through the same load harness on the indexed and heartbeat
+  entries, with a copy of the earlier build as every cell's floor,
+  twelve trials a cell on the 7900X and the 2700 and eighteen on Ubuntu
+  24.04 in a 16-processor virtual machine on a Ryzen 7 5700G. No cell's
+  interval lies below its copy's. Of 72 cells three
+  medians sit under their copy's 95 percent interval, each interval
+  overlapping its copy's (the 7900X at 4,096 reps in the quiet window
+  beside 24 spinners' run, 0.957 against a copy interval from 0.963, and
+  at 16 reps beside 12, 0.969 against one from 0.972; the 2700 at 512
+  reps beside 8, 0.965 against one from 0.985), and none over it. The
+  medians ran 0.870 to 1.259 on the 7900X, 0.795 to 1.206 on the 2700
+  and 0.918 to 1.113 in the virtual machine.
+
 - **A wide cooperative fan-out stranded work in parked workers'
   mailboxes.** A mailbox is drained only by the worker that owns it,
   and a mailbox push was served by the deque's wake, which claims

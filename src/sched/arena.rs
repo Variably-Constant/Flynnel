@@ -52,7 +52,10 @@ use crate::numa_topology::numa_topology;
 
 /// Fork-join primitive: run `a` and `b` and return both results.
 ///
-/// Dispatch behavior per tier (as selected by [`pick_tier`]):
+/// A plan capped at one worker ([`JobPlan::with_workers`]`(1)`) runs
+/// `a` then `b` serially on the calling thread whatever its tier, and
+/// never reads or starts the pool. Otherwise, dispatch behavior per
+/// tier (as selected by [`pick_tier`]):
 ///
 /// - `SchedTier::Inline` runs `a` then `b` serially in the caller
 ///   (see [`inline_join_context`]).
@@ -105,6 +108,9 @@ where
     RA: Send,
     RB: Send,
 {
+    if plan.capped_to_caller() {
+        return inline_join_context(a, b);
+    }
     let tier = pick_tier(plan, numa_topology());
     match tier {
         SchedTier::Inline => inline_join_context(a, b),
