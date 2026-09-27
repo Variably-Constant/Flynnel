@@ -240,10 +240,7 @@ fn a_resident_op_mutates_the_block_and_the_handle_addresses_it() {
 
     let mut back = vec![0u8; floats.len()];
     peer.fetch(&handle, &mut back).expect("fetch");
-    let got: Vec<f32> = back
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let got: Vec<f32> = back.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
     assert!(
         got.iter().all(|&x| x == 2.0),
         "every f32 of the resident block advanced by one"
@@ -281,10 +278,7 @@ fn a_prefetched_handle_orders_work_behind_the_upload_without_a_wait() {
 
     let mut back = vec![0u8; data.len()];
     peer.fetch(&handle, &mut back).expect("fetch");
-    let got: Vec<f32> = back
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let got: Vec<f32> = back.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
     assert!(
         got.iter().all(|&x| x == 3.0),
         "the op ran after the upload, so 2.0 became 3.0 rather than 1.0"
@@ -386,10 +380,7 @@ extern "C" __global__ void addk(float* p, unsigned n, unsigned k) {
 
     let mut back = vec![0u8; data.len()];
     peer.fetch_bulk(&handle, &mut back).expect("fetch_bulk");
-    let got: Vec<f32> = back
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let got: Vec<f32> = back.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
     assert_eq!(got.len(), n);
     assert!(
         got.iter().all(|&x| x == 5.0),

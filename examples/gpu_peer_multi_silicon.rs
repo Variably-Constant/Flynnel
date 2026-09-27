@@ -67,8 +67,10 @@ fn main() {
         group.fetch(&h2, &mut out).expect("fetch");
         let want = seed + 2.0;
         let bad = out
-            .chunks_exact(4)
-            .filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) != want)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|c| f32::from_le_bytes(**c) != want)
             .count();
         group.unpin(h2).expect("unpin");
         assert_eq!(bad, 0, "round {round}: {bad} elements missing cross-device history");

@@ -556,8 +556,8 @@ mod tests {
         let n_consumers = 4;
         let n_per_producer = 5_000u32;
         let mut grid = new_composed_mpmc::<u32>(n_producers, n_consumers, 64);
-        let producers: Vec<_> = grid.producers.drain(..).collect();
-        let consumers: Vec<_> = grid.consumers.drain(..).collect();
+        let producers = std::mem::take(&mut grid.producers);
+        let consumers = std::mem::take(&mut grid.consumers);
 
         let total = (n_per_producer as usize) * n_producers;
         let consumed = Arc::new(AtomicUsize::new(0));
@@ -621,7 +621,7 @@ mod tests {
         let n_per = 10_000u32;
         let mut composed = new_composed_mpsc::<u32>(n_producers, 64);
         let consumer = composed.consumer;
-        let producers: Vec<_> = composed.producers.drain(..).collect();
+        let producers = std::mem::take(&mut composed.producers);
 
         let total = (n_per as usize) * n_producers;
         let consumed = Arc::new(AtomicUsize::new(0));

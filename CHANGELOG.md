@@ -9,6 +9,26 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Changed
 
+- The twenty constant-size `chunks_exact` calls clippy 1.98's
+  `chunks_exact_to_as_chunks` names read through `as_chunks` instead,
+  whose chunks are arrays, so a value is read with `from_le_bytes(*c)`
+  and no index: `gpu_peer::hybrid::add1_f32_cpu`, `gpu_peer::linalg`'s
+  f64 and i32 readers, five tests and eight examples.
+  `flynnel_ring_composed`'s tests take their producers and consumers
+  with `std::mem::take`, as 1.98's `drain_collect` asks, so the crate
+  is clippy-clean under 1.98.
+
+  `benches/byte_chunks.rs` times each of the three production loops as
+  three arms in one process: the `chunks_exact` form, the `as_chunks`
+  form, and the `chunks_exact` form again as the control, back to back
+  from an arm that rotates by process, quiet and beside threads
+  spinning on half and on all of the logical processors, at 1,000,
+  100,000 and 1,000,000 values. Six processes a machine, two at each
+  starting arm, 27 cells each: on the Ryzen 9 7900X, the Ryzen 7 2700
+  and Ubuntu 24.04 in a 16-processor virtual machine on a Ryzen 7 5700G
+  the `as_chunks` form is slower in none and faster in none, and every
+  cell sits inside its control's range.
+
 - The PowerShell module is built on PoWerRuSt 0.2.3, from 0.2.0, by
   cargo-pwrs 0.2.3, and PoWerRuSt, pwrs-macros and pwrs-sys all stand at
   0.2.3 in its lock. A class whose constructor refuses, such as

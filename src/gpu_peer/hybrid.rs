@@ -179,9 +179,8 @@ where
 /// Convenience: the resident opcode paired with a matching CPU
 /// closure for the built-in ADD1 op (demo/test symmetry helper).
 pub fn add1_f32_cpu(bytes: &mut [u8]) {
-    for c in bytes.chunks_exact_mut(4) {
-        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) + 1.0;
-        c.copy_from_slice(&v.to_le_bytes());
+    for c in bytes.as_chunks_mut::<4>().0 {
+        *c = (f32::from_le_bytes(*c) + 1.0).to_le_bytes();
     }
 }
 

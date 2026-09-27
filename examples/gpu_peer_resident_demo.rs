@@ -72,9 +72,9 @@ fn main() {
     let mut out = vec![0u8; bytes];
     for h in &handles {
         peer.fetch(h, &mut out).expect("fetch");
-        for c in out.chunks_exact(4) {
+        for c in out.as_chunks::<4>().0 {
             assert_eq!(
-                f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                f32::from_le_bytes(*c),
                 per_handle as f32,
                 "element must have exactly {per_handle} ordered adds"
             );

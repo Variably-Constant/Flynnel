@@ -398,6 +398,11 @@ harness = false
 required-features = ["gpu-peer"]
 
 [[bench]]
+name = "byte_chunks"
+harness = false
+required-features = ["gpu-peer"]
+
+[[bench]]
 name = "inline_collapse"
 harness = false
 

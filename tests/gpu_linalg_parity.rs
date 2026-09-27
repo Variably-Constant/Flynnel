@@ -323,10 +323,7 @@ fn accel_route_runs_gemm_on_device_and_matches() {
     assert!(saw_backend, "the device side never ran across three dispatches");
     let mut out = vec![0u8; batch * m * n * 8];
     peer.fetch_bulk(&pc, &mut out).expect("fetch c");
-    let got: Vec<f64> = out
-        .chunks_exact(8)
-        .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-        .collect();
+    let got: Vec<f64> = out.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect();
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
         assert_eq!(g.to_bits(), w.to_bits(), "device element {i}: {g} vs cpu {w}");
     }

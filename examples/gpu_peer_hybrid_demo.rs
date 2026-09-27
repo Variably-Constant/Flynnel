@@ -55,8 +55,10 @@ fn main() {
     // through every placement flip and residence transfer.
     let out = mirror.host_bytes(&mut peer).expect("sync host");
     let bad = out
-        .chunks_exact(4)
-        .filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) != rounds as f32)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|c| f32::from_le_bytes(**c) != rounds as f32)
         .count();
     println!("\nall {n_f32} elements == {rounds}.0 after mixed placements: {}",
              if bad == 0 { "VERIFIED" } else { "FAIL" });

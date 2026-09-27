@@ -627,9 +627,7 @@ pub(crate) fn f64_bytes(v: &[f64]) -> Vec<u8> {
 }
 
 pub(crate) fn bytes_f64(b: &[u8]) -> Vec<f64> {
-    b.chunks_exact(8)
-        .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-        .collect()
+    b.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect()
 }
 
 fn i32_bytes(v: &[i32]) -> Vec<u8> {
@@ -964,7 +962,7 @@ pub struct LuResult {
 fn fetch_i32(peer: &mut GpuPeer, p: &Pinned, elems: usize) -> Result<Vec<i32>, GpuPeerError> {
     let mut out = vec![0u8; elems * 4];
     peer.fetch_bulk(&p.handle, &mut out)?;
-    Ok(out.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    Ok(out.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect())
 }
 
 /// Enqueue batched in-place LU with partial pivoting on the wide

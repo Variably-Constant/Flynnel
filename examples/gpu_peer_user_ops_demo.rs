@@ -89,10 +89,7 @@ fn main() {
     // Full verification through fetch.
     let mut out = vec![0u8; n_f32 * 4];
     peer.fetch(&handle, &mut out).expect("fetch");
-    let bad = out
-        .chunks_exact(4)
-        .filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) != 16.0)
-        .count();
+    let bad = out.as_chunks::<4>().0.iter().filter(|c| f32::from_le_bytes(**c) != 16.0).count();
     println!("[4] all {n_f32} resident elements == 16.0: {}",
              if bad == 0 { "VERIFIED" } else { "FAIL" });
     assert_eq!(bad, 0);

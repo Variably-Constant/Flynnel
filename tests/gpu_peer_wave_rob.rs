@@ -132,7 +132,7 @@ fn arena(peer: &mut GpuPeer, wave: &Wave) -> Vec<u32> {
     let mut bytes = vec![0u8; 4 * (CAPACITY as usize + 1)];
     peer.fetch_bulk_at(wave.handle(), wave.layout().arena_off as usize, &mut bytes)
         .expect("read the arena");
-    bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect()
+    bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect()
 }
 
 fn depth_of(peer: &mut GpuPeer, wave: &Wave, id: u32) -> u32 {

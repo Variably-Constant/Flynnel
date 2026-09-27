@@ -44,15 +44,15 @@ fn main() {
     let mut verified = 0usize;
     let t0 = Instant::now();
     for m in 0..total {
-        for (i, chunk) in payload.chunks_exact_mut(4).enumerate() {
-            chunk.copy_from_slice(&(((m + i) % 1000) as f32).to_le_bytes());
+        for (i, chunk) in payload.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *chunk = (((m + i) % 1000) as f32).to_le_bytes();
         }
         let ticket = peer.submit(OP_ADD1_F32, &payload).expect("submit");
         let status = peer.wait(ticket, Duration::from_secs(5)).expect("wait");
         assert_eq!(status, STATUS_DONE, "block {m} must complete");
         peer.read_result(ticket, &mut result).expect("result fits the slot");
-        for (i, chunk) in result.chunks_exact(4).enumerate() {
-            let got = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for (i, chunk) in result.as_chunks::<4>().0.iter().enumerate() {
+            let got = f32::from_le_bytes(*chunk);
             let want = ((m + i) % 1000) as f32 + 1.0;
             assert_eq!(got, want, "block {m} element {i}");
         }
@@ -74,8 +74,8 @@ fn main() {
     let mut pending = std::collections::VecDeque::new();
     let t0 = Instant::now();
     for m in 0..total {
-        for (i, chunk) in payload.chunks_exact_mut(4).enumerate() {
-            chunk.copy_from_slice(&(((m + i) % 1000) as f32).to_le_bytes());
+        for (i, chunk) in payload.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *chunk = (((m + i) % 1000) as f32).to_le_bytes();
         }
         pending.push_back((m, peer.submit(OP_ADD1_F32, &payload).expect("submit")));
         if pending.len() >= window {

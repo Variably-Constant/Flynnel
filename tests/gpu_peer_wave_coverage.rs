@@ -107,7 +107,7 @@ fn every_position_runs_once(blocks: u32, frontier: Frontier) {
     let mut bytes = vec![0u8; 4 * (1 + 2 * CAPACITY as usize)];
     peer.fetch_bulk_at(wave.handle(), wave.layout().arena_off as usize, &mut bytes)
         .expect("read the arena");
-    let words: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+    let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
     assert_eq!(words[0], CAPACITY - ROOTS, "{frontier:?} on {team}: every child took an id");
     let runs = &words[1 + CAPACITY as usize..];
     let never: Vec<usize> = (0..CAPACITY as usize).filter(|&id| runs[id] == 0).collect();

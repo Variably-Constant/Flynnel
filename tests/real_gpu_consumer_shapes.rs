@@ -103,8 +103,8 @@ fn a_wide_team_reads_its_answer_back_from_the_submitted_payload() {
 
     let mut args = vec![0u8; HEADER + N * 4 * 2];
     args[..4].copy_from_slice(&(N as u32).to_le_bytes());
-    for (i, chunk) in args[HEADER..HEADER + N * 4].chunks_exact_mut(4).enumerate() {
-        chunk.copy_from_slice(&(i as f32).to_le_bytes());
+    for (i, chunk) in args[HEADER..HEADER + N * 4].as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        *chunk = (i as f32).to_le_bytes();
     }
 
     let t = peer
