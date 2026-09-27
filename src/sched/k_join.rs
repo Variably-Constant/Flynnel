@@ -6,7 +6,7 @@
 //! time dispatch:
 //!
 //! - At `K <= 4` (microsizes, sub-microsecond per-op work) the
-//!   function monomorphises to literally `(a(), b())` - no
+//!   function monomorphizes to literally `(a(), b())` - no
 //!   scheduler call, no JobPlan allocation, zero overhead.
 //! - At `K >= 5` it builds a [`JobPlan`] and delegates to
 //!   [`crate::sched::join`], which dispatches by tier.
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn k_join_with_plan_at_k8_uses_custom_hw_class() {
-        // Verify the plan-taking variant accepts a customised plan
+        // Verify the plan-taking variant accepts a customized plan
         // without dropping any fields.
         let plan = JobPlan::new(8, 1024)
             .with_hw_class(HwClass::Avx2)

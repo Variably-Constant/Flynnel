@@ -62,7 +62,7 @@ Target hardware class. See [HwClass](Foundation-Types-Reference.md#hwclass). Def
 
 A declared matrix-extension class (`AmxBf16`, `AmxInt8`, `Sme`, or a tensor-core class) promotes the scheduler tier, so a tile batch too small to clear the inline fold dispatches instead of folding. The smallest tile such a class can mean is a multiply-accumulate over a 16x16 block, orders above the dispatch cost the fold weighs against. The vector classes say nothing the batch size does not and steer nothing.
 
-The class asserts the **regime**, not that the host has the unit. It is a claim about the shape of the work: tile-based dispatch, entered as a mode region, with entry costs amortised per region rather than per op. `ScalarFallback` exists so `run_in_region` code compiles and runs where the matrix extension is absent, so declaring the class on vector silicon emulating tile ops is accurate rather than a lie that happens to help. The arithmetic underneath is the backend's.
+The class asserts the **regime**, not that the host has the unit. It is a claim about the shape of the work: tile-based dispatch, entered as a mode region, with entry costs amortized per region rather than per op. `ScalarFallback` exists so `run_in_region` code compiles and runs where the matrix extension is absent, so declaring the class on vector silicon emulating tile ops is accurate rather than a lie that happens to help. The arithmetic underneath is the backend's.
 
 ### `variant: Variant`
 
@@ -101,7 +101,7 @@ Per-op typical values from the source (Zen3 / FpN<8> baseline):
 
 | Op | ns/item |
 |----|---------|
-| `add_slice` / `sub_slice` | ~10 (SIMD-vectorised) |
+| `add_slice` / `sub_slice` | ~10 (SIMD-vectorized) |
 | `mul_slice` | ~10 to 20 |
 | `spmv` per row | ~50 ns multiplied by `nnz_per_row` |
 | `gemm` per output element | ~32 ns multiplied by `k` (inner dim) |
@@ -176,7 +176,7 @@ It reaches every route, but by two different mechanisms.
 
 On the routes that take a split budget, the triple, indexed and collect helpers, the token-bucket and reduce paths, and `for_each_chunk`'s probe and pinned-variant routes, it caps the leaves at `workers * 2^log2`.
 
-On the seed-depth route, which is what `for_each_chunk` and `for_each_chunk_indexed` take when the plan carries an authoritative per-item estimate, it shifts the depth: `adaptive_seed_depth` derives a depth from the estimate, applies the worker floor and the hysteresis stabiliser, then adds this log2, capped at one leaf per item. A factor of 2 on a depth of 6 seeds 256 leaves rather than 64.
+On the seed-depth route, which is what `for_each_chunk` and `for_each_chunk_indexed` take when the plan carries an authoritative per-item estimate, it shifts the depth: `adaptive_seed_depth` derives a depth from the estimate, applies the worker floor and the hysteresis stabilizer, then adds this log2, capped at one leaf per item. A factor of 2 on a depth of 6 seeds 256 leaves rather than 64.
 
 The distinction between the two sources matters more here than elsewhere. Only a factor the caller set through [`with_oversubscription_log2`](#builder-methods) shifts the seed depth. A profile-derived or learned factor does not, and neither does the process-global split multiplier, so on that route the only oversubscription applied is one the caller asked for.
 
@@ -207,7 +207,7 @@ The clamp ceiling is `3` (8x oversubscription) so accidental misuse cannot blow 
 
 Hard cap on the worker count for this dispatch. `None` means use every available worker; `Some(1)` runs the body on the calling thread; `Some(N)` spreads over at most N workers. Lets a per-call site request a smaller subset of the pool than the arena holds (for example, a probe path that wants 4 workers regardless of the host's 44-thread allocation).
 
-`effective_workers(arena_workers)` applies the cap, and every data-parallel entry resolves its split budget through it. `Some(1)` is recognised from the plan alone by `par_iter::runs_on_caller`, so a capped call reaches neither the worker pool nor the host dispatch profile.
+`effective_workers(arena_workers)` applies the cap, and every data-parallel entry resolves its split budget through it. `Some(1)` is recognized from the plan alone by `par_iter::runs_on_caller`, so a capped call reaches neither the worker pool nor the host dispatch profile.
 
 ### `bisect_variant: Option<BisectVariant>`
 
@@ -233,7 +233,7 @@ Per-tier deque the recursive-split right-half is pushed to. `None` (default) mea
 
 **Removed in 0.6.0**, along with `JobPlan::with_k_gating` and `WorkloadShapeHints::k_gating`. The field was written by the constructors, the builder and the shape mapping, and read by no dispatch path.
 
-K-gating is process-global, per worker rather than per call. Every worker carries a KHL per-slot backing and an Fcl counter-only backing at once, with an atomic tag naming the live one, and a job pushed to the other is reachable only while that worker's orphan-drain flag is set - a flag any pop or steal clears on finding that backing empty. Honouring a per-dispatch hint means probing both backings on every steal, which is the cost the flag exists to reclaim. So the field could not be wired, and a hint with no reader cannot report that it is doing nothing.
+K-gating is process-global, per worker rather than per call. Every worker carries a KHL per-slot backing and an Fcl counter-only backing at once, with an atomic tag naming the live one, and a job pushed to the other is reachable only while that worker's orphan-drain flag is set - a flag any pop or steal clears on finding that backing empty. Honoring a per-dispatch hint means probing both backings on every steal, which is the cost the flag exists to reclaim. So the field could not be wired, and a hint with no reader cannot report that it is doing nothing.
 
 To pin a backing, use `AdaptiveDispatcher::migrate_k_gating` or `LocalArena::migrate_all_workers_k_gating`, which flip every worker's tag in one pass. The [`KGating`](Foundation-Types-Reference.md#kgating) type itself is unchanged.
 
@@ -426,7 +426,7 @@ Under the default worker sizing this equals the arena's whole width. The per-nod
 
 It diverges from `NumaArena::total_workers` only where the primaries are fewer than the logical threads: `FLYNNEL_SCHED_PHYSICAL_ONLY=on`, `FLYNNEL_SCHED_SMT=off`, or an explicit `FLYNNEL_SCHED_WORKERS` below the logical count. There the siblings exist and park unless a dispatch with `use_smt` is in flight, so `total_workers` counts threads that exist rather than threads that run, and the Tiny-Tasks model sized against it overstates parallelism twofold and asks for chunks about 1.4 times too narrow.
 
-It is also capped by the CPUs the process is allowed to use at that moment, from `sched::host_width::allowed_parallelism`. The pool is spawned once and its threads outlive a change to the process affinity mask or the cgroup CPU quota, so on a host that has narrowed since startup the arena counts workers that can no longer reach a core, and chunking against that count divides work among threads that will not run it. The query honours both the affinity mask and the cgroup quota and is re-read at most every 250 ms, because it costs a syscall and, on Linux, a cgroup read.
+It is also capped by the CPUs the process is allowed to use at that moment, from `sched::host_width::allowed_parallelism`. The pool is spawned once and its threads outlive a change to the process affinity mask or the cgroup CPU quota, so on a host that has narrowed since startup the arena counts workers that can no longer reach a core, and chunking against that count divides work among threads that will not run it. The query honors both the affinity mask and the cgroup quota and is re-read at most every 250 ms, because it costs a syscall and, on Linux, a cgroup read.
 
 Starts the arena if it is not already running, so it is not a free inspection on a process that has not yet used the pool.
 

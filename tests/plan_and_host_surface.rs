@@ -53,7 +53,7 @@ fn the_adaptive_spin_toggle_does_not_disturb_the_window() {
 
 /// A reset discards the yields counted before it.
 ///
-/// The assertion is not that the counter reads zero afterwards. Idle
+/// The assertion is not that the counter reads zero afterward. Idle
 /// workers keep yielding on their own schedule once a pool is live, so
 /// a read taken any time after the reset can already have moved, and a
 /// test demanding zero passes or fails on timing rather than on
@@ -256,7 +256,7 @@ fn a_named_shape_outranks_an_estimate_the_caller_never_supplied() {
         assert!(
             plan.use_smt,
             "at {n} items the named shape decides the routing, whatever the \
-             inherited default would have totalled"
+             inherited default would have totaled"
         );
         assert_eq!(plan.leaf_shape, LeafShape::LatencyCompute);
     }
@@ -322,7 +322,7 @@ fn a_leaf_shape_hint_reaches_the_pool_even_at_a_micro_k() {
 #[test]
 fn the_tier_bands_are_the_ones_the_plan_documents() {
     let topo = numa_topology();
-    // A micro K with a batch that cannot amortise dispatch.
+    // A micro K with a batch that cannot amortize dispatch.
     assert_eq!(flynnel::sched::plan::pick_tier(&JobPlan::new(2, 100), topo), SchedTier::Inline);
     // The same K with enough aggregate work.
     assert_eq!(

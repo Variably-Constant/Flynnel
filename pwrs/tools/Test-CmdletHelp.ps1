@@ -67,10 +67,10 @@ foreach ($cmd in $commands) {
 
     # A synopsis is a statement about what the command does. The two
     # shapes that read as unfinished are one that does not end in a
-    # full stop and one that opens with a lowercase letter, and both
+    # period and one that opens with a lowercase letter, and both
     # are cheap to see and cheap to fix.
     if ($synopsis -notmatch '\.$') {
-        $problems.Add("$($cmd.Name): the synopsis does not end in a full stop, so it reads as a fragment")
+        $problems.Add("$($cmd.Name): the synopsis does not end in a period, so it reads as a fragment")
     }
     if ($synopsis -cmatch '^[a-z]') {
         $problems.Add("$($cmd.Name): the synopsis opens lowercase")

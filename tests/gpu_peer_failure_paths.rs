@@ -325,7 +325,7 @@ fn a_pool_too_small_for_the_buffer_refuses_the_pin() {
         peer.pin_bulk(&vec![5u8; 64 * 1024]).is_err(),
         "a buffer past the whole pool must be refused rather than truncated"
     );
-    // The pool is still usable afterwards, so the refusal did not
+    // The pool is still usable afterward, so the refusal did not
     // leave blocks claimed.
     let handle = peer.pin_bulk(&vec![5u8; 8192]).expect("a fitting buffer still pins");
     peer.unpin(handle).expect("unpin");

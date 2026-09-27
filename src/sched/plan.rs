@@ -136,7 +136,7 @@ pub struct JobPlan {
     ///   parallelism.
     ///
     /// Per-op typical values (Zen3 / FpN<8> baseline):
-    /// - `add_slice` / `sub_slice`: ~10ns/elem (SIMD-vectorised)
+    /// - `add_slice` / `sub_slice`: ~10ns/elem (SIMD-vectorized)
     /// - `mul_slice`: ~10-20ns/elem
     /// - `spmv` per row: ~50ns * nnz_per_row
     /// - `gemm` per output element: ~32ns * k (k = inner dim)
@@ -164,7 +164,7 @@ pub struct JobPlan {
     /// SLAW default.
     ///
     /// A caller whose own per-chunk work is larger than that adds it
-    /// here. `optimal_chunk_count` minimises `W/C + O*C`, so what it
+    /// here. `optimal_chunk_count` minimizes `W/C + O*C`, so what it
     /// asks of `O` is that the cost be paid once per chunk, not that
     /// the scheduler be the one paying it: a merge across a chunk
     /// boundary or a per-chunk setup pass belongs in this number.
@@ -191,7 +191,7 @@ pub struct JobPlan {
     pub task_overhead_ns: Option<u32>,
     /// Per-chunk serial span in nanoseconds (Tiny-Tasks model): the
     /// part of a chunk that does not shrink when the chunk does, such
-    /// as a serial prologue before a fan-out or the trunk of a
+    /// as a serial prelude before a fan-out or the trunk of a
     /// recursive body. For uniform-leaf workloads (matmul, slice ops)
     /// it is 0; `None` is read as 0.
     ///
@@ -568,7 +568,7 @@ impl JobPlan {
         // classifier. `new` seeds this field from the process-active
         // profile, and that default describes no particular call, so
         // letting it reach the fine-grain corner would drop a shape the
-        // caller named in favour of a number the caller never wrote.
+        // caller named in favor of a number the caller never wrote.
         let caller_estimate = if self.estimated_per_item_ns_explicit {
             self.estimated_per_item_ns
         } else {
@@ -1061,7 +1061,7 @@ impl JobPlan {
 
     /// Builder: select an experimental `for_each_chunk` policy
     /// variant for bench A/B comparison. See [`BisectVariant`]
-    /// for the variant catalogue.
+    /// for the variant catalog.
     pub fn with_bisect_variant(mut self, variant: BisectVariant) -> Self {
         self.bisect_variant = Some(variant);
         self
@@ -1223,7 +1223,7 @@ impl JobPlan {
     /// Derivation sketch: total-time = serial_work / C + (O + S) * C.
     /// A chunk pays the scheduler's overhead and its own serial span
     /// once each, whatever work it carries, so the two enter the
-    /// optimisation as one per-chunk fixed cost. d/dC = -W/C^2 +
+    /// optimization as one per-chunk fixed cost. d/dC = -W/C^2 +
     /// (O + S) = 0 ⇒ C = sqrt(W / (O + S)). Including parallelism
     /// (P workers running in parallel) bumps the optimal C up by a
     /// factor of sqrt(P) because each worker's fixed cost is paid

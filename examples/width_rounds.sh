@@ -3,7 +3,7 @@
 # process.
 #
 # available_parallelism reads the affinity mask and the cgroup quota,
-# and a busy neighbour moves neither, so a load-based harness never
+# and a busy neighbor moves neither, so a load-based harness never
 # reaches this switch. What reaches it is a narrowing applied partway
 # through a run: with the switch off the pool goes on chunking for the
 # machine it started on, with it on the worker count follows within the

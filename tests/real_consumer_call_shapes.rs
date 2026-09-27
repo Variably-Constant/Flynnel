@@ -18,7 +18,7 @@
 //! the answers are correct, and the routing decision the caller asked
 //! for is the one the plan carries. Wall-clock speedup is deliberately
 //! absent - the host these run on is shared, and a timing assertion
-//! there measures the neighbour.
+//! there measures the neighbor.
 //!
 //! How many threads a dispatch actually reached is the same kind of
 //! measurement and is absent for the same reason. The bisect collapses
@@ -120,7 +120,7 @@ fn collect_indexed_with_min_leaf_one_and_no_hint_at_all() {
 }
 
 // ---------------------------------------------------------------------
-// A nearest-neighbour index, at its vector dimensions
+// A nearest-neighbor index, at its vector dimensions
 // ---------------------------------------------------------------------
 
 /// `JobPlan::new(0, c).with_leaf_shape(PortCompute)` then

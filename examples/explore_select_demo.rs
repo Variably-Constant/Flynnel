@@ -97,7 +97,7 @@ fn main() {
 
     // The distinguishing property: the winner slept the LONGEST (it
     // had the fewest actions), so it finished last. A first-past-the-
-    // post race would have cancelled it in favor of clone {worst}.
+    // post race would have canceled it in favor of clone {worst}.
     let winner_sleep = 240_000u64 / best.actions.max(1) as u64;
     let worst_sleep = 240_000u64 / worst.actions.max(1) as u64;
     println!("[2] semantic contrast:");

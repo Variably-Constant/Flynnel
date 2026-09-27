@@ -267,7 +267,7 @@ impl MmfChaseLevDeque {
 
         // Zero the slot buffer. The Chase-Lev protocol never reads a
         // slot whose index is not in [top, bottom), so zeroing is
-        // defence-in-depth rather than load-bearing.
+        // defense-in-depth rather than load-bearing.
         let slots_start = std::mem::size_of::<DequeHeader>();
         // SAFETY: slots_start..slots_start + capacity*SLOT_SIZE is
         // exactly the unwritten tail of the map; write_bytes through

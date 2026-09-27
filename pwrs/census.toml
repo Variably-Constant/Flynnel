@@ -806,7 +806,7 @@ note = "splits a caller's own &mut [T] between the two sides, so the backend hal
 [[entry]]
 item = "crate::sched::levers::oncore_spread"
 reason = "internal-to-another-surface"
-note = "the oncore_spread row of Get-FlynnelLever, which carries its measured price: paired at 4096 reps on three hosts, 0.9978 at a 0.22 per cent bound on bare metal, 0.9922 at 4.79 on a Linux guest, 0.9917 at 11.15 on FreeBSD"
+note = "the oncore_spread row of Get-FlynnelLever, which carries its measured price: paired at 4096 reps on three hosts, 0.9978 at a 0.22 percent bound on bare metal, 0.9922 at 4.79 on a Linux guest, 0.9917 at 11.15 on FreeBSD"
 
 [[entry]]
 item = "crate::sched::levers::batch_weight"
@@ -1371,7 +1371,7 @@ note = "batched publication lines, three items to a line. Same reasoning"
 [[entry]]
 item = "crate::backend::shared_mem::urd"
 reason = "unsafe-or-structural"
-note = "a mailbox per thief. Same reasoning; Get-FlynnelCpuInfo reports HasWaitpkg and HasMonitorx so a script can see which waits this host can execute. Every wait now opens with a spin floor of SPIN_BEFORE_WAIT polls and only then reaches whatever monitor wait the host has, WAITPKG or MONITORX, so a publish already in flight is caught at spin latency and reaches no monitor at all. The earlier reading that the monitor wait was slower in three cells of four was taken with no floor, so it was catching wakes the spin would have caught; what the second stage buys is the physical core's issue width handed to an SMT sibling, which those rows cannot see because they time the thief rather than its neighbours. The co-runner group in benches/urd_thief_wait.rs measures that and has not run on any host"
+note = "a mailbox per thief. Same reasoning; Get-FlynnelCpuInfo reports HasWaitpkg and HasMonitorx so a script can see which waits this host can execute. Every wait now opens with a spin floor of SPIN_BEFORE_WAIT polls and only then reaches whatever monitor wait the host has, WAITPKG or MONITORX, so a publish already in flight is caught at spin latency and reaches no monitor at all. The earlier reading that the monitor wait was slower in three cells of four was taken with no floor, so it was catching wakes the spin would have caught; what the second stage buys is the physical core's issue width handed to an SMT sibling, which those rows cannot see because they time the thief rather than its neighbors. The co-runner group in benches/urd_thief_wait.rs measures that and has not run on any host"
 
 [[entry]]
 item = "crate::backend::shared_mem::lcrq_lifo"

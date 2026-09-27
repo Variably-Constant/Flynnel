@@ -354,7 +354,7 @@ extern "C" __global__ void flynnel_peer_poller(
             }
         }
         else if (op != OP_NOP) {
-            // Anything the chain did not recognise. Without this a
+            // Anything the chain did not recognize. Without this a
             // mistyped or out-of-range opcode completes as done and
             // the caller reads the payload it submitted back as a
             // result.

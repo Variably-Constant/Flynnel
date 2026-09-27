@@ -21,7 +21,7 @@ be running when the storm also caught their control. That reads as a
 policy difference and is a clock.
 
 POSITION, because a window measured first in its trial is worth a few
-per cent more than one measured last. The rotation exists to cancel
+percent more than one measured last. The rotation exists to cancel
 that, and this says whether it did: an arm that drew position one more
 often than the others had an advantage the rotation was meant to
 remove.

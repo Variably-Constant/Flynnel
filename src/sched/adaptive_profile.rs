@@ -1063,7 +1063,7 @@ mod tests {
     /// Over the tag rather than the process-wide cell: `tick_auto_classify`
     /// migrates that cell from whichever thread ran a dispatch, so any
     /// test that stored a profile and read it back could be answered by
-    /// a neighbouring test's classifier instead of by its own store.
+    /// a neighboring test's classifier instead of by its own store.
     #[test]
     fn every_profile_survives_its_tag_and_the_cell_starts_port_bound() {
         for profile in [

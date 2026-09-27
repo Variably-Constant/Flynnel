@@ -46,7 +46,7 @@ const SLEEPING: u8 = 2;
 /// Latch is set. Terminal state.
 const SET: u8 = 3;
 
-/// One-time signalling primitive. Starts at [`UNSET`]; transitions
+/// One-time signaling primitive. Starts at [`UNSET`]; transitions
 /// monotonically to [`SET`].
 ///
 /// See module-level docs for the state machine and the

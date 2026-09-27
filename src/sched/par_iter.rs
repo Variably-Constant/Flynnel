@@ -726,10 +726,10 @@ const TARGET_LEAF_WORK_NS: u64 = 1_000_000;
 static SEED_HYSTERESIS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 /// Reads the environment once, before the setting is answered.
-static STABILISERS_FROM_ENV: std::sync::Once = std::sync::Once::new();
+static STABILIZERS_FROM_ENV: std::sync::Once = std::sync::Once::new();
 
-fn stabilisers_from_env() {
-    STABILISERS_FROM_ENV.call_once(|| {
+fn stabilizers_from_env() {
+    STABILIZERS_FROM_ENV.call_once(|| {
         let off = matches!(
             std::env::var_os("FLYNNEL_SEED_HYSTERESIS").as_deref(),
             Some(v) if v == "0"
@@ -747,7 +747,7 @@ fn stabilisers_from_env() {
 /// read-modify-writes on a line every dispatch reads, so a caller
 /// polling it in a loop charges the scheduler rather than only itself.
 pub fn seed_hysteresis() -> bool {
-    stabilisers_from_env();
+    stabilizers_from_env();
     SEED_HYSTERESIS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -769,7 +769,7 @@ fn seed_depth_reporting() -> bool {
 /// which for a decision driven by a measured estimate is the thing
 /// being measured.
 pub fn set_seed_hysteresis(on: bool) -> bool {
-    stabilisers_from_env();
+    stabilizers_from_env();
     SEED_HYSTERESIS.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -837,7 +837,7 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
     // the far side of a boundary cannot halve or double the leaf count
     // by itself.
     let depth = match plan.site {
-        Some(site) if seed_hysteresis() => site.get().stabilise_seed_depth(depth),
+        Some(site) if seed_hysteresis() => site.get().stabilize_seed_depth(depth),
         _ => depth,
     };
     // A factor the caller set is them describing their own workload,
@@ -1684,7 +1684,7 @@ fn pinned_host_profile() -> Option<HostDispatchProfile> {
 /// installed collapse threshold doubles as the "not yet calibrated"
 /// marker. A value that does not parse is reported and the caller
 /// measures the host, so a mistyped pin is loud rather than silently
-/// honoured as something else.
+/// honored as something else.
 fn parse_pinned_profile(text: &str) -> Option<HostDispatchProfile> {
     let mut fields = text.split(',');
     let mut take = |what: &str| -> Option<u64> {
@@ -5043,7 +5043,7 @@ mod tests {
             "zero is read as no bound rather than as re-measure always"
         );
 
-        // A clock that moved backwards, or a record stamped ahead of
+        // A clock that moved backward, or a record stamped ahead of
         // this host, must not re-measure at every start until the
         // clock catches up.
         let mut future = CpuCalibration::new(1_000, 70_000, 40_000, 41, 9, Some(990));
@@ -5661,7 +5661,7 @@ mod tests {
         // test's dispatches feed, and the process-global counters,
         // which every dispatch in the suite feeds. The exact checks
         // read the site. The global counters are checked as floors,
-        // because a neighbour's leaves can only add to them.
+        // because a neighbor's leaves can only add to them.
         //
         // One worker, so each dispatch is one leaf run on this thread
         // inside the wall time measured around the loop. The summed
@@ -5726,7 +5726,7 @@ mod tests {
 
         // The global half flushes on its own cadence from whatever
         // residue this thread carried in, so its rise can trail the
-        // site's by one batch less a leaf, and neighbours' leaves can
+        // site's by one batch less a leaf, and neighbors' leaves can
         // only raise it.
         let global_count = after.count.wrapping_sub(before.count);
         assert!(
@@ -6101,7 +6101,7 @@ mod tests {
         // it, so nothing contends and nothing needs a lock. The length
         // is stored plus one, which leaves zero meaning never covered
         // and lets a tile claimed twice be caught where it happens
-        // rather than inferred afterwards from a list that still
+        // rather than inferred afterward from a list that still
         // sorts.
         let tiles = n.div_ceil(width);
         let lens: Vec<AtomicUsize> = (0..tiles).map(|_| AtomicUsize::new(0)).collect();

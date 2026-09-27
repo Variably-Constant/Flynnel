@@ -24,7 +24,7 @@ fn plan(n: usize) -> JobPlan {
 #[test]
 fn race_variants_labels_the_answer_with_the_arm_that_produced_it() {
     // Three distinguishable answers: whichever wins, the tag and the
-    // value must agree. A mislabelled winner is a silently wrong
+    // value must agree. A mislabeled winner is a silently wrong
     // precision claim.
     let (value, variant) = race_variants(&plan(3), |_| Some(1u32), |_| Some(2u32), |_| 3u32);
     let expected = match variant {
@@ -46,7 +46,7 @@ fn race_variants_falls_through_to_correct_when_no_tier_is_tolerable() {
 
 #[test]
 fn race_variants_runs_the_correct_tier_to_completion_even_when_it_loses() {
-    // The safety net is not cancellable: it must finish whatever else
+    // The safety net is not cancelable: it must finish whatever else
     // wins, or a later caller relying on it has nothing.
     let correct_finished = AtomicUsize::new(0);
     let (value, variant) = race_variants(
@@ -85,7 +85,7 @@ fn explore_select_keeps_the_best_and_every_explorer_finishes() {
         |a, b| a < b,
     );
     assert_eq!(got, Some((0, 0)), "the smallest wins under this ordering");
-    assert_eq!(ran.load(Ordering::Relaxed), n, "no explorer was cancelled");
+    assert_eq!(ran.load(Ordering::Relaxed), n, "no explorer was canceled");
     assert_eq!(explore_select(&plan(0), 0, |i| i, |a, b| a < b), None, "nothing to select");
 }
 
@@ -109,7 +109,7 @@ fn race_any_cancels_the_losers() {
             // Poll for a bounded time rather than forever, so a failure
             // to cancel fails the assertion instead of hanging.
             for _ in 0..2000 {
-                if token.is_cancelled() {
+                if token.is_canceled() {
                     saw_cancel.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
@@ -299,7 +299,7 @@ fn race_statistical_finds_the_dominant_candidate_and_answers_an_empty_field() {
 }
 
 #[test]
-fn race_statistical_minimises_when_asked_to() {
+fn race_statistical_minimizes_when_asked_to() {
     let n = 4usize;
     let opts = StatOpts {
         value_range: 1.0,
@@ -317,10 +317,10 @@ fn race_statistical_minimises_when_asked_to() {
 fn a_cancel_token_composed_by_hand_carries_the_signal() {
     // The documented use for a caller building its own race on join.
     let token = CancelToken::new();
-    assert!(!token.is_cancelled(), "a fresh token is not cancelled");
+    assert!(!token.is_canceled(), "a fresh token is not canceled");
     let clone = token.clone();
     token.cancel();
-    assert!(clone.is_cancelled(), "a clone observes the cancel");
+    assert!(clone.is_canceled(), "a clone observes the cancel");
     token.cancel();
-    assert!(clone.is_cancelled(), "and cancelling twice changes nothing");
+    assert!(clone.is_canceled(), "and canceling twice changes nothing");
 }

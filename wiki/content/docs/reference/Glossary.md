@@ -67,7 +67,7 @@ Terms specific to Flynnel and the broader extended-Flynn-taxonomy vocabulary.
 |------|---------|
 | Chase-Lev deque | Wait-free single-owner double-ended queue used per worker. Owner pushes/pops at one end; thieves steal at the other. |
 | Injector | MPMC queue at the arena level for cross-thread submissions. |
-| Latch | One-shot signalling primitive (`CoreLatch`) transitioning monotonically `UNSET -> SLEEPY -> SLEEPING -> SET`. |
+| Latch | One-shot signaling primitive (`CoreLatch`) transitioning monotonically `UNSET -> SLEEPY -> SLEEPING -> SET`. |
 | JEC | Jobs-Event-Counter sleep-protocol: workers count observed-job events before falling asleep so a producer's submit-then-wake handshake avoids lost wakeups. |
 | Parker | Per-worker sleep primitive built on `std::thread::park` with a yield-N-then-park spin floor. |
 | SLAW | "Scalable Locality-aware Adaptive Work-stealing" (Guo-Zhao-Cavé-Sarkar, IPDPS 2010, pp. 1-12). The adaptive splitter pattern Flynnel uses. |
@@ -75,7 +75,7 @@ Terms specific to Flynnel and the broader extended-Flynn-taxonomy vocabulary.
 | NUMA | Non-Uniform Memory Access. A multi-socket / multi-CCD topology where some memory addresses are faster to access from some cores. |
 | CCX | Cache-Coherent Complex (AMD Zen terminology). A cluster of cores sharing one L3 slice. Detected by Flynnel via CPUID `0x8000_001D` sub-leaf 3 on `AuthenticAMD` parts. |
 | CCD | Core Complex Die. A physical Zen chiplet, typically containing one or two CCXs. |
-| Module / Tile / Die | Intel CPUID `1Fh` v2-extended-topology domain types (numeric 3 / 4 / 5 in `ECX[15:8]`). On Sapphire Rapids+ the Module domain size is the chiplet-tile size - cores sharing one L3 slice - and is the analogue of AMD's CCX for Flynnel's cluster-detection probe. |
+| Module / Tile / Die | Intel CPUID `1Fh` v2-extended-topology domain types (numeric 3 / 4 / 5 in `ECX[15:8]`). On Sapphire Rapids+ the Module domain size is the chiplet-tile size - cores sharing one L3 slice - and is the analog of AMD's CCX for Flynnel's cluster-detection probe. |
 | DSU | DynamIQ Shared Unit. ARMv8+ cluster construct - cores within a DSU share L2/L3 cache. Flynnel detects DSU size on aarch64 Linux via `/sys/devices/system/cpu/cpuN/topology/cluster_id`. |
 | perflevel | Apple Silicon performance-level grouping. `perflevel0` = P-cores, `perflevel1` = E-cores (on M-series). Queried via `sysctl hw.perflevel0.physicalcpu` for P-cluster size on macOS aarch64. |
 | SLIT | System Locality Information Table. ACPI's per-pair NUMA distance matrix. |

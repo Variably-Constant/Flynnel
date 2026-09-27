@@ -33,14 +33,14 @@ fn main() {
 
     // --- 0. race_variants (first tolerable wins, MISD) --------------
     // Fast meets tolerance instantly; the correct-tier safety net is
-    // slow, so the fast tolerable answer wins and correct is cancelled.
+    // slow, so the fast tolerable answer wins and correct is canceled.
     let (r, v) = race_variants::<u32, _, _, _>(
         &plan,
         |_t| Some(1u32),
         |_t| None,
         |t| {
             for _ in 0..200 {
-                if t.is_cancelled() {
+                if t.is_canceled() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(1));
@@ -64,7 +64,7 @@ fn main() {
             return 0u32; // the instant replica
         }
         for _ in 0..100 {
-            if token.is_cancelled() {
+            if token.is_canceled() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -94,10 +94,10 @@ fn main() {
         &plan,
         |_t| (2..n).find(|d| n.is_multiple_of(*d)).map(|d| (d, n / d)),
         |t| {
-            // Only certify prime after a FULL clean scan. Cancelled or
+            // Only certify prime after a FULL clean scan. Canceled or
             // factor-found means no verdict from this side.
             for d in 2..n {
-                if t.is_cancelled() || n.is_multiple_of(d) {
+                if t.is_canceled() || n.is_multiple_of(d) {
                     return None;
                 }
             }

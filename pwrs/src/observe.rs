@@ -189,7 +189,7 @@ pub(crate) fn trace_state_row() -> TraceState {
 /// Reads whether the dispatch trace is recording and how it was armed.
 ///
 /// The ring is seeded from an environment variable read once, and
-/// Set-FlynnelTraceState can move it afterwards. EnabledBy says which
+/// Set-FlynnelTraceState can move it afterward. EnabledBy says which
 /// of those last decided it.
 ///
 /// The dispatch counters are a separate switch and are still latched
@@ -949,7 +949,7 @@ fn site_row(
     }
 }
 
-/// Reads every dispatch call site the scheduler has materialised in
+/// Reads every dispatch call site the scheduler has materialized in
 /// this process, and what each has learned.
 ///
 /// A site appears once a dispatch has reached that source location, so

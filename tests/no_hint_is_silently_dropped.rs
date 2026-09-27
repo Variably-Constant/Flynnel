@@ -388,7 +388,7 @@ fn a_worker_cap_of_one_runs_the_body_on_the_calling_thread() {
 }
 
 /// Setting a hint twice keeps the second, and setting two different
-/// hints keeps both. A builder that reset its neighbours would drop a
+/// hints keeps both. A builder that reset its neighbors would drop a
 /// hint the caller had already given.
 #[test]
 fn hints_compose_rather_than_overwrite_each_other() {

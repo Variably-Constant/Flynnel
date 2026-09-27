@@ -8,7 +8,7 @@ scheduler: one memory-mapped file is simultaneously a plain mapped
 region (this process and any process opening the same file) and
 device-visible memory (registered with the CUDA driver) that a
 resident kernel polls. Work moves through Lamport single-producer /
-single-consumer lanes with doorbell signalling - no kernel launch on
+single-consumer lanes with doorbell signaling - no kernel launch on
 the per-message path, no atomics across the CPU/GPU boundary, no
 copies beyond the payload writes.
 
@@ -1105,8 +1105,8 @@ literal that no compiler checks against `OP_USER_BASE`. Binding only
 the host constant does not fix that; it moves the coupling from
 host-against-crate to host-against-your-own-device-source, and the two
 failures are not equally visible. A host that submits an opcode the
-device does not recognise fails at the device and says so. A host that
-submits one the device recognises and rejects fails every call as an
+device does not recognize fails at the device and says so. A host that
+submits one the device recognizes and rejects fails every call as an
 ordinary error, which reads as a broken accelerator rather than a
 version skew.
 
@@ -1162,7 +1162,7 @@ the prefix too.
 
 `pin_prefetch(data)` uploads a block WITHOUT waiting and returns the
 handle plus the upload ticket. Lane FIFO order is the dependency
-order, so any task submitted on that handle afterwards is ordered
+order, so any task submitted on that handle afterward is ordered
 after the upload with no fence, no event, no wait. The scheduler
 front-loads a working set the way a CPU prefetcher front-loads a
 cache line - fire and forget, correctness by construction. Reap the

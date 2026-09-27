@@ -59,7 +59,7 @@ fn widths_from_cuda(src: &str) -> Vec<Width> {
             } else if decl.starts_with("u32") {
                 Width::B32
             } else {
-                panic!("unrecognised parameter type in the CUDA declaration: {decl:?}");
+                panic!("unrecognized parameter type in the CUDA declaration: {decl:?}");
             }
         })
         .collect()
@@ -84,7 +84,7 @@ fn widths_from_ptx(ptx: &str) -> Vec<Width> {
             } else if line.contains(".u32") || line.contains(".b32") {
                 Some(Width::B32)
             } else {
-                panic!("unrecognised parameter width in the PTX entry: {line:?}");
+                panic!("unrecognized parameter width in the PTX entry: {line:?}");
             }
         })
         .collect()

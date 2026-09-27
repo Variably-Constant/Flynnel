@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn table_lookup_diagonal_is_zero() {
-        // Synthesise a 4x4 table with known entries.
+        // Synthesize a 4x4 table with known entries.
         let entries_ns: Vec<u32> = vec![
             0, 30, 60, 90,
             30, 0, 30, 60,

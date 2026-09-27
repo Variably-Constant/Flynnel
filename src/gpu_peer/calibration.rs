@@ -8,7 +8,7 @@
 //!
 //! Measured quantities:
 //! - doorbell round-trip (min / median / p99) against a resident
-//!   kernel: the substrate's signalling latency;
+//!   kernel: the substrate's signaling latency;
 //! - CPU/GPU clock offset error via paired QPC/globaltimer sampling
 //!   (integer-domain differencing; best-RTT-quartile spread);
 //! - launch+sync baseline: the cost a wake-from-idle pays and the

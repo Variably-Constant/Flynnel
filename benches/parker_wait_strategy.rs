@@ -201,8 +201,8 @@ fn report_latch(name: &str, held_before: bool) {
 /// Wake latency with other parkers alive and being unparked.
 ///
 /// A monitor wait watches the cache line its `wake_counter` sits in,
-/// so what a neighbouring parker does to its own counter matters if
-/// the two share a line. One parker has no neighbour, which is what
+/// so what a neighboring parker does to its own counter matters if
+/// the two share a line. One parker has no neighbor, which is what
 /// every other group here measures, and a pool has twenty-odd: this
 /// group is the difference between those two, and it is the shape a
 /// live arena actually has.
@@ -210,8 +210,8 @@ fn report_latch(name: &str, held_before: bool) {
 /// The noise thread unparks every parker except the one being timed.
 /// Nothing it does should reach that one, and any effect on the
 /// timing is the layout rather than the protocol.
-fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
-    let name = format!("parker_neighbours_{label}");
+fn bench_neighbors(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
+    let name = format!("parker_neighbors_{label}");
     let held_before = flynnel::sched::sleep::monitor_wait_held();
     let mut group = c.benchmark_group(&name);
     group.warm_up_time(Duration::from_secs(1));
@@ -223,13 +223,13 @@ fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
                 .unwrap_or(4);
             // Allocated together, the way an arena allocates its
             // worker parkers, so they land near each other.
-            let neighbours: Vec<Arc<Parker>> = (0..n)
+            let neighbors: Vec<Arc<Parker>> = (0..n)
                 .map(|_| Arc::new(Parker::with_strategy(0, strategy)))
                 .collect();
 
             let stop = Arc::new(AtomicU32::new(0));
             let noise_stop = Arc::clone(&stop);
-            let noise_set: Vec<Arc<Parker>> = neighbours.clone();
+            let noise_set: Vec<Arc<Parker>> = neighbors.clone();
             let noise = std::thread::spawn(move || {
                 while noise_stop.load(Ordering::Relaxed) == 0 {
                     for p in &noise_set {
@@ -277,7 +277,7 @@ fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
 /// is not one of them.
 ///
 /// Every other group here times the parker. This one times its
-/// neighbour, and the parkers do nothing at all: they park once and
+/// neighbor, and the parkers do nothing at all: they park once and
 /// stay parked for the whole measurement. The question is what a
 /// waiting worker takes from the rest of the machine while it waits.
 ///
@@ -290,20 +290,20 @@ fn bench_neighbours(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
 /// of those dominates is not something the instruction set answers.
 ///
 /// A pool holds one worker per logical CPU, so on a busy host this is
-/// the difference between a neighbour having the box and sharing it
+/// the difference between a neighbor having the box and sharing it
 /// with two dozen residents.
 ///
 /// The zero-parker row is the control and the rows only mean
 /// something against it: it is the same workload with nothing else
 /// alive, so it says what the measurement costs when there is nothing
 /// to take.
-fn bench_idle_neighbours(c: &mut Criterion, label: &str, parkers: Option<WaitStrategy>) {
-    let name = format!("parker_idle_neighbours_{label}");
+fn bench_idle_neighbors(c: &mut Criterion, label: &str, parkers: Option<WaitStrategy>) {
+    let name = format!("parker_idle_neighbors_{label}");
     let held_before = flynnel::sched::sleep::monitor_wait_held();
     let mut group = c.benchmark_group(&name);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
-    group.bench_function("neighbour_work", |b| {
+    group.bench_function("neighbor_work", |b| {
         b.iter_custom(|iters| {
             let n = match parkers {
                 None => 0,
@@ -615,24 +615,24 @@ fn bench_all(c: &mut Criterion) {
     // read against, and StdPark is included here unlike the group
     // below: this asks what a waiting thread does to the machine, and
     // leaving the run queue is as much an answer as halting on it.
-    bench_idle_neighbours(c, "none", None);
-    bench_idle_neighbours(c, "stdpark", Some(WaitStrategy::StdPark));
+    bench_idle_neighbors(c, "none", None);
+    bench_idle_neighbors(c, "stdpark", Some(WaitStrategy::StdPark));
     if waitpkg {
-        bench_idle_neighbours(c, "waitpkg", Some(WaitStrategy::Waitpkg));
+        bench_idle_neighbors(c, "waitpkg", Some(WaitStrategy::Waitpkg));
     }
     if monitorx {
-        bench_idle_neighbours(c, "monitorx", Some(WaitStrategy::Monitorx));
+        bench_idle_neighbors(c, "monitorx", Some(WaitStrategy::Monitorx));
     }
 
-    // Neighbours last, and only the two strategies a monitor wait can
-    // take: StdPark has no monitor, so a neighbouring store cannot
+    // Neighbors last, and only the two strategies a monitor wait can
+    // take: StdPark has no monitor, so a neighboring store cannot
     // reach it and the row would only restate the idle one.
     if waitpkg {
-        bench_neighbours(c, "waitpkg", WaitStrategy::Waitpkg);
+        bench_neighbors(c, "waitpkg", WaitStrategy::Waitpkg);
     }
     if monitorx {
-        bench_neighbours(c, "stdpark", WaitStrategy::StdPark);
-        bench_neighbours(c, "monitorx", WaitStrategy::Monitorx);
+        bench_neighbors(c, "stdpark", WaitStrategy::StdPark);
+        bench_neighbors(c, "monitorx", WaitStrategy::Monitorx);
     }
 
     // Printed after the arms, because it is only knowable once a wait

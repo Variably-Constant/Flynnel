@@ -250,7 +250,7 @@ impl FlynnelDrive {
         out
     }
 
-    /// Every call site the scheduler has materialised: those at a source
+    /// Every call site the scheduler has materialized: those at a source
     /// location, named by it, then those another native library keyed,
     /// named by the key.
     ///

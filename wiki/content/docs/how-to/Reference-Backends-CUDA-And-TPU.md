@@ -82,7 +82,7 @@ backend.secondary_stream().synchronize().unwrap();
 
 ### `KernelArg` mapping
 
-| Variant | Marshalled as |
+| Variant | Marshaled as |
 |---------|---------------|
 | `I32` / `I64` / `U32` / `U64` / `F32` / `F64` | Pushed by value into the cudarc launch builder. |
 | `DevicePtr(usize)` | Cast to `u64` and pushed; matches CUDA's pointer-as-u64 calling convention. |
@@ -185,12 +185,12 @@ register_backend(Arc::new(backend));
 | `dispatch_parallel_for(count, work)` | Host-side fan-out (same shape as CUDA backend). |
 | `dispatch_one(work)` | Spawns an OS thread. |
 | `register_kernel(name, source)` | `source` is UTF-8 Python source defining a function bound to `name`. The bridge `exec`s the source and `jax.jit()`s the function; returns a per-backend handle. |
-| `dispatch_kernel(handle, count, args)` | Serializes a JSON request to the bridge with the unpacked args; bridge calls the JIT function and blocks until the result materialises. |
+| `dispatch_kernel(handle, count, args)` | Serializes a JSON request to the bridge with the unpacked args; bridge calls the JIT function and blocks until the result materializes. |
 | `devices()` | Devices the JAX runtime reported during the handshake (e.g., `["TpuDevice(id=0, ...)"]`). Useful for telemetry. |
 
 ### `KernelArg` mapping
 
-| Variant | Marshalled as JSON |
+| Variant | Marshaled as JSON |
 |---------|-------------------|
 | `I32(v)` | `{"i32": v}` |
 | `I64(v)` | `{"i64": v}` |
@@ -338,7 +338,7 @@ The runnable version is at [`examples/wasm_dispatch_demo.rs`](https://github.com
 
 ### When to reach for WASM dispatch
 
-Use this backend when consumers want sandboxed portable kernels: user-supplied transformation closures, runtime-loaded plugins, or kernels that need to run inside browser / WASI environments without recompiling. The host pays a one-time module-compilation cost (cranelift JIT) at `register_kernel`; per-launch cost is comparable to a function call within the wasmtime sandbox (~5 us by the reported capabilities, dominated by sandbox entry and result marshalling).
+Use this backend when consumers want sandboxed portable kernels: user-supplied transformation closures, runtime-loaded plugins, or kernels that need to run inside browser / WASI environments without recompiling. The host pays a one-time module-compilation cost (cranelift JIT) at `register_kernel`; per-launch cost is comparable to a function call within the wasmtime sandbox (~5 us by the reported capabilities, dominated by sandbox entry and result marshaling).
 
 WASM is NOT the right backend for raw throughput: scalar single-threaded execution per call means a fan-out of host work is faster on the in-process CPU backend. The reach-for-it case is plugin / sandboxing semantics, not speed.
 

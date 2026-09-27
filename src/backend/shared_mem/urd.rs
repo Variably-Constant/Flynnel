@@ -30,7 +30,7 @@
 //!
 //! What the second stage buys is a core it stops occupying, and that
 //! is measured by the co-runner group in `benches/urd_thief_wait.rs`,
-//! which times the thief's neighbours rather than the thief. Until
+//! which times the thief's neighbors rather than the thief. Until
 //! that group has run on a host, the choice above rests on the
 //! instruction being present and not on it being cheaper there:
 //! [`crate::sched::sleep::WaitController`] found the same monitor
@@ -152,8 +152,8 @@ impl WaitStrategy {
     ///
     /// The co-runner group in `benches/urd_thief_wait.rs` is what
     /// measures this, not the rows above, which time the thief
-    /// rather than its neighbours. It oversubscribes deliberately,
-    /// one neighbour per logical CPU, because that is the
+    /// rather than its neighbors. It oversubscribes deliberately,
+    /// one neighbor per logical CPU, because that is the
     /// arrangement in which the difference has somewhere to show.
     /// It has not run on any host.
     pub fn pick() -> Self {

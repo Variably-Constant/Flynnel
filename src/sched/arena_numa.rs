@@ -92,7 +92,7 @@ impl NumaArena {
         let n_nodes = topo.num_nodes.max(1) as usize;
         let cpu_to_node = topo.node_of_cpu.clone();
 
-        // Materialise all core_ids once; partition into per-node
+        // Materialize all core_ids once; partition into per-node
         // sub-sets by the topology's node_of_cpu map.
         let pinning_enabled = !pin_disabled_env_local();
         let all_core_ids = if pinning_enabled {

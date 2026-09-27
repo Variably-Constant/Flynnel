@@ -555,7 +555,7 @@ fn main() {
     // ratio between them would divide by all of it.
     //
     // The arms alternate by trial so neither always runs first. A window
-    // is worth a few per cent more in one position than the other, and
+    // is worth a few percent more in one position than the other, and
     // an order held fixed would put that difference in the ratio.
     for t in 1..=trials {
         let control_first = t % 2 == 1;

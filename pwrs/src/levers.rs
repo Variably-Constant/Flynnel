@@ -188,7 +188,7 @@ pub struct Lever {
 }
 
 const ONCORE_PRICE: &str = "Paired at 4096 reps of uniform work on three hosts, 40 trials each: \
-    0.9978 at a 0.22 per cent bound on a 24-thread Windows bare-metal box with a control of \
+    0.9978 at a 0.22 percent bound on a 24-thread Windows bare-metal box with a control of \
     0.9988 at 0.38; 0.9922 at 4.79 on a 16-core Linux guest; 0.9917 at 11.15 on a 16-core \
     FreeBSD guest. Not slower on any host and no speed-up claimed on any. It is a correctness \
     lever and is judged on the class it produces: the learned class differs between the arms in \
@@ -198,7 +198,7 @@ const ONCORE_PRICE: &str = "Paired at 4096 reps of uniform work on three hosts, 
 
 const ALLOWED_WIDTH_PRICE: &str = "One affinity query every 250 ms, paid for nothing on a host \
     whose mask never changes. Paired at 4096 reps on a 24-thread Windows bare-metal box, 40 \
-    trials, no decision moving between the arms: 1.0006 at a 0.13 per cent bound over 40 clean \
+    trials, no decision moving between the arms: 1.0006 at a 0.13 percent bound over 40 clean \
     pairs, control 1.0000 at 0.10. What it buys is a host that narrows after the pool is \
     spawned, which tests/affinity_follows_process_mask holds on all three platforms.";
 
@@ -228,7 +228,7 @@ const SLOT_PARK_PRICE: &str = "Off, and measured to change nothing: in four arms
 
 const WASM_STORE_PRICE: &str = "Off, and measured to lose. On a 24-thread Windows host a store \
     per thread is 4.4x faster with every worker settled on an idle box and 5x slower in the same \
-    shape under load, 1222 against 6316 us, and every first-dispatch cell is 5 to 7 per cent \
+    shape under load, 1222 against 6316 us, and every first-dispatch cell is 5 to 7 percent \
     slower.";
 
 const NO_PRICE: &str = "";

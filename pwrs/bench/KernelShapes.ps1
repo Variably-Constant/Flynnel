@@ -26,7 +26,7 @@
 # The control is a fixed arithmetic loop this module cannot reach,
 # benched first and again last. Its drift across the run is the
 # position effect: how much of a row's difference is where the row sat
-# rather than what it did. A control outside a few per cent means the
+# rather than what it did. A control outside a few percent means the
 # box moved under the run and no row in it is readable.
 #
 # The empty cell is the cheapest cmdlet in the module, which does no
@@ -41,10 +41,10 @@
 #
 # The control bounds position inside one run. The anchor bounds drift
 # between builds, which the control cannot see: a branchy microsecond
-# cell in quartz moved 53 per cent across a rebuild that touched
+# cell in quartz moved 53 percent across a rebuild that touched
 # neither measured function, while that run's controls held inside 6
-# per cent. Stationary cells in the same rebuild moved under 10 per
-# cent, so the anchor speaks only for the straight-scan rows and each
+# percent. Stationary cells in the same rebuild moved under 10
+# percent, so the anchor speaks only for the straight-scan rows and each
 # row says whether it is one.
 #
 # Ratios are read within one run against that run's control. A figure
@@ -215,7 +215,7 @@ function Start-Cooldown {
 # only the quiet arm cannot speak to it.
 #
 # Burners are separate processes rather than threads so they contend
-# for cores the way a neighbour does, and so a wedged one can be seen
+# for cores the way a neighbor does, and so a wedged one can be seen
 # and killed in a process listing rather than being invisible inside
 # this one.
 
@@ -308,7 +308,7 @@ $anchorBody = { Measure-FlynnelReduce -InputObject $anchorBuffer -Operation Sum 
 # the state the cells have to be timed in. Three seconds of the
 # single-threaded control body was tried first: it raised one core's
 # clock, the anchor read its lowest of five runs, and the closing
-# control then read 74 per cent slower than the opening one, because
+# control then read 74 percent slower than the opening one, because
 # the minutes of kernel cells in between heated the package and the
 # warm-up had not.
 #
@@ -864,7 +864,7 @@ foreach ($row in $rows) {
     $distancePct = if ($null -ne $row.VsSerial -and $row.VsSerial -gt 0) {
         [Math]::Abs(100.0 * ($row.VsSerial - 1.0))
     } else { $null }
-    # Computed before it is handed over, because a parenthesised `if`
+    # Computed before it is handed over, because a parenthesized `if`
     # in an argument position is parsed as a command named `if`, which
     # is a name nothing answers to. It passes a syntax check and fails
     # only when the line runs, and everything in this block runs after

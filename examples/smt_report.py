@@ -164,7 +164,7 @@ def main(path):
                     print(f"  {arm_name:<5} smt_window={seen}, and this arm means {want}"
                           f" - do not read its rows")
                 else:
-                    print(f"  {arm_name:<5} smt_window={seen}, as labelled")
+                    print(f"  {arm_name:<5} smt_window={seen}, as labeled")
         print()
         print("engagement, from the same arms:")
         for arm in ("off", "null", "on"):
@@ -198,7 +198,7 @@ def main(path):
             print("  above are not a reading of this mechanism.")
         elif on and all(f.get("smt_switch") == "false" for f in on):
             print()
-            print("  The switch reports itself OFF on the arm labelled on; the driver")
+            print("  The switch reports itself OFF on the arm labeled on; the driver")
             print("  did not set it and no row here measures it.")
 
     empties = sum(

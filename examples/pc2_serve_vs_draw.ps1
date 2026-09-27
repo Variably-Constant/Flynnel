@@ -16,7 +16,7 @@
 # both and largely cancels. The ratio is what the arms are compared on.
 #
 # Arm order alternates by trial. A window measured first in its trial is
-# worth a few per cent more, and a fixed order would give that to one
+# worth a few percent more, and a fixed order would give that to one
 # arm every time.
 
 param(
@@ -44,7 +44,7 @@ $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 #
 # A count of cargo, rustc, cl and link names reads near zero on a host
 # saturated by anything that is not a compile: pc2 has been observed at
-# 99 per cent CPU with that count at 1. A run claiming a quiet box has
+# 99 percent CPU with that count at 1. A run claiming a quiet box has
 # to measure the box, not a list of names it expects to find.
 #
 # PercentIdleTime on the _Total instance is a 100 ns counter, so the

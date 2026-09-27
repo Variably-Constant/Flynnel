@@ -5,7 +5,7 @@
 //! process and any other process can open, and (b) device-visible
 //! memory a resident GPU kernel polls and writes. Work flows through
 //! Lamport single-producer/single-consumer lanes with doorbell
-//! signalling - no kernel launch on the per-message path, no atomics
+//! signaling - no kernel launch on the per-message path, no atomics
 //! across the CPU/GPU boundary (measured unsafe over PCIe hosts
 //! without native atomics), and no data copies besides the payload
 //! writes themselves.
@@ -362,7 +362,7 @@ fn device_capabilities(ordinal: usize) -> DeviceCapabilities {
 /// what is resident rather than what this process allocated, which is
 /// what a caller wanting to know whether it has the device to itself
 /// needs: a run sizing an allocation against the total alone will
-/// collide with a neighbour that the total cannot see.
+/// collide with a neighbor that the total cannot see.
 ///
 /// Memory is what the driver exposes. Utilization is not on this
 /// surface, so a process holding a context while launching nothing
@@ -778,7 +778,7 @@ impl GpuPeer {
     pub fn init(config: GpuPeerConfig) -> Result<Self, GpuPeerError> {
         // Read the caller's context before creating ours, because
         // creation binds: cudarc's CudaContext::new ends in
-        // bind_to_thread, so afterwards the current context is always
+        // bind_to_thread, so afterward the current context is always
         // the one this call retained and the comparison would be with
         // itself.
         // Two gates before anything reads the driver, including the
@@ -1158,7 +1158,7 @@ impl GpuPeer {
     /// reports one or two. A lane relaunched late and draining a
     /// backlog claims from a full ring and reports a depth near
     /// `slots_per_lane`. The count says stalls happened; the depth says
-    /// which kind, and the host cannot recover it afterwards because
+    /// which kind, and the host cannot recover it afterward because
     /// the ring has moved on by the time a status is read.
     pub fn barrier_stalls(&self) -> (u32, u32) {
         (
@@ -1448,7 +1448,7 @@ impl GpuPeer {
     /// [`Self::pin`] without waiting: zero-synchronization prefetch.
     /// The upload rides the handle's lane, and lane FIFO order IS the
     /// dependency order - any task submitted on this handle
-    /// afterwards executes after the data has landed, with no fence,
+    /// afterward executes after the data has landed, with no fence,
     /// no event, no wait anywhere. The returned upload ticket must be
     /// reaped first among the lane's tickets (in-order reap rule).
     pub fn pin_prefetch(

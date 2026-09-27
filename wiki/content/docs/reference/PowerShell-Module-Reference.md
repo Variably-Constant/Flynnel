@@ -196,7 +196,7 @@ Enumerations: `Flynnel.Source`, `Flynnel.KGating`, `Flynnel.AccelKind`, `Flynnel
 
 The store is shared by every process on the host, so `Clear-FlynnelCalibrationStore` asks first and supports `-WhatIf`. It does not delete the file: other processes hold it mapped, and it is cleared by publishing a zeroed record under the same writer lease and the same lock every reader uses.
 
-A stored CPU record says what its trust verdict is made of. `IsTrustworthy` is `Samples` and `Confirmations` both above zero, not a spread test, because reproducibility is a property of two draws and no statistic over one draw's samples substitutes for a second draw agreeing. `OccupancyPerMille` is beside them: the spread says whether the samples agreed with each other, and only occupancy says whether they agreed on the wrong number because a neighbour held half the machine.
+A stored CPU record says what its trust verdict is made of. `IsTrustworthy` is `Samples` and `Confirmations` both above zero, not a spread test, because reproducibility is a property of two draws and no statistic over one draw's samples substitutes for a second draw agreeing. `OccupancyPerMille` is beside them: the spread says whether the samples agreed with each other, and only occupancy says whether they agreed on the wrong number because a neighbor held half the machine.
 
 ## Rings - 9 commands
 
@@ -378,9 +378,9 @@ Objects: `Flynnel.RaceOutcome`, `Flynnel.RaceArm`.
 
 **They answer opposite questions and are worth running as a pair.** The race reports `TailRatio`, the slowest arm's time over the winner's, which is what hedging trimmed on this host; 1.0 is a race that saved nothing. The exploration cancels nothing, because a slow explorer that finds the best answer is the point of that shape, so what it reports is what exploring costs.
 
-**The call returns when every arm has returned.** Cancelling a loser stops it spending more; it does not hand the call back early. `SlowestArmNs` is what the call actually waited for.
+**The call returns when every arm has returned.** Canceling a loser stops it spending more; it does not hand the call back early. `SlowestArmNs` is what the call actually waited for.
 
-**`CancelledEarly` zero means different things in the two shapes.** On a race it means every loser finished before the winner's signal reached it, which is a fact about how even this host is. On an exploration it is the shape: nothing is canceled. Raise `-Count` or `-Repetitions` to give a signal time to arrive.
+**`CanceledEarly` zero means different things in the two shapes.** On a race it means every loser finished before the winner's signal reached it, which is a fact about how even this host is. On an exploration it is the shape: nothing is canceled. Raise `-Count` or `-Repetitions` to give a signal time to arrive.
 
 **Only two of the crate's nine racing entry points are bound.** The other seven need an arm that can decline a contract it failed, refute a peer, or disagree with one. Every body this module can offer is a declared deterministic kernel, so a cmdlet over `race_agree` would always answer unanimous - a property of the binding rather than of the work.
 
@@ -404,7 +404,7 @@ A running scheduler, browsed. `Import-Module` creates it; there is nothing to mo
 Flynnel:\
   host\         topology, cpu, latency, cache
   pool\         summary, spin, split, workers\<n>
-  sites\        one per call site the scheduler has materialised
+  sites\        one per call site the scheduler has materialized
   backends\     one per backend kind, present on this host or not
   calibration\  summary, thresholds
   trace\        state

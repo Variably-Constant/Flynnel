@@ -83,7 +83,7 @@ foreach ($i in 1..$Runs) {
     #
     # Busy cores beside the process count because the count names four
     # images and reads near zero on a box saturated by anything else:
-    # observed at 99 per cent CPU with that count at 1.
+    # observed at 99 percent CPU with that count at 1.
     $foreign = @(Get-Process -Name cargo,rustc,cl,link -ErrorAction SilentlyContinue).Count
     "RUN $i foreign=$foreign busy_cores=$(Get-BusyCores)" | Add-Content -Path $log
 

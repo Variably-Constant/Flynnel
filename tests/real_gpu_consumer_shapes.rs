@@ -37,7 +37,7 @@ mod common;
 
 /// One device at a time, across test binaries as well as within this
 /// one; cargo runs the binaries concurrently, and these shapes are the
-/// ones whose timings a neighbour distorts most.
+/// ones whose timings a neighbor distorts most.
 fn serial() -> common::DeviceLock {
     common::device()
 }

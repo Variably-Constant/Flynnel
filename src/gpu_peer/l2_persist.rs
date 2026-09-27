@@ -113,7 +113,7 @@ impl L2Persist {
     /// Mark `[dev_ptr, dev_ptr + num_bytes)` as persisting on `stream`,
     /// so `hit_ratio` (0.0..=1.0) of its lines are preferentially
     /// retained in the set-aside L2. Kernels launched on that stream
-    /// afterwards read the window from L2 instead of HBM once it is
+    /// afterward read the window from L2 instead of HBM once it is
     /// primed. `num_bytes` clamps to the access-window ceiling.
     pub fn pin_window(
         &self,

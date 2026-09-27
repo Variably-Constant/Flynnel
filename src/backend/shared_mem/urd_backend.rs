@@ -133,7 +133,7 @@ impl SharedMemoryUrdBackend {
             .map_err(|e| BackendError::Launch(format!("URD build item: {e:?}")))?;
         // Published straight out of the caller's own buffer. The
         // buffer belongs to this thread, so holding it across the
-        // publish blocks nobody, and clearing it afterwards keeps its
+        // publish blocks nobody, and clearing it afterward keeps its
         // capacity where handing the vector away would make the next
         // batch allocate.
         //
@@ -201,7 +201,7 @@ impl SharedMemoryUrdBackend {
                 return Ok(0);
             }
             let staged = buffer.len();
-            // Published in place and cleared afterwards, for the
+            // Published in place and cleared afterward, for the
             // reasons given on the auto-flush in dispatch_marshal: the
             // buffer is this thread's, so nothing waits on it, and
             // clearing keeps the capacity the next batch would

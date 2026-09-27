@@ -3,7 +3,7 @@ title: Extended Flynn Taxonomy
 weight: 2
 ---
 
-The architectural framing Flynnel speaks. This page explains why the crate is named after Michael J. Flynn and how the eight-axis mapping below organises every primitive in the crate into a single coherent vocabulary.
+The architectural framing Flynnel speaks. This page explains why the crate is named after Michael J. Flynn and how the eight-axis mapping below organizes every primitive in the crate into a single coherent vocabulary.
 
 ## Michael J. Flynn and the 1966 taxonomy
 
@@ -62,7 +62,7 @@ The bread-and-butter axis. [`flynnel::join(plan, a, b)`](Sched-Module-Reference.
 
 The closure body remains CPU-runnable (an arbitrary Rust closure cannot codegen to PTX). For real GPU compute, consumers use the [`dispatch_kernel`](Backend-System.md#dispatch_kernel) handle path with a pre-built PTX / Python kernel body.
 
-Two flavours of SIMT kernel ship in the bench surface, demonstrating the distinction:
+Two flavors of SIMT kernel ship in the bench surface, demonstrating the distinction:
 
 - **Per-thread SIMT** (`kernels/newton_sqrt.ptx`): one thread per element, no explicit warp-level primitives. The GPU groups threads into warps of 32 in hardware, but the kernel body does not exchange register values across lanes. This is the canonical embarrassingly-parallel shape and is correct for any per-element-independent workload.
 - **Warp-cooperative SIMT** (CUDA C source inlined in `benches/flynn_axes.rs` as `KERNEL_CUDA_C_WARP`, compiled via `cudarc::nvrtc::compile_ptx`): threads use `__shfl_xor_sync(0xffffffff, residual, mask)` (butterfly warp shuffle) to do a 32-lane max-reduce of the per-iteration residual at the end of each Newton iteration, then take a warp-wide early-exit branch when the warp-max falls below epsilon. This is genuine cross-lane register exchange without going through shared memory and demonstrates a warp-level ballot pattern. It pays back on workloads where convergence is bursty enough that early exit fires routinely.

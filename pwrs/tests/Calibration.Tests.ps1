@@ -141,7 +141,7 @@ Describe 'Measure-FlynnelHostDispatch' {
         $result.Source | Should -Be ([Flynnel.Source]::Measured)
         $result.MeasuredAt | Should -Not -BeNullOrEmpty
         $result.ThisCallMeasured | Should -BeTrue
-        # And the getter agrees afterwards, rather than the provenance
+        # And the getter agrees afterward, rather than the provenance
         # living only in the measuring call's own answer.
         $after = Get-FlynnelHostDispatch
         $after.Source | Should -Be ([Flynnel.Source]::Measured)

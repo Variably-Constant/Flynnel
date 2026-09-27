@@ -9,7 +9,7 @@
 //! That is visible in the numbers. The 64-block barrier wait in
 //! gpu_peer_team printed 51264, 53440 and 412416 ns across three runs
 //! on one host, an eight times swing decided by which other binary was
-//! resident. A test asserting a bound on that measures the neighbour.
+//! resident. A test asserting a bound on that measures the neighbor.
 //!
 //! The lock here is a file, because the binaries are separate processes
 //! and a `Mutex` cannot reach across them. It is advisory: a process
@@ -21,13 +21,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Whether a foreign process was resident on the device while a timed
-/// region ran, so a reading taken across it is about the neighbour.
+/// region ran, so a reading taken across it is about the neighbor.
 ///
 /// The lock above excludes Flynnel's own test binaries and nothing
 /// else. A process from another project holds the device regardless,
 /// and a wall-clock assertion then measures it. The driver exposes
 /// memory but not utilization, so memory is the signal here: a
-/// neighbour's allocation is visible where its load is not.
+/// neighbor's allocation is visible where its load is not.
 ///
 /// The threshold is measured rather than chosen. Sample before the
 /// device work is set up and again once its buffers exist, and the
@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 /// allocated after that, so a rise during the timed region larger than
 /// the run's own footprint is somebody else.
 ///
-/// Sampling runs across the region, not at its ends: a neighbour that
+/// Sampling runs across the region, not at its ends: a neighbor that
 /// arrives and leaves between two endpoint samples is invisible to
 /// both.
 ///
@@ -91,7 +91,7 @@ impl DeviceMemoryWatch {
     }
 
     /// Whether a wall-clock reading taken across this region is about
-    /// this crate rather than about a neighbour.
+    /// this crate rather than about a neighbor.
     ///
     /// Unknown when the driver would not answer, and an unknown reading
     /// is treated as measurable: refusing to assert whenever the query

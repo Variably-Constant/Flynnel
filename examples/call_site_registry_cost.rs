@@ -298,7 +298,7 @@ fn main() {
             table_insert(k, i + 1);
         }
     }
-    // The crate's own registry wants the same sites materialised, so
+    // The crate's own registry wants the same sites materialized, so
     // the real cell times a hit and not sixty-four first sights.
     for i in 0..SITES {
         black_box(resolve_one(i));

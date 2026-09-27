@@ -95,7 +95,7 @@ Hardware class a primitive may target. Maps the K-axis hardware regime: vector S
 
 **A matrix-extension class steers [`SchedTier`](#schedtier) as of 0.5.1.** Declaring `Sme`, `AmxBf16`, `AmxInt8`, `AmxFp16`, or either tensor-core class promotes the tier, so a tile batch too small to clear the inline fold dispatches instead of folding onto the caller. The smallest tile such a class can mean is a multiply-accumulate over a 16x16 block, orders above the dispatch cost the fold weighs against. The vector classes say nothing the batch size does not and steer nothing.
 
-The class asserts the regime, not that the host carries the unit. It is a claim about the shape of the work: tile-based dispatch, entered as a mode region, entry costs amortised per region rather than per op. `ScalarFallback` exists so `run_in_region` code compiles and runs where the extension is absent, so declaring a matrix-extension class on vector silicon emulating tile ops is accurate rather than a lie that happens to help.
+The class asserts the regime, not that the host carries the unit. It is a claim about the shape of the work: tile-based dispatch, entered as a mode region, entry costs amortized per region rather than per op. `ScalarFallback` exists so `run_in_region` code compiles and runs where the extension is absent, so declaring a matrix-extension class on vector silicon emulating tile ops is accurate rather than a lie that happens to help.
 
 | Class | Regime | Typical silicon |
 |-------|--------|-----------------|

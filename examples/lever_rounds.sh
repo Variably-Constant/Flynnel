@@ -45,7 +45,7 @@
 # tracks drift does not.
 #
 # The curve's shape discriminates nothing on its own. A lever that
-# genuinely helps only when cores are free and an artefact of an
+# genuinely helps only when cores are free and an artifact of an
 # unloaded box both produce a ratio that moves with load.
 # Repeatability under a changed visiting order is what separates them.
 #

@@ -4,7 +4,7 @@
 //! A throughput window measures dispatches completed in a stretch of
 //! wall time, which is the quantity a busy machine destroys: on a host
 //! carrying other builds the trial-to-trial spread reached ten times,
-//! against differences under test of a fraction of a per cent.
+//! against differences under test of a fraction of a percent.
 //!
 //! The trace stamps every `LeafStart` and `LeafEnd` with a TSC read, so
 //! the gap from one leaf ending to the next starting IS the per-leaf

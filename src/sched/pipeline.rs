@@ -143,7 +143,7 @@ where
                         return;
                     }
                 }
-                // Upstream signalled end; propagate.
+                // Upstream signaled end; propagate.
                 out_tx.shutdown();
             });
         }
@@ -232,7 +232,7 @@ where
 /// access. Safe at the public boundary because each block index
 /// `i` is touched by exactly one parallel task and then by the
 /// combine thread, in sequence: combine reads block `i` only
-/// after parallel `i` signalled done. The signal-then-read
+/// after parallel `i` signaled done. The signal-then-read
 /// happens-before relationship is established by the crossbeam
 /// channel's send/recv pair.
 pub fn par_map_serial_reduce<T, U, R, FOp, FCombine>(
@@ -286,7 +286,7 @@ where
                 }
                 while next_idx < n && ready[next_idx] {
                     let ptr = lhs_addr as *const T;
-                    // SAFETY: the parallel stage signalled block
+                    // SAFETY: the parallel stage signaled block
                     // `next_idx` done before sending its index, so
                     // the memory at `lhs + next_idx` is no longer
                     // being mutated and we can take a shared

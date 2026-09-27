@@ -95,9 +95,9 @@ function Test-UnderMeasurementLease {
 # Declare a span on the box, without waiting for it to be quiet.
 #
 # A build, a bake or a correctness gate holds the box as long as a timing run
-# and has had nothing to announce itself with, so a neighbour reads occupancy
+# and has had nothing to announce itself with, so a neighbor reads occupancy
 # off CPU and cannot tell a gap between two phases from an ending. This writes
-# the span where a neighbour reads it, carrying what the run is for and whom
+# the span where a neighbor reads it, carrying what the run is for and whom
 # to ask about it.
 #
 # It does not take the measurement lease. pc2_lease.py holds that for exactly
@@ -154,7 +154,7 @@ function Exit-BoxRun {
 #
 # Lives here so every harness reports the same quantity. A count of
 # cargo, rustc, cl and link names reads near zero on a box saturated by
-# anything that is not a compile, observed at 99 per cent CPU with that
+# anything that is not a compile, observed at 99 percent CPU with that
 # count at 1, and Win32_Processor LoadPercentage read 100 on the same
 # instant this read 4.33.
 #
@@ -263,7 +263,7 @@ function Enter-TimingRun {
     # declines to measure, which reads as a busy host rather than as an
     # unreachable threshold.
     #
-    # 1.2 clears that floor and stays under the 1.4 a neighbour's gate
+    # 1.2 clears that floor and stays under the 1.4 a neighbor's gate
     # uses, so this never measures on a box busier than they would take.
     #
     # A device-bound run takes 20.0 instead, which is where a load ladder

@@ -509,7 +509,7 @@ mod tests {
     // readings below are computed over a `LeafStats` value built the way
     // `record_leaf_time_ns` builds the counters, which no other test can
     // touch; the one test that goes through the global recorder asserts
-    // deltas as floors, since a neighbour's leaves can only add.
+    // deltas as floors, since a neighbor's leaves can only add.
     fn stats_of_leaf_times(leaf_ns: &[u64]) -> LeafStats {
         let mut s = LeafStats {
             count: 0,

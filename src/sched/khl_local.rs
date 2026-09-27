@@ -405,7 +405,7 @@ impl SchedKhlDeque {
         // by construction so this loop exits immediately.
         //
         // Back-pressure mitigation: bounded spin, then yield. A
-        // pure spin-loop monopolises this CPU; yielding gives the
+        // pure spin-loop monopolizes this CPU; yielding gives the
         // OS a chance to schedule thieves on this core if they
         // are runnable but not yet on-cpu. Threshold 64 chosen
         // empirically: a thief's release sequence is typically

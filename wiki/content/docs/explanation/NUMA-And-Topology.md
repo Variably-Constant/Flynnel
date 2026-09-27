@@ -91,7 +91,7 @@ Independent of the macro NUMA partitioning above, the probe also detects the siz
 
 In every case the field stores `log2(cluster_size_in_logical_processors)` rounded down. For AMD CCX = 8 (Zen 1-4) this is 3; for Apple M1 Pro (8 P-cores) this is 3; for Sapphire Rapids 1-tile SKU with ~15 cores it floors to 3; for Graviton with one big cluster this is `log2(total_cores)`.
 
-The Intel Module-domain code is the analogue of AMD's CCX code: same shape, different CPUID leaf, exact match for what `cluster_size_log2` is meant to represent. The Module domain (type 3 in CPUID 1Fh per Intel's [SDM-Processor-Topology-Enumeration reference repo](https://github.com/intel/SDM-Processor-Topology-Enumeration) `cpuid_topology.h` `CPU_DOMAIN` enum) is the chiplet boundary on Sapphire Rapids and later.
+The Intel Module-domain code is the analog of AMD's CCX code: same shape, different CPUID leaf, exact match for what `cluster_size_log2` is meant to represent. The Module domain (type 3 in CPUID 1Fh per Intel's [SDM-Processor-Topology-Enumeration reference repo](https://github.com/intel/SDM-Processor-Topology-Enumeration) `cpuid_topology.h` `CPU_DOMAIN` enum) is the chiplet boundary on Sapphire Rapids and later.
 
 ### Methods
 

@@ -566,7 +566,7 @@ impl Cmdlet for InvokeFlynnelMap {
         // PsArray and not a PsMemory view. The view hands the buffer
         // over without a managed copy and measured the same: 5.19 ms
         // against 5.18 over 200,000 elements, inside a control that
-        // drifted 4.55 per cent. So the return's remaining 25 ns an
+        // drifted 4.55 percent. So the return's remaining 25 ns an
         // element is not the copy, and the view only adds a Rust-side
         // one. Do not re-try this without a different reason.
         //

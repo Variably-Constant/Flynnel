@@ -6,7 +6,7 @@
 //! implementation, a request for a backend nobody registered resolves
 //! to the CPU one, and a kernel binding against an absent backend is
 //! refused rather than accepted and silently never used. A registry
-//! that accepted a binding it could not honour would leave the caller
+//! that accepted a binding it could not honor would leave the caller
 //! believing work was accelerated while the CPU quietly did all of it.
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -60,7 +60,7 @@ fn activating_an_absent_backend_falls_back_to_the_cpu() {
     assert_eq!(
         active_backend_id(),
         Backend::Cuda { device_id: 0 },
-        "the request is recorded even when it cannot be honoured"
+        "the request is recorded even when it cannot be honored"
     );
     let (resolved, fell_back) = resolve_active_backend();
     assert!(fell_back, "and the fallback is reported rather than hidden");

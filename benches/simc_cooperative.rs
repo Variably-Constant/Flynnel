@@ -34,7 +34,7 @@
 //!   pool. Widths below the gate are the control: both
 //!   flynnel arms run the same code there, so a group that does not
 //!   show them agreeing is not measuring what it claims.
-//! - **Same result-collection**: both halves materialise a Vec<u64>
+//! - **Same result-collection**: both halves materialize a Vec<u64>
 //!   in caller order so the bench measures equivalent total work
 //!   including the result-gather phase.
 //! - **The primitive's named feature is exercised**:
@@ -403,15 +403,15 @@ impl StallWatch {
             eprintln!("    {t}");
         }
         eprintln!("  closures that never started: {}", never.len());
-        eprintln!("    {}", summarise(&never));
+        eprintln!("    {}", summarize(&never));
         eprintln!("  closures started and not finished: {}", unfinished.len());
-        eprintln!("    {}", summarise(&unfinished));
+        eprintln!("    {}", summarize(&unfinished));
     }
 }
 
 /// Render a sorted index list as runs, so 1024 missing indices read as
 /// one range rather than a thousand numbers.
-fn summarise(indices: &[usize]) -> String {
+fn summarize(indices: &[usize]) -> String {
     if indices.is_empty() {
         return "none".to_string();
     }

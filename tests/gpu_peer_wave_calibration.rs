@@ -51,12 +51,12 @@ fn wave_calibration_measures_keeps_and_stores_the_costs() {
 
     // The calibration runs waves on the device against a deadline, so a
     // process from another project can make it time out. That is a
-    // reading of the neighbour, and the device lock reaches only
+    // reading of the neighbor, and the device lock reaches only
     // Flynnel's own test binaries.
     //
     // Sampled either side of the call rather than across it, because
     // the calibration is one call with no interior to sample. A
-    // neighbour that arrives and leaves inside it is missed; one that
+    // neighbor that arrives and leaves inside it is missed; one that
     // is still resident when the call fails is not.
     let mut watch = common::DeviceMemoryWatch::before_setup();
     let mut first = peer(true);
@@ -71,12 +71,12 @@ fn wave_calibration_measures_keeps_and_stores_the_costs() {
             if watch.measurable() {
                 panic!("calibrate: {err:?}");
             }
-            // Otherwise it is the neighbour, said out loud rather than
+            // Otherwise it is the neighbor, said out loud rather than
             // skipped: an assertion that vanishes quietly is
             // indistinguishable from one that passed.
             println!(
                 "UNMEASURED, not asserted: the calibration did not finish ({err:?}). {}. \
-                 That is a reading of the neighbour rather than of this crate.",
+                 That is a reading of the neighbor rather than of this crate.",
                 watch.describe()
             );
             if let Err(e) = std::fs::remove_dir_all(&dir) {

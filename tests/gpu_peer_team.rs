@@ -88,7 +88,7 @@ fn impatient_team_peer(blocks_per_lane: u32, barrier_deadline_ns: u64) -> GpuPee
 ///
 /// The sizes are the ones consumers configure: 1 is the ungrouped
 /// default and the control, 2 is what an index scanner runs, 4 and 8
-/// are the range a nearest-neighbour consumer swept, and 64 is what a
+/// are the range a nearest-neighbor consumer swept, and 64 is what a
 /// desktop compositor's field op sets in production. A hole at any rank
 /// means the barrier retired a slot the whole team had not finished
 /// writing.
@@ -376,12 +376,12 @@ fn a_barrier_expiry_records_its_count_and_the_ring_depth() {
 /// 18.7 times under the 5 ms deadline and 1.87 times under the bound
 /// asserted here. Under load the same binary at the same commit read
 /// 412,416, 926,432, 2,112,704 and 2,369,440 ns: a spread of about nine
-/// times decided by the neighbour.
+/// times decided by the neighbor.
 ///
 /// The device lock in [`common`] excludes Flynnel's own test binaries
 /// and nothing else, so a process from another project still holds the
 /// device. [`common::DeviceMemoryWatch`] is what separates the two
-/// cases, and a reading taken against a neighbour is reported as
+/// cases, and a reading taken against a neighbor is reported as
 /// unmeasured instead of failing.
 #[test]
 fn a_healthy_team_costs_far_less_at_the_barrier_than_its_deadline() {
@@ -420,14 +420,14 @@ fn a_healthy_team_costs_far_less_at_the_barrier_than_its_deadline() {
 
         // The wait is wall-clock, and a 64-block request runs at the
         // device's SM count, so it cannot assemble until that many are
-        // free. A neighbour holding them makes this a reading of the
-        // neighbour. Say so rather than report it as a regression, and
+        // free. A neighbor holding them makes this a reading of the
+        // neighbor. Say so rather than report it as a regression, and
         // say it loudly: a skipped assertion that prints nothing is
         // indistinguishable from one that passed.
         if !watch.measurable() {
             println!(
                 "team {team}: UNMEASURED, not asserted. {}. The {waited} ns above is a \
-                 reading of that neighbour, not of this crate.",
+                 reading of that neighbor, not of this crate.",
                 watch.describe()
             );
             continue;

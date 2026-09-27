@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 /// Lower lines do not separate the two: the quiet processes also held
 /// about 1,500 yields between 0.5 and 2 ms, and at 100 us they read about
 /// 1,970 long yields each and parked 15,400 to 21,300 times, which cost
-/// the quiet median about 6 per cent there. A guest's vCPU is descheduled
+/// the quiet median about 6 percent there. A guest's vCPU is descheduled
 /// mid-yield often enough to look like a lost core; a lost time slice is
 /// longer.
 pub const LONG_YIELD: Duration = Duration::from_millis(2);

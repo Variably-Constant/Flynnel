@@ -354,11 +354,11 @@ impl WorkerCtx {
         // return having woken its quota without ever reaching the one
         // worker that matters.
         //
-        // The scope is still honoured for the burst accumulator, whose
+        // The scope is still honored for the burst accumulator, whose
         // jobs land on a deque and do have other takers. It is not
-        // honoured here: suppressing a targeted wake leaves the job
+        // honored here: suppressing a targeted wake leaves the job
         // behind a wake that never comes, and the batched broadcast
-        // afterwards reaches only whoever is parked at that instant.
+        // afterward reaches only whoever is parked at that instant.
         //
         // Cost is one plain load of the target's state, and a
         // compare-exchange only when that load says the target is
@@ -2089,7 +2089,7 @@ fn worker_loop(
     unsafe { set_current_worker_ctx(&ctx as *const WorkerCtx) };
     // Use a defer-guard for the clear so a panic in any code below
     // still unregisters the thread-local before the stack unwinds
-    // past ctx (defence-in-depth; worker bodies should not panic).
+    // past ctx (defense-in-depth; worker bodies should not panic).
     struct ClearOnDrop;
     impl Drop for ClearOnDrop {
         fn drop(&mut self) {

@@ -331,7 +331,7 @@ fn tag_to_variant(tag: u8) -> Variant {
         // Tag 1 is Faithful by spec. Unknown tags decode to Faithful
         // as a safe mid-tier default; this can only happen if the
         // JobRef was constructed via a non-Variant path (no current
-        // API allows this) so it is defence-in-depth, not a real
+        // API allows this) so it is defense-in-depth, not a real
         // recovery branch.
         _ => Variant::Faithful,
     }

@@ -8,14 +8,14 @@
 //! among workers that cannot reach a core.
 //!
 //! This is a different quantity from how busy the machine is. A
-//! neighbour's load is continuous and contested, with no cutoff that
+//! neighbor's load is continuous and contested, with no cutoff that
 //! separates busy from quiet, and shaping a dispatch on it makes
 //! identical code behave differently run to run. An affinity mask is a
 //! fact: the process may use these CPUs and not those, it changed or it
 //! did not, and there is no threshold to choose.
 //!
 //! `std::thread::available_parallelism` answers this question on Linux
-//! and FreeBSD, honouring the process affinity mask and the cgroup CPU
+//! and FreeBSD, honoring the process affinity mask and the cgroup CPU
 //! quota. It does not answer it on Windows: its documented limitation
 //! is that it "may overcount the amount of parallelism available on
 //! systems limited by process-wide affinity masks, or job object
@@ -127,7 +127,7 @@ fn report_probe_failure(err: &std::io::Error, keeping: usize) {
 /// this crate takes no libc dependency of its own.
 ///
 /// The quota is applied as a floor because `available_parallelism`
-/// honoured it and dropping it would size a pool for the machine
+/// honored it and dropping it would size a pool for the machine
 /// inside a container allowed part of it. It is read once: a quota can
 /// change, but two file reads at this cadence buy less than they cost,
 /// and the affinity half does follow a change.

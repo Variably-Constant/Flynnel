@@ -61,7 +61,7 @@ A full end-to-end demo covering all three sits at [`examples/adaptive_dispatcher
 
 ## Wiki contents
 
-The pages below are organised under the four Diataxis sections (cards above). Each page is also reachable directly:
+The pages below are organized under the four Diataxis sections (cards above). Each page is also reachable directly:
 
 ### Tutorials
 
@@ -77,7 +77,7 @@ The pages below are organised under the four Diataxis sections (cards above). Ea
 ### Explanation
 
 - [Architecture Overview](Architecture-Overview.md) - the layered design top-down from `JobPlan` to Chase-Lev deques.
-- [Extended Flynn Taxonomy](Extended-Flynn-Taxonomy.md) - why the crate is named after Flynn and how the eight-axis mapping organises every primitive.
+- [Extended Flynn Taxonomy](Extended-Flynn-Taxonomy.md) - why the crate is named after Flynn and how the eight-axis mapping organizes every primitive.
 - [Comparison To Other Schedulers](Comparison-To-Other-Schedulers.md) - Flynnel vs rayon, Cilk, tokio, std::thread.
 - [Internals: Work-Stealing Algorithm](Internals-Work-Stealing.md) - the low-level mechanics inside the CPU arena.
 - [NUMA and Topology](NUMA-And-Topology.md) - how Flynnel probes the host hardware.
@@ -87,7 +87,7 @@ The pages below are organised under the four Diataxis sections (cards above). Ea
 
 - [JobPlan Reference](JobPlan-Reference.md) - every field on the plan struct.
 - [Foundation Types Reference](Foundation-Types-Reference.md) - `Variant`, `SchedTier`, `HwClass`, `DispatchProfile`, `OpClass`.
-- [Sched Module Reference](Sched-Module-Reference.md) - every primitive in `flynnel::sched`, organised by Flynn axis.
+- [Sched Module Reference](Sched-Module-Reference.md) - every primitive in `flynnel::sched`, organized by Flynn axis.
 - [Backend System](Backend-System.md) - the `DispatchBackend` trait + registry.
 - [Environment Variables](Environment-Variables.md) - every env var Flynnel honors at startup.
 - [Glossary](Glossary.md) - terms specific to Flynnel and the broader extended-Flynn vocabulary.

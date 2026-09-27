@@ -65,7 +65,7 @@ pub const CALIBRATION_MAGIC: u64 = 0x464C_4342_0000_0001;
 /// A stored record is the cheapest dispatch cost seen for its stamp, so
 /// a spuriously fast reading stands for the life of the stamp: nothing
 /// later can be cheaper than a wrong floor, and neither a fresh draw nor
-/// `FLYNNEL_CALIBRATION_MAX_AGE_S` ageing one out will beat it.
+/// `FLYNNEL_CALIBRATION_MAX_AGE_S` aging one out will beat it.
 pub const LAYOUT_VERSION: u32 = 9;
 
 /// Devices a table records. A host with more reports the first
@@ -208,7 +208,7 @@ pub struct CpuCalibration {
     ///
     /// The spread says whether the samples agreed with each other. It
     /// cannot say whether they agreed on the wrong number, which is what
-    /// a draw taken while a neighbour held half the machine produces:
+    /// a draw taken while a neighbor held half the machine produces:
     /// every sample slow, and slow by about the same amount. This is the
     /// figure that separates those, and it gates nothing - a reader with
     /// two records can prefer the better-drawn one, which is a
@@ -337,7 +337,7 @@ pub struct WaveCostRecord {
 /// The fields mirror what the GPU peer already measures at every init:
 /// a doorbell round trip at three points of its distribution, the
 /// cross-device clock error, the visibility bound derived from them,
-/// the validated Fischer margin, and a launch-and-synchronise baseline
+/// the validated Fischer margin, and a launch-and-synchronize baseline
 /// the doorbell path is competing against.
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -372,7 +372,7 @@ pub struct AccelCalibration {
     pub clock_err_ns: u64,
     /// Fischer margin the self-test validated.
     pub delta_ns: u64,
-    /// Kernel launch and synchronise baseline.
+    /// Kernel launch and synchronize baseline.
     pub launch_ns: u64,
     /// Team size the wave costs below were measured at; 0 when none have
     /// been recorded.

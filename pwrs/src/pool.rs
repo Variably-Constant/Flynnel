@@ -634,7 +634,7 @@ impl IoPool {
 ///
 /// The process-wide pool is built from the environment before the
 /// first dispatch: `global_io_pool()` is a `OnceLock`, so a session
-/// that has already dispatched cannot gain one afterwards.
+/// that has already dispatched cannot gain one afterward.
 ///
 /// What this cmdlet is good for, then, is starting a pool and reading
 /// the width it actually got. It is said plainly because the

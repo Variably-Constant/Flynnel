@@ -332,7 +332,7 @@ impl Cmdlet for GetFlynnelBackend {
             pwrs::warning!(
                 ps,
                 "the CPU backend is not registered, which should not be reachable: every \
-                 row below reads a registry that failed to initialise, so Registered is \
+                 row below reads a registry that failed to initialize, so Registered is \
                  unreliable on all of them"
             )?;
         }

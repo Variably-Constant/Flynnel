@@ -5,7 +5,7 @@
 //! a child takes the next number from a counter in the wave's arena, and
 //! each segment adds one to its own run count there. The host then reads
 //! every id's count, so a segment run twice and a segment never run are
-//! each named rather than cancelling out in a total.
+//! each named rather than canceling out in a total.
 //!
 //! Requires a CUDA device and NVRTC.
 #![cfg(feature = "gpu-peer")]

@@ -267,11 +267,11 @@ fn read_site(state: &CallSiteState) -> SiteView {
 }
 
 /// `later - earlier` for a cumulative counter, or an error naming both
-/// readings when the counter went backwards.
+/// readings when the counter went backward.
 fn advanced(what: &str, earlier: u64, later: u64) -> Result<u64, String> {
     match later.checked_sub(earlier) {
         Some(delta) => Ok(delta),
-        None => Err(format!("{what} went backwards between samples: {earlier} then {later}")),
+        None => Err(format!("{what} went backward between samples: {earlier} then {later}")),
     }
 }
 
@@ -404,7 +404,7 @@ mod cpu {
             .count() as u32;
 
         let own_stat = fs::read_to_string("/proc/self/stat").map_err(|err| format!("reading /proc/self/stat: {err}"))?;
-        // The command name is parenthesised and may hold spaces, so fields
+        // The command name is parenthesized and may hold spaces, so fields
         // are counted from its closing parenthesis: utime and stime are the
         // 14th and 15th fields of the line, the 12th and 13th after it.
         let Some(close) = own_stat.rfind(')') else {

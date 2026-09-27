@@ -75,7 +75,7 @@ pub enum TraceEvent {
     /// timed.
     ///
     /// The strategy is recorded per park rather than read from the
-    /// controller afterwards, because the controller reports where it
+    /// controller afterward, because the controller reports where it
     /// ended up and a run that switched partway through looks from
     /// its report exactly like one that started there.
     ParkEnter = 14,
@@ -144,7 +144,7 @@ thread_local! {
 }
 
 /// Process-wide enable flag, seeded from `FLYNNEL_TRACE` on the first
-/// call to [`is_enabled`] and settable afterwards.
+/// call to [`is_enabled`] and settable afterward.
 ///
 /// An `AtomicBool` rather than a `OnceLock<bool>` so the ring can be
 /// turned on after the process has started. Latched, nothing could:
@@ -160,7 +160,7 @@ thread_local! {
 /// plain-bool control, five hundred million calls a cell, median of
 /// seven. Two readable runs put the difference at +0.0059 and
 /// -0.0350 ns a call: it straddles zero, so the change is not
-/// resolvable and is bounded at 0.014 per cent of a 200,000-element
+/// resolvable and is bounded at 0.014 percent of a 200,000-element
 /// dispatch. Both shapes sit about 0.08 ns above the control, which
 /// is under a cycle, so the pipeline absorbs either one.
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);

@@ -31,7 +31,7 @@ use crate::sched::plan::JobPlan;
 
 /// Cooperative cancel signal shared across racing variants.
 /// Long-running variant closures poll
-/// [`Self::is_cancelled`] at checkpoints to abandon early when a
+/// [`Self::is_canceled`] at checkpoints to abandon early when a
 /// peer has already produced a tolerable result.
 ///
 /// Cancellation is best-effort: a closure may complete its
@@ -43,11 +43,11 @@ pub struct CancelToken {
 }
 
 impl CancelToken {
-    /// A fresh token in the not-cancelled state, for a race the
+    /// A fresh token in the not-canceled state, for a race the
     /// caller composes itself on [`crate::sched::join`] or the
     /// indexed walkers rather than through the races in this module:
     /// clone it into every arm, and the arm that settles calls
-    /// [`Self::cancel`]. A token that is never cancelled is the
+    /// [`Self::cancel`]. A token that is never canceled is the
     /// honest argument for a path that takes one but has no peers.
     #[must_use]
     pub fn new() -> Self {
@@ -57,7 +57,7 @@ impl CancelToken {
     /// Returns `true` once any racing variant has produced a
     /// tolerable result. Cheap (single atomic load).
     #[inline]
-    pub fn is_cancelled(&self) -> bool {
+    pub fn is_canceled(&self) -> bool {
         self.flag.load(Ordering::Acquire)
     }
 
@@ -226,7 +226,7 @@ where
 }
 
 /// Hedged racing: fire `n` attempts at the same work and keep the
-/// first that finishes, cancelling the rest.
+/// first that finishes, canceling the rest.
 ///
 /// This is the tail-latency move. When an attempt's latency is
 /// variable - one of several replicas, one of several mirrors, one of
@@ -274,7 +274,7 @@ where
 }
 
 /// Quorum racing: fire `n` attempts and return as soon as the first
-/// `k` have finished, cancelling the stragglers.
+/// `k` have finished, canceling the stragglers.
 ///
 /// The shape behind a quorum read: ask several replicas, act on the
 /// first majority to answer, ignore the slow rest. `k` is clamped to
@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn cancel_token_observed_by_losers() {
-        // When Fast wins quickly, a slow-but-cancellable Correct
+        // When Fast wins quickly, a slow-but-cancelable Correct
         // should observe the token and abort. Use an atomic
         // counter to verify Correct's cooperative checkpoints
         // observed cancellation at least once.
@@ -809,7 +809,7 @@ mod tests {
             |_token| None,
             move |token| {
                 for _ in 0..1000 {
-                    if token.is_cancelled() {
+                    if token.is_canceled() {
                         saw_cancel_c.fetch_add(1, Ordering::Relaxed);
                         return 99u32;
                     }
@@ -922,7 +922,7 @@ mod tests {
                 return 0u32;
             }
             for _ in 0..200 {
-                if token.is_cancelled() {
+                if token.is_canceled() {
                     saw.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
@@ -1058,7 +1058,7 @@ mod tests {
         // A caller-composed race: one token, two arms holding clones,
         // the settling arm cancels, the other arm observes it.
         let token = CancelToken::new();
-        assert!(!token.is_cancelled(), "fresh token is not cancelled");
+        assert!(!token.is_canceled(), "fresh token is not canceled");
         let peer = token.clone();
         let plan = JobPlan::new(6, 2);
         let saw_cancel = Arc::new(AtomicU32::new(0));
@@ -1071,7 +1071,7 @@ mod tests {
             },
             move || {
                 for _ in 0..2000 {
-                    if peer.is_cancelled() {
+                    if peer.is_canceled() {
                         saw.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -1080,7 +1080,7 @@ mod tests {
             },
         );
         assert_eq!(saw_cancel.load(Ordering::Relaxed), 1, "the peer observed the caller's cancel");
-        assert!(!CancelToken::default().is_cancelled(), "default is a fresh token");
+        assert!(!CancelToken::default().is_canceled(), "default is a fresh token");
     }
 
     #[test]
@@ -1095,7 +1095,7 @@ mod tests {
         let (_r, _v) = race_variants::<u32, _, _, _>(
             &plan,
             move |token| {
-                if !token.is_cancelled() {
+                if !token.is_canceled() {
                     observed_f.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(1u32)

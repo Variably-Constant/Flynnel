@@ -151,7 +151,7 @@ mod host {
         }
         let own_stat = fs::read_to_string("/proc/self/stat")
             .map_err(|err| format!("reading /proc/self/stat: {err}"))?;
-        // The command name is parenthesised and may hold spaces, so fields
+        // The command name is parenthesized and may hold spaces, so fields
         // are counted from its closing parenthesis: utime and stime are the
         // 12th and 13th after it.
         let Some(close) = own_stat.rfind(')') else {
@@ -177,7 +177,7 @@ mod host {
         let total = later
             .total
             .checked_sub(earlier.total)
-            .ok_or_else(|| "the summed CPU ticks went backwards".to_string())?
+            .ok_or_else(|| "the summed CPU ticks went backward".to_string())?
             as f64;
         if total <= 0.0 {
             return Err("no CPU ticks passed between the two samples".to_string());
@@ -185,15 +185,15 @@ mod host {
         let busy = later
             .busy
             .checked_sub(earlier.busy)
-            .ok_or_else(|| "the busy ticks went backwards".to_string())? as f64;
+            .ok_or_else(|| "the busy ticks went backward".to_string())? as f64;
         let own = later
             .own
             .checked_sub(earlier.own)
-            .ok_or_else(|| "this process's ticks went backwards".to_string())? as f64;
+            .ok_or_else(|| "this process's ticks went backward".to_string())? as f64;
         let steal = later
             .steal
             .checked_sub(earlier.steal)
-            .ok_or_else(|| "the stolen ticks went backwards".to_string())? as f64;
+            .ok_or_else(|| "the stolen ticks went backward".to_string())? as f64;
         Ok((
             busy / total * later.cpus,
             own / total * later.cpus,
@@ -304,11 +304,11 @@ mod host {
         let busy = later
             .busy
             .checked_sub(earlier.busy)
-            .ok_or_else(|| "the busy time went backwards".to_string())? as f64;
+            .ok_or_else(|| "the busy time went backward".to_string())? as f64;
         let own = later
             .own
             .checked_sub(earlier.own)
-            .ok_or_else(|| "this process's time went backwards".to_string())? as f64;
+            .ok_or_else(|| "this process's time went backward".to_string())? as f64;
         Ok((busy / wall, own / wall, 0.0))
     }
 }

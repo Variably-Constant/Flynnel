@@ -236,7 +236,7 @@ fn main() {
     // identical entries would be a worse record of it, not a better
     // one: nobody reads three hundred lines to learn one thing, and
     // the next person to add a function to that family has to
-    // remember to add a line saying what every neighbouring line
+    // remember to add a line saying what every neighboring line
     // already says.
     //
     // How many items each entry covers is printed below, because a
@@ -538,7 +538,7 @@ fn cfg_of(attrs: &[syn::Attribute], where_: &str) -> String {
         match attr.meta.require_list() {
             Ok(list) => out.push(list.tokens.to_string()),
             Err(e) => fail(format!(
-                "a cfg attribute in {where_} has no parenthesised list, so what gates the \
+                "a cfg attribute in {where_} has no parenthesized list, so what gates the \
                  item cannot be read: {e}"
             )),
         }

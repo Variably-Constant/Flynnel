@@ -729,7 +729,7 @@ __device__ __forceinline__ void flw_rebalance(flw_slice* s)
 }
 
 // Ends a generation. Every thread of every block calls it once per
-// generation, after its share of segments. Afterwards every thread holds
+// generation, after its share of segments. Afterward every thread holds
 // the next generation's range and whether the slice runs it.
 __device__ __forceinline__ void flw_generation_end(flw_slice* s)
 {

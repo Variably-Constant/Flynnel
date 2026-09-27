@@ -73,7 +73,7 @@ Describe 'the types this family exports' {
 
     It 'covers every map operation the enum declares' {
         # An operation the enum names and no kernel implements would
-        # bind and then do nothing recognisable, and nothing else here
+        # bind and then do nothing recognizable, and nothing else here
         # would report it.
         $x = @(4.0, -9.0, 0.25)
         foreach ($op in [Enum]::GetValues([Flynnel.MapOp])) {

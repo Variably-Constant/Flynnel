@@ -256,16 +256,16 @@ fn read_defaulting_on(name: &str) -> bool {
 /// On unless the variable turns it off. The bracket costs nothing
 /// measurable: on a 24-thread host, three workload shapes each over
 /// forty paired trials read 1.0033, 1.0000 and 1.0019 against the same
-/// code with it off, at bounds of 0.64, 0.22 and 0.31 per cent with
+/// code with it off, at bounds of 0.64, 0.22 and 0.31 percent with
 /// controls resolving to 0.19 and tighter.
 /// Measured again on three hosts, paired by trial, at 4096 reps of
-/// uniform work: 0.9978 at a 0.22 per cent bound on a 24-thread Windows
+/// uniform work: 0.9978 at a 0.22 percent bound on a 24-thread Windows
 /// bare-metal box, 32 clean pairs of 40, control 0.9988 at 0.38;
 /// 0.9922 at 4.79 on a 16-core Linux guest, 0.9917 at 11.15 on a
 /// 16-core FreeBSD guest. Not slower on any, no speed-up claimed on any.
 ///
 /// The bare-metal cell was read twice. An earlier rotation gave 0.9964
-/// at 1.90 per cent over 7 pairs of 40, taken while an unrelated process
+/// at 1.90 percent over 7 pairs of 40, taken while an unrelated process
 /// held a core continuously: the box's idle floor was 1.81 cores against
 /// the harness's 1.4-core gate, so most trials were dropped for a
 /// condition none of them caused. The figures above are the repeat on a
@@ -274,7 +274,7 @@ fn read_defaulting_on(name: &str) -> bool {
 ///
 /// The bracket is taken in all three - oncore_items reads zero on the
 /// arm without the lever and millions on the arm with it - and on the
-/// bare-metal run no class moves, so 1.90 per cent is what the
+/// bare-metal run no class moves, so 1.90 percent is what the
 /// instrumentation costs when nothing downstream changes.
 ///
 /// A correctness lever, judged on the class it produces rather than on
@@ -286,7 +286,7 @@ fn read_defaulting_on(name: &str) -> bool {
 /// has nothing here to correct.
 ///
 /// Its price on a guest, at an 8 second window over 40 trials: 0.9814
-/// at a 2.52 per cent bound where the class moves, 0.9872 at 4.34 where
+/// at a 2.52 percent bound where the class moves, 0.9872 at 4.34 where
 /// it holds. About the same either way. On quiet bare metal, where no
 /// class moves at this size, 0.9978 at 0.22 over 32 pairs.
 pub fn oncore_spread() -> bool {
@@ -373,7 +373,7 @@ pub fn slot_park_now() -> bool {
 /// rounds against the same code with every switch off: the loaded
 /// median stayed level, 1.17 ms against 1.13, and the tail fell, p99
 /// 15.2 ms against 32.2 and calls of 5 ms or more 23 against 128 in the
-/// median round; the quiet median rose 5.8 per cent beside a serial
+/// median round; the quiet median rose 5.8 percent beside a serial
 /// control that rose 3.7. On a 16-vCPU guest at 517dba9 it raised the
 /// quiet median from about 1.3 to 3.1 ms in each of three rounds, with
 /// the serial control level across the arms: a parked thread halts its
@@ -446,9 +446,9 @@ pub fn spin_monitor() -> bool {
 ///
 /// Engaged and not slower on three hosts, paired by trial against the
 /// same code with it off: a 24-thread Windows bare-metal box reads
-/// 1.0012 at a 0.61 per cent bound over ten pairs, a 16-core Linux
+/// 1.0012 at a 0.61 percent bound over ten pairs, a 16-core Linux
 /// guest sits inside its null at all three loads, and a 16-core FreeBSD
-/// guest reads 1.0639 at 9.37 per cent over forty. The arms differ on
+/// guest reads 1.0639 at 9.37 percent over forty. The arms differ on
 /// every host - off resolves SMT true, on resolves it false - and no
 /// speed-up is claimed anywhere.
 ///
@@ -472,7 +472,7 @@ pub fn smt_from_window() -> bool {
 /// 250 ms, paid for nothing on a host whose mask never changes. Measured
 /// twice, paired by trial on a 24-thread Windows bare-metal box at 4096
 /// reps of uniform work, 40 trials each, no decision moving between the
-/// arms: 1.0006 at a 0.13 per cent bound over 40 clean pairs, retained
+/// arms: 1.0006 at a 0.13 percent bound over 40 clean pairs, retained
 /// 1.0005 at 0.17, control 1.0000 at 0.10, on the code that ships; and
 /// 1.0000 at 0.15 over 23 clean pairs, retained 1.0014 at 0.21, control
 /// 1.0000 at 0.30, on a tree whose Windows probe was still
@@ -579,7 +579,7 @@ mod tests {
             "read_defaulting_on must answer on for a switch nobody set"
         );
 
-        // And that each reader still honours an explicit off, so a
+        // And that each reader still honors an explicit off, so a
         // default-on switch can be turned off by a caller.
         unsafe { std::env::set_var("FLYNNEL_LEVER_DEFAULT_TEST", "0") };
         assert!(!read("FLYNNEL_LEVER_DEFAULT_TEST"));

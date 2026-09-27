@@ -94,7 +94,7 @@ Pin the host dispatch profile to the three nanosecond counts given, and skip the
 
 For comparing this scheduler against one that does not measure its own dispatch cost. Without a pin the two arms differ in whether they adapt as well as in how they schedule, and the ratio mixes the two; pinning the same cost on both sides leaves only the scheduling difference, and the adaptive gain can then be reported separately.
 
-All three fields are required, because pinning some and measuring the rest yields a profile that is neither and defeats the comparison. Zero is refused in any field, since an installed collapse threshold of zero is what marks a profile as not yet calibrated. Anything that does not parse is reported on stderr and the host is measured instead, so a mistyped pin is loud rather than silently honoured as some other value.
+All three fields are required, because pinning some and measuring the rest yields a profile that is neither and defeats the comparison. Zero is refused in any field, since an installed collapse threshold of zero is what marks a profile as not yet calibrated. Anything that does not parse is reported on stderr and the host is measured instead, so a mistyped pin is loud rather than silently honored as some other value.
 
 ```
 FLYNNEL_HOST_PROFILE_NS=4000,12000,20000

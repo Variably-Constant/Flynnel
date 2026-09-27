@@ -4,7 +4,7 @@
 # host rather than the work. That is deliberate and it is what these
 # cmdlets measure, but it also means an assertion about which arm won
 # would be an assertion about the scheduler's mood. The claims here
-# are structural, plus the two behavioural ones that actually
+# are structural, plus the two behavioral ones that actually
 # distinguish the shapes: a race returns a winner that is one of the
 # arms it fired, and an exploration leaves every arm finished.
 
@@ -43,7 +43,7 @@ Describe 'Measure-FlynnelRaceAny' {
 
     It 'waits for every arm, so the slowest is at least the winner' {
         # The crate's join contract, and the row must not pretend
-        # otherwise: cancelling a loser stops it spending more, it does
+        # otherwise: canceling a loser stops it spending more, it does
         # not hand the call back early.
         $r = Measure-FlynnelRaceAny -Count 50000 -Attempts 4 -Operation Sqrt
         $r.SlowestArmNs | Should -BeGreaterOrEqual $r.WinnerNs
@@ -90,7 +90,7 @@ Describe 'Measure-FlynnelRaceAny' {
         $arms = @($rows | Where-Object { $null -ne $_.Index })
 
         foreach ($a in $arms) {
-            if ($a.CancelledEarly) {
+            if ($a.CanceledEarly) {
                 $a.ItemsDone | Should -BeLessThan $script:Count `
                     -Because 'an arm that stopped short did not finish its items'
                 $a.Won | Should -BeFalse -Because 'the winner is never the one canceled'
@@ -98,7 +98,7 @@ Describe 'Measure-FlynnelRaceAny' {
                 $a.ItemsDone | Should -Be $script:Count
             }
         }
-        $outcome.CancelledEarly | Should -Be @($arms | Where-Object CancelledEarly).Count
+        $outcome.CanceledEarly | Should -Be @($arms | Where-Object CanceledEarly).Count
     }
 
     It 'refuses a race of none' {
@@ -123,12 +123,12 @@ Describe 'Measure-FlynnelExploreSelect' {
         $arms.Count | Should -Be 5
         foreach ($a in $arms) {
             $a.ItemsDone | Should -Be 50000
-            $a.CancelledEarly | Should -BeFalse
+            $a.CanceledEarly | Should -BeFalse
         }
     }
 
     It 'reports no cancellation, because the shape cancels nothing' {
-        (Measure-FlynnelExploreSelect -Count 20000 -Attempts 4 -Operation Sqrt).CancelledEarly |
+        (Measure-FlynnelExploreSelect -Count 20000 -Attempts 4 -Operation Sqrt).CanceledEarly |
             Should -Be 0
     }
 

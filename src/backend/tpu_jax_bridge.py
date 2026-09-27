@@ -26,7 +26,7 @@ up the function bound to `name`, jax.jit()s it, and stores it by handle.
 `dispatch` looks the function up by handle, unpacks args into positional
 parameters (count first, then the arg values in caller-supplied order),
 calls the function, and blocks until the result device-array
-materialises (so the caller can rely on the launch having completed
+materializes (so the caller can rely on the launch having completed
 when the response arrives).
 """
 
@@ -142,7 +142,7 @@ def main():
                 jit_fn, _original = kernels[handle]
                 try:
                     result = jit_fn(int(count), *py_args)
-                    # Block until materialised so the caller can rely on
+                    # Block until materialized so the caller can rely on
                     # launch completion when this response arrives.
                     if hasattr(result, "block_until_ready"):
                         result.block_until_ready()

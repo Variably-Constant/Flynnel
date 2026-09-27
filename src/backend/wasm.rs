@@ -525,7 +525,7 @@ impl Drop for WasmBackend {
 mod tests {
     use super::*;
 
-    /// A stand-in entry, so the table's own behaviour is tested
+    /// A stand-in entry, so the table's own behavior is tested
     /// without building a wasmtime store for every slot.
     fn table_entry(engine: &Engine) -> Arc<KernelEntry> {
         let module = Module::new(engine, ADD_WASM).expect("the add module builds");

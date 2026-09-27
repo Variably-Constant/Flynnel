@@ -61,7 +61,7 @@
 //! true when a script drives the same object from two runspaces.
 //!
 //! The lock costs an uncontended acquire on a path whose cheapest
-//! crossing is 1907 ns, so it is under a tenth of a per cent of a
+//! crossing is 1907 ns, so it is under a tenth of a percent of a
 //! method call, and a batch pays it once rather than once an item.
 //! Held for the batch, though: a `PushMany` of ten thousand items
 //! keeps every other runspace's ring call waiting for the whole of it.

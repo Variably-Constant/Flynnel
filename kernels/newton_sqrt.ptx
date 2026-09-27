@@ -2,7 +2,7 @@
 // Per-thread Newton sqrt iteration. Each thread runs `iters`
 // iterations of `v = 0.5 * (v + x/v)` on its assigned element.
 // Compute-intensive enough to be meaningful work after H2D transfer
-// cost is amortised.
+// cost is amortized.
 //
 // Signature (CUDA C equivalent):
 //   __global__ void newton_sqrt(float* data, int n, int iters)

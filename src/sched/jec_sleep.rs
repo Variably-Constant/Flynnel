@@ -677,7 +677,7 @@ pub(crate) struct Sleep {
     /// The flag is what makes shutdown durable. Waking is not: a wake
     /// reaches only the workers that are parked at the moment it
     /// runs, and a worker still walking its tiers is not one of them,
-    /// so without something left behind it parks afterwards and
+    /// so without something left behind it parks afterward and
     /// nothing ever wakes it again, which is `LocalArena::drop`
     /// joining a worker that will not return.
     ///
@@ -1208,7 +1208,7 @@ mod tests {
     fn a_window_that_keeps_being_missed_shrinks_toward_the_floor() {
         // Parks dominating means the spin ran out before work arrived,
         // which on a contended host is a worker burning slices a
-        // neighbour could have used.
+        // neighbor could have used.
         let mut window = adapted_window(DEFAULT_SPIN_WINDOW_ROUNDS, 300, 4);
         assert_eq!(window, DEFAULT_SPIN_WINDOW_ROUNDS / 2);
 

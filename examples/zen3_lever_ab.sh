@@ -3,9 +3,9 @@
 #
 # The three-arm rotation in lever_rounds.sh compares arms that ran at
 # different times, so drift between them lands in the ratio and its null
-# measures the drift: 11 per cent on a quiet 16-core guest. Pairing
+# measures the drift: 11 percent on a quiet 16-core guest. Pairing
 # within a trial subtracts it, and the same shape on Windows resolves to
-# 0.61 per cent on ten pairs. Every speed lever here is smaller than the
+# 0.61 percent on ten pairs. Every speed lever here is smaller than the
 # rotation's floor and larger than this one's.
 #
 # Both arms name the switch value. An unset switch takes whatever the
@@ -81,7 +81,7 @@ else
     # Each process then takes its own calibration draw, and the draw
     # sets the dispatch cost and collapse threshold that decide the
     # routing throughput measures. That variance sits on top of the
-    # lever's and is not separable afterwards, so the row says it.
+    # lever's and is not separable afterward, so the row says it.
     echo "UNPINNED_PROFILE every arm draws its own calibration; the draw's variance is in every ratio below and cannot be told from the lever's"
 fi
 

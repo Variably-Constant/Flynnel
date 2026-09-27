@@ -73,8 +73,8 @@ fn a_profile_first_asked_for_on_a_worker_whose_peers_parked_is_a_dispatch() {
     // A worker's inline pass read 100 ns on a 24-thread Windows host,
     // whose outside draws read 4300 to 4800 in a loaded test process, and
     // 170 to 181 ns on a 16-vCPU Linux guest against 1300 to 2200: a
-    // factor of 7 to 48. Idle draws of one host spread by about 15 per
-    // cent (1300 to 1500 ns over 48 draws on the Windows host), so half
+    // factor of 7 to 48. Idle draws of one host spread by about 15
+    // percent (1300 to 1500 ns over 48 draws on the Windows host), so half
     // the outside draw separates the two on both hosts with room either
     // side.
     assert!(

@@ -200,7 +200,7 @@ fn the_plan_follows_a_narrowed_process_mask() {
     assert_eq!(
         width_narrowed, NARROW_TO,
         "the process mask holds {NARROW_TO} cpus and allowed_parallelism \
-         read {width_narrowed}, so available_parallelism does not honour \
+         read {width_narrowed}, so available_parallelism does not honor \
          the process affinity mask on this platform and the lever cannot \
          see a narrowing here"
     );

@@ -34,7 +34,7 @@
 //!   shape the lever exists for. A crew respawned per iteration would
 //!   make `settled` a second copy of `first_dispatch` wearing the
 //!   other name. A lever adopted on `settled` alone would be adopted
-//!   on the half of the evidence that favours it.
+//!   on the half of the evidence that favors it.
 //! - **One thread and many.** An uncontended lock is a handful of
 //!   cycles, so the single-thread rows are where "never slower" has to
 //!   hold, and the many-thread rows are where the turns being taken

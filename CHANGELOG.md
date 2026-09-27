@@ -50,7 +50,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   the change, 18 trials at 16 and 512 reps, quiet and under load, on a
   24-thread Ryzen 9 7900X (beside other builds in most trials), a Zen 3
   Linux guest and a 16-thread Ryzen 7 2700: every cell's median ratio
-  lies inside the 95 per cent interval of its copy's, the ratios running
+  lies inside the 95 percent interval of its copy's, the ratios running
   0.970 to 1.052 on the 7900X, 0.923 to 1.097 on the guest and 0.938 to
   1.062 on the 2700, against copies of 0.971 to 1.051, 0.901 to 1.143
   and 0.946 to 1.071. Against the build without the window readers, 36
@@ -59,7 +59,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   1.002 within the lower and 0.990 within the upper (copy 0.988 and
   0.976); on the 2700, 0.9665 [0.9343, 1.0289] (copy 0.9753 [0.9316,
   1.0307]), where with the locked read-modify-writes the readers had
-  leaned 1.5 to 2.7 per cent slower over five runs.
+  leaned 1.5 to 2.7 percent slower over five runs.
 
 - The module's kernel cmdlets run the crate's own jobs from
   `flynnel::kernels` (see Added). Each resolves its managed input, builds
@@ -106,6 +106,17 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   unchanged. `kernels::DESCRIPTORS` names the new cmdlet; the kernel and
   its answers are unchanged, so `kernels::REVISION` is not raised.
 
+- The crate, the PowerShell module and the wiki are spelled in US
+  English throughout, and three public names are respelled with them:
+  `CancelToken::is_canceled`, `CallSiteState::stabilize_seed_depth`,
+  and the `CanceledEarly` property of Flynnel.RaceArm and
+  Flynnel.RaceOutcome, each of which had the British spelling. No alias
+  keeps the old spelling, so a caller takes the new one; what each does
+  is unchanged. The `parker_wait_strategy` bench's groups are
+  `parker_neighbors_*` and `parker_idle_neighbors_*`, with a
+  `neighbor_work` cell, so a Criterion baseline saved under the British
+  spelling does not compare.
+
 - `external_dispatch`'s documentation says what the caller does: it
   hands the join to a worker, spins for the plan's budget, then parks
   until the latch sets, and runs none of the join's work itself.
@@ -117,7 +128,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   sampled park, payload that wake's cost in nanoseconds. `WaitSwitch`
   (15) when the controller moves, payload the strategy now in use. The
   strategy is recorded per park rather than read from the controller
-  afterwards, because the controller reports where it ended up and a run
+  afterward, because the controller reports where it ended up and a run
   that switched partway through looks from its report exactly like one
   that started there.
 
@@ -141,17 +152,17 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   that control, on the two runs of six that passed their own readability
   test:
 
-  quiet, control 0.5958 ns at a 2.11 per cent spread, floor 0.0126 ns -
+  quiet, control 0.5958 ns at a 2.11 percent spread, floor 0.0126 ns -
   payload alone 0.5603, whole emit 1.2316.
 
-  loaded at 8 spinners on 16 cores, control 1.8348 ns at a 4.00 per cent
+  loaded at 8 spinners on 16 cores, control 1.8348 ns at a 4.00 percent
   spread, floor 0.0734 ns - payload alone 0.4705, emit with the payload
   passed as an argument 1.2533, emit with the switch read first 0.1299.
   The difference between those last two is 1.1234 ns a park, against a
   floor of 0.0734.
 
   The other four runs declared themselves unreadable on control spreads
-  of 45.46, 76.70, 79.96 and 62.51 per cent and are not quoted. An
+  of 45.46, 76.70, 79.96 and 62.51 percent and are not quoted. An
   earlier batch was unreadable for a different reason, a control sampled
   only at the run's two endpoints while every other cell was
   interleaved, which put the one cell everything is subtracted from on
@@ -165,7 +176,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   FreeBSD and Windows. Its price is the re-read on a host whose mask
   never changes, measured twice paired by trial on a 24-thread
   bare-metal box at 4096 reps of uniform work over 40 trials with no
-  decision moving between the arms: 1.0006 at a 0.13 per cent bound
+  decision moving between the arms: 1.0006 at a 0.13 percent bound
   over 40 clean pairs, retained 1.0005 at 0.17, control 1.0000 at 0.10,
   on the code that ships; and 1.0000 at 0.15 over 23 clean pairs,
   retained 1.0014 at 0.21, control 1.0000 at 0.30, on a tree whose
@@ -181,7 +192,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   host that does not deschedule has nothing for it to correct.
 
   Its cost, every figure an upper bound rather than a resolved
-  difference: 0.9978 at a 0.22 per cent bound on a 24-thread bare-metal
+  difference: 0.9978 at a 0.22 percent bound on a 24-thread bare-metal
   box over 32 clean pairs of 40, control 0.9988 at 0.38, and 1.3 to 1.9
   on a Linux guest. That cell was read twice - an earlier rotation gave
   0.9964 at 1.90 over 7 pairs while an unrelated process held a core
@@ -190,7 +201,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   none of them caused. The difference between the two bounds is the
   floor, not the lever. On that
   guest at an 8 second window over 40 trials it reads 0.9814 at a 2.52
-  per cent bound in the trials where the class moves and 0.9872 at 4.34
+  percent bound in the trials where the class moves and 0.9872 at 4.34
   where it holds - about the same either way. An earlier reading at a 2
   second window put those at 1.0000 and 0.9759 and suggested the routing
   change paid for the bracket; the longer window cut the bound from 6.44
@@ -230,7 +241,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   window directly with `FLYNNEL_SPIN_WINDOW_ROUNDS` - 8 against 500,
   the controller out of the comparison and every trial usable - gives
   1.0250 and 1.0271 on a Linux guest at half and full load, and 0.9980
-  and 1.0655 on a FreeBSD guest, at bounds of 3.9 to 9.0 per cent. The
+  and 1.0655 on a FreeBSD guest, at bounds of 3.9 to 9.0 percent. The
   ratio is flat across load, so the lever cannot show faster-under-load
   whatever its size: there is nothing for load to change.
 
@@ -251,8 +262,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   and `examples/paired_arms_report.py` takes an optional field to split
   its pairs on. The three-arm rotation compares arms that ran at
   different times, so drift between them lands in the ratio: its null
-  read 11 per cent on a quiet 16-core guest where the paired shape reads
-  0.61 per cent on ten pairs on a busier host. Every speed lever here is
+  read 11 percent on a quiet 16-core guest where the paired shape reads
+  0.61 percent on ten pairs on a busier host. Every speed lever here is
   smaller than the first figure and larger than the second.
 
   The split exists because a mechanism can fire in one run and not the
@@ -291,7 +302,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   otherwise carries booleans, so the label check now decides from the
   values it found rather than from which line they came from: a field
   holding only `true` or `false` reads the label as a switch, anything
-  else compares literally. Without that, an arm labelled
+  else compares literally. Without that, an arm labeled
   `spin_window=8` would have been compared against `false` and a sound
   arm reported as a mismatch.
 
@@ -346,8 +357,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   `LAYOUT_VERSION` 7 to 8, which invalidates stored tables by stamp.
 
   Against the never-slower criterion, both halves on that host: serving
-  removes the draw at start, and routing shows no difference at 1.05 per
-  cent resolution over 14 paired trials whose control resolves to 0.24.
+  removes the draw at start, and routing shows no difference at 1.05
+  percent resolution over 14 paired trials whose control resolves to 0.24.
 
 - `PublishOutcome::Published` and `KeptIncumbent` carry the agreement
   count, and `KeptIncumbent`'s two figures are dispatch costs in
@@ -389,7 +400,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   window, with no load and beside threads spinning on half and on all
   of the logical processors, at 16, 512 and 4,096 work-items, a copy of
   the earlier build as every cell's floor, six trials a cell. Every
-  cell's median sits inside its copy's 95 per cent interval, 0.848 to
+  cell's median sits inside its copy's 95 percent interval, 0.848 to
   1.088 on the 7900X's RTX 5070 and 0.914 to 1.089 on the 2700's RTX
   3070. The CPU dispatch path, which this touches nowhere, reads the
   same way on all three hosts (the leaf-spread entry under Fixed).
@@ -490,8 +501,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   and three rounds of that reproducer against the same code with every
   switch off, `JOIN_PARK` left the loaded median level, 1.17 ms against
   1.13, and cut the tail: p99 15.2 ms against 32.2, and calls of 5 ms or
-  more 23 against 128 in the median round. Its quiet median rose 5.8 per
-  cent beside a serial control that rose 3.7. On a 16-vCPU Linux guest
+  more 23 against 128 in the median round. Its quiet median rose 5.8
+  percent beside a serial control that rose 3.7. On a 16-vCPU Linux guest
   it raised the quiet median from about 1.3 to 3.1 ms in each round,
   with the serial control level across the arms, because a parked
   thread halts its vCPU and the wake through the hypervisor costs far
@@ -517,7 +528,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   million. A first line of 100 us did not separate them: the quiet
   processes read about 1,970 each, because a guest's vCPU is descheduled
   mid-yield often enough to look like a lost core, and parked 15,400 to
-  21,300 times at a quiet cost of about 6 per cent.
+  21,300 times at a quiet cost of about 6 percent.
 
   At 2 ms it ships on. On the guest, in two runs of 15 rounds of the
   reproducer against the same code with it off, each on a fresh
@@ -526,7 +537,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   1.034 across the middle nine), and the calls of 5 ms or more under load
   fell to 0.56 and 0.60 of the off arm's, fewer in 13 and 12 rounds,
   while the loaded median resolved in neither. `JOIN_PARK` in the same
-  runs cost the quiet median 23 per cent in all 30 rounds. On the
+  runs cost the quiet median 23 percent in all 30 rounds. On the
   24-thread host the median round's loaded p99 was 25.0 ms against 32.2
   and its calls of 5 ms or more 104 against 128, with the quiet median at
   0.469 ms against 0.452 beside a serial control at 3.710 against 3.576;
@@ -635,8 +646,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   supply it.
 
   Neither is visible in the rows above, which time the thief rather
-  than its neighbours. The co-runner group in
-  `benches/urd_thief_wait.rs` times the neighbours and oversubscribes
+  than its neighbors. The co-runner group in
+  `benches/urd_thief_wait.rs` times the neighbors and oversubscribes
   deliberately, one per logical CPU, which is the arrangement where
   the difference has somewhere to show. It has not run on any host,
   so the choice rests on the instruction being present rather than on
@@ -716,7 +727,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   refcounts sit immediately before its data so every clone and drop
   fired it too. In a pool the monitor therefore never held. Found by
   a consumer's workload rather than by this crate's bench, which
-  constructs one parker and so has no neighbour to be disturbed by.
+  constructs one parker and so has no neighbor to be disturbed by.
 
   `benches/parker_wait_strategy.rs` carries all three arms in one
   process, each at a 50 us and a 500 us inter-arrival and each both
@@ -740,7 +751,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 - **A PowerShell module, `pwrs/`, binding the scheduler surface
   directly to the Rust.** 109 cmdlets, 79 classes and 36 enumerations
   over PWRS, plus a read-only `Flynnel:` drive. It is a binary module:
-  no marshalling layer, no second implementation, and the objects a
+  no marshaling layer, no second implementation, and the objects a
   cmdlet writes are the crate's own readings.
 
   The families: the host's topology, CPU facts, inter-core latency
@@ -815,20 +826,20 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
   Measured on the 24-thread bare-metal box under the measurement
   lease, three arms - a baseline, the same code against that baseline,
-  and the unordered fold patched back. The ordering costs about 11 per
-  cent on a sequential stream of 64-byte chunks and about 43 per cent
+  and the unordered fold patched back. The ordering costs about 11
+  percent on a sequential stream of 64-byte chunks and about 43 percent
   on a four-producer fan-out of them; at 4 KiB and above it disappears
   into the hasher.
 
   Only two of the five cells are readable and the control is what says
   which. Identical code against its own baseline moved +3.05, +0.92,
-  +5.16, +10.46 and +7.45 per cent, four of them at p = 0.00, so
+  +5.16, +10.46 and +7.45 percent, four of them at p = 0.00, so
   criterion's own significance test cannot see between-run drift at
   all: it is computed from the spread within one run. The three cells
   reporting the unordered fold as slower are mechanically impossible -
   it does strictly less work - and all three sit in the drift
   direction. A comparison taken this way resolves nothing below about
-  ten per cent on either host.
+  ten percent on either host.
 
 - `tests/affinity_follows_process_mask.rs` holds what
   `FLYNNEL_LEVER_ALLOWED_WIDTH` does. It starts the arena at full width,
@@ -868,7 +879,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   A failed call falls back to `available_parallelism` rather than
   publishing a width nothing measured, and the mask is per processor
   group, so above 64 CPUs it describes the group. Both the module and
-  the architecture page had said the width honoured the mask without
+  the architecture page had said the width honored the mask without
   naming a platform, and now say which call each platform uses.
 
   The test reads the mask back through `sched_getaffinity`,
@@ -908,7 +919,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   earlier build as every cell's floor, six trials a cell on the
   24-thread 7900X and the 2700 and eighteen on the Linux guest. No
   cell's interval lies below its copy's. Of 36 cells one median sits
-  under its copy's 95 per cent interval (the 7900X at 16 reps with no
+  under its copy's 95 percent interval (the 7900X at 16 reps with no
   load, 0.953 against a copy interval from 0.957) and none over it. The
   medians ran 0.853 to 1.096 on the 7900X, 0.940 to 1.159 on the 2700
   and 0.920 to 1.138 on the guest.
@@ -984,8 +995,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   this moves, with a copy of the earlier build as every cell's floor,
   six trials a cell on the 24-thread 7900X and the 2700 and eighteen on
   the Linux guest. No cell's interval lies below its copy's, and of 72
-  cells one median sits under its copy's 95 per cent interval, by a
-  tenth of a per cent (the 7900X's heartbeat entry at 4,096 reps with
+  cells one median sits under its copy's 95 percent interval, by a
+  tenth of a percent (the 7900X's heartbeat entry at 4,096 reps with
   no load, 0.996 against a copy interval from 0.997), while eight sit
   over theirs. The medians ran 0.975 to 1.594 and 0.960 to 1.242 on the
   7900X's two entries, 0.939 to 1.241 and 1.023 to 1.112 on the guest's,
@@ -1046,8 +1057,8 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   counter rate the process has already measured, falling back to the
   fixed count until something has, so a fill never pays the rate probe's
   three one-millisecond spins itself. A test converts the quantum back
-  through the leaf path's own conversion and requires it within one per
-  cent of `HEARTBEAT_NS`.
+  through the leaf path's own conversion and requires it within one
+  percent of `HEARTBEAT_NS`.
 
 - **With every park switch off, the park-lever changes made fine-grained
   dispatch slower.** On a 24-thread Windows host, paired by trial on one
@@ -1063,7 +1074,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   that round is now one out-of-line, cold, non-generic function. Against
   the release before the levers the fixed tree still reads 0.9884 over
   40 paired trials, slower in 30, so these two changes recover about a
-  fifth of the cost and about 1.2 per cent remains. An 8-core desktop's
+  fifth of the cost and about 1.2 percent remains. An 8-core desktop's
   pairs spread too widely to resolve any of the three comparisons, the
   original cost included.
 
@@ -1151,7 +1162,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
   The index is now taken on the submitting thread and a ready prefix is
   folded as it completes, with `finalize` folding whatever is left.
-  Proved to fire by restoring the old behaviour: both new tests fail
+  Proved to fire by restoring the old behavior: both new tests fail
   on it - `arrivals [3, 1, 0, 2] rooted differently from submission
   order`, and `nothing folds while index 0 is missing` - and pass on
   the fix. Its cost is in Added, above.
@@ -1259,7 +1270,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 - `gpu_peer::device_memory_in_use()` reports bytes in use and the
   device total for the calling thread's current context, covering the
   whole device rather than this process. A caller sizing an allocation
-  against the total alone collides with a neighbour the total cannot
+  against the total alone collides with a neighbor the total cannot
   see. Memory is what the driver exposes; utilization is not on this
   surface, so a process holding a context while launching nothing
   registers as its allocation and not as load.
@@ -1445,7 +1456,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   pool is spawned once and its threads outlive a change to the process
   affinity mask or the cgroup CPU quota, so a host that has narrowed
   since startup left the arena counting workers that cannot reach a
-  core. `std::thread::available_parallelism` honours both and is re-read
+  core. `std::thread::available_parallelism` honors both and is re-read
   at most every 250 ms, because the answer costs a syscall and on Linux
   a cgroup read. A failed query says so once, naming the error and the
   width it keeps, and holds the last successful reading: one is a width
@@ -1463,7 +1474,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   any host after this measures again. The spread a record already
   carried says whether its samples agreed with each other; it cannot say
   whether they agreed on the wrong number, which is what a draw taken
-  while a neighbour held half the machine produces - every sample slow,
+  while a neighbor held half the machine produces - every sample slow,
   and slow by about the same amount. The figure gates nothing: the share
   of free cores is a continuous property of a host rather than a state
   it is in, so no cutoff separates a contended draw from a clean one,
@@ -1568,7 +1579,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
-- The GPU tests no longer report a neighbour as a Flynnel regression.
+- The GPU tests no longer report a neighbor as a Flynnel regression.
   `gpu_peer_team`'s barrier assertion and `gpu_peer_wave_calibration`
   are wall-clock, and the device lock in the test tree excludes
   Flynnel's own test binaries and nothing else, so a process from
@@ -1852,8 +1863,8 @@ Two things a consumer has to do rather than read:
 
   It shifts the depth rather than scaling the target.
   `adaptive_seed_depth` derives a depth from the estimate, applies the
-  worker floor and the hysteresis stabiliser, then adds the log2, capped
-  at one leaf per item. Both of those stabilisers already work in depth,
+  worker floor and the hysteresis stabilizer, then adds the log2, capped
+  at one leaf per item. Both of those stabilizers already work in depth,
   and the two orders agree only when the target is already a power of
   two: on a target of 51 with a factor of 2, scaling the target gives
   102 and seeds 128, while shifting the depth rounds 51 to 64 and then
@@ -2099,7 +2110,7 @@ Two things a consumer has to do rather than read:
   because a dispatch is exactly the interval in which the caller stops
   working and waits for its leaves - the better the spread, the longer
   the wait and the lower the figure. On an idle host the regimes ordered
-  backwards from load: the floor-bound one that barely parallelizes read
+  backward from load: the floor-bound one that barely parallelizes read
   100 percent, the one that spreads furthest read 60.
 
   The counts ride the existing leaf buffer, read once when a site's

@@ -220,7 +220,7 @@ Describe 'the backends level' {
 }
 
 Describe 'the sites level' {
-    It 'lists a child per call site the scheduler has materialised' {
+    It 'lists a child per call site the scheduler has materialized' {
         # A site appears only once a dispatch has reached that source
         # location, so an empty level means this process has run no
         # work through Flynnel, not that the level failed.

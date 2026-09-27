@@ -89,7 +89,7 @@ Say ("LINUX_MANIFEST   {0} {1} bytes" -f $linManifest.FullName, $linManifest.Len
 
 # Byte for byte, not line by line. The merge compares the text and a
 # line-ending difference is a text difference, so a comparison that
-# normalises them would pass here and fail there.
+# normalizes them would pass here and fail there.
 $winBytes = [System.IO.File]::ReadAllBytes($winManifest.FullName)
 $linBytes = [System.IO.File]::ReadAllBytes($linManifest.FullName)
 $same = $winBytes.Length -eq $linBytes.Length

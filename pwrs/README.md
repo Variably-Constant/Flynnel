@@ -231,7 +231,7 @@ a spread test, because reproducibility is a property of two draws and
 no statistic over one draw's samples substitutes for a second draw
 agreeing. `OccupancyPerMille` is beside them: the spread says whether
 the samples agreed with each other, and only occupancy says whether
-they agreed on the wrong number because a neighbour held half the
+they agreed on the wrong number because a neighbor held half the
 machine.
 
 **Rings.** The scheduler's own in-process queues, each bound over a

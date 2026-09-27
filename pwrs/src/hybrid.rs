@@ -17,7 +17,7 @@
 //! So the work is declared and synthetic: `-Count` items of the
 //! module's own making, put through a declared operation `-Repetitions`
 //! times. Nothing crosses the PowerShell boundary but the report, and
-//! the numbers describe the hybrid plumbing rather than the marshalling
+//! the numbers describe the hybrid plumbing rather than the marshaling
 //! in front of it.
 //!
 //! # With no device registered the backend half is the CPU backend
@@ -524,7 +524,7 @@ pub struct MeasureFlynnelHybridSplit {
     #[param(position = 2)]
     pub repetitions: Option<u32>,
     /// How many times to apply it per item on the backend side, which
-    /// is how a backend with a different per-item cost is modelled.
+    /// is how a backend with a different per-item cost is modeled.
     /// Same as Repetitions when unset, which is the case where the
     /// share has no reason to move.
     #[param]

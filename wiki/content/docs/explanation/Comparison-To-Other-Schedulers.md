@@ -97,7 +97,7 @@ Flynnel does NOT compete with tokio's reactor; using Flynnel for async I/O is a 
 
 Flynnel ships its own equivalents of every crossbeam primitive its production code needs:
 
-| Flynnel primitive | Surface | Crossbeam analogue | Module |
+| Flynnel primitive | Surface | Crossbeam analog | Module |
 |---|---|---|---|
 | `chase_lev_local::{Worker, Stealer, Steal}` | Single-owner LIFO + multi-thief FIFO steal | `crossbeam::deque::{Worker, Stealer, Steal}` | [`src/sched/chase_lev_local.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/chase_lev_local.rs) |
 | `injector::Injector<T>` | Global MPMC fork queue with Success/Empty/Retry steal | `crossbeam::deque::Injector<T>` | [`src/sched/injector.rs`](https://github.com/Variably-Constant/Flynnel/blob/main/src/sched/injector.rs) |

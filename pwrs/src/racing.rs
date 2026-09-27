@@ -4,7 +4,7 @@
 //! # The two shapes answer opposite questions
 //!
 //! `Measure-FlynnelRaceAny` fires several attempts and keeps whichever
-//! finishes first, signalling the rest to stop. That is the
+//! finishes first, signaling the rest to stop. That is the
 //! tail-latency move: where an attempt's latency varies, firing a few
 //! and taking the earliest trims the slow tail. What it reports is
 //! what that trim is worth on this host, as `TailRatio`: the slowest
@@ -12,7 +12,7 @@
 //! nothing and larger is more trimmed.
 //!
 //! `Measure-FlynnelExploreSelect` runs every attempt to completion and
-//! picks the best by a comparator. Nothing is cancelled, because a
+//! picks the best by a comparator. Nothing is canceled, because a
 //! slow explorer that finds the best answer is the entire point. What
 //! it reports is what exploring costs: every arm is paid for.
 //!
@@ -22,7 +22,7 @@
 //!
 //! # The call returns when every arm has returned
 //!
-//! Both of them. Cancelling a loser does not hand the call back early;
+//! Both of them. Canceling a loser does not hand the call back early;
 //! it stops the loser from spending more. That is the crate's join
 //! contract and the rows say so through `SlowestArmNs`, which is what
 //! the call actually waited for.
@@ -32,7 +32,7 @@
 //! A losing arm stops at its next check, not the instant a peer wins,
 //! so the body here polls the token between blocks of work rather than
 //! per item: a token read per item would cost more than the work it
-//! guards. `CancelledEarly` counts the arms that saw it and stopped,
+//! guards. `CanceledEarly` counts the arms that saw it and stopped,
 //! and a race where none did is a race whose arms all finished before
 //! the winner's signal reached them, which is a real answer about how
 //! even this host is.
@@ -77,7 +77,7 @@ pub struct RaceArm {
     /// Whether it saw the cancel signal and stopped short. False on
     /// the winner, and false on a loser that finished before the
     /// signal reached it.
-    pub cancelled_early: bool,
+    pub canceled_early: bool,
     /// Whether this arm won.
     pub won: bool,
     /// Its checksum, so the arms can be compared and the optimizer
@@ -96,7 +96,7 @@ pub struct RaceOutcome {
     /// How long the winner took.
     pub winner_ns: u64,
     /// How long the slowest arm took. The call waited for this,
-    /// because cancelling a loser stops it spending more rather than
+    /// because canceling a loser stops it spending more rather than
     /// handing the call back.
     pub slowest_arm_ns: u64,
     /// Wall time of the whole call.
@@ -105,7 +105,7 @@ pub struct RaceOutcome {
     /// every loser finished before the winner's signal reached it,
     /// which says this host's arms are even rather than that
     /// cancellation is broken.
-    pub cancelled_early: u32,
+    pub canceled_early: u32,
     /// The slowest arm's time over the winner's. What hedging trimmed
     /// on this host for this shape: 1.0 is a race that saved nothing.
     pub tail_ratio: f64,
@@ -143,12 +143,12 @@ fn run_arm(
     let t0 = std::time::Instant::now();
     let mut acc = 0.0f64;
     let mut done = 0usize;
-    let mut cancelled = false;
+    let mut canceled = false;
     while done < count {
         if let Some(t) = token
-            && t.is_cancelled()
+            && t.is_canceled()
         {
-            cancelled = true;
+            canceled = true;
             break;
         }
         let end = (done + POLL_EVERY).min(count);
@@ -168,26 +168,26 @@ fn run_arm(
         index: index as u32,
         elapsed_ns: t0.elapsed().as_nanos() as u64,
         items_done: done as u32,
-        cancelled_early: cancelled,
+        canceled_early: canceled,
         won: false,
         checksum: acc,
     }
 }
 
 /// Fires several attempts at one declared operation and keeps
-/// whichever finishes first, signalling the rest to stop.
+/// whichever finishes first, signaling the rest to stop.
 ///
 /// The tail-latency move. Where an attempt's latency varies, firing a
 /// few and taking the earliest trims the slow tail, and TailRatio is
 /// what that trim was worth here: the slowest arm's time over the
 /// winner's, where 1.0 is a race that saved nothing.
 ///
-/// The call returns once every arm has returned. Cancelling a loser
+/// The call returns once every arm has returned. Canceling a loser
 /// stops it spending more; it does not hand the call back early, and
 /// SlowestArmNs is what the call actually waited for. That is the
 /// crate's join contract and this cmdlet does not pretend otherwise.
 ///
-/// CancelledEarly counts the arms that saw the signal and stopped.
+/// CanceledEarly counts the arms that saw the signal and stopped.
 /// Zero is a real answer and the common one at small sizes: it means
 /// every loser finished before the winner's signal reached it, which
 /// says the arms on this host are even rather than that cancellation
@@ -289,15 +289,15 @@ impl Cmdlet for MeasureFlynnelRaceAny {
         // and the spread across the losers is most of the answer.
         let arms: Arc<Vec<Mutex<Option<RaceArm>>>> =
             Arc::new((0..n).map(|_| Mutex::new(None)).collect());
-        let cancelled = Arc::new(AtomicU32::new(0));
+        let canceled = Arc::new(AtomicU32::new(0));
 
         let body = Arc::clone(&each);
         let slots = Arc::clone(&arms);
-        let counter = Arc::clone(&cancelled);
+        let counter = Arc::clone(&canceled);
         let t0 = std::time::Instant::now();
         let won = race_any(&plan, n, move |i, token| {
             let arm = run_arm(i, count, reps, body.as_ref(), Some(token));
-            if arm.cancelled_early {
+            if arm.canceled_early {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
             let elapsed = arm.elapsed_ns;
@@ -347,7 +347,7 @@ impl Cmdlet for MeasureFlynnelRaceAny {
             winner_ns,
             slowest_arm_ns: slowest,
             total_ns,
-            cancelled_early: cancelled.load(Ordering::Relaxed),
+            canceled_early: canceled.load(Ordering::Relaxed),
             tail_ratio: tail_ratio_of(slowest, winner_ns),
             count: self.count,
         })?;
@@ -361,9 +361,9 @@ impl Cmdlet for MeasureFlynnelRaceAny {
 }
 
 /// Runs every attempt at one declared operation to completion and
-/// reports the fastest, cancelling nothing.
+/// reports the fastest, canceling nothing.
 ///
-/// The complement of Measure-FlynnelRaceAny. Nothing is cancelled
+/// The complement of Measure-FlynnelRaceAny. Nothing is canceled
 /// because a slow explorer that finds the best answer is the entire
 /// point of this shape, so what this reports is what exploring costs:
 /// every arm is paid for, and TotalNs covers all of them.
@@ -374,7 +374,7 @@ impl Cmdlet for MeasureFlynnelRaceAny {
 ///
 /// Run this and Measure-FlynnelRaceAny over the same shape and the
 /// pair says whether hedging is worth it on this host: the race's
-/// TailRatio is what cancelling saved, and this cmdlet's spread is
+/// TailRatio is what canceling saved, and this cmdlet's spread is
 /// what it would have cost to keep every arm.
 ///
 /// # Examples
@@ -493,9 +493,9 @@ impl Cmdlet for MeasureFlynnelExploreSelect {
             winner_ns,
             slowest_arm_ns: slowest,
             total_ns,
-            // Nothing is cancelled in this shape, and a zero here is
+            // Nothing is canceled in this shape, and a zero here is
             // the shape rather than a host that was even.
-            cancelled_early: 0,
+            canceled_early: 0,
             tail_ratio: tail_ratio_of(slowest, winner_ns),
             count: self.count,
         })?;

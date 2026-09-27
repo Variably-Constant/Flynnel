@@ -239,7 +239,7 @@ pub(crate) fn clock_pair() -> (ThreadTicks, u64) {
 pub(crate) fn clock_pair() -> (ThreadTicks, u64) {
     // Nanoseconds since a fixed point in this process, from the
     // monotonic clock. A wall clock is the wrong instrument here twice
-    // over: it can step backwards, which turns a subtraction into a
+    // over: it can step backward, which turns a subtraction into a
     // zero-length interval, and it is the slower read on a path taken
     // once per batch of leaves.
     static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

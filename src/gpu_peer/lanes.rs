@@ -371,12 +371,12 @@ pub(crate) mod tests {
 
     /// A read of exactly the slot's capacity fills the caller's buffer
     /// entirely, and one byte more is refused instead of being served
-    /// from the neighbouring slot.
+    /// from the neighboring slot.
     ///
     /// The two submissions are adjacent slots on one lane carrying
     /// distinguishable bytes, so the boundary the refusal protects is
     /// a real one: were the read unchecked, the extra byte would be
-    /// the neighbour's, and a caller reading a status word alone could
+    /// the neighbor's, and a caller reading a status word alone could
     /// not tell that from its own result.
     #[test]
     fn a_read_past_the_slot_is_refused_rather_than_served_from_the_next() {
@@ -389,11 +389,11 @@ pub(crate) mod tests {
             .try_submit(&r, OP_ADD1_F32, &vec![0xAAu8; max])
             .expect("capacity fits")
             .expect("lane free");
-        let neighbour = ls
+        let neighbor = ls
             .try_submit_on(&r, mine.lane, OP_ADD1_F32, &vec![0xBBu8; max])
             .expect("capacity fits")
             .expect("lane free");
-        assert_eq!(neighbour.seq, mine.seq + 1, "the next slot on the same lane");
+        assert_eq!(neighbor.seq, mine.seq + 1, "the next slot on the same lane");
         fake_consume_all(&r);
 
         let mut exact = vec![0u8; max];
@@ -412,7 +412,7 @@ pub(crate) mod tests {
         }
 
         let mut theirs = vec![0u8; max];
-        ls.read_result(&r, neighbour, &mut theirs).expect("capacity is readable");
+        ls.read_result(&r, neighbor, &mut theirs).expect("capacity is readable");
         assert!(
             theirs.iter().all(|&b| b == 0xBB),
             "the bytes past the boundary belong to the next submission"

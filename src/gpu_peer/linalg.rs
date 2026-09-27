@@ -37,7 +37,7 @@ use crate::sched::plan::JobPlan;
 ///
 /// The CPU half and the device half run concurrently and the caller
 /// frame blocks in the split until both return, so the device closure
-/// needs somewhere to leave an error that the frame reads afterwards.
+/// needs somewhere to leave an error that the frame reads afterward.
 /// A later report replaces an earlier one, which is what the slot it
 /// replaces did.
 #[derive(Default)]

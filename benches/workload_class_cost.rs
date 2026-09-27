@@ -2,7 +2,7 @@
 //!
 //! ## The question
 //!
-//! Preemption lands on some leaves and not others, so a neighbour's load
+//! Preemption lands on some leaves and not others, so a neighbor's load
 //! reaches the classifier as variance rather than as uniform slowdown. A
 //! site whose leaves are uniform can therefore read as irregular on a
 //! loaded host and migrate class, and the class selects a fan-out shape
@@ -17,7 +17,7 @@
 //! Load is what causes the misclassification. It must not be present
 //! while the cost is measured, or the reading prices contention instead.
 //! Nothing in this file generates load, and a run taken while a
-//! neighbour is up measures something else.
+//! neighbor is up measures something else.
 //!
 //! ## Every profile, rather than one pair
 //!
@@ -50,10 +50,10 @@
 //!
 //! ## Read each arm's interval, not only its estimate
 //!
-//! A neighbour arriving mid-run reaches arms unequally, and criterion's
+//! A neighbor arriving mid-run reaches arms unequally, and criterion's
 //! confidence interval shows it before any process table does: two arms
 //! once came back varying by more than a factor of two internally while
-//! their neighbours held within one percent. A wide interval is a
+//! their neighbors held within one percent. A wide interval is a
 //! tenant report.
 //!
 //! ## Why every shape is registered twice, in opposite order

@@ -5,7 +5,7 @@ sidebar:
   open: true
 ---
 
-The Flynnel docs are organised under the [Diataxis](https://diataxis.fr/) framework: four kinds of documentation, each answering a different reader question.
+The Flynnel docs are organized under the [Diataxis](https://diataxis.fr/) framework: four kinds of documentation, each answering a different reader question.
 
 {{< cards >}}
   {{< card link="tutorials/" title="Tutorials" subtitle="Learning-oriented. Start with Getting Started for the 5-minute join + for_each_chunk quickstart." icon="academic-cap" >}}

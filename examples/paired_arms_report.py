@@ -11,7 +11,7 @@ one means the arm under test was FASTER.
 
 Prints how large an effect this many trials could have resolved, so a
 null reads as a bound rather than as an absence. A run that cannot see
-a ten per cent regression must not be quoted as evidence there is none.
+a ten percent regression must not be quoted as evidence there is none.
 
 The arm-state block answers a separate question: whether each arm ran
 the switch its label claims. `paired_armstate_defect_sample.log` beside
@@ -24,7 +24,7 @@ on, and is what the refusal is checked against:
 An arm that pins a state rather than flipping a switch names a width
 the `levers:` line does not carry. Its value is read from the
 engagement line under the same name and compared literally, so an arm
-labelled `spin_window=500` whose pin did not take is caught the same
+labeled `spin_window=500` whose pin did not take is caught the same
 way a lever arm is. `paired_pinstate_defect_sample.log` carries one arm
 that took and one that did not:
 
@@ -180,7 +180,7 @@ def report_arm_states(per, arms):
                   f"and this arm means {want}")
             wrong += 1
         else:
-            print(f"  {name:<28} {field}={seen} on the {where} line, as labelled")
+            print(f"  {name:<28} {field}={seen} on the {where} line, as labeled")
     if wrong:
         print(f"{wrong} arm(s) did not run the switch their label claims. Their "
               "pairs compare something with itself; do not read the table below.")
@@ -253,7 +253,7 @@ def report(per, under_test, reference, max_busy=None, counters=(), unpinned=Fals
     if unpinned:
         print("UNPINNED: every arm drew its own calibration, and the draw sets")
         print("the routing this measures. That variance is in every ratio below")
-        print("and cannot be separated from the lever's afterwards.")
+        print("and cannot be separated from the lever's afterward.")
     print("ARM STATES, read before anything else:")
     report_arm_states(per, (under_test, reference))
     report_engagement(per, under_test, reference)

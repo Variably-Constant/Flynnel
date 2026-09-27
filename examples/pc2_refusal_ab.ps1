@@ -17,7 +17,7 @@
 # serve it and report a control window beside a loaded one.
 #
 # Arm order alternates by trial, since a window measured first in its
-# trial is worth a few per cent more.
+# trial is worth a few percent more.
 
 param(
     [Parameter(Mandatory = $true)][string]$Sha,

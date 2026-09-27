@@ -292,7 +292,7 @@ def repeatability(per_visit, levers, loads):
     doing while that stretch of the run happened.
 
     This is the test the shape of the curve cannot do. A lever that
-    genuinely helps only when cores are free and an artefact of an
+    genuinely helps only when cores are free and an artifact of an
     unloaded box BOTH give a ratio that moves with load, so a moving
     ratio is not evidence either way. Reproducing under a changed
     visiting order is.

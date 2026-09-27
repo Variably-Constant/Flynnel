@@ -16,7 +16,7 @@
 # gets a fresh calibration directory so its first process draws rather
 # than inheriting another arm's record.
 #
-# Arm order rotates per trial. A window is worth a few per cent more in
+# Arm order rotates per trial. A window is worth a few percent more in
 # one position, and three arms held in a fixed order would give the
 # first position to one of them every time.
 

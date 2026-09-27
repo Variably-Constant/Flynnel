@@ -2,7 +2,7 @@
 #
 # These cmdlets measure, so most of what can be asserted about them is
 # structural: the halves add up to the whole, the share is in range, the
-# bucket is the logarithm of the count. Two claims are behavioural and
+# bucket is the logarithm of the count. Two claims are behavioral and
 # both are here, because they are the only reasons the shapes exist: the
 # halves really overlap, and the placement model really settles.
 #
@@ -285,7 +285,7 @@ Describe 'Measure-FlynnelHybridPipeline' {
 
     It 'costs less per input over many inputs than over one' {
         # What pipelining buys: the fill is paid once, so the per-input
-        # cost falls towards the slowest stage as the run lengthens.
+        # cost falls toward the slowest stage as the run lengthens.
         $one = Measure-FlynnelHybridPipeline -Count 1 -Width 8192
         $many = Measure-FlynnelHybridPipeline -Count 400 -Width 8192
         $many.NsPerInput | Should -BeLessThan $one.NsPerInput `

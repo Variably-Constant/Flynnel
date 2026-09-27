@@ -10,7 +10,7 @@
 //! # Why this exists rather than a bench arm
 //!
 //! `pwrs/bench/KernelShapes.ps1` times whole kernels. Two runs of the
-//! same build on pc2 put its anchor 3.8 per cent apart, so it cannot
+//! same build on pc2 put its anchor 3.8 percent apart, so it cannot
 //! resolve one atomic load across the ~1560 consulted loads a dispatch
 //! makes. Reading its drift line after this change would report noise
 //! either way. The predicate has to be timed directly.
@@ -51,7 +51,7 @@
 //! reported as a diagnostic rather than as the verdict. What decides
 //! whether a difference holds is the span of the control across its
 //! own repeats: a figure smaller than that span was not resolved by
-//! the run, and one wider than five per cent leaves nothing readable.
+//! the run, and one wider than five percent leaves nothing readable.
 //!
 //! Both predicates are written out here rather than called through the
 //! crate, so one binary times both shapes and no second build is
@@ -63,7 +63,7 @@
 //! # Why this rather than an A/B of the park path
 //!
 //! `benches/parker_wait_strategy.rs` put its overhead arm at -16.5 and
-//! +23.9 per cent against the settled arm. A quantity one predicate
+//! +23.9 percent against the settled arm. A quantity one predicate
 //! wide does not survive a spread that size, so an A/B of the park
 //! path would report no change whatever the truth was. Timing the
 //! expression directly keeps the park's own cost out of the
@@ -79,7 +79,7 @@ use flynnel::sched::trace::{self, TraceEvent};
 /// Calls per timed cell.
 ///
 /// Five hundred million rather than fifty. At fifty the cell was 31
-/// milliseconds and the control moved 2.6 to 12.6 per cent across a
+/// milliseconds and the control moved 2.6 to 12.6 percent across a
 /// run - which is 0.016 to 0.079 ns on a 0.63 ns cell, the same size
 /// as the difference being measured. Every run declared itself
 /// unreadable, correctly. A longer cell is the fix: the predicate
@@ -263,7 +263,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Warm both predicates past their one-time initialisation, so no
+    // Warm both predicates past their one-time initialization, so no
     // cell pays for it and every cell times the steady state. The emit
     // path has the same seeding inside it.
     black_box(latch_enabled());
@@ -283,7 +283,7 @@ fn main() {
     let mut emit = Vec::with_capacity(REPEATS);
     let mut guarded = Vec::with_capacity(REPEATS);
     // Interleaved rather than run in blocks: a frequency change or a
-    // neighbour arriving partway through would otherwise land on one
+    // neighbor arriving partway through would otherwise land on one
     // shape and not the other, and the difference between them is the
     // whole answer.
     //

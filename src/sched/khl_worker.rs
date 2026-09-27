@@ -102,7 +102,7 @@ impl KhlStash {
         self.numa_hint = body.numa_hint;
         self.variant = body.variant;
         let items = body.items_for_adapter();
-        // LLVM lowers copy_from_slice to a vectorised memcpy /
+        // LLVM lowers copy_from_slice to a vectorized memcpy /
         // SIMD load+store on x86_64; preferable to a hand-rolled
         // loop here.
         self.items[..(n - 1)].copy_from_slice(&items[1..n]);

@@ -738,7 +738,7 @@ impl CallSiteState {
     /// calls before it takes effect, so one estimate landing the far
     /// side of a power-of-two boundary does not halve or double the
     /// leaf count on its own.
-    pub fn stabilise_seed_depth(&self, observed: usize) -> usize {
+    pub fn stabilize_seed_depth(&self, observed: usize) -> usize {
         let obs = observed as u32;
         let active = self.active_depth.load(Ordering::Relaxed);
         if active == DEPTH_UNSET {
@@ -931,7 +931,7 @@ impl CallSiteState {
     /// cv^2 per mille of per-item cost measured on the thread's own
     /// clock, or `None` where no leaf carried an on-core reading.
     ///
-    /// This is the figure a neighbour cannot move. Wall time rises both
+    /// This is the figure a neighbor cannot move. Wall time rises both
     /// because the work is irregular and because the thread lost its
     /// core, and preemption lands on some leaves and not others, so it
     /// reaches a wall-time spread as variance that is indistinguishable
@@ -2007,7 +2007,7 @@ pub fn site_for_location(loc: &'static std::panic::Location<'static>) -> SiteRef
     SiteRef::new(site)
 }
 
-/// Number of distinct call sites the registry has materialised.
+/// Number of distinct call sites the registry has materialized.
 #[cfg(test)]
 pub(crate) fn registry_len() -> usize {
     site_nodes().count()
@@ -2038,7 +2038,7 @@ fn table_nodes<N: TableNode>(table: &'static [AtomicPtr<N>]) -> impl Iterator<It
     })
 }
 
-/// One call site the registry has materialised, and where it is.
+/// One call site the registry has materialized, and where it is.
 #[derive(Copy, Clone, Debug)]
 pub struct RegisteredSite {
     /// The source location the site was first seen at.
@@ -2400,7 +2400,7 @@ mod tests {
         assert_eq!(repeats[1], repeats[2]);
         assert_ne!(repeats[0], a);
         assert_ne!(repeats[0], b);
-        assert!(registry_len() >= 3, "registry materialises one state per site");
+        assert!(registry_len() >= 3, "registry materializes one state per site");
     }
 
     #[test]
@@ -2568,17 +2568,17 @@ mod tests {
         static S: CallSiteState = CallSiteState::new();
         assert_eq!(S.seeded_depth(), None, "a fresh site has seeded nothing");
         assert_eq!(
-            S.stabilise_seed_depth(5),
+            S.stabilize_seed_depth(5),
             5,
             "the first dispatch takes the depth its estimate asks for"
         );
         assert_eq!(
-            S.stabilise_seed_depth(6),
+            S.stabilize_seed_depth(6),
             5,
             "one estimate the far side of a boundary does not move the depth"
         );
         assert_eq!(
-            S.stabilise_seed_depth(6),
+            S.stabilize_seed_depth(6),
             6,
             "a second consecutive call asking the same thing does"
         );
@@ -2588,37 +2588,37 @@ mod tests {
     #[test]
     fn a_run_toward_a_new_depth_restarts_when_a_third_value_intervenes() {
         static S: CallSiteState = CallSiteState::new();
-        assert_eq!(S.stabilise_seed_depth(5), 5);
-        assert_eq!(S.stabilise_seed_depth(6), 5);
+        assert_eq!(S.stabilize_seed_depth(5), 5);
+        assert_eq!(S.stabilize_seed_depth(6), 5);
         assert_eq!(
-            S.stabilise_seed_depth(7),
+            S.stabilize_seed_depth(7),
             5,
             "a different candidate breaks the run toward 6"
         );
         assert_eq!(
-            S.stabilise_seed_depth(6),
+            S.stabilize_seed_depth(6),
             5,
             "so 6 starts its run again rather than arriving already seconded"
         );
-        assert_eq!(S.stabilise_seed_depth(6), 6);
+        assert_eq!(S.stabilize_seed_depth(6), 6);
     }
 
     #[test]
     fn a_depth_the_site_already_holds_clears_a_pending_run() {
         static S: CallSiteState = CallSiteState::new();
-        assert_eq!(S.stabilise_seed_depth(5), 5);
-        assert_eq!(S.stabilise_seed_depth(6), 5);
+        assert_eq!(S.stabilize_seed_depth(5), 5);
+        assert_eq!(S.stabilize_seed_depth(6), 5);
         assert_eq!(
-            S.stabilise_seed_depth(5),
+            S.stabilize_seed_depth(5),
             5,
             "asking for what is already in force is not a change"
         );
         assert_eq!(
-            S.stabilise_seed_depth(6),
+            S.stabilize_seed_depth(6),
             5,
             "and it broke the run, so 6 needs two agreeing calls again"
         );
-        assert_eq!(S.stabilise_seed_depth(6), 6);
+        assert_eq!(S.stabilize_seed_depth(6), 6);
     }
 
     #[test]

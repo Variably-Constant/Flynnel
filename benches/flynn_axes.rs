@@ -538,15 +538,15 @@ fn bench_misd(c: &mut Criterion) {
             let (pi_val, _variant) = race_variants(
                 &plan,
                 |cancel| {
-                    let a = AtomicBool::new(cancel.is_cancelled());
+                    let a = AtomicBool::new(cancel.is_canceled());
                     fast_pi(&a)
                 },
                 |cancel| {
-                    let a = AtomicBool::new(cancel.is_cancelled());
+                    let a = AtomicBool::new(cancel.is_canceled());
                     faithful_pi(&a)
                 },
                 |cancel| {
-                    let a = AtomicBool::new(cancel.is_cancelled());
+                    let a = AtomicBool::new(cancel.is_canceled());
                     correct_pi(&a)
                 },
             );

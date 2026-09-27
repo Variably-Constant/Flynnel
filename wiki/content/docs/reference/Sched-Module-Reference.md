@@ -3,7 +3,7 @@ title: Sched Module Reference
 weight: 3
 ---
 
-Every primitive in the `flynnel::sched` module, organised by Flynn axis. The workhorses (`join`, `for_each_chunk`, `for_each_indexed`, `for_each_chunk_ref`, `cooperative_join_n`, `join_hybrid`, `hybrid_pipeline`, `race_variants`, `CancelToken`, `k_join`) are also exposed at the crate root (`flynnel::*`).
+Every primitive in the `flynnel::sched` module, organized by Flynn axis. The workhorses (`join`, `for_each_chunk`, `for_each_indexed`, `for_each_chunk_ref`, `cooperative_join_n`, `join_hybrid`, `hybrid_pipeline`, `race_variants`, `CancelToken`, `k_join`) are also exposed at the crate root (`flynnel::*`).
 
 ## Index by Flynn axis
 
@@ -573,7 +573,7 @@ where P: Send + Sync + 'static, R: Send + Sync + 'static,
       FR: FnOnce(&CancelToken) -> Option<R> + Send,
 ```
 
-A duel: two sides chase opposite verdicts and the first to settle wins, cancelling the other. A SAT portfolio is the clean case - one engine hunts a model, the other a proof of unsatisfiability, and whichever lands first ends it. The same shape drives a capability probe: certify a property absent versus witness it present. The two sides return different types (a model is not a refutation), so the verdict carries both; if both give up, it is `Unsettled`.
+A duel: two sides chase opposite verdicts and the first to settle wins, canceling the other. A SAT portfolio is the clean case - one engine hunts a model, the other a proof of unsatisfiability, and whichever lands first ends it. The same shape drives a capability probe: certify a property absent versus witness it present. The two sides return different types (a model is not a refutation), so the verdict carries both; if both give up, it is `Unsettled`.
 
 ### `race_agree`
 
@@ -627,13 +627,13 @@ The trials are noisy, so wall-clock and single-result selection both lie - one l
 pub struct CancelToken { /* opaque */ }
 
 impl CancelToken {
-    pub fn new() -> Self;                // not cancelled; Default is the same
-    pub fn is_cancelled(&self) -> bool;  // cheap atomic load
+    pub fn new() -> Self;                // not canceled; Default is the same
+    pub fn is_canceled(&self) -> bool;   // cheap atomic load
     pub fn cancel(&self);                // idempotent; every clone observes it
 }
 ```
 
-The races in this module hand each arm a token; `new` is for a race the caller composes itself on [`join`](#join) or the indexed walkers: clone the token into every arm, and the arm that settles calls `cancel`. A token that is never cancelled is the honest argument for a path that takes one but has no peers. Re-exported at the crate root.
+The races in this module hand each arm a token; `new` is for a race the caller composes itself on [`join`](#join) or the indexed walkers: clone the token into every arm, and the arm that settles calls `cancel`. A token that is never canceled is the honest argument for a path that takes one but has no peers. Re-exported at the crate root.
 
 ### `par_map_in_place`
 
@@ -644,7 +644,7 @@ where T: Send, F: Fn(&mut T) + Sync,
 
 Apply `op` to each element in parallel, with one dispatched task per element (leaf chunk size = 1). Use this when each element's `op` is large enough (~10 us+) to amortize per-task dispatch overhead. For small per-element work use [`for_each_chunk`](#for_each_chunk) instead, which groups multiple elements per leaf via the bisect splitter.
 
-Examples of one-task-per-element work: per-block high-precision arithmetic, per-row matrix factorisation, per-particle PDE step, per-image GPU dispatch coordinator. The common shape is "few large units" rather than "many small units".
+Examples of one-task-per-element work: per-block high-precision arithmetic, per-row matrix factorization, per-particle PDE step, per-image GPU dispatch coordinator. The common shape is "few large units" rather than "many small units".
 
 ### `par_zip_apply`
 

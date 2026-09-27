@@ -219,7 +219,7 @@ fn bench_corunner(c: &mut Criterion, label: &str, strategy: WaitStrategy) {
 
                 // The thief waits on a mailbox nothing has published
                 // to, so it is still waiting for the whole measured
-                // span and is released afterwards.
+                // span and is released afterward.
                 let thief_urd = Arc::clone(&urd);
                 let thief = std::thread::spawn(move || thief_urd.wait_and_drain(0, u64::MAX));
                 std::thread::sleep(Duration::from_millis(2));

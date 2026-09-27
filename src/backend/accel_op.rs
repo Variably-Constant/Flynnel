@@ -151,7 +151,7 @@ fn update_bindings(op: &'static AccelOp, edit: impl Fn(&mut Bindings)) {
 
 /// Register an accelerator-routable op: a CPU implementation plus a
 /// per-item H2D byte estimate for the cost gate. Kernel bindings
-/// attach afterwards via [`bind_accel_kernel`] /
+/// attach afterward via [`bind_accel_kernel`] /
 /// [`bind_accel_kernel_handle`]; until one is bound, every dispatch
 /// of this op runs the CPU implementation.
 pub fn register_accel_op<F>(name: &str, bytes_per_item: u32, cpu: F) -> AccelOpId

@@ -17,7 +17,7 @@ printed beside it to show how much interference there was, not as
 competing estimates.
 
 Gaps are counted per thread. A gap taken across two threads is not a
-gap, it is the offset between two TSCs that were never synchronised.
+gap, it is the offset between two TSCs that were never synchronized.
 """
 
 import re

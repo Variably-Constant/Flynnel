@@ -947,7 +947,7 @@ mod store {
         ///
         /// SpreadPerMille says whether the samples agreed with each
         /// other. It cannot say whether they agreed on the wrong
-        /// number, which is what a draw taken while a neighbour held
+        /// number, which is what a draw taken while a neighbor held
         /// half the machine produces: every sample slow, and slow by
         /// about the same amount. This is the figure that separates
         /// those, and it gates nothing.

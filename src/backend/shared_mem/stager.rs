@@ -25,7 +25,7 @@
 //! lock-freedom, and a lock-free queue over pre-allocated slots would
 //! not pay it. What no shared structure can avoid is the shared cache
 //! line itself. Giving each thread its own buffer removes that line
-//! rather than synchronising on it faster, which is why it is both the
+//! rather than synchronizing on it faster, which is why it is both the
 //! fastest arm and the one that needs no exclusion at all.
 //!
 //! # The slot index

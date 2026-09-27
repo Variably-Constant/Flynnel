@@ -105,7 +105,7 @@ fn monitor_holds() -> bool {
 /// monitor, in RDTSC cycles.
 ///
 /// The verdict says a wait got nowhere; this says how fast. Arms
-/// totalling about four times the instruction pair mean the monitor
+/// totaling about four times the instruction pair mean the monitor
 /// never armed at all, while hundreds of thousands of cycles mean it
 /// armed and something ended it, and those want different answers.
 /// Nothing in the verdict distinguishes them.
@@ -452,8 +452,8 @@ impl WaitStrategy {
 /// line it is already writing, so an unsampled wake pays nothing it
 /// was not already paying. A park is the slow path by construction:
 /// the cheapest outcome measured here is about half a microsecond and
-/// the timing costs two clock reads, so a timed park pays a few per
-/// cent and one park in [`PROBE_EVERY_MIN`] is timed at the closest
+/// the timing costs two clock reads, so a timed park pays a few
+/// percent and one park in [`PROBE_EVERY_MIN`] is timed at the closest
 /// the controller ever looks.
 pub struct WaitController {
     /// Mean observed wake cost in nanoseconds, indexed by
@@ -1024,7 +1024,7 @@ impl Parker {
     }
 
     /// Block the calling thread until `is_ready` returns `true`,
-    /// shutdown is signalled, or the thread is unparked.
+    /// shutdown is signaled, or the thread is unparked.
     ///
     /// Returns `true` when `is_ready()` was observed or the thread
     /// was unparked; returns `false` on shutdown.
@@ -1309,14 +1309,14 @@ impl Parker {
         // wake checks below.
         const WAIT_DEADLINE_NS: u64 = 10_000_000;
         const TSC_HZ_ESTIMATE: u64 = 2_500_000_000;
-        // A monitor that keeps firing on traffic to a neighbouring
+        // A monitor that keeps firing on traffic to a neighboring
         // address would otherwise spin here for the whole budget. The
         // count bounds that case on its own, without assuming any
         // iteration actually waits.
         const MAX_ARMS: u32 = 256;
         // This many arms inside `ARMS_TOO_FAST_CYCLES` means the
         // monitor is not holding, and the wait parks instead. Four
-        // honoured budgets take tens of milliseconds; four unheld
+        // honored budgets take tens of milliseconds; four unheld
         // ones take about four times the instruction pair, measured
         // at 2369 cycles on a 7900X and 1606 on a 2700.
         const ARMS_BEFORE_JUDGING: u32 = 4;
@@ -1463,7 +1463,7 @@ impl Parker {
         thread::park();
     }
 
-    /// Test whether shutdown has been signalled. Workers can poll
+    /// Test whether shutdown has been signaled. Workers can poll
     /// this between job executions to exit promptly.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
@@ -1739,7 +1739,7 @@ mod tests {
     #[test]
     fn two_arms_within_the_margin_leave_the_verdict_alone() {
         // Switching on noise costs a process its exploitation and
-        // buys nothing. Ten per cent apart is inside the twenty the
+        // buys nothing. Ten percent apart is inside the twenty the
         // controller demands.
         let c = fresh_controller();
         for _ in 0..SCORE_CAP * 2 {
@@ -1911,7 +1911,7 @@ mod tests {
     #[test]
     fn no_two_parkers_can_share_a_cache_line() {
         // A monitor wait watches the line wake_counter sits in, so a
-        // neighbour sharing it turns that neighbour's every unpark
+        // neighbor sharing it turns that neighbor's every unpark
         // into a wake here. Pinned by alignment rather than by size,
         // because adding a field must not be able to undo it.
         assert_eq!(std::mem::align_of::<Parker>(), 64);
