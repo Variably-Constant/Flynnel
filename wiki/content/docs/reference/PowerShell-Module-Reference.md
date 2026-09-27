@@ -5,7 +5,7 @@ weight: 10
 
 Every command the Flynnel PowerShell module exports, by family, with the objects and enumerations each one deals in. For the task-oriented introduction see [How To Use The PowerShell Module](../how-to/How-To-Use-The-PowerShell-Module/).
 
-111 commands, 82 object types, 37 enumerations. Every command answers to a shorter name with the `Fly` prefix; the alias is listed beside each.
+112 commands, 83 object types, 37 enumerations. Every command answers to a shorter name with the `Fly` prefix; the alias is listed beside each.
 
 `Get-Help <command> -Full` carries the parameters, the examples and what each parameter means. This page is the map, not a substitute for it.
 
@@ -232,7 +232,7 @@ Methods on a push side: `Push`, `PushMany`, `Stat`. On a pop side: `Pop`, `PopMa
 
 The single-owner shapes are a contract the module cannot enforce. An SPSC producer and consumer carry a `Cell` cursor and no synchronization because the crate expects exactly one thread on each; handing the same producer to two runspaces corrupts the ring and nothing here can detect it. The two ends come back as two objects for that reason.
 
-## Backends and accelerator ops - 4 commands
+## Backends and accelerator ops - 5 commands
 
 What devices this host has, and where an operation would run. This family inspects; it launches nothing.
 
@@ -240,10 +240,11 @@ What devices this host has, and where an operation would run. This family inspec
 |---|---|---|
 | `Get-FlynnelBackend` | `Get-FlyBackend` | a row per backend kind, on every host |
 | `Test-FlynnelBackend` | `Test-FlyBackend` | runs the probe now rather than at startup |
+| `Get-FlynnelCudaDevice` | `Get-FlyCudaDevice` | a row per CUDA device the driver counts, read without a context |
 | `Get-FlynnelAccelOp` | `Get-FlyAccelOp` | every registered operation and its bindings |
 | `Get-FlynnelAccelTarget` | `Get-FlyAccelTarget` | where one would route under a plan |
 
-Objects: `Flynnel.Backend`, `Flynnel.BackendProbe`, `Flynnel.AccelOp`, `Flynnel.AccelTarget`. Enumeration: `Flynnel.BackendKind`.
+Objects: `Flynnel.Backend`, `Flynnel.BackendProbe`, `Flynnel.CudaDevice`, `Flynnel.AccelOp`, `Flynnel.AccelTarget`. Enumeration: `Flynnel.BackendKind`.
 
 **An absent device is a row, never a missing row.** The module ships with every backend feature on, so the code for each is present everywhere and absence is always a runtime fact.
 

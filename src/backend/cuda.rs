@@ -29,8 +29,16 @@
 //!   by [`CudaBackend::copy_in`], read by [`CudaBackend::copy_out`] or
 //!   [`CudaBackend::copy_out_range`], handed to a kernel by
 //!   [`DeviceBuffer::arg`], and freed when dropped.
+//! - Mapped memory: a [`MappedBuffer`] is page-locked host memory the
+//!   device reads and writes directly, made by [`CudaBackend::map_host`],
+//!   written and read through its host slices with no copy, handed to a
+//!   kernel by [`MappedBuffer::arg`], and freed when dropped.
 //! - [`CudaBackend::device_name`] and [`CudaBackend::mem_info`], so a
 //!   caller can refuse or cut a block before allocating it.
+//! - [`CudaBackend::device_info`] and [`DeviceInfo::of_ordinal`], the
+//!   device's capability, size and limits, and
+//!   [`CudaBackend::device_count`]; neither of the last two makes a
+//!   context.
 //!
 //! ## Nothing beyond the driver
 //!
@@ -52,24 +60,29 @@
 //! against the default stream's copies only by the caller: synchronize or
 //! join that stream before reading back what the kernel wrote.
 //!
+//! A [`MappedBuffer`]'s host slices wait for every launch that passed the
+//! buffer, on whichever stream, and so does its free.
+//!
 //! ## When to use
 //!
 //! For consumers that have pre-compiled PTX they want to launch
 //! through a uniform Flynnel surface. Consumers that need richer
-//! CUDA semantics (per-launch streams, pinned host memory, CUDA
-//! graphs) typically ship their own
+//! CUDA semantics (per-launch configuration, CUDA graphs) typically
+//! ship their own
 //! [`crate::backend::DispatchBackend`] impl backed by their
 //! preferred CUDA wrapper.
 
 #![allow(clippy::missing_errors_doc)]
 
+use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchArgs,
-    LaunchConfig, PushKernelArg,
+    CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError,
+    LaunchArgs, LaunchConfig, PushKernelArg, result, sys,
 };
 
 use crate::sched::notify_ring::{NotifyHub, NotifySendResult, NotifySender};
@@ -157,6 +170,202 @@ impl<T: DeviceElement> std::fmt::Debug for DeviceBuffer<T> {
     }
 }
 
+/// Page-locked host memory holding a run of `T` that one CUDA device
+/// reads and writes directly, made by [`CudaBackend::map_host`].
+///
+/// A kernel reaches it over the bus through [`Self::arg`], so what the
+/// host writes into [`Self::as_mut_slice`] needs no copy in and what a
+/// kernel writes is read from [`Self::as_slice`] with no copy out. Every
+/// device access crosses the bus, so a buffer a kernel reads many times,
+/// or updates atomically, belongs in a [`DeviceBuffer`].
+///
+/// A host slice first waits for every launch that passed the buffer:
+/// for the last of them when all of them since the previous host slice
+/// ran on one stream, and for all work on the device when more than one
+/// stream did. Launches on two streams are not ordered against each
+/// other. Freed when dropped, after the same wait. Only the backend that
+/// made it accepts it for a launch.
+pub struct MappedBuffer<T: DeviceElement> {
+    memory: MappedMemory,
+    len: usize,
+    element: PhantomData<T>,
+}
+
+impl<T: DeviceElement> MappedBuffer<T> {
+    /// Elements the buffer holds.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether it holds none, which an allocation never makes.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The buffer as a kernel argument. It reaches the kernel as the
+    /// 64-bit device address of its first element.
+    pub fn arg(&self) -> KernelArg<'_> {
+        KernelArg::Buffer(&self.memory)
+    }
+
+    /// The elements, once every launch that passed the buffer has
+    /// finished.
+    pub fn as_slice(&mut self) -> Result<&[T], BackendError> {
+        self.memory.settle()?;
+        // SAFETY: the allocation holds `len` elements of `T` at a page
+        // boundary and every bit pattern is a `T`; `settle` has waited
+        // for every launch that passed the buffer, and `&mut self` keeps
+        // any other from being issued while the slice lives.
+        Ok(unsafe { std::slice::from_raw_parts(self.memory.host.as_ptr().cast::<T>(), self.len) })
+    }
+
+    /// The elements to write, once every launch that passed the buffer
+    /// has finished. A launch issued after the slice is dropped reads what
+    /// was written.
+    pub fn as_mut_slice(&mut self) -> Result<&mut [T], BackendError> {
+        self.memory.settle()?;
+        // SAFETY: as for `as_slice`, and `&mut self` makes this the only
+        // slice of the allocation.
+        Ok(unsafe {
+            std::slice::from_raw_parts_mut(self.memory.host.as_ptr().cast::<T>(), self.len)
+        })
+    }
+}
+
+impl<T: DeviceElement> std::fmt::Debug for MappedBuffer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedBuffer")
+            .field("element", &std::any::type_name::<T>())
+            .field("len", &self.len)
+            .field("device", &self.memory.event.context().ordinal())
+            .finish()
+    }
+}
+
+/// `CU_STREAM_PER_THREAD`: one handle that names a different stream on
+/// each thread that launches on it.
+const PER_THREAD_STREAM: u64 = 0x2;
+
+/// The allocation behind a [`MappedBuffer`], untyped, and what a launch
+/// takes from it: the device address it passes and the event it records.
+struct MappedMemory {
+    /// Page-locked host memory from `cuMemHostAlloc`, `bytes` long.
+    host: NonNull<u8>,
+    /// The same memory's address in the device's address space.
+    device: u64,
+    bytes: usize,
+    /// Recorded on a launch's stream after every launch that passes the
+    /// memory. Holds the context the memory was allocated in.
+    event: CudaEvent,
+    /// The stream every launch since the last settle ran on, as its
+    /// handle plus one, so that zero means none has; the legacy default
+    /// stream's handle is zero.
+    stream: AtomicU64,
+    /// Set when a launch since the last settle ran on a second stream or
+    /// on the per-thread stream, or when recording the event failed.
+    mixed: AtomicBool,
+}
+
+// SAFETY: `host` is page-locked memory this value owns and frees once. A
+// shared reference reads `device` and `bytes`, records the event, which
+// cudarc documents as thread safe, and updates two atomics; the host
+// slices of the memory need `&mut` to the buffer that owns it.
+unsafe impl Send for MappedMemory {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for MappedMemory {}
+
+impl MappedMemory {
+    /// Notes a launch on `stream` that passed this memory: the stream
+    /// joins the ones the next settle waits for, and the event moves past
+    /// the launch. A record the driver refuses marks the memory mixed, so
+    /// the next settle waits for the whole device, which covers the
+    /// launch the event missed.
+    fn note_launch(&self, stream: &CudaStream) -> Result<(), DriverError> {
+        // Relaxed throughout: a settle holds `&mut`, which it can have only
+        // once every launch holding `&self` has returned.
+        let handle = stream.cu_stream() as usize as u64;
+        if handle == PER_THREAD_STREAM {
+            self.mixed.store(true, Ordering::Relaxed);
+        } else {
+            let tag = handle.wrapping_add(1);
+            if let Err(held) =
+                self.stream
+                    .compare_exchange(0, tag, Ordering::Relaxed, Ordering::Relaxed)
+                && held != tag
+            {
+                self.mixed.store(true, Ordering::Relaxed);
+            }
+        }
+        let recorded = self.event.record(stream);
+        if recorded.is_err() {
+            self.mixed.store(true, Ordering::Relaxed);
+        }
+        recorded
+    }
+
+    /// Waits until no launch that passed this memory is in flight: for
+    /// the event when every launch since the last settle ran on one
+    /// stream, since each recorded it after itself and a stream runs in
+    /// order, and for all work on the device otherwise. The next launch
+    /// starts the account again.
+    fn settle(&mut self) -> Result<(), BackendError> {
+        if *self.mixed.get_mut() {
+            self.event.context().synchronize().map_err(|e| {
+                memory_error(
+                    "waiting for the device, which more than one stream used, before a \
+                     mapped buffer's host slice"
+                        .to_string(),
+                    e,
+                )
+            })?;
+        } else {
+            self.event.synchronize().map_err(|e| {
+                memory_error("waiting for a mapped buffer's last launch".to_string(), e)
+            })?;
+        }
+        *self.mixed.get_mut() = false;
+        *self.stream.get_mut() = 0;
+        Ok(())
+    }
+}
+
+impl DeviceArg for MappedMemory {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl std::fmt::Debug for MappedMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedMemory")
+            .field("bytes", &self.bytes)
+            .field("device", &self.event.context().ordinal())
+            .finish()
+    }
+}
+
+impl Drop for MappedMemory {
+    fn drop(&mut self) {
+        if let Err(e) = self.settle() {
+            eprintln!(
+                "[flynnel::cuda] freeing {} bytes of mapped memory after its launches \
+                 could not be waited for: {e}",
+                self.bytes
+            );
+        }
+        if let Err(e) = self.event.context().bind_to_thread() {
+            eprintln!("[flynnel::cuda] binding the context to free mapped memory: {e:?}");
+        }
+        // SAFETY: `host` came from cuMemHostAlloc and is freed only here.
+        if let Err(e) = unsafe { result::free_host(self.host.as_ptr().cast()) } {
+            eprintln!(
+                "[flynnel::cuda] the driver refused to free {} bytes of mapped memory: {e:?}",
+                self.bytes
+            );
+        }
+    }
+}
+
 /// A launch's view of one [`KernelArg::Buffer`]: the typed slice, handed
 /// to cudarc as it is, so cudarc orders the launch after the buffer's
 /// last write and its free after the launch.
@@ -168,11 +377,14 @@ enum BufferRef<'a> {
     U64(&'a CudaSlice<u64>),
     F32(&'a CudaSlice<f32>),
     F64(&'a CudaSlice<f64>),
+    /// A [`MappedBuffer`]'s memory, passed as its device address; the
+    /// launch notes itself on it once queued.
+    Mapped(&'a MappedMemory),
 }
 
 impl<'a> BufferRef<'a> {
-    /// The [`DeviceBuffer`] behind `arg`, or `None` when it is some other
-    /// backend's memory.
+    /// The [`DeviceBuffer`] or [`MappedBuffer`] behind `arg`, or `None`
+    /// when it is some other backend's memory.
     fn of(arg: &'a dyn DeviceArg) -> Option<Self> {
         let any = arg.as_any();
         macro_rules! find {
@@ -185,7 +397,7 @@ impl<'a> BufferRef<'a> {
             };
         }
         find!(u8 => U8, i32 => I32, u32 => U32, i64 => I64, u64 => U64, f32 => F32, f64 => F64);
-        None
+        any.downcast_ref::<MappedMemory>().map(BufferRef::Mapped)
     }
 
     fn context(&self) -> &Arc<CudaContext> {
@@ -197,6 +409,7 @@ impl<'a> BufferRef<'a> {
             BufferRef::U64(s) => s.context(),
             BufferRef::F32(s) => s.context(),
             BufferRef::F64(s) => s.context(),
+            BufferRef::Mapped(m) => m.event.context(),
         }
     }
 
@@ -212,6 +425,7 @@ impl<'a> BufferRef<'a> {
             BufferRef::U64(s) => builder.arg(s),
             BufferRef::F32(s) => builder.arg(s),
             BufferRef::F64(s) => builder.arg(s),
+            BufferRef::Mapped(m) => builder.arg(&m.device),
         };
     }
 }
@@ -273,6 +487,122 @@ impl std::fmt::Debug for CudaBackend {
     }
 }
 
+/// What the driver reports about one CUDA device: its name, its
+/// compute capability and size, and the limits a kernel is chosen and
+/// sized by. A later fact is a new field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeviceInfo {
+    /// The device's name.
+    pub name: String,
+    /// Compute capability, the major version times ten plus the minor:
+    /// 86 for 8.6, 120 for 12.0.
+    pub capability: u32,
+    /// Streaming multiprocessors.
+    pub multiprocessors: u32,
+    /// Peak multiprocessor clock, in kHz.
+    pub clock_khz: u32,
+    /// Single-precision over double-precision throughput: 2 where
+    /// doubles run at half the rate of singles.
+    pub fp64_ratio: u32,
+    /// Device memory, in bytes.
+    pub memory_bytes: u64,
+    /// Whether the device shares the host's memory instead of having
+    /// its own.
+    pub integrated: bool,
+    /// Whether the device can map page-locked host memory, which
+    /// [`CudaBackend::map_host`] needs.
+    pub maps_host_memory: bool,
+    /// Whether the device and the host share one virtual address space.
+    pub unified_addressing: bool,
+    /// Whether atomic operations between the device and the host are
+    /// native to the link between them.
+    pub host_native_atomics: bool,
+    /// Whether a kernel's run time is limited, as it is on a device that
+    /// drives a display under the operating system's watchdog.
+    pub watchdog: bool,
+    /// L2 cache, in bytes.
+    pub l2_cache_bytes: u32,
+    /// Peak memory clock, in kHz.
+    pub memory_clock_khz: u32,
+    /// Width of the global memory bus, in bits.
+    pub memory_bus_bits: u32,
+    /// Threads in a warp.
+    pub warp_size: u32,
+    /// Most threads one block can hold.
+    pub max_threads_per_block: u32,
+    /// Most threads resident on one multiprocessor.
+    pub max_threads_per_multiprocessor: u32,
+    /// Shared memory one block can use without opting in to more, in
+    /// bytes.
+    pub shared_memory_per_block: u32,
+    /// Asynchronous engines, each able to run a copy beside a kernel.
+    pub async_engines: u32,
+}
+
+impl DeviceInfo {
+    /// What the driver reports about device `ordinal`, read through
+    /// `cuDeviceGetAttribute`, `cuDeviceGetName` and `cuDeviceTotalMem`
+    /// without making a context, so reading it takes no device memory.
+    ///
+    /// [`BackendError::DeviceUnavailable`] when the driver is not loadable
+    /// or has no device `ordinal`, and when it refuses any one fact, which
+    /// is named on stderr beside the driver's answer rather than read as
+    /// zero.
+    pub fn of_ordinal(ordinal: u32) -> Result<Self, BackendError> {
+        use sys::CUdevice_attribute as A;
+        driver_loadable(ordinal)?;
+        let unavailable = |what: String| {
+            BackendError::DeviceUnavailable(Backend::Cuda { device_id: ordinal })
+                .map_io_context(what)
+        };
+        result::init().map_err(|e| unavailable(format!("initializing the driver: {e:?}")))?;
+        let index = i32::try_from(ordinal).map_err(|e| {
+            unavailable(format!("device {ordinal} is past the driver's range: {e}"))
+        })?;
+        let device = result::device::get(index)
+            .map_err(|e| unavailable(format!("no device {ordinal}: {e:?}")))?;
+        let fact = |attribute: A| -> Result<u32, BackendError> {
+            // SAFETY: `device` came from cuDeviceGet on the initialized
+            // driver.
+            let value = unsafe { result::device::get_attribute(device, attribute) }
+                .map_err(|e| unavailable(format!("reading {attribute:?}: {e:?}")))?;
+            u32::try_from(value)
+                .map_err(|e| unavailable(format!("{attribute:?} answered {value}: {e}")))
+        };
+        let flag = |attribute: A| fact(attribute).map(|value| value != 0);
+        let name = result::device::get_name(device)
+            .map_err(|e| unavailable(format!("reading the name: {e:?}")))?;
+        // SAFETY: as for the attributes.
+        let memory_bytes = unsafe { result::device::total_mem(device) }
+            .map_err(|e| unavailable(format!("reading the total memory: {e:?}")))?;
+        Ok(Self {
+            name,
+            capability: fact(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)? * 10
+                + fact(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?,
+            multiprocessors: fact(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+            clock_khz: fact(A::CU_DEVICE_ATTRIBUTE_CLOCK_RATE)?,
+            fp64_ratio: fact(A::CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO)?,
+            memory_bytes: memory_bytes as u64,
+            integrated: flag(A::CU_DEVICE_ATTRIBUTE_INTEGRATED)?,
+            maps_host_memory: flag(A::CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY)?,
+            unified_addressing: flag(A::CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING)?,
+            host_native_atomics: flag(A::CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED)?,
+            watchdog: flag(A::CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT)?,
+            l2_cache_bytes: fact(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?,
+            memory_clock_khz: fact(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)?,
+            memory_bus_bits: fact(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?,
+            warp_size: fact(A::CU_DEVICE_ATTRIBUTE_WARP_SIZE)?,
+            max_threads_per_block: fact(A::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?,
+            max_threads_per_multiprocessor: fact(
+                A::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+            )?,
+            shared_memory_per_block: fact(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
+            async_engines: fact(A::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT)?,
+        })
+    }
+}
+
 impl CudaBackend {
     /// The kernel registered under `handle`.
     ///
@@ -306,19 +636,7 @@ impl CudaBackend {
     /// carries no text, so the driver's own error is written to stderr
     /// beside it.
     pub fn with_device(device_id: u32) -> Result<Self, BackendError> {
-        // Two gates before the first driver call. cudarc resolves its
-        // symbols lazily and panics when it cannot load libcuda, so the
-        // driver must be known loadable first: `cuda_available` is the
-        // cached probe, and `is_culib_present` answers against cudarc's
-        // own library-name candidates.
-        if !crate::backend::detect::cuda_available() {
-            return Err(BackendError::DeviceUnavailable(Backend::Cuda { device_id }));
-        }
-        // SAFETY: the call only attempts a `libloading::Library::new` on
-        // each candidate name and reports whether one resolved.
-        if !unsafe { cudarc::driver::sys::is_culib_present() } {
-            return Err(BackendError::DeviceUnavailable(Backend::Cuda { device_id }));
-        }
+        driver_loadable(device_id)?;
         let context =
             CudaContext::new(device_id as usize).map_err(|e| map_driver_error(device_id, e))?;
         let stream = context.default_stream();
@@ -413,6 +731,95 @@ impl CudaBackend {
         self.context
             .mem_get_info()
             .map_err(|e| memory_error(format!("reading device {}'s memory", self.device_id), e))
+    }
+
+    /// The CUDA devices the driver enumerates, counted without making a
+    /// context. [`BackendError::DeviceUnavailable`] when the driver is not
+    /// loadable, so a host without one reads differently from a driver
+    /// that enumerates no device.
+    pub fn device_count() -> Result<u32, BackendError> {
+        driver_loadable(0)?;
+        result::init().map_err(|e| map_driver_error(0, e))?;
+        let count = result::device::get_count().map_err(|e| map_driver_error(0, e))?;
+        u32::try_from(count).map_err(|e| {
+            BackendError::DeviceUnavailable(Backend::Cuda { device_id: 0 })
+                .map_io_context(format!("the driver counted {count} devices: {e}"))
+        })
+    }
+
+    /// What the driver reports about this backend's device; see
+    /// [`DeviceInfo::of_ordinal`], which this reads through.
+    pub fn device_info(&self) -> Result<DeviceInfo, BackendError> {
+        DeviceInfo::of_ordinal(self.device_id)
+    }
+
+    /// Page-locked host memory for `len` elements of `T` that this device
+    /// reads and writes directly, set to zero. Refused for zero elements,
+    /// and by a device that cannot map host memory, which
+    /// [`DeviceInfo::maps_host_memory`] reports.
+    pub fn map_host<T: DeviceElement>(&self, len: usize) -> Result<MappedBuffer<T>, BackendError> {
+        if len == 0 {
+            return Err(BackendError::Memory(
+                "mapped memory needs at least one element".to_string(),
+            ));
+        }
+        let what = || {
+            format!(
+                "mapping {len} {} for device {}",
+                std::any::type_name::<T>(),
+                self.device_id
+            )
+        };
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| BackendError::Memory(format!("{}: past the address space", what())))?;
+        let event = self
+            .context
+            .new_event(None)
+            .map_err(|e| memory_error(what(), e))?;
+        self.context
+            .bind_to_thread()
+            .map_err(|e| memory_error(what(), e))?;
+        // SAFETY: this device's context is current on this thread, and the
+        // driver writes the address of what it allocates.
+        let raw = unsafe { result::malloc_host(bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP) }
+            .map_err(|e| memory_error(what(), e))?;
+        let Some(host) = NonNull::new(raw.cast::<u8>()) else {
+            return Err(BackendError::Memory(format!(
+                "{}: the driver answered a null address",
+                what()
+            )));
+        };
+        let mut device: sys::CUdeviceptr = 0;
+        // SAFETY: `host` starts an allocation cuMemHostAlloc just made with
+        // DEVICEMAP in the current context, and the flags must be zero.
+        let mapped =
+            unsafe { sys::cuMemHostGetDevicePointer_v2(&mut device, host.as_ptr().cast(), 0) }
+                .result();
+        if let Err(e) = mapped {
+            // SAFETY: the allocation above, which nothing else holds.
+            if let Err(freed) = unsafe { result::free_host(host.as_ptr().cast()) } {
+                eprintln!(
+                    "[flynnel::cuda] freeing {bytes} bytes the device could not map: {freed:?}"
+                );
+            }
+            return Err(memory_error(format!("{}: no device address", what()), e));
+        }
+        // SAFETY: the allocation is `bytes` long and writable, and no launch
+        // can reach it before this returns.
+        unsafe { host.as_ptr().write_bytes(0, bytes) };
+        Ok(MappedBuffer {
+            memory: MappedMemory {
+                host,
+                device,
+                bytes,
+                event,
+                stream: AtomicU64::new(0),
+                mixed: AtomicBool::new(false),
+            },
+            len,
+            element: PhantomData,
+        })
     }
 
     /// Device memory for `len` elements of `T`, set to zero. Refused for
@@ -694,7 +1101,7 @@ impl CudaBackend {
         // type correctness is a contract with the kernel's author, the
         // safety hole cudarc documents on launch().
         unsafe { builder.launch(cfg) }.map_err(|e| BackendError::Launch(format!("{e:?}")))?;
-        Ok(())
+        note_mapped(stream, &buffers)
     }
 
     /// A host slice's bytes in device memory of their own for one launch
@@ -846,6 +1253,47 @@ fn probe_capabilities() -> BackendCapabilities {
     }
 }
 
+/// Notes a queued launch on `stream` on each [`MappedBuffer`] it passed.
+/// A record the driver refuses is reported with the kernel already
+/// queued, and that buffer's next host slice waits for the whole device.
+fn note_mapped(stream: &CudaStream, buffers: &[BufferRef<'_>]) -> Result<(), BackendError> {
+    let mut refused = Vec::new();
+    for buffer in buffers {
+        if let BufferRef::Mapped(memory) = buffer
+            && let Err(e) = memory.note_launch(stream)
+        {
+            refused.push(format!("{e:?}"));
+        }
+    }
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(BackendError::Launch(format!(
+        "the kernel was queued, and recording its launch on {} mapped buffer(s) failed: {}; \
+         each one's next host slice waits for the whole device",
+        refused.len(),
+        refused.join("; ")
+    )))
+}
+
+/// The driver loadable, or [`BackendError::DeviceUnavailable`] for
+/// `device_id`. Two gates before the first driver call: cudarc resolves
+/// its symbols lazily and panics when it cannot load libcuda, so the
+/// driver must be known loadable first. `cuda_available` is the cached
+/// probe, and `is_culib_present` answers against cudarc's own
+/// library-name candidates.
+fn driver_loadable(device_id: u32) -> Result<(), BackendError> {
+    if !crate::backend::detect::cuda_available() {
+        return Err(BackendError::DeviceUnavailable(Backend::Cuda { device_id }));
+    }
+    // SAFETY: the call only attempts a `libloading::Library::new` on
+    // each candidate name and reports whether one resolved.
+    if !unsafe { sys::is_culib_present() } {
+        return Err(BackendError::DeviceUnavailable(Backend::Cuda { device_id }));
+    }
+    Ok(())
+}
+
 /// `DeviceUnavailable` for a driver refusal. The variant carries no text,
 /// so the driver's own error is written to stderr beside it rather than
 /// dropped.
@@ -863,7 +1311,6 @@ fn memory_error(what: String, e: DriverError) -> BackendError {
 /// information log buffers, and the logs are what that answers; a second
 /// attempt that loads is unloaded at once and says so.
 fn jit_logs(context: &CudaContext, ptx: &str) -> String {
-    use cudarc::driver::sys;
     let source = match std::ffi::CString::new(ptx) {
         Ok(source) => source,
         Err(nul) => return format!("the PTX holds a NUL byte at {}", nul.nul_position()),
@@ -1223,6 +1670,207 @@ mod tests {
             one.copy_out(&theirs, &mut out),
             Err(BackendError::Memory(_))
         ));
+    }
+
+    #[test]
+    fn a_kernel_reads_and_writes_mapped_memory_with_no_copy() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let handle = backend
+            .register_ptx("add_one", ADD_ONE_PTX)
+            .expect("add_one loads");
+        let mut mapped = backend.map_host::<u32>(1000).expect("map");
+        for (i, v) in mapped
+            .as_mut_slice()
+            .expect("host slice")
+            .iter_mut()
+            .enumerate()
+        {
+            *v = i as u32 * 3;
+        }
+        let n = mapped.len() as u32;
+        backend
+            .dispatch_kernel(handle, n, &[mapped.arg(), KernelArg::U32(n)])
+            .expect("launch");
+        let want: Vec<u32> = (0..n).map(|i| i * 3 + 1).collect();
+        assert_eq!(mapped.as_slice().expect("host slice"), &want[..]);
+    }
+
+    #[test]
+    fn mapped_memory_starts_zeroed_and_refuses_zero_elements() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let mut mapped = backend.map_host::<u64>(17).expect("map");
+        assert!(
+            mapped
+                .as_slice()
+                .expect("host slice")
+                .iter()
+                .all(|&v| v == 0)
+        );
+        assert!(matches!(
+            backend.map_host::<u8>(0),
+            Err(BackendError::Memory(_))
+        ));
+    }
+
+    #[test]
+    fn a_host_slice_waits_for_the_last_launch_on_one_stream() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let handle = backend
+            .register_ptx("add_one", ADD_ONE_PTX)
+            .expect("add_one loads");
+        let mut mapped = backend.map_host::<u32>(4096).expect("map");
+        let n = mapped.len() as u32;
+        for _ in 0..3 {
+            backend
+                .dispatch_kernel(handle, n, &[mapped.arg(), KernelArg::U32(n)])
+                .expect("launch");
+        }
+        assert!(
+            !*mapped.memory.mixed.get_mut(),
+            "three launches on one stream wait on the event"
+        );
+        assert!(
+            mapped
+                .as_slice()
+                .expect("host slice")
+                .iter()
+                .all(|&v| v == 3)
+        );
+        assert_eq!(
+            *mapped.memory.stream.get_mut(),
+            0,
+            "a settle starts the account again"
+        );
+    }
+
+    #[test]
+    fn a_host_slice_waits_for_the_device_once_two_streams_used_the_buffer() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let handle = backend
+            .register_ptx("add_one", ADD_ONE_PTX)
+            .expect("add_one loads");
+        let mut mapped = backend.map_host::<u32>(4096).expect("map");
+        let n = mapped.len() as u32;
+        backend
+            .dispatch_kernel_on_stream(
+                backend.stream(),
+                handle,
+                n,
+                &[mapped.arg(), KernelArg::U32(n)],
+            )
+            .expect("first launch");
+        backend.stream().synchronize().expect("first launch done");
+        backend
+            .dispatch_kernel_on_stream(
+                backend.secondary_stream(),
+                handle,
+                n,
+                &[mapped.arg(), KernelArg::U32(n)],
+            )
+            .expect("second launch");
+        assert!(
+            *mapped.memory.mixed.get_mut(),
+            "a second stream marks the buffer mixed"
+        );
+        assert!(
+            mapped
+                .as_slice()
+                .expect("host slice")
+                .iter()
+                .all(|&v| v == 2)
+        );
+        assert!(!*mapped.memory.mixed.get_mut(), "a settle clears the mark");
+    }
+
+    #[test]
+    fn a_launch_on_the_per_thread_stream_counts_as_mixed() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let handle = backend
+            .register_ptx("add_one", ADD_ONE_PTX)
+            .expect("add_one loads");
+        let mut mapped = backend.map_host::<u32>(64).expect("map");
+        let per_thread = backend.context().per_thread_stream();
+        backend
+            .dispatch_kernel_on_stream(&per_thread, handle, 64, &[mapped.arg(), KernelArg::U32(64)])
+            .expect("launch");
+        assert!(
+            *mapped.memory.mixed.get_mut(),
+            "one handle names a stream per thread"
+        );
+        assert!(
+            mapped
+                .as_slice()
+                .expect("host slice")
+                .iter()
+                .all(|&v| v == 1)
+        );
+    }
+
+    #[test]
+    fn another_backends_mapped_buffer_is_refused() {
+        let (Some(one), Some(two)) = (backend(), backend()) else {
+            return;
+        };
+        let handle = one
+            .register_ptx("add_one", ADD_ONE_PTX)
+            .expect("add_one loads");
+        let theirs = two.map_host::<u32>(3).expect("map");
+        assert!(matches!(
+            one.dispatch_kernel(handle, 3, &[theirs.arg(), KernelArg::U32(3)]),
+            Err(BackendError::Memory(_))
+        ));
+    }
+
+    #[test]
+    fn the_device_answers_every_fact_and_agrees_with_the_context() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let info = backend.device_info().expect("device info");
+        eprintln!("device 0: {info:?}");
+        assert_eq!(info.name, backend.device_name().expect("name"));
+        let (major, minor) = backend.context().compute_capability().expect("capability");
+        assert_eq!(
+            i64::from(info.capability),
+            i64::from(major) * 10 + i64::from(minor)
+        );
+        assert_eq!(
+            Some(info.multiprocessors),
+            crate::backend::detect::cuda_sm_count(0)
+        );
+        assert_eq!(
+            info.memory_bytes,
+            backend.mem_info().expect("mem_info").1 as u64
+        );
+        assert_eq!(info.warp_size, backend.capabilities().simt_width);
+        assert!(info.maps_host_memory, "map_host's tests ran on this device");
+        assert!(info.max_threads_per_block <= info.max_threads_per_multiprocessor);
+        assert!(info.clock_khz > 0 && info.memory_clock_khz > 0);
+        assert!(info.memory_bus_bits > 0 && info.l2_cache_bytes > 0);
+        assert!(info.fp64_ratio >= 1 && info.shared_memory_per_block > 0);
+        assert_eq!(
+            DeviceInfo::of_ordinal(0).expect("device 0 by ordinal"),
+            info
+        );
+        let count = CudaBackend::device_count().expect("count");
+        assert!(count >= 1);
+        assert!(
+            matches!(
+                DeviceInfo::of_ordinal(count),
+                Err(BackendError::DeviceUnavailable(_))
+            ),
+            "no device past the count"
+        );
     }
 
     #[test]

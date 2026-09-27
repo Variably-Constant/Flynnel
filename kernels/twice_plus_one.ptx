@@ -1,0 +1,45 @@
+//
+// Bench PTX for the CUDA backend's memory paths: one light body over f64
+// elements, one thread an element, each thread past `n` doing nothing.
+//
+//   twice_plus_one(src, dst, n)   dst[i] = 2 * src[i] + 1
+//
+// Written for sm_70 so the driver's JIT builds it for any later device.
+//
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry twice_plus_one(
+    .param .u64 src,
+    .param .u64 dst,
+    .param .u32 n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<8>;
+    .reg .f64 %fd<5>;
+
+    ld.param.u64 %rd1, [src];
+    ld.param.u64 %rd2, [dst];
+    ld.param.u32 %r1, [n];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra TWICE_PLUS_ONE_DONE;
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+    mul.wide.u32 %rd5, %r5, 8;
+    add.s64 %rd6, %rd3, %rd5;
+    add.s64 %rd7, %rd4, %rd5;
+    ld.global.f64 %fd1, [%rd6];
+    mov.f64 %fd2, 0d4000000000000000;
+    mov.f64 %fd3, 0d3FF0000000000000;
+    fma.rn.f64 %fd4, %fd1, %fd2, %fd3;
+    st.global.f64 [%rd7], %fd4;
+TWICE_PLUS_ONE_DONE:
+    ret;
+}

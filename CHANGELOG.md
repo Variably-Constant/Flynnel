@@ -367,6 +367,55 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- **Mapped host memory and the device's facts on the CUDA backend.**
+  `CudaBackend::map_host::<T>(len)` answers a `MappedBuffer<T>`:
+  page-locked host memory the device reads and writes directly, set to
+  zero, over the element types `DeviceBuffer` takes. `MappedBuffer::arg`
+  passes its device address to a kernel, `as_mut_slice` and `as_slice`
+  write and read it on the host with no copy, and it is freed when
+  dropped. A host slice, and the free, first wait for every launch that
+  passed the buffer: for the last of them when every launch since the
+  previous host slice ran on one stream, and for all work on the device
+  once a second stream, or the per-thread stream, used it. Launches on
+  two streams are not ordered against each other, as with
+  `DeviceBuffer`. A device that cannot map host memory refuses
+  `map_host`.
+
+  `CudaBackend::device_info` and `DeviceInfo::of_ordinal` answer a
+  `DeviceInfo`: the device's name, compute capability, multiprocessors,
+  peak clocks, single-to-double throughput ratio, memory, L2 cache,
+  memory bus width, warp and block limits, shared memory per block and
+  asynchronous engines, and whether it is integrated, maps host memory,
+  shares one address space with the host, has native host atomics and
+  runs kernels under a watchdog. It reads through the driver's
+  attribute, name and memory queries with no context made, and a fact
+  the driver refuses fails the read, with the fact named on stderr,
+  rather than reading as zero. `CudaBackend::device_count` counts the
+  devices the same way. Get-FlynnelCudaDevice writes one
+  Flynnel.CudaDevice row per device, or the one `-DeviceId` names.
+
+  `benches/cuda_mapped_memory.rs` times a light kernel over f64 elements
+  fed and read through device memory and copies against the same kernel
+  over mapped memory, at 1,000, 100,000 and 1,000,000 elements, quiet
+  and beside threads spinning on half and on all logical processors.
+  Its medians, mapped against copies, on the 7900X's RTX 5070: 11.33
+  against 44.86 us at 1,000 elements, 127.68 against 288.85 us at
+  100,000 and 1.029 against 1.501 ms at 1,000,000, quiet, and mapped is
+  faster by 1.46 to 3.96 times across all nine cells. On the 2700's RTX
+  3070: 37.50 against 59.78 us, 326.83 against 769.78 us and 2.955
+  against 4.815 ms, quiet, and 1.17 to 2.37 times across all nine.
+
+  A launch now looks through its arguments for mapped buffers. The
+  launch path, measured against the build before it as the device
+  memory entry below describes, once with a scalar argument and once
+  with a device buffer: in 60 cells no interval lies below its copy's.
+  The medians run 0.845 to 1.143 on the 7900X (copies 0.880 to 1.273)
+  and 0.880 to 1.435 on the 2700 (copies 0.835 to 1.252); three sit
+  under their copy's interval, 0.981 at 512 work-items quiet and 0.845
+  at 512 beside all 24 threads on the 7900X with a device buffer, and
+  0.976 at 16 beside all 16 threads on the 2700 with a scalar, and one
+  over.
+
 - **Device memory on the CUDA backend, and PTX through the driver
   alone.** `CudaBackend::alloc_zeroed` and `upload` make a
   `DeviceBuffer<T>` of `u8`, `i32`, `u32`, `i64`, `u64`, `f32` or

@@ -36,6 +36,7 @@
 
 use pwrs::prelude::*;
 
+use flynnel::backend::cuda::{CudaBackend, DeviceInfo};
 use flynnel::backend::detect;
 use flynnel::backend::registry::{
     backend_by_id, backends as registered_backends, ensure_default_registered,
@@ -431,6 +432,167 @@ impl Cmdlet for TestFlynnelBackend {
                 Ok(())
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// CUDA devices
+// ---------------------------------------------------------------------
+
+/// What the driver reports about one CUDA device: its name, compute
+/// capability and size, and the limits a kernel is chosen and sized by.
+#[psclass(name = "Flynnel.CudaDevice")]
+#[derive(Clone, Default)]
+pub struct CudaDevice {
+    /// The ordinal the driver enumerates the device at, which is the
+    /// device id the Cuda backend takes.
+    pub device_id: u32,
+    /// The device's name.
+    pub name: String,
+    /// Compute capability, the major version times ten plus the minor:
+    /// 86 for 8.6, 120 for 12.0.
+    pub capability: u32,
+    /// Streaming multiprocessors.
+    pub multiprocessors: u32,
+    /// Peak multiprocessor clock, in kHz.
+    pub clock_khz: u32,
+    /// Single-precision over double-precision throughput: 2 where
+    /// doubles run at half the rate of singles.
+    pub fp64_ratio: u32,
+    /// Device memory, in bytes.
+    pub memory_bytes: u64,
+    /// Whether the device shares the host's memory instead of having
+    /// its own.
+    pub integrated: bool,
+    /// Whether the device can map page-locked host memory.
+    pub maps_host_memory: bool,
+    /// Whether the device and the host share one virtual address space.
+    pub unified_addressing: bool,
+    /// Whether atomic operations between the device and the host are
+    /// native to the link between them.
+    pub host_native_atomics: bool,
+    /// Whether a kernel's run time is limited, as it is on a device that
+    /// drives a display under the operating system's watchdog.
+    pub watchdog: bool,
+    /// L2 cache, in bytes.
+    pub l2_cache_bytes: u32,
+    /// Peak memory clock, in kHz.
+    pub memory_clock_khz: u32,
+    /// Width of the global memory bus, in bits.
+    pub memory_bus_bits: u32,
+    /// Threads in a warp.
+    pub warp_size: u32,
+    /// Most threads one block can hold.
+    pub max_threads_per_block: u32,
+    /// Most threads resident on one multiprocessor.
+    pub max_threads_per_multiprocessor: u32,
+    /// Shared memory one block can use without opting in to more, in
+    /// bytes.
+    pub shared_memory_per_block: u32,
+    /// Asynchronous engines, each able to run a copy beside a kernel.
+    pub async_engines: u32,
+}
+
+impl CudaDevice {
+    fn new(device_id: u32, info: DeviceInfo) -> Self {
+        Self {
+            device_id,
+            name: info.name,
+            capability: info.capability,
+            multiprocessors: info.multiprocessors,
+            clock_khz: info.clock_khz,
+            fp64_ratio: info.fp64_ratio,
+            memory_bytes: info.memory_bytes,
+            integrated: info.integrated,
+            maps_host_memory: info.maps_host_memory,
+            unified_addressing: info.unified_addressing,
+            host_native_atomics: info.host_native_atomics,
+            watchdog: info.watchdog,
+            l2_cache_bytes: info.l2_cache_bytes,
+            memory_clock_khz: info.memory_clock_khz,
+            memory_bus_bits: info.memory_bus_bits,
+            warp_size: info.warp_size,
+            max_threads_per_block: info.max_threads_per_block,
+            max_threads_per_multiprocessor: info.max_threads_per_multiprocessor,
+            shared_memory_per_block: info.shared_memory_per_block,
+            async_engines: info.async_engines,
+        }
+    }
+}
+
+/// Reads what the CUDA driver reports about each device it enumerates,
+/// or about one.
+///
+/// The facts come from the driver's attribute, name and memory queries
+/// and no CUDA context is made, so reading them allocates nothing on the
+/// device and starts nothing. Capability, the multiprocessor count and
+/// the double-precision ratio are what a kernel is chosen by;
+/// MapsHostMemory, Integrated and HostNativeAtomics say whether mapped
+/// host memory suits a job; Watchdog says whether a long kernel will be
+/// stopped by the operating system.
+///
+/// A host whose CUDA driver does not load writes no rows and warns that
+/// the driver is not there, which is a different answer from a driver
+/// that enumerates no device. A fact the driver refuses is an error for
+/// that device alone; the driver's own answer is written to the
+/// process's standard error beside it.
+///
+/// # Examples
+///
+/// `Get-FlynnelCudaDevice`
+///
+/// `Get-FlynnelCudaDevice -DeviceId 0 | Format-List Name, Capability, Fp64Ratio`
+#[cmdlet(
+    verb = "Get",
+    noun = "FlynnelCudaDevice",
+    alias = "Get-FlyCudaDevice",
+    output = ["Flynnel.CudaDevice"]
+)]
+#[derive(Default)]
+pub struct GetFlynnelCudaDevice {
+    /// Only this device. Every device the driver enumerates when unset.
+    #[param(position = 0)]
+    pub device_id: Option<u32>,
+}
+
+impl Cmdlet for GetFlynnelCudaDevice {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let count = match CudaBackend::device_count() {
+            Ok(count) => count,
+            Err(e) => {
+                return pwrs::warning!(
+                    ps,
+                    "no CUDA device can be read: the driver did not load or would not count \
+                     its devices ({e})"
+                );
+            }
+        };
+        let ordinals = match self.device_id {
+            Some(id) if id >= count => {
+                return Err(PsError::new(
+                    ErrorCategory::ObjectNotFound,
+                    "FlynnelNoCudaDevice",
+                    format!("there is no CUDA device {id}; the driver enumerates {count}"),
+                )
+                .terminating());
+            }
+            Some(id) => id..id + 1,
+            None => 0..count,
+        };
+        for ordinal in ordinals {
+            match DeviceInfo::of_ordinal(ordinal) {
+                Ok(info) => ps.write(CudaDevice::new(ordinal, info))?,
+                Err(e) => ps.write_error(&PsError::new(
+                    ErrorCategory::ReadError,
+                    "FlynnelCudaDeviceUnread",
+                    format!(
+                        "CUDA device {ordinal} could not be read ({e}); the fact the driver \
+                         refused is on the process's standard error"
+                    ),
+                ))?,
+            }
+        }
+        Ok(())
     }
 }
 

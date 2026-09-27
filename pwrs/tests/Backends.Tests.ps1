@@ -33,7 +33,7 @@ BeforeAll {
 
 Describe 'the types and enums this family exports' {
     It 'shapes each type the way its cmdlet documents' {
-        foreach ($type in 'Flynnel.Backend', 'Flynnel.BackendProbe',
+        foreach ($type in 'Flynnel.Backend', 'Flynnel.BackendProbe', 'Flynnel.CudaDevice',
                           'Flynnel.AccelOp', 'Flynnel.AccelTarget') {
             @(Get-FlynnelTypeProperty -TypeName $type).Count |
                 Should -BeGreaterThan 0 -Because "$type must carry something"
@@ -168,6 +168,66 @@ Describe 'Test-FlynnelBackend' {
 
     It 'throws on nothing' {
         { Test-FlynnelBackend } | Should -Not -Throw
+    }
+}
+
+Describe 'Get-FlynnelCudaDevice' {
+    BeforeAll {
+        $script:Devices = @(Get-FlynnelCudaDevice -WarningVariable devicesWarned -WarningAction SilentlyContinue)
+        $script:DevicesWarned = @($devicesWarned)
+        Write-Host ("BACKEND_SUITE cuda_devices={0}" -f $script:Devices.Count)
+    }
+
+    It 'writes a row for each device, or warns that no driver loaded' {
+        if ($script:Devices.Count -eq 0) {
+            $script:DevicesWarned.Count | Should -BeGreaterThan 0 -Because 'no rows must say why'
+            Set-ItResult -Skipped -Because "no CUDA device on this host: $($script:DevicesWarned -join ' ')"
+            return
+        }
+        $script:DevicesWarned.Count | Should -Be 0
+        for ($i = 0; $i -lt $script:Devices.Count; $i++) {
+            $script:Devices[$i].DeviceId | Should -Be $i -Because 'rows come in the driver''s order'
+        }
+    }
+
+    It 'agrees with the Cuda backend row about the multiprocessors' {
+        $cuda = $script:Rows | Where-Object Kind -eq 'Cuda' | Select-Object -First 1
+        if ($script:Devices.Count -eq 0 -or -not $cuda.SmCountKnown) {
+            Set-ItResult -Skipped -Because 'no CUDA device answered a multiprocessor count here'
+            return
+        }
+        $script:Devices[0].Multiprocessors | Should -Be $cuda.SmCount
+    }
+
+    It 'answers facts that agree with each other' {
+        if ($script:Devices.Count -eq 0) {
+            Set-ItResult -Skipped -Because 'no CUDA device on this host'
+            return
+        }
+        foreach ($d in $script:Devices) {
+            $d.Name | Should -Not -BeNullOrEmpty
+            $d.Capability | Should -BeGreaterThan 0
+            $d.MemoryBytes | Should -BeGreaterThan 0
+            $d.MaxThreadsPerBlock | Should -BeLessOrEqual $d.MaxThreadsPerMultiprocessor
+            $d.Fp64Ratio | Should -BeGreaterOrEqual 1
+            $d.MapsHostMemory | Should -BeOfType [bool]
+            $d.Watchdog | Should -BeOfType [bool]
+        }
+    }
+
+    It 'answers for one device, and refuses one past the count' {
+        if ($script:Devices.Count -eq 0) {
+            Set-ItResult -Skipped -Because 'no CUDA device on this host'
+            return
+        }
+        $one = Get-FlynnelCudaDevice -DeviceId 0
+        @($one).Count | Should -Be 1
+        $one.Name | Should -Be $script:Devices[0].Name
+        { Get-FlynnelCudaDevice -DeviceId 9999 } | Should -Throw -ExpectedMessage '*no CUDA device 9999*'
+    }
+
+    It 'answers to its Fly alias' {
+        @(Get-FlyCudaDevice -WarningAction SilentlyContinue).Count | Should -Be $script:Devices.Count
     }
 }
 

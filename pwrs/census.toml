@@ -725,6 +725,16 @@ reason = "unsafe-or-structural"
 note = "device memory one CudaBackend allocated, valid only on that backend's context and freed when dropped. A script cannot hold the backend that makes one, so it has no allocator to get one from"
 
 [[entry]]
+item = "crate::backend::cuda::MappedBuffer"
+reason = "unsafe-or-structural"
+note = "page-locked host memory one CudaBackend mapped for its device, valid only for that backend's launches and freed when dropped. A script cannot hold the backend that makes one, so it has no allocator to get one from"
+
+[[entry]]
+item = "crate::backend::cuda::DeviceInfo"
+reason = "internal-to-another-surface"
+note = "bound field for field as Flynnel.CudaDevice, with the ordinal beside it as DeviceId; Get-FlynnelCudaDevice reads it through DeviceInfo::of_ordinal for each device CudaBackend::device_count enumerates, without making a context"
+
+[[entry]]
 item = "crate::backend::cuda::DeviceElement"
 reason = "generic-over-caller-type"
 note = "a sealed trait naming the element types a DeviceBuffer holds; it bounds the Rust caller's choice of T and has no value of its own"

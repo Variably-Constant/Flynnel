@@ -270,7 +270,9 @@ with `Where-Object Role -eq Producer` rather than by counting.
 **Backends.** What devices this host has and what each can do.
 `Get-FlynnelBackend` writes a row for every backend the build carries,
 on every host. `Test-FlynnelBackend` runs the host's probe again.
-`Get-FlynnelAccelOp` lists the accelerator operations registered in
+`Get-FlynnelCudaDevice` reads what the CUDA driver reports about each
+device, its compute capability, size and limits, without making a CUDA
+context. `Get-FlynnelAccelOp` lists the accelerator operations registered in
 the process and `Get-FlynnelAccelTarget` says where one would run
 under a plan, without running it.
 
