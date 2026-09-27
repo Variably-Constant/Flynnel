@@ -1433,7 +1433,7 @@ note = "the same wrapper around the per-thief mailbox deque. Same reasoning"
 [[entry]]
 item = "crate::backend::shared_mem::dispatch_calibration"
 reason = "internal-to-another-surface"
-note = "measures each variant's per-call cost on this host and pins the cells where a measurement disagrees with the fixed rule. Get-FlynnelCrossProcessRoute reports which of the two decided a routing, through FromExplicitCell and HeuristicVariant; running the calibration needs a peer draining the other end, which is the unbuilt half of this family"
+note = "measures each variant's per-call cost on this host, each on temporary files with drain threads of its own in this process, and pins the cells where a measurement disagrees with the fixed rule. calibrate_cell is Measure-FlynnelCrossProcessRouting, over a routing table made for the call so nothing is pinned, and it reaches measure_variant_ns_per_call; calibrate_routing_table is calibrate_cell over three fixed shapes, and estimate_calibration_budget is a time estimate for that sweep. Get-FlynnelCrossProcessRoute reports which of rule and cell decided a routing, through FromExplicitCell and HeuristicVariant"
 
 [[entry]]
 item = "crate::backend::shared_mem::pass_registry"

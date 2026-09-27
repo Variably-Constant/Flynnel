@@ -12,19 +12,22 @@
 //!
 //! # What is bound here so far
 //!
-//! The routing question and the registry reading, both of which answer
-//! without a peer process existing. Which of the four deque variants a
-//! dispatch of a given shape would use is decided from the shape and
-//! the host, and a script sizing a cross-process dispatch wants it
-//! before it starts one. How many passes this process has registered,
-//! and whether a named one is among them, is a reading of this
-//! process.
+//! The routing question, the registry reading and the routing
+//! measurement, none of which needs a peer process. Which of the four
+//! deque variants a dispatch of a given shape would use is decided from
+//! the shape and the host, and a script sizing a cross-process dispatch
+//! wants it before it starts one. What each variant costs for that
+//! shape is measured the way the crate's calibration measures it, on
+//! temporary files with drain threads of its own in this process. How
+//! many passes this process has registered, and whether a named one is
+//! among them, is a reading of this process.
 //!
-//! Submitting work to a peer, and the calibration that re-measures the
-//! routing table, wait on a second process and land in later slices.
+//! Submitting work to a peer waits on a second process and lands in a
+//! later slice.
 
 use pwrs::prelude::*;
 
+use flynnel::backend::shared_mem::dispatch_calibration::calibrate_cell;
 use flynnel::backend::shared_mem::pass_registry;
 use flynnel::backend::shared_mem::variant_dispatch::{
     DequeVariant as CrateVariant, DispatcherRoutingTable, WorkloadShape,
@@ -256,6 +259,145 @@ impl Cmdlet for GetFlynnelCrossProcessRoute {
             expected_burst_size: shape.expected_burst_size,
             explicit_cells: table.cells().len() as u32,
         })
+    }
+}
+
+/// What one cross-process dispatch of a shape cost over one deque
+/// variant on this host.
+#[psclass(name = "Flynnel.CrossProcessMeasurement")]
+#[derive(Clone, Default)]
+pub struct CrossProcessMeasurement {
+    /// Which variant.
+    pub variant: DequeVariantKind,
+    /// Its label.
+    pub label: String,
+    /// The time over every dispatch timed, divided by their number, in
+    /// nanoseconds. Null when the variant cannot carry the shape's
+    /// inline arguments or its backend could not be built here, which is
+    /// a different answer from a cost.
+    pub ns_per_call: Option<f64>,
+    /// Whether this variant measured cheapest of those that measured.
+    pub fastest: bool,
+    /// The variant Get-FlynnelCrossProcessRoute's table picks for this
+    /// shape, so a script can see whether the measurement agrees with
+    /// the rule.
+    pub routed_variant: DequeVariantKind,
+    /// Rounds timed after the warm-up.
+    pub iterations: u32,
+    /// Drain threads the shape declared.
+    pub n_drain_threads: u32,
+    /// Inline argument bytes the shape declared.
+    pub args_inline_bytes: u32,
+    /// Dispatches in each timed round.
+    pub expected_burst_size: u32,
+}
+
+/// Measures what a cross-process dispatch of one shape costs over each
+/// deque variant on this host, beside the variant the routing table
+/// picks for it.
+///
+/// Each variant runs the way the crate's calibration runs it: its
+/// backend on temporary mapped files with drain threads of its own in
+/// this process, a warm-up, then Iterations rounds of ExpectedBurstSize
+/// dispatches each, waiting on the last of every round. URD drains with
+/// NDrainThreads threads and the others with one. NsPerCall is the time
+/// over every dispatch timed, divided by their number, and the files are
+/// removed after.
+///
+/// Nothing is pinned. The routing table the calibration writes its
+/// winner into is made for this call and dropped, so
+/// Get-FlynnelCrossProcessRoute answers afterward as it did before.
+///
+/// A variant whose inline slot is narrower than ArgsInlineBytes cannot
+/// carry the shape, and its NsPerCall is null rather than a cost.
+///
+/// This is timing on this machine, one measurement per variant a call,
+/// and a figure taken on a loaded host is that host's figure.
+///
+/// # Examples
+///
+/// `Measure-FlynnelCrossProcessRouting -ArgsInlineBytes 8`
+///
+/// `Measure-FlynnelCrossProcessRouting -ArgsInlineBytes 8 -ExpectedBurstSize 64 -Iterations 256`
+#[cmdlet(
+    verb = "Measure",
+    noun = "FlynnelCrossProcessRouting",
+    alias = "Measure-FlyCrossProcessRouting",
+    output = ["Flynnel.CrossProcessMeasurement"]
+)]
+#[derive(Default)]
+pub struct MeasureFlynnelCrossProcessRouting {
+    /// Argument bytes each item carries inline.
+    #[param(mandatory, position = 0)]
+    pub args_inline_bytes: u32,
+    /// Drain threads the shape declares. One when unset.
+    #[param(position = 1)]
+    pub n_drain_threads: Option<u32>,
+    /// Dispatches in each timed round, of which the last is waited on.
+    /// One when unset, which is request and reply.
+    #[param(position = 2)]
+    pub expected_burst_size: Option<u32>,
+    /// Rounds timed after the warm-up. 1024 when unset, which is what
+    /// the crate's calibration takes.
+    #[param]
+    pub iterations: Option<u32>,
+    /// The base-2 logarithm of the cores cooperating as one logical
+    /// vector. Part of a shape's identity for an explicitly pinned
+    /// cell, and not read by the heuristic.
+    #[param]
+    pub k_unified: Option<u32>,
+    /// The hardware-class tier the dispatch targets, where zero is
+    /// scalar or SMT-shared cores and higher values are further-away
+    /// coherence tiers.
+    #[param]
+    pub k_hardware_class: Option<u32>,
+}
+
+impl Cmdlet for MeasureFlynnelCrossProcessRouting {
+    fn process(&mut self, ps: &Pipeline<'_>) -> PsResult<()> {
+        let args_inline_bytes = shape_byte("ArgsInlineBytes", self.args_inline_bytes)?;
+        let k_unified = shape_byte("KUnified", self.k_unified.unwrap_or(0))?;
+        let k_hardware_class = shape_byte("KHardwareClass", self.k_hardware_class.unwrap_or(0))?;
+        let iterations = self.iterations.unwrap_or(1024);
+        if iterations == 0 {
+            return Err(
+                arg_err("Iterations must be at least one; zero rounds time nothing").terminating(),
+            );
+        }
+        let shape = WorkloadShape {
+            n_drain_threads: self.n_drain_threads.unwrap_or(1),
+            args_inline_bytes,
+            expected_burst_size: self.expected_burst_size.unwrap_or(1),
+            k_unified,
+            k_hardware_class,
+        };
+        let routed = DispatcherRoutingTable::default_heuristic().pick(&shape);
+        let mut scratch = DispatcherRoutingTable::default_heuristic();
+        let cell = calibrate_cell(
+            &mut scratch,
+            shape,
+            &[
+                CrateVariant::ChaseLev,
+                CrateVariant::Loh,
+                CrateVariant::Khpd,
+                CrateVariant::Urd,
+            ],
+            iterations,
+        );
+        for m in cell.measurements {
+            ps.write(CrossProcessMeasurement {
+                variant: DequeVariantKind::from(m.variant),
+                label: m.variant.label().to_string(),
+                ns_per_call: m.ns_per_call,
+                fastest: cell.winner == Some(m.variant),
+                routed_variant: DequeVariantKind::from(routed),
+                iterations,
+                n_drain_threads: shape.n_drain_threads,
+                args_inline_bytes: u32::from(args_inline_bytes),
+                expected_burst_size: shape.expected_burst_size,
+            })?;
+        }
+        Ok(())
     }
 }
 

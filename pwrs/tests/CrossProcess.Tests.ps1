@@ -1,9 +1,10 @@
 # The cross-process worker family.
 #
 # What is bound so far answers without a peer process, so every
-# assertion here runs on every host. The routing decision is made from
-# the shape and the host; the registry reading is a reading of this
-# process. Neither starts a peer.
+# assertion on the cmdlets runs on every host. The routing decision is
+# made from the shape and the host; the registry reading is a reading of
+# this process. Neither starts a peer. The last block does: it runs the
+# crate's four cross-process examples, each of which starts its own peer.
 #
 # The routing assertions check what the table DECIDES, not only that it
 # answers. A suite that accepted any variant would pass for a
@@ -22,7 +23,7 @@ BeforeAll {
 Describe 'the types and the enum this family exports' {
     It 'shapes each type the way its cmdlet documents' {
         foreach ($type in 'Flynnel.DequeVariantInfo', 'Flynnel.CrossProcessRoute',
-                          'Flynnel.PassRegistry') {
+                          'Flynnel.CrossProcessMeasurement', 'Flynnel.PassRegistry') {
             @(Get-FlynnelTypeProperty -TypeName $type).Count |
                 Should -BeGreaterThan 0 -Because "$type must carry something"
         }
@@ -189,5 +190,130 @@ Describe 'Get-FlynnelPassRegistry' {
     It 'refuses a name and an id together' {
         { Get-FlynnelPassRegistry -Name 'a' -Id 1 } |
             Should -Throw -ExpectedMessage '*not both*'
+    }
+}
+
+Describe 'Measure-FlynnelCrossProcessRouting' {
+    # Timing on whatever host runs the suite, so nothing here asserts on
+    # the size of a cost: only on which variants answered, that the
+    # fastest is the cheapest of them, and that the routing table was
+    # left as it was.
+
+    It 'measures every variant once and names one fastest' {
+        $rows = @(Measure-FlynnelCrossProcessRouting -ArgsInlineBytes 8 -Iterations 32)
+        $rows.Count | Should -Be 4
+        @($rows | ForEach-Object { [string]$_.Variant } | Sort-Object -Unique).Count | Should -Be 4
+        $fastest = @($rows | Where-Object Fastest)
+        $fastest.Count | Should -Be 1
+        $fastest[0].NsPerCall | Should -Not -BeNullOrEmpty
+        foreach ($row in $rows) {
+            if ($null -ne $row.NsPerCall) {
+                $row.NsPerCall | Should -BeGreaterThan 0
+                $fastest[0].NsPerCall | Should -BeLessOrEqual $row.NsPerCall
+            }
+            $row.Iterations | Should -Be 32
+        }
+    }
+
+    It 'gives a variant that cannot carry the arguments no cost, rather than a zero one' {
+        # KHPD carries eight argument bytes inline, so sixteen do not fit.
+        $rows = @(Measure-FlynnelCrossProcessRouting -ArgsInlineBytes 16 -Iterations 16)
+        $khpd = $rows | Where-Object { [string]$_.Variant -eq 'Khpd' }
+        $khpd | Should -Not -BeNullOrEmpty
+        $khpd.NsPerCall | Should -BeNullOrEmpty
+        $khpd.Fastest | Should -BeFalse
+    }
+
+    It 'reports the routed variant beside the measurement, and pins nothing' {
+        $before = Get-FlynnelCrossProcessRoute -ArgsInlineBytes 8
+        $rows = @(Measure-FlynnelCrossProcessRouting -ArgsInlineBytes 8 -Iterations 16)
+        foreach ($row in $rows) {
+            [string]$row.RoutedVariant | Should -Be ([string]$before.Variant)
+        }
+        $after = Get-FlynnelCrossProcessRoute -ArgsInlineBytes 8
+        [string]$after.Variant | Should -Be ([string]$before.Variant)
+        $after.FromExplicitCell | Should -Be $before.FromExplicitCell
+        $after.ExplicitCells | Should -Be $before.ExplicitCells
+    }
+
+    It 'refuses zero iterations' {
+        { Measure-FlynnelCrossProcessRouting -ArgsInlineBytes 8 -Iterations 0 } |
+            Should -Throw -ExpectedMessage '*at least one*'
+    }
+}
+
+Describe 'a peer in another process' {
+    # Each of the crate's four cross-process examples is a whole round
+    # trip over one deque variant: the originator creates the deque and
+    # latch files, starts itself again as the worker on the same files,
+    # pushes a hundred add jobs, reads every sum back through the latch
+    # arena, tells the worker to exit and removes both files. It exits 1
+    # when a sum is wrong or the worker failed.
+    #
+    # They run from the binaries a release build of the crate leaves in
+    # target/release/examples, so cargo is not resident while the suite
+    # asserts; a host that has not built them skips, saying which build
+    # makes them. An originator spins on its latches with no deadline of
+    # its own, so each run has one here, and a run that outlives it is
+    # stopped with its worker and fails.
+
+    BeforeAll {
+        $script:ExampleDir = Join-Path $PSScriptRoot '..\..\target\release\examples'
+        $script:ExampleSuffix = ''
+        if ($PSVersionTable.PSEdition -eq 'Desktop' -or $IsWindows) { $script:ExampleSuffix = '.exe' }
+
+        # The example's exit code and every line it wrote, or TimedOut
+        # when it ran past $Seconds and was stopped with its worker.
+        function Invoke-PeerExample {
+            param([string]$Path, [int]$Seconds = 60)
+            $info = [System.Diagnostics.ProcessStartInfo]::new($Path)
+            $info.UseShellExecute = $false
+            $info.RedirectStandardOutput = $true
+            $info.RedirectStandardError = $true
+            $process = [System.Diagnostics.Process]::Start($info)
+            $out = $process.StandardOutput.ReadToEndAsync()
+            $err = $process.StandardError.ReadToEndAsync()
+            $timedOut = -not $process.WaitForExit($Seconds * 1000)
+            if ($timedOut) {
+                if ($PSVersionTable.PSEdition -eq 'Desktop') {
+                    & taskkill.exe /T /F /PID $process.Id | Out-Null
+                } else {
+                    $process.Kill($true)
+                }
+                $process.WaitForExit()
+            }
+            [PSCustomObject]@{
+                TimedOut = $timedOut
+                ExitCode = $process.ExitCode
+                Lines    = @(($out.Result + $err.Result) -split "`r?`n" | Where-Object { $_ })
+            }
+        }
+    }
+
+    It 'runs <Name> to a verified round trip and removes its files' -ForEach @(
+        @{ Name = 'chase_lev_mmf_steal' }
+        @{ Name = 'khpd_steal' }
+        @{ Name = 'loh_steal' }
+        @{ Name = 'urd_steal' }
+    ) {
+        $exe = Join-Path $script:ExampleDir ($Name + $script:ExampleSuffix)
+        if (-not (Test-Path $exe)) {
+            Set-ItResult -Skipped -Because "$exe is not built; cargo build --release --examples builds it"
+            return
+        }
+        $run = Invoke-PeerExample -Path $exe
+        $run.TimedOut | Should -BeFalse -Because ("it ran past its deadline: " + ($run.Lines -join ' | '))
+        $run.ExitCode | Should -Be 0 -Because ($run.Lines -join ' | ')
+        ($run.Lines | Where-Object { $_ -match '^originator: all 100 results match expected sums' }) |
+            Should -Not -BeNullOrEmpty -Because 'every sum came back through the latch arena'
+        ($run.Lines | Where-Object { $_ -match '^originator: worker acked exit' }) |
+            Should -Not -BeNullOrEmpty -Because 'the worker drained and acknowledged its exit'
+        @($run.Lines | Where-Object { $_ -match '^MISMATCH' }).Count | Should -Be 0
+        foreach ($role in 'deque', 'latches') {
+            $line = $run.Lines | Where-Object { $_ -match "^originator: $role\s+= " } | Select-Object -First 1
+            $line | Should -Not -BeNullOrEmpty -Because "the originator names its $role file"
+            $path = ($line -replace "^originator: $role\s+= ", '').Trim()
+            Test-Path -LiteralPath $path | Should -BeFalse -Because "the originator removes $path"
+        }
     }
 }

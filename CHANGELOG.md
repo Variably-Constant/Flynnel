@@ -494,6 +494,25 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- **What each cross-process deque variant costs for a shape, measured
+  on the host.** Measure-FlynnelCrossProcessRouting takes the shape
+  Get-FlynnelCrossProcessRoute takes and writes one
+  Flynnel.CrossProcessMeasurement per variant: NsPerCall, Fastest, and
+  RoutedVariant, the variant the routing table picks for that shape.
+  Each variant runs as `dispatch_calibration::calibrate_cell` runs it,
+  on temporary mapped files with drain threads of its own in the
+  calling process, a warm-up and then Iterations rounds of
+  ExpectedBurstSize dispatches; a variant too narrow for the arguments
+  answers null rather than a cost. The table the calibration writes its
+  winner into is made for the call and dropped, so nothing is pinned.
+
+  The module's cross-process suite also runs the crate's four
+  cross-process examples from a release build, each a whole round trip
+  in which the originator starts itself again as the worker on the same
+  deque and latch files: every sum read back, the worker's exit
+  acknowledged and both files removed, under a deadline that stops the
+  pair if it runs past it.
+
 - **Four more readings on the `Flynnel:` drive, and the trace ring as
   rows.** `backends\accel-ops\<name>` holds a leaf per registered
   accelerator operation, the row Get-FlynnelAccelOp writes.

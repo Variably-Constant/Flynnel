@@ -5,7 +5,7 @@ weight: 10
 
 Every command the Flynnel PowerShell module exports, by family, with the objects and enumerations each one deals in. For the task-oriented introduction see [How To Use The PowerShell Module](../how-to/How-To-Use-The-PowerShell-Module/).
 
-113 commands, 84 object types, 38 enumerations. Every command answers to a shorter name with the `Fly` prefix; the alias is listed beside each.
+114 commands, 85 object types, 38 enumerations. Every command answers to a shorter name with the `Fly` prefix; the alias is listed beside each.
 
 `Get-Help <command> -Full` carries the parameters, the examples and what each parameter means. This page is the map, not a substitute for it.
 
@@ -351,7 +351,7 @@ Objects: `Flynnel.Lever`, `Flynnel.AllowedWidth`, `Flynnel.ServePolicyState`. En
 
 **Agreement is not proof the lever is still unresolved.** Disagreement proves it resolved before the variable was last written; agreement is consistent with both. The column is named for what it measures.
 
-## Cross-process - 3 commands
+## Cross-process - 4 commands
 
 Work that crosses a process boundary, and how it is routed there.
 
@@ -359,13 +359,16 @@ Work that crosses a process boundary, and how it is routed there.
 |---|---|---|
 | `Get-FlynnelCrossProcessVariant` | `Get-FlyCrossProcessVariant` | which deque variant a shape would use |
 | `Get-FlynnelCrossProcessRoute` | `Get-FlyCrossProcessRoute` | the routing table behind that answer |
+| `Measure-FlynnelCrossProcessRouting` | `Measure-FlyCrossProcessRouting` | what each variant costs for a shape on this host |
 | `Get-FlynnelPassRegistry` | `Get-FlyPassRegistry` | the passes this process has registered |
 
-Objects: `Flynnel.DequeVariantInfo`, `Flynnel.CrossProcessRoute`, `Flynnel.PassRegistry`. Enumeration: `Flynnel.DequeVariant`.
+Objects: `Flynnel.DequeVariantInfo`, `Flynnel.CrossProcessRoute`, `Flynnel.CrossProcessMeasurement`, `Flynnel.PassRegistry`. Enumeration: `Flynnel.DequeVariant`.
 
 **The wire carries an id, never code.** A cross-process job cannot carry a closure, because the peer cannot dereference a pointer into this process's heap. It carries `(closure_id, args)` and the peer looks the id up in its own pass registry. That is the same shape the accelerator ops use at the device boundary, and it is what makes the family reachable from a script at all: a script names a pass the peer already holds.
 
-**All three answer without a peer process existing.** The variant a dispatch of a given shape would use is decided from the shape and the host, which is what a script sizing a dispatch wants before starting one; the registry reading is a reading of this process.
+**All four answer without a peer process existing.** The variant a dispatch of a given shape would use is decided from the shape and the host, which is what a script sizing a dispatch wants before starting one; the registry reading is a reading of this process.
+
+**`Measure-FlynnelCrossProcessRouting` times each variant the way the crate's calibration does**: its backend on temporary mapped files with drain threads of its own in this process, a warm-up, then `Iterations` rounds of `ExpectedBurstSize` dispatches, waiting on the last of each. It writes one `Flynnel.CrossProcessMeasurement` per variant with `NsPerCall`, null for a variant too narrow for the arguments, `Fastest`, and `RoutedVariant`, the variant the routing table picks for the same shape. Nothing is pinned: the table the calibration writes into is made for the call and dropped.
 
 **Submitting work to a peer is not bound.** Nor is the calibration that re-measures the routing table. Both need a second process.
 
