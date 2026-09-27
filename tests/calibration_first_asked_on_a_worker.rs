@@ -18,7 +18,8 @@
 //! dispatch does, and the two cannot be told apart. The gate runs it
 //! under the release-test profile.
 
-use std::time::Duration;
+use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 use flynnel::sched::par_iter::{
     calibrate_host_dispatch, host_dispatch_profile, measured_collapse_threshold_ns,
@@ -54,9 +55,16 @@ fn a_profile_first_asked_for_on_a_worker_whose_peers_parked_is_a_dispatch() {
     // is the only record in this test's directory, and one draw alone is
     // stored provisional and not served.
     let from_outside = calibrate_host_dispatch();
+
+    // The inline pass itself, measured as the control: once the peers
+    // have parked again, a join a worker makes on the plan the profile's
+    // own samples use pops back the half it pushed.
+    std::thread::sleep(Duration::from_millis(500));
+    let (inline_ns, ()) = flynnel::join(&onto_a_worker, inline_pass_ns, || ());
     println!(
         "FIRST_ON_PARKED_WORKER workers={workers} measured_before={before:?} dispatch={} \
-         collapse={} wake={} outside_dispatch={} outside_collapse={} outside_wake={}",
+         collapse={} wake={} outside_dispatch={} outside_collapse={} outside_wake={} \
+         inline={inline_ns}",
         on_worker.dispatch_cost_ns,
         on_worker.collapse_threshold_ns,
         on_worker.jec_wake_threshold_ns,
@@ -70,18 +78,44 @@ fn a_profile_first_asked_for_on_a_worker_whose_peers_parked_is_a_dispatch() {
         println!("FIRST_ON_PARKED_WORKER_UNREACHED the pool has {workers} worker, so no join is handed to another");
         return;
     }
-    // A worker's inline pass read 100 ns on a 24-thread Windows host,
-    // whose outside draws read 4300 to 4800 in a loaded test process, and
-    // 170 to 181 ns on a 16-vCPU Linux guest against 1300 to 2200: a
-    // factor of 7 to 48. Idle draws of one host spread by about 15
-    // percent (1300 to 1500 ns over 48 draws on the Windows host), so half
-    // the outside draw separates the two on both hosts with room either
-    // side.
+    // A worker that timed its own inline pass would draw the control's
+    // figure, rounded to its clock's tick: about 100 ns on a 24-thread
+    // Windows host, whose clock ticks every 100 ns, and 170 to 181 ns on a
+    // 16-vCPU Linux guest. A dispatch drawn on a worker read 800 to 1,600
+    // ns over eight gates on the Windows host. More than twice the control
+    // tells the two apart with room either side, whichever way the tick
+    // rounds the inline figure, and both come from this process, so a
+    // load that slows one slows the other.
     assert!(
-        on_worker.dispatch_cost_ns.saturating_mul(2) >= from_outside.dispatch_cost_ns,
-        "the first query, on a worker, drew a dispatch cost of {} ns against {} ns drawn \
-         from outside the pool, so the worker timed its own inline pass",
-        on_worker.dispatch_cost_ns,
-        from_outside.dispatch_cost_ns
+        on_worker.dispatch_cost_ns > inline_ns.saturating_mul(2),
+        "the first query, on a worker, drew a dispatch cost of {} ns against an inline pass of \
+         {inline_ns} ns timed on a worker in this process, so the worker timed its own inline pass",
+        on_worker.dispatch_cost_ns
     );
+}
+
+/// Joins in one sample of the inline control.
+const INLINE_BATCH: u32 = 16;
+
+/// Samples of the inline control; the fastest is kept.
+const INLINE_SAMPLES: u32 = 64;
+
+/// One join's cost when the calling worker pops back the half it pushed,
+/// in nanoseconds: the fastest of `INLINE_SAMPLES` batches of
+/// `INLINE_BATCH` joins on the plan the host profile's own samples use,
+/// per join. A join a woken peer took raises its batch and so cannot
+/// lower the figure, and a batch resolves a join shorter than the clock's
+/// tick.
+fn inline_pass_ns() -> u64 {
+    let plan = JobPlan::new(0, 2);
+    (0..INLINE_SAMPLES)
+        .map(|_| {
+            let start = Instant::now();
+            for _ in 0..INLINE_BATCH {
+                black_box(flynnel::join(&plan, || black_box(1u32), || black_box(2u32)));
+            }
+            start.elapsed().as_nanos() as u64 / u64::from(INLINE_BATCH)
+        })
+        .min()
+        .expect("INLINE_SAMPLES is not zero")
 }
