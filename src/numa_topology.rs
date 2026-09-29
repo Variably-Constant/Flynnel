@@ -235,7 +235,7 @@ fn detect_linux() -> Option<NumaTopology> {
         let Some(rest) = name.strip_prefix("node") else { continue };
         match rest.parse::<u32>() {
             Ok(id) => nodes.push(id),
-            Err(e) => eprintln!(
+            Err(e) => notice!(
                 "flynnel numa: {root}/node{rest} is not a node id ({e}), so that entry \
                  contributes no node",
                 root = root.display()

@@ -53,11 +53,11 @@ fn calib_wait(r: Result<Result<Vec<u8>, String>, BackendError>) -> Option<()> {
     match r {
         Ok(Ok(_reply)) => Some(()),
         Ok(Err(handler_err)) => {
-            eprintln!("calib: handler reported error: {handler_err}");
+            notice!("calib: handler reported error: {handler_err}");
             None
         }
         Err(backend_err) => {
-            eprintln!("calib: backend error: {backend_err}");
+            notice!("calib: backend error: {backend_err}");
             None
         }
     }

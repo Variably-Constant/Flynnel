@@ -347,18 +347,18 @@ impl std::fmt::Debug for MappedMemory {
 impl Drop for MappedMemory {
     fn drop(&mut self) {
         if let Err(e) = self.settle() {
-            eprintln!(
+            notice!(
                 "[flynnel::cuda] freeing {} bytes of mapped memory after its launches \
                  could not be waited for: {e}",
                 self.bytes
             );
         }
         if let Err(e) = self.event.context().bind_to_thread() {
-            eprintln!("[flynnel::cuda] binding the context to free mapped memory: {e:?}");
+            notice!("[flynnel::cuda] binding the context to free mapped memory: {e:?}");
         }
         // SAFETY: `host` came from cuMemHostAlloc and is freed only here.
         if let Err(e) = unsafe { result::free_host(self.host.as_ptr().cast()) } {
-            eprintln!(
+            notice!(
                 "[flynnel::cuda] the driver refused to free {} bytes of mapped memory: {e:?}",
                 self.bytes
             );
@@ -547,7 +547,7 @@ impl DeviceInfo {
     ///
     /// [`BackendError::DeviceUnavailable`] when the driver is not loadable
     /// or has no device `ordinal`, and when it refuses any one fact, which
-    /// is named on stderr beside the driver's answer rather than read as
+    /// is named in a note beside the driver's answer rather than read as
     /// zero.
     pub fn of_ordinal(ordinal: u32) -> Result<Self, BackendError> {
         use sys::CUdevice_attribute as A;
@@ -633,7 +633,7 @@ impl CudaBackend {
     /// first NVIDIA GPU).
     ///
     /// A driver refusal is [`BackendError::DeviceUnavailable`], which
-    /// carries no text, so the driver's own error is written to stderr
+    /// carries no text, so the driver's own error is written as a note
     /// beside it.
     pub fn with_device(device_id: u32) -> Result<Self, BackendError> {
         driver_loadable(device_id)?;
@@ -799,7 +799,7 @@ impl CudaBackend {
         if let Err(e) = mapped {
             // SAFETY: the allocation above, which nothing else holds.
             if let Err(freed) = unsafe { result::free_host(host.as_ptr().cast()) } {
-                eprintln!(
+                notice!(
                     "[flynnel::cuda] freeing {bytes} bytes the device could not map: {freed:?}"
                 );
             }
@@ -1192,7 +1192,7 @@ impl DispatchBackend for CudaBackend {
         // a caller holds `&self`, and a closed hub is said rather than
         // passed over.
         if let NotifySendResult::Closed(_) = self.worker_tx.send(work) {
-            eprintln!(
+            notice!(
                 "[flynnel::cuda] device {}: the worker has shut down, so the work item did not run",
                 self.device_id
             );
@@ -1295,7 +1295,7 @@ fn driver_loadable(device_id: u32) -> Result<(), BackendError> {
 }
 
 /// `DeviceUnavailable` for a driver refusal. The variant carries no text,
-/// so the driver's own error is written to stderr beside it rather than
+/// so the driver's own error is written as a note beside it rather than
 /// dropped.
 fn map_driver_error(device_id: u32, e: DriverError) -> BackendError {
     BackendError::DeviceUnavailable(Backend::Cuda { device_id }).map_io_context(format!("{e:?}"))
@@ -1388,7 +1388,7 @@ impl Drop for CudaBackend {
             // A worker that died of a panic took its work with it, and
             // a drop cannot return that to anyone. Saying so is the
             // only thing left; dropping it reports a clean shutdown.
-            eprintln!(
+            notice!(
                 "flynnel: CUDA backend worker thread panicked: {}",
                 panic_message(&panicked)
             );
@@ -1415,10 +1415,10 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Helper used in the constructor to attach a stderr context line
+/// Helper used in the constructor to attach a context note
 /// to a `DeviceUnavailable` error before returning. The
 /// `BackendError::DeviceUnavailable` variant carries no message
-/// field; the trait-side context is preserved by writing to stderr.
+/// field; the trait-side context is preserved by writing it as a note.
 trait WithIoContext: Sized {
     fn map_io_context(self, msg: String) -> Self;
 }
@@ -1427,7 +1427,7 @@ impl WithIoContext for BackendError {
     fn map_io_context(self, msg: String) -> Self {
         match self {
             BackendError::DeviceUnavailable(b) => {
-                eprintln!("[flynnel::cuda] {}: {msg}", b.name());
+                notice!("[flynnel::cuda] {}: {msg}", b.name());
                 BackendError::DeviceUnavailable(b)
             }
             other => other,

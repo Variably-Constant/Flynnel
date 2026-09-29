@@ -205,8 +205,8 @@ impl DualDeque {
         // any production wiring must size the deque to cover the
         // worst-case burst from its dispatcher (1024 slots ample).
         if self.in_heap.push(job).is_err() {
-            // Best-effort: signal via stderr but don't panic.
-            eprintln!("flynnel::sched::dual_deque: in-heap deque overflow; job dropped");
+            // Best-effort: report it as a note but don't panic.
+            notice!("flynnel::sched::dual_deque: in-heap deque overflow; job dropped");
         }
     }
 

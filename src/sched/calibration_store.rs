@@ -1014,7 +1014,7 @@ impl WriterGuard<'_> {
             // two numbers rather than one measurement.
             let floor = incumbent.dispatch_cost_ns.max(1);
             let times_floor = cpu.dispatch_cost_ns as f64 / floor as f64;
-            eprintln!(
+            notice!(
                 "flynnel: this draw costs {times_floor:.1}x the cheapest seen for this stamp \
                  ({} against {} ns); two draws disagree by {dispatch},{collapse},{wake} per \
                  mille on dispatch,collapse,wake; incumbent spread {} occupancy {:?}, \
@@ -1095,7 +1095,7 @@ impl Drop for WriterGuard<'_> {
             hdr.writer_pid
                 .compare_exchange(me, NO_WRITER, Ordering::AcqRel, Ordering::Acquire)
         {
-            eprintln!(
+            notice!(
                 "flynnel: the calibration lease held by pid {me} was taken by pid {holder} \
                  mid-measurement; leaving it with the new holder"
             );

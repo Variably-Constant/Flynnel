@@ -2004,7 +2004,7 @@ impl Drop for LocalArena {
             if let Some(h) = slot.take()
                 && h.join().is_err()
             {
-                eprintln!("flynnel: worker thread panicked before shutdown join");
+                notice!("flynnel: worker thread panicked before shutdown join");
             }
         }
     }

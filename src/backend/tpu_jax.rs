@@ -198,11 +198,11 @@ fn owner_loop(mut state: BridgeState, hub: &NotifyHub<BridgeRequest>) {
             // meet as an unexplained missing bridge.
             Ok(status) => {
                 if !status.success() {
-                    eprintln!("tpu_jax: the bridge process ended with {status}");
+                    notice!("tpu_jax: the bridge process ended with {status}");
                 }
             }
             Err(unwaitable) => {
-                eprintln!("tpu_jax: the bridge process could not be waited for: {unwaitable}");
+                notice!("tpu_jax: the bridge process could not be waited for: {unwaitable}");
             }
         }
     }
@@ -456,13 +456,13 @@ fn reap(interpreter: &str, mut child: Child) {
     match child.kill() {
         Ok(()) => {}
         Err(gone) => {
-            eprintln!("tpu_jax: the {interpreter} child was already gone: {gone}");
+            notice!("tpu_jax: the {interpreter} child was already gone: {gone}");
         }
     }
     match child.wait() {
         Ok(_ended) => {}
         Err(unwaitable) => {
-            eprintln!("tpu_jax: the {interpreter} child could not be waited for: {unwaitable}");
+            notice!("tpu_jax: the {interpreter} child could not be waited for: {unwaitable}");
         }
     }
 }
@@ -597,7 +597,7 @@ impl WithIoContext for BackendError {
     fn map_io_context(self, msg: String) -> Self {
         match self {
             BackendError::DeviceUnavailable(b) => {
-                eprintln!("[flynnel::tpu_jax] {}: {msg}", b.name());
+                notice!("[flynnel::tpu_jax] {}: {msg}", b.name());
                 BackendError::DeviceUnavailable(b)
             }
             other => other,

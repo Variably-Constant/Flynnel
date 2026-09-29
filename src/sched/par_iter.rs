@@ -197,7 +197,7 @@ fn measure_tsc_per_ns_16() -> u64 {
             }
         }
         if !(16..=256).contains(&best) {
-            eprintln!(
+            notice!(
                 "flynnel: the timestamp counter measured {} ticks per nanosecond in sixteenths, \
                  which is outside 1 to 16 per nanosecond; leaf times are read as nanoseconds \
                  instead",
@@ -877,7 +877,7 @@ fn adaptive_seed_depth(plan: &JobPlan, items: usize, workers: usize) -> usize {
         let ns = plan.estimated_per_item_ns.unwrap_or(0);
         let key = ((items as u64) << 32) | ns as u64;
         if LAST_SHAPE.swap(key, core::sync::atomic::Ordering::Relaxed) != key {
-            eprintln!(
+            notice!(
                 "seed depth: items {items} per_item_ns {:?} effective_ns {:?} \
                  workers {workers} target_leaves {target_leaf_count} \
                  seeded_leaves {} depth {depth}",
@@ -1272,7 +1272,7 @@ fn stored_or_measured() -> HostDispatchProfile {
     let store = match CalibrationStore::open_or_create(&dir, &stamp) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            notice!(
                 "flynnel: the calibration table under {} is unusable ({e:?}); \
                  this process measures its own dispatch profile",
                 dir.display()
@@ -1294,7 +1294,7 @@ fn stored_or_measured() -> HostDispatchProfile {
                 Some(bound) if bound > 0 => format!("serves until it is {bound} s old"),
                 _ => "serves until the layout version changes".to_string(),
             };
-            eprintln!(
+            notice!(
                 "flynnel: host profile {},{},{} READ from the stored record, not \
                  measured; it was drawn {age_s} s ago at {} per mille occupancy with \
                  spread {} per mille and {lasts}",
@@ -1315,8 +1315,8 @@ fn stored_or_measured() -> HostDispatchProfile {
     // figure marks a contended measurement is not known, and a threshold
     // picked ahead of the distribution describes whoever picked it. It is
     // sampled once, on the thread that measured, and both reported and
-    // stored, so the figure a reader sees on stderr is the one the record
-    // carries.
+    // stored, so the figure a reader sees in the note is the one the
+    // record carries.
     let Draw { profile, spread, occupancy: drawn_at, publishable } = draw_host_dispatch();
     if std::env::var_os("FLYNNEL_OCCUPANCY").is_some() {
         // An unmeasured interval is reported as unmeasured. Printing a
@@ -1329,25 +1329,25 @@ fn stored_or_measured() -> HostDispatchProfile {
         // draw is readable and the draw itself is not, so two draws
         // cannot be told apart by anything except the line that says
         // what they ran under.
-        eprintln!(
+        notice!(
             "flynnel: host profile {},{},{}",
             profile.dispatch_cost_ns,
             profile.collapse_threshold_ns,
             profile.jec_wake_threshold_ns,
         );
         match drawn_at {
-            Some(share) => eprintln!(
+            Some(share) => notice!(
                 "flynnel: host calibration ran at {share} per mille occupancy, \
                  spread {spread} per mille",
             ),
-            None => eprintln!(
+            None => notice!(
                 "flynnel: host calibration measured no occupancy on this platform, \
                  spread {spread} per mille",
             ),
         }
     }
     if !publishable {
-        eprintln!(
+        notice!(
             "flynnel: this draw was taken on a pool worker, whose joins time its own inline \
              pass rather than a dispatch, so it routes this process and is not stored"
         );
@@ -1375,7 +1375,7 @@ fn stored_or_measured() -> HostDispatchProfile {
             use crate::sched::calibration_store::PublishOutcome;
             match outcome {
                 PublishOutcome::KeptIncumbent { incumbent, offered, confirmations } => {
-                    eprintln!(
+                    notice!(
                         "flynnel: this host's stored calibration dispatches in {incumbent} \
                          ns and this one in {offered}; the cheaper record stands and this \
                          process uses what it measured. It carries {confirmations} \
@@ -1387,12 +1387,12 @@ fn stored_or_measured() -> HostDispatchProfile {
                         }
                     );
                 }
-                PublishOutcome::Published { confirmations: 0 } => eprintln!(
+                PublishOutcome::Published { confirmations: 0 } => notice!(
                     "flynnel: this draw is stored and provisional; nothing has agreed \
                      with it yet, so the next start measures again and the two are \
                      compared"
                 ),
-                PublishOutcome::Published { confirmations } => eprintln!(
+                PublishOutcome::Published { confirmations } => notice!(
                     "flynnel: this draw is stored with {confirmations} agreeing draw(s) \
                      and serves the next start"
                 ),
@@ -1401,9 +1401,9 @@ fn stored_or_measured() -> HostDispatchProfile {
         // Another process on this host is measuring the same table. Its
         // record serves the next start; this process keeps the profile
         // it measured. Expected under a parallel test run, so it is not
-        // worth a line on stderr.
+        // worth a note.
         Err(StoreError::WriterActive) => {}
-        Err(e) => eprintln!(
+        Err(e) => notice!(
             "flynnel: measured this host but could not publish it ({e:?}); \
              the next process measures again"
         ),
@@ -1474,7 +1474,7 @@ fn configured_max_age_s() -> Option<u64> {
         return Some(DEFAULT_CALIBRATION_MAX_AGE_S);
     };
     let Some(text) = raw.to_str() else {
-        eprintln!(
+        notice!(
             "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S is not valid UTF-8; using the \
              default of {DEFAULT_CALIBRATION_MAX_AGE_S}s"
         );
@@ -1483,7 +1483,7 @@ fn configured_max_age_s() -> Option<u64> {
     match text.trim().parse::<u64>() {
         Ok(v) => Some(v),
         Err(e) => {
-            eprintln!(
+            notice!(
                 "flynnel: FLYNNEL_CALIBRATION_MAX_AGE_S wants a whole number of \
                  seconds and got {text:?} ({e}); using the default of \
                  {DEFAULT_CALIBRATION_MAX_AGE_S}s"
@@ -1503,7 +1503,7 @@ fn now_unix_s() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
         Err(e) => {
-            eprintln!(
+            notice!(
                 "flynnel: this host's clock reads before the epoch ({e}), so a stored \
                  calibration's age cannot be taken and it stands"
             );
@@ -1573,7 +1573,7 @@ fn draw_host_dispatch() -> Draw {
         let helper = match spawned {
             Ok(helper) => helper,
             Err(e) => {
-                eprintln!(
+                notice!(
                     "flynnel: could not start a thread to calibrate outside the pool ({e}); \
                      this worker draws on itself, so its dispatch cost times its own inline \
                      pass, and the draw is not stored"
@@ -1668,7 +1668,7 @@ fn pinned_host_profile() -> Option<HostDispatchProfile> {
     match raw.to_str() {
         Some(text) => parse_pinned_profile(text),
         None => {
-            eprintln!(
+            notice!(
                 "flynnel: FLYNNEL_HOST_PROFILE_NS is not valid UTF-8; measuring this host instead"
             );
             None
@@ -1689,21 +1689,21 @@ fn parse_pinned_profile(text: &str) -> Option<HostDispatchProfile> {
     let mut fields = text.split(',');
     let mut take = |what: &str| -> Option<u64> {
         let Some(field) = fields.next() else {
-            eprintln!(
+            notice!(
                 "flynnel: FLYNNEL_HOST_PROFILE_NS wants dispatch,collapse,wake in ns; the {what} field is missing, so measuring this host instead"
             );
             return None;
         };
         match field.trim().parse::<u64>() {
             Ok(0) => {
-                eprintln!(
+                notice!(
                     "flynnel: FLYNNEL_HOST_PROFILE_NS {what} is zero, which marks an uncalibrated profile; measuring this host instead"
                 );
                 None
             }
             Ok(ns) => Some(ns),
             Err(e) => {
-                eprintln!(
+                notice!(
                     "flynnel: FLYNNEL_HOST_PROFILE_NS {what} field {field:?} is not a nanosecond count ({e}); measuring this host instead"
                 );
                 None
@@ -1714,7 +1714,7 @@ fn parse_pinned_profile(text: &str) -> Option<HostDispatchProfile> {
     let collapse_threshold_ns = take("collapse")?;
     let jec_wake_threshold_ns = take("wake")?;
     if fields.next().is_some() {
-        eprintln!(
+        notice!(
             "flynnel: FLYNNEL_HOST_PROFILE_NS takes exactly dispatch,collapse,wake; measuring this host instead"
         );
         return None;
@@ -1808,8 +1808,8 @@ fn measure_host_dispatch() -> (HostDispatchProfile, u32) {
     /// overhead on work that did not need the pool; over-estimating it
     /// forfeits the parallelism outright.
     ///
-    /// `FLYNNEL_PROFILE_SAMPLES=1` prints every sample of each timed
-    /// point to stderr, so the spread and this bias can be read off
+    /// `FLYNNEL_PROFILE_SAMPLES=1` writes every sample of each timed
+    /// point as a note, so the spread and this bias can be read off
     /// one calibration rather than inferred from repeated runs.
     fn fastest<F: FnMut()>(mut f: F) -> u64 {
         let mut samples = [0u64; SAMPLES];
@@ -1820,7 +1820,7 @@ fn measure_host_dispatch() -> (HostDispatchProfile, u32) {
         }
         samples.sort_unstable();
         if std::env::var_os("FLYNNEL_PROFILE_SAMPLES").is_some() {
-            eprintln!(
+            notice!(
                 "profile point: min {} median {} max {} samples {samples:?}",
                 samples[0],
                 samples[SAMPLES / 2],
@@ -1906,7 +1906,7 @@ fn measure_host_dispatch() -> (HostDispatchProfile, u32) {
             // known conditions can be compared on either without being
             // re-run. The spread is what the trust check reads today;
             // the IQR is the candidate it would be read against.
-            eprintln!(
+            notice!(
                 "profile sweep: min {} median {} max {} spread {} iqr {} per mille samples {samples:?}",
                 samples[0],
                 samples[SAMPLES / 2],
@@ -2275,7 +2275,7 @@ where
             ^ ((ns as u64) << 8)
             ^ effective_min_leaf as u64;
         if LAST_FLOOR_SHAPE.swap(key, core::sync::atomic::Ordering::Relaxed) != key {
-            eprintln!(
+            notice!(
                 "leaf floor: items {n} per_item_ns {:?} explicit {} \
                  use_smt {} caller_floor {} effective_floor {effective_min_leaf}",
                 plan.estimated_per_item_ns,
@@ -2970,7 +2970,7 @@ fn report_unreachable_model(plan: &JobPlan, n: usize) {
     static LAST_SHAPE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
     let key = ((n as u64) << 32) ^ u64::from(plan.task_overhead_ns.unwrap_or(0));
     if LAST_SHAPE.swap(key, core::sync::atomic::Ordering::Relaxed) != key {
-        eprintln!(
+        notice!(
             "tiny-tasks model not consulted: items {n} task_overhead_ns {:?} \
              estimated_per_item_ns {:?} stated {}. The model needs a per-item \
              cost the caller stated or the entry probe measured, so the \

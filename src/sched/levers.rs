@@ -53,7 +53,7 @@ fn read(name: &str) -> bool {
             // Set to something unreadable. Reporting it matters because
             // the alternative is an arm that was asked for, did not run,
             // and produced a row indistinguishable from the other arm.
-            eprintln!(
+            notice!(
                 "flynnel: {name} is set to something that is not UTF-8 ({raw:?}); \
                  treating it as off, which may not be the arm you asked for"
             );
@@ -141,7 +141,7 @@ fn raw(name: &str) -> Option<String> {
         Ok(text) => Some(text),
         Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(value)) => {
-            eprintln!(
+            notice!(
                 "flynnel: {name} is set to something that is not UTF-8 ({value:?}); \
                  treating it as unset, which may not be the arm you asked for"
             );
@@ -170,7 +170,7 @@ pub fn serve_policy() -> ServePolicy {
             return match rest.parse::<u32>() {
                 Ok(bound) => ServePolicy::SpreadAt(bound),
                 Err(e) => {
-                    eprintln!(
+                    notice!(
                         "flynnel: FLYNNEL_SERVE_POLICY spread: wants a whole number of \
                          parts per mille and got {rest:?} ({e}); running the shipped arm"
                     );
@@ -183,7 +183,7 @@ pub fn serve_policy() -> ServePolicy {
             "any" => ServePolicy::Any,
             "occupancy" => ServePolicy::Occupancy,
             other => {
-                eprintln!(
+                notice!(
                     "flynnel: FLYNNEL_SERVE_POLICY is {other:?}, which is not spread, any, \
                      occupancy or spread:<per-mille>; running the shipped arm"
                 );
@@ -209,7 +209,7 @@ pub fn occupancy_floor_per_mille() -> u32 {
         match text.trim().parse::<u32>() {
             Ok(v) => v,
             Err(e) => {
-                eprintln!(
+                notice!(
                     "flynnel: FLYNNEL_OCCUPANCY_FLOOR_PER_MILLE wants a whole number and \
                      got {text:?} ({e}); using 900"
                 );

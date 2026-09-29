@@ -273,7 +273,7 @@ fn pin_or_say(core: CoreId) {
     }
     static SAID: AtomicBool = AtomicBool::new(false);
     if !SAID.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        notice!(
             "flynnel: this host refused to bind a thread to cpu {:?}; the latency table \
              measures whatever cores the scheduler chose and its figures name a pair they \
              may not have run on",

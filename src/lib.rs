@@ -64,6 +64,16 @@
 // crate denies it and the doc leg gains the power to fail.
 #![deny(rustdoc::broken_intra_doc_links)]
 
+/// A note for whoever runs the program, formatted as `eprintln!`
+/// formats and delivered through [`notice::set_sink`]'s sink, or to
+/// stderr when none is installed. Defined ahead of every module so each
+/// one can use it.
+macro_rules! notice {
+    ($($arg:tt)*) => {
+        $crate::notice::emit(::core::format_args!($($arg)*))
+    };
+}
+
 pub mod backend;
 pub mod cpu_info;
 pub mod dispatch_profile;
@@ -72,6 +82,7 @@ pub mod foundation;
 #[cfg(feature = "gpu-peer")]
 pub mod gpu_peer;
 pub mod kernels;
+pub mod notice;
 pub mod numa_topology;
 pub mod op_class;
 pub mod sched;

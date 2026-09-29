@@ -1215,7 +1215,7 @@ impl GpuPeer {
             let stats = self.wave_stats(&wave)?;
             self.release_wave(wave)?;
             if status != STATUS_DONE || stats.slice_state != SliceState::Finished {
-                eprintln!(
+                notice!(
                     "flynnel gpu_peer: a wave calibration run ({frontier:?}, depth {depth}) \
                      retired with status {status}: {stats:?}"
                 );
@@ -1252,7 +1252,7 @@ pub(crate) fn stored_wave_costs(ordinal: usize, width: u32) -> Option<WaveCosts>
     let store = match CalibrationStore::open_or_create(&dir, &HostStamp::detect()) {
         Ok(store) => store,
         Err(err) => {
-            eprintln!(
+            notice!(
                 "flynnel gpu_peer: the calibration table under {} is unusable ({err:?}), \
                  so no stored wave costs are read",
                 dir.display()
@@ -1291,13 +1291,13 @@ fn persist_wave_costs(ordinal: usize, costs: WaveCosts) {
     };
 
     let Some(dir) = calibration_dir() else {
-        eprintln!("flynnel gpu_peer: no calibration directory, so the wave costs stay on this peer");
+        notice!("flynnel gpu_peer: no calibration directory, so the wave costs stay on this peer");
         return;
     };
     let store = match CalibrationStore::open_or_create(&dir, &HostStamp::detect()) {
         Ok(store) => store,
         Err(err) => {
-            eprintln!(
+            notice!(
                 "flynnel gpu_peer: the calibration table under {} is unusable ({err:?}), \
                  so the wave costs stay on this peer",
                 dir.display()
@@ -1308,27 +1308,27 @@ fn persist_wave_costs(ordinal: usize, costs: WaveCosts) {
     let writer = match store.try_acquire_writer() {
         Ok(writer) => writer,
         Err(StoreError::WriterActive) => {
-            eprintln!(
+            notice!(
                 "flynnel gpu_peer: another process is writing the calibration table, \
                  so the wave costs stay on this peer"
             );
             return;
         }
         Err(err) => {
-            eprintln!("flynnel gpu_peer: the calibration lease failed ({err:?}), so the wave costs stay on this peer");
+            notice!("flynnel gpu_peer: the calibration lease failed ({err:?}), so the wave costs stay on this peer");
             return;
         }
     };
     writer.beat();
     let Some((cpu, mut devices)) = store.read() else {
-        eprintln!(
+        notice!(
             "flynnel gpu_peer: the calibration table could not be read between writers, \
              so the wave costs stay on this peer"
         );
         return;
     };
     let Some(i) = devices.iter().position(|d| d.ordinal as usize == ordinal) else {
-        eprintln!(
+        notice!(
             "flynnel gpu_peer: device {ordinal} has no stored record to carry the wave costs, \
              so they stay on this peer"
         );

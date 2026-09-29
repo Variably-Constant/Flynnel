@@ -36,7 +36,7 @@
 //! `new_non_primary` is how one is obtained - because such a context is
 //! replaced on the calling thread, after which the consumer's launches
 //! run on the primary context instead of the one it built.
-//! [`GpuPeer::init`] reports this, to stderr and through
+//! [`GpuPeer::init`] reports this, as a note and through
 //! [`GpuPeer::displaced_foreign_context`], so a consumer can fall back
 //! rather than discover it at a launch far from the cause. A consumer
 //! holding the primary context, which is what `CudaContext::new`
@@ -196,7 +196,7 @@ fn calibrate_or_reuse(
     let store = match CalibrationStore::open_or_create(&dir, &stamp) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            notice!(
                 "flynnel gpu peer: the calibration table under {} is unusable ({e:?}); \
                  measuring this device",
                 dir.display()
@@ -288,7 +288,7 @@ fn calibrate_or_reuse(
         // Another process is measuring this host. Its record serves the
         // next start; this one keeps what it just established.
         Err(StoreError::WriterActive) => {}
-        Err(e) => eprintln!(
+        Err(e) => notice!(
             "flynnel gpu peer: calibrated device {ordinal} but could not publish it ({e:?})"
         ),
     }
@@ -420,8 +420,8 @@ pub struct GpuPeerConfig {
     ///
     /// [`GpuPeer::init`] clamps this to the device's streaming
     /// multiprocessor count when the driver reports one, because a team
-    /// wider than the device loses ranks at its barrier, and says so on
-    /// stderr when it does. [`GpuPeer::team_size`] is the size in use,
+    /// wider than the device loses ranks at its barrier, and says so in
+    /// a note when it does. [`GpuPeer::team_size`] is the size in use,
     /// and it is the `team_size` the user op receives.
     ///
     /// Every lane runs this team unless [`Self::lane_teams`] gives each
@@ -647,7 +647,7 @@ fn warn_on_foreign_context(prior: Option<cu::CUcontext>) -> bool {
     let Some(prior) = prior else { return false };
     match current_context() {
         Some(ours) if ours != prior => {
-            eprintln!(
+            notice!(
                 "flynnel gpu_peer: a different CUDA context was current on this \
                  thread ({prior:?}) and the peer's primary context ({ours:?}) has \
                  replaced it. The peer operates on the device primary context; \
@@ -811,7 +811,7 @@ impl GpuPeer {
                     // the checked-in PTX rejects it
                     // (CUDA_ERROR_UNSUPPORTED_PTX_VERSION); the host's
                     // own NVRTC emits PTX its driver accepts.
-                    eprintln!(
+                    notice!(
                         "flynnel gpu_peer: checked-in PTX rejected ({ptx_err:?}); \
                          compiling the peer kernels with NVRTC instead"
                     );
@@ -932,7 +932,7 @@ impl GpuPeer {
             requested.iter().map(|&asked| clamp_team_size(asked, sm_count)).collect();
         for (lane, (&asked, &got)) in requested.iter().zip(&lane_teams).enumerate() {
             if got != asked {
-                eprintln!(
+                notice!(
                     "flynnel gpu_peer: lane {lane} asked for {asked} blocks, which exceeds \
                      device {}'s {got} streaming multiprocessors; it runs a team of {got}",
                     config.device_ordinal

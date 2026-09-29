@@ -280,7 +280,7 @@ fn nvml_driver_model(bus_id: &str) -> Result<DriverModel, String> {
     // SAFETY: balances the successful init above.
     let rc = unsafe { shutdown() };
     if rc != NVML_SUCCESS {
-        eprintln!("flynnel gpu_peer watchdog: nvmlShutdown returned {rc}");
+        notice!("flynnel gpu_peer watchdog: nvmlShutdown returned {rc}");
     }
     result
 }

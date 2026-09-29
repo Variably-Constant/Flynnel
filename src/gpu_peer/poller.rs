@@ -263,7 +263,7 @@ impl Poller {
                 // Teardown has nothing left to try, and the stop flag
                 // has already ended the resident quantum, so this is
                 // reported rather than propagated.
-                eprintln!("flynnel gpu_peer: lane {lane} shutdown sync failed: {e:?}");
+                notice!("flynnel gpu_peer: lane {lane} shutdown sync failed: {e:?}");
             }
         }
     }

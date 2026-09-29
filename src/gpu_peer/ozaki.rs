@@ -44,7 +44,7 @@ impl OzakiKernels {
         let module = match peer.context().load_module(Ptx::from_src(OZAKI_PTX)) {
             Ok(m) => m,
             Err(ptx_err) => {
-                eprintln!(
+                notice!(
                     "flynnel gpu_peer ozaki: checked-in PTX rejected ({ptx_err:?}); \
                      compiling the ozaki kernels with NVRTC instead"
                 );

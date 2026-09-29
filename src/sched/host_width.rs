@@ -87,7 +87,7 @@ fn is_due(last_ms: u64, now_ms: u64, interval_ms: u64) -> bool {
 fn report_probe_failure(err: &std::io::Error, keeping: usize) {
     static SAID: AtomicBool = AtomicBool::new(false);
     if !SAID.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        notice!(
             "flynnel: this host does not report how many CPUs the process \
              may use ({err}); the pool keeps a width of {keeping} and will \
              retry"
@@ -287,7 +287,7 @@ fn quota_to_cpus(quota: u64, period: u64) -> Option<usize> {
 fn report_quota_unreadable(path: &str, saw: &dyn std::fmt::Display) {
     static SAID: AtomicBool = AtomicBool::new(false);
     if !SAID.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        notice!(
             "flynnel: {path} reads {saw}, which is not a quota and a period; the pool \
              sizes by the affinity mask alone and ignores whatever limit that file sets"
         );

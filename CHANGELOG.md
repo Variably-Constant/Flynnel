@@ -507,6 +507,20 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Added
 
+- **A program that embeds Flynnel decides where its notes go.**
+  `flynnel::notice::set_sink(Some(sink))` installs a `fn(&str)` that
+  receives every note the library writes, one line without its
+  newline: the calibration outcomes, a lever set to something
+  unreadable, a device or driver that refused, the diagnostics a
+  `FLYNNEL_` variable asks for. The program may log each note or drop
+  it; `set_sink(None)` sends notes to stderr again. With no sink
+  installed each note goes to stderr exactly as before, so a program
+  that installs none sees no difference. The sink is held in an atomic
+  pointer: installing it is one store and each note one load, with no
+  lock, from any thread. The `FLYNNEL_TRACE` dump is event data rather
+  than a note and goes to stderr whatever sink is installed, and the
+  crate's own tests, examples and benches print as they did.
+
 - **What each cross-process deque variant costs for a shape, measured
   on the host.** Measure-FlynnelCrossProcessRouting takes the shape
   Get-FlynnelCrossProcessRoute takes and writes one

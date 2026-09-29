@@ -208,7 +208,7 @@ fn load_module(
     match peer.context().load_module(Ptx::from_src(ptx)) {
         Ok(m) => Ok(m),
         Err(ptx_err) => {
-            eprintln!(
+            notice!(
                 "flynnel gpu_peer {what}: checked-in PTX rejected ({ptx_err:?}); \
                  compiling the {what} kernels with NVRTC instead"
             );

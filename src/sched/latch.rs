@@ -552,13 +552,13 @@ impl LockLatch {
     /// set when called.
     pub fn wait(&self) {
         if locklatch_diagnose_enabled() {
-            eprintln!("[locklatch] wait enter tid={:?}", std::thread::current().id());
+            notice!("[locklatch] wait enter tid={:?}", std::thread::current().id());
         }
         // Fast path: if the latch is already set, return without
         // touching the OnceLock or any park syscalls.
         if self.flag.load(std::sync::atomic::Ordering::Acquire) {
             if locklatch_diagnose_enabled() {
-                eprintln!("[locklatch] wait exit (fast)  tid={:?}", std::thread::current().id());
+                notice!("[locklatch] wait exit (fast)  tid={:?}", std::thread::current().id());
             }
             return;
         }
@@ -583,7 +583,7 @@ impl LockLatch {
         // do not park forever.
         if self.flag.load(std::sync::atomic::Ordering::Acquire) {
             if locklatch_diagnose_enabled() {
-                eprintln!("[locklatch] wait exit (race)  tid={:?}", std::thread::current().id());
+                notice!("[locklatch] wait exit (race)  tid={:?}", std::thread::current().id());
             }
             return;
         }
@@ -597,7 +597,7 @@ impl LockLatch {
             std::thread::park();
         }
         if locklatch_diagnose_enabled() {
-            eprintln!("[locklatch] wait exit  tid={:?}", std::thread::current().id());
+            notice!("[locklatch] wait exit  tid={:?}", std::thread::current().id());
         }
     }
 
