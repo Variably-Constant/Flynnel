@@ -198,6 +198,7 @@ name = "call_site_registry_cost"
 
 [[example]]
 name = "staging_buffer_cost"
+required-features = ["shared-memory-worker-reference"]
 
 [[example]]
 name = "adaptive_dispatcher_demo"
@@ -387,6 +388,10 @@ name = "chunk_stack_headroom"
 [[example]]
 name = "oversubscribed_caller"
 
+[[test]]
+name = "cross_process_wire"
+required-features = ["shared-memory-worker-reference"]
+
 [[bench]]
 name = "flynn_axes"
 harness = false
@@ -444,6 +449,7 @@ harness = false
 [[bench]]
 name = "urd_thief_wait"
 harness = false
+required-features = ["shared-memory-worker-reference"]
 
 [[bench]]
 name = "simc_cooperative"
@@ -494,6 +500,7 @@ required-features = ["gpu-peer"]
 [[bench]]
 name = "verify_chain_fold"
 harness = false
+required-features = ["verify-chain"]
 
 [[bench]]
 name = "cuda_mapped_memory"

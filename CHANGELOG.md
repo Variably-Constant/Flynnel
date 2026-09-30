@@ -5,7 +5,65 @@ measurements from `benches/` and `tests/` on the two bench hosts, an
 RTX 3070 with a Ryzen 7 2700 (16 threads) and an RTX 5070 with a
 Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
-## Unreleased
+## 0.6.0 - 2026-09-29
+
+This release is the `flynnel` crate. The PowerShell module in `pwrs/`
+is described below where it changed and is not published with it.
+
+### Known problems
+
+- **An idle `IoPool` can read as every worker busy.** On a host where
+  the scheduler's wait controller settles on MONITORX, which AMD
+  processors offer, each idle `IoPool` worker waits in that
+  instruction, and the operating system counts a thread in a monitor
+  wait as running. On a Ryzen 9 7900X an idle pool of 24 workers used
+  processor time equal to all 24 for the whole of a 50 ms window in
+  most runs. The workers are waiting rather than computing, but the
+  pool shows as fully busy and keeps its processors out of deeper idle
+  states.
+
+- **The PowerShell module's text commands are slower on about 1 MiB of
+  text than before its kernels moved into the crate.** Counting,
+  search, split, replace and case mapping over 15 to 16 blocks of
+  64 KiB take 1.10 to 1.50 times as long, measured on Windows in both
+  shells; on larger texts they run at 0.96 to 1.14 of the earlier
+  time. The crate's text kernels cut a text into 64 KiB blocks, where
+  the module's own kernels cut it into four chunks a worker; 16 KiB
+  blocks were slower still on a 64 KiB text.
+
+- **Off x86-64 the trace ring's timestamps carry no time.** Every event
+  records a value near zero, so a trace dumped with `FLYNNEL_TRACE` on
+  those targets does not order its events in time. x86-64 reads the
+  time-stamp counter and is unaffected.
+
+- **Three tests can fail on a host whose processors are all busy.**
+  `sched::hybrid::tests::pipeline_actually_overlaps_stages`,
+  `min_leaf_one_keeps_a_heavy_batch_parallel_at_both_sizes` in
+  `tests/consumer_reported_contracts.rs`, and the PowerShell module's
+  check that Measure-FlynnelHybridJoin's halves overlap each assert
+  wall time or observed parallelism, and under saturation they can fail
+  although the scheduler did what they guard.
+
+- **The tpu_jax bridge costs more per call at low concurrency.** Its
+  callers share the bridge's pipe through a thread that owns it. On a
+  Ryzen 9 7900X against an echo child that costs 41 us more per call
+  than a lock held across the call with one caller on an idle machine
+  (189 us against 147 us), 16 us more with two, and nothing measurable
+  from 24 callers on.
+
+### Future enhancements
+
+- A park for pool and hub workers that never uses a monitor wait, so an
+  idle pool reads as idle.
+- A text block sized by the input, 64 KiB blocks up to 256 KiB of text
+  and 16 KiB blocks beyond, to remove the slowdown on medium texts.
+- A real clock for trace timestamps off x86-64, in nanoseconds.
+- Tests that check overlap and splitting directly rather than through
+  wall time, so they pass on a saturated host.
+- In the PowerShell module: the GPU peer's lanes, waves and resident
+  and wide operations; invoking a registered accelerator operation from
+  a script; racing candidate plans over a declared kernel; and
+  publication to the PowerShell Gallery.
 
 ### Changed
 
@@ -1190,6 +1248,15 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
 ### Fixed
 
+- **Every target builds without the default features.** The
+  `urd_thief_wait` and `verify_chain_fold` benches, the
+  `staging_buffer_cost` example and the `cross_process_wire` test use
+  modules behind a feature and now name it in `required-features`
+  (`shared-memory-worker-reference`, or `verify-chain` for
+  `verify_chain_fold`), so `cargo check --no-default-features
+  --all-targets` skips them rather than failing, and a default build,
+  which carries every feature, still builds and runs them.
+
 - **An IoPool task could sit queued while a worker was parked.** A
   NotifyHub with several consumers, which every IoPool is, woke the next
   consumer round-robin whether it was parked or busy, and a consumer
@@ -1544,9 +1611,9 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 - `.gitignore` ignored `/target` only at the workspace root, so
   `pwrs/target` was untracked and unignored.
 
-## 0.6.0 - 2026-09-13
+### Also in 0.6.0, recorded 2026-09-13
 
-### Removed
+#### Removed
 
 - `JobPlan::k_gating`, `JobPlan::with_k_gating` and
   `WorkloadShapeHints::k_gating`. The field was written by three
@@ -1571,7 +1638,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
 
   `WorkloadShape::hints()` now returns the hints that steer.
 
-### Added
+#### Added
 
 - `CallSiteState::window_cv2_range_per_mille()` reports the smallest and
   largest per-window cv^2 across every classifier tick.
@@ -1640,7 +1707,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   about 1.4 times too narrow. The arena's own doc gave that 24-against-12
   example without saying it describes the non-default sizing.
 
-### Changed
+#### Changed
 
 - `for_each_chunk_indexed_min_leaf` and `for_each_chunk_triple_min_leaf`
   derive their leaf width from the Tiny-Tasks model when the plan
@@ -1925,7 +1992,7 @@ Ryzen 9 7900X (24 threads); the wiki carries the full tables.
   varies the cost over `1 ..= 2 * reps - 1`, keeping the mean at `reps`
   so the two shapes are comparable in total work.
 
-### Fixed
+#### Fixed
 
 - The GPU tests no longer report a neighbor as a Flynnel regression.
   `gpu_peer_team`'s barrier assertion and `gpu_peer_wave_calibration`
